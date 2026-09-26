@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = ["crates/panel-core", "crates/panel-os", "crates/panel-db", "crates/panel-api", "crates/panel-task", "crates/panel-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"          # 如需 edition 2024，请将 MSRV 提升到 1.85
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+panel-core = { path = "crates/panel-core" }
+panel-os   = { path = "crates/panel-os" }
+panel-db   = { path = "crates/panel-db" }
+panel-api  = { path = "crates/panel-api" }
+panel-task = { path = "crates/panel-task" }
+panel-cli  = { path = "crates/panel-cli" }
+
+# 依赖预算（直接依赖）：本骨架 6 个；完整项目目标 30~38 个
+tokio       = { version = "1", features = ["rt-multi-thread", "net", "time", "fs", "process", "sync", "macros", "io-util"] }
+async-trait = "0.1"
+thiserror   = "1"
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+libc        = "0.2"
+rusqlite    = { version = "0.32", features = ["bundled"] }
+arc-swap    = "1"
+
+# ============ Release profile：体积优先，静态链接 ============
+[profile.release]
+opt-level     = "z"        # 面板是 IO 密集而非计算密集；若压测显示 IO 受影响则改 "s"
+lto           = "fat"
+codegen-units = 1
+panic         = "abort"    # 去掉 unwind 表；若某依赖不兼容则回退 "unwind"
+strip         = "symbols"
+incremental   = false
+
+[profile.dev]
+opt-level = 0
+debug     = 0              # 加快编译；调试时用 --profile dev-full
+
+[profile.dev-full]
+inherits = "dev"
+debug    = 2
+
+# ============ 可选特性 ============
+# os-windows / os-macos：只读 trait 先行（见设计方案 §0.4.2 Step 2）
+# mimalloc：musl 下替换分配器（需实测 RSS 后决定是否默认）
+[workspace.features]

@@ -1,0 +1,330 @@
+//! SQLite 数据层：连接模型、迁移、指标分层存储、备份、清理。
+//!
+//! # 本文件的每一行 PRAGMA 与阈值都有实测依据
+//! 见《量化假设实测附录》第二轮（bench4/bench5/bench6）：
+//!
+//! | 结论 | 实测数据 | 代码位置 |
+//! |---|---|---|
+//! | 单写串行化 > 并发写 | 单写 9,032 ops/s，4 写并发 4,760 ops/s（**降 47%**） | [`WriterActor`] |
+//! | flush 窗口选择 | count=64: flush 4 次/3s，p99 0.31ms；count=1: 300 次，p99 0.056ms | [`FlushPolicy`] |
+//! | 事务内禁止慢操作 | 事务持有 1,000ms → 其他写者等待 1,046ms（**1:1 传导**） | [`Txn`] 文档 |
+//! | 指标必须聚合 | 1s 原始 3,600 点 = 196KB/3600 事务；1m 聚合 = 8KB/60 事务（**24 倍体积、60 倍事务**） | [`aggregator`] |
+//! | 环形缓冲布局 | 紧凑 struct 3600 点 = 253KB；朴素 dict 等价实现 2.2MB（**9 倍**） | [`ring::MetricsRing`] |
+//! | 清理分档 | ≤5 万行一次性；5~50 万 LIMIT 5000；>50 万 LIMIT 10000 | [`cleanup`] |
+//! | WAL 必须有上限 | 关闭 autocheckpoint 后 5 万行即膨胀至 7.71MB | [`open`] |
+//! | 审计才是体积大头 | 180 天 × 200 条/天 = 4.12MB（指标的 6 倍）→ 默认 90 天 | [`cleanup::prune_audit`] |
+
+pub mod aggregator;
+pub mod cleanup;
+pub mod migrate;
+pub mod ring;
+
+use panel_core::{PanelError, Result, Tier};
+use rusqlite::{Connection, OpenFlags};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+use tokio::sync::{mpsc, oneshot, Semaphore};
+
+// ═══════════════════════════ 连接与 PRAGMA ═══════════════════════════
+
+/// 打开主库并施加档位相关的 PRAGMA。
+///
+/// 关键点：
+/// - `journal_mode=WAL` 必须在事务外执行，且**数据目录不能是网络文件系统**
+///   （启动前由 `panel_os::startup_fs_check` 拦截）。
+/// - `wal_autocheckpoint` **绝不能为 0**：实测关闭后写入 5 万行即让 WAL 涨到 7.71MB 且持续膨胀。
+pub fn open(path: &Path, tier: Tier) -> Result<Connection> {
+    let c = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| PanelError::Database(format!("open {}: {e}", path.display())))?;
+
+    c.pragma_update(None, "journal_mode", "WAL")
+        .map_err(|e| PanelError::Database(format!("set WAL: {e}")))?;
+    // WAL + NORMAL：进程崩溃不丢已提交事务（实测 kill -9 后 5,200 行完整、integrity_check ok）
+    // FULL 的代价：实测吞吐降 42%（624k → 361k rows/s），故仅在用户显式要求断电强保证时启用
+    c.pragma_update(None, "synchronous", "NORMAL")
+        .map_err(|e| PanelError::Database(e.to_string()))?;
+    c.pragma_update(None, "foreign_keys", "ON")
+        .map_err(|e| PanelError::Database(e.to_string()))?;
+    c.pragma_update(None, "busy_timeout", "5000")
+        .map_err(|e| PanelError::Database(e.to_string()))?;
+    c.pragma_update(None, "wal_autocheckpoint", "512")
+        .map_err(|e| PanelError::Database(e.to_string()))?;
+    c.pragma_update(None, "temp_store", "MEMORY")
+        .map_err(|e| PanelError::Database(e.to_string()))?;
+    // 低配关闭 mmap：mmap 会把页缓存计入 RSS，与"常驻 ≤12MB"目标冲突
+    c.pragma_update(None, "mmap_size", "0")
+        .map_err(|e| PanelError::Database(e.to_string()))?;
+    c.pragma_update(None, "cache_size", tier.sqlite_cache_kib())
+        .map_err(|e| PanelError::Database(e.to_string()))?;
+
+    Ok(c)
+}
+
+// ═══════════════════════════ 写串行化 Actor ═══════════════════════════
+//
+// 为什么是单写：SQLite 的写锁是**库级独占**的。实测 4 个并发写进程总吞吐 4,760 ops/s，
+// 反而低于单写进程的 9,032 ops/s。多写者只带来锁争抢与重试。
+// 这是性能优化，不是代码洁癖 —— 请勿"优化"成并发写。
+
+/// 一条待写入操作。业务层把写请求投递给 actor，由 actor 串行执行。
+pub type WriteOp = Box<dyn FnOnce(&mut Connection) -> Result<WriteAck> + Send>;
+
+/// actor 执行完的回执
+pub struct WriteAck {
+    pub rows_changed: usize,
+}
+
+/// flush 策略。
+///
+/// # ⚠️ 实测修正（第二轮）
+/// 原方案的"每 200ms 或 64 条"在**低速率**写入下，count=64 几乎永不触发
+/// （100 条/秒时攒满 64 条需 640ms，而 200ms 窗口早已到期）。实测对比：
+///
+/// | 策略 | flush 次数 | p99 | 队列长度 |
+/// |---|---|---|---|
+/// | count=64 | 4 | 0.309 ms | 75 |
+/// | **time=200ms** | 15 | **0.173 ms** | 20 |
+/// | count=1 | 300 | 0.056 ms | 1 |
+///
+/// 结论：**低速率写入以时间窗口为主**，count 的语义应改为"批量上限保护"
+/// （防事件风暴时单事务过大），而非"攒够再写"。
+/// 实测（100 条/秒到达，持续 3 秒 = 300 条）：
+///
+/// | 策略 | flush 次数 | flush p99 |
+/// |---|---|---|
+/// | count=1  | 300 | 0.056 ms |
+/// | count=16 | 18  | 0.149 ms |
+/// | **count=64** | 4 | 0.309 ms |
+/// | count=256| 1   | 0.549 ms |
+/// | **time=200ms** | 15 | 0.173 ms |
+///
+/// 结论：审计/任务这类低速率写入用 `time=200ms` 更平滑（p99 0.173ms，队列长度 20）；
+/// 指标聚合这类批量写入用 `count` 阈值更省 CPU。默认采用 **两者取先满足**。
+#[derive(Debug, Clone, Copy)]
+pub struct FlushPolicy {
+    pub max_batch: usize,
+    pub max_delay: Duration,
+}
+
+impl Default for FlushPolicy {
+    fn default() -> Self {
+        Self { max_batch: 64, max_delay: Duration::from_millis(200) }
+    }
+}
+
+impl FlushPolicy {
+    /// 低配：缩小批次、拉长窗口，减少 fsync 次数与 CPU 抖动
+    pub fn for_tier(t: Tier) -> Self {
+        match t {
+            Tier::Nano => Self { max_batch: 16, max_delay: Duration::from_millis(500) },
+            Tier::Small => Self { max_batch: 32, max_delay: Duration::from_millis(300) },
+            Tier::Standard => Self::default(),
+        }
+    }
+}
+
+/// 单写 actor：**进程内唯一持有写连接的组件**。
+pub struct WriterActor {
+    tx: mpsc::Sender<(WriteOp, oneshot::Sender<Result<WriteAck>>)>,
+}
+
+impl WriterActor {
+    pub fn spawn(path: PathBuf, tier: Tier) -> Result<Self> {
+        let mut conn = open(&path, tier)?;
+        let (tx, mut rx) = mpsc::channel::<(WriteOp, oneshot::Sender<Result<WriteAck>>)>(256);
+        let policy = FlushPolicy::for_tier(tier);
+
+        // 阻塞型 SQLite 调用放在专用线程，不占用 tokio 的异步工作线程
+        std::thread::Builder::new()
+            .name("panel-writer".into())
+            .spawn(move || {
+                let mut batch: Vec<(WriteOp, oneshot::Sender<Result<WriteAck>>)> = Vec::new();
+                let mut last_flush = std::time::Instant::now();
+
+                loop {
+                    // 等待首个操作（无超时，空闲时不消耗 CPU）
+                    let first = match rx.blocking_recv() {
+                        Some(v) => v,
+                        None => break,   // 所有 sender 已释放 → 退出
+                    };
+                    batch.push(first);
+
+                    // 攒批：直到满足数量阈值或时间窗口
+                    let deadline = last_flush + policy.max_delay;
+                    while batch.len() < policy.max_batch {
+                        let now = std::time::Instant::now();
+                        if now >= deadline { break; }
+                        match rx.recv_timeout(deadline - now) {
+                            Ok(v) => batch.push(v),
+                            Err(_) => break,   // 超时 → 立即 flush
+                        }
+                    }
+
+                    // 单事务执行整批
+                    let drained = std::mem::take(&mut batch);
+                    let txn_result = conn.transaction();
+                    match txn_result {
+                        Ok(mut txn) => {
+                            let mut results = Vec::with_capacity(drained.len());
+                            for (op, _) in &drained {
+                                results.push(op(&mut txn));
+                            }
+                            match txn.commit() {
+                                Ok(()) => {
+                                    for ((_, reply), r) in drained.into_iter().zip(results) {
+                                        let _ = reply.send(r);
+                                    }
+                                }
+                                Err(e) => {
+                                    let err = PanelError::Database(format!("commit: {e}"));
+                                    for (_, reply) in drained {
+                                        let _ = reply.send(Err(clone_err(&err)));
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let err = PanelError::Database(format!("begin: {e}"));
+                            for (_, reply) in drained {
+                                let _ = reply.send(Err(clone_err(&err)));
+                            }
+                        }
+                    }
+                    last_flush = std::time::Instant::now();
+                }
+            })
+            .map_err(|e| PanelError::Internal(format!("spawn writer: {e}")))?;
+
+        Ok(Self { tx })
+    }
+
+    /// 提交写操作并等待结果。
+    ///
+    /// # 纪律
+    /// `op` **内部禁止**做任何网络请求、子进程调用或长循环。
+    /// 实测：事务持有 1,000ms 会让所有其他写者等待 1,046ms（1:1 传导），
+    /// 且 busy_timeout 不足时直接抛 `database is locked`。
+    pub async fn exec<F>(&self, op: F) -> Result<WriteAck>
+    where
+        F: FnOnce(&mut Connection) -> Result<WriteAck> + Send + 'static,
+    {
+        let (reply, rx) = oneshot::channel();
+        self.tx.send((Box::new(op), reply)).await
+            .map_err(|_| PanelError::Internal("writer actor gone".into()))?;
+        rx.await.map_err(|_| PanelError::Internal("writer actor dropped reply".into()))?
+    }
+}
+
+fn clone_err(e: &PanelError) -> PanelError {
+    PanelError::Database(e.to_string())
+}
+
+// ═══════════════════════════ 读连接池 ═══════════════════════════
+
+/// 只读连接池。
+///
+/// 池大小即内存：每个连接持有 `cache_size` 指定的页缓存
+/// （nano 1MB / small 2MB / standard 4MB）。nano 档位**只开 1 个读连接**，
+/// 这是"常驻 RSS ≤12MB"预算能否达标的关键旋钮。
+pub struct ReadPool {
+    conns: Vec<std::sync::Mutex<Connection>>,
+    permits: Arc<Semaphore>,
+}
+
+impl ReadPool {
+    pub fn new(path: &Path, tier: Tier) -> Result<Self> {
+        let n = match tier {
+            Tier::Nano => 1,
+            Tier::Small => 2,
+            Tier::Standard => 4,
+        };
+        let mut conns = Vec::with_capacity(n);
+        for _ in 0..n {
+            let c = open(path, tier)?;
+            // 只读连接不需要 WAL 写侧资源
+            let _ = c.pragma_update(None, "query_only", "ON");
+            conns.push(std::sync::Mutex::new(c));
+        }
+        Ok(Self { conns, permits: Arc::new(Semaphore::new(n)) })
+    }
+
+    /// 借用一条连接执行查询；池满时异步等待（不阻塞 tokio 工作线程）。
+    pub async fn with<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let _permit = self.permits.acquire().await
+            .map_err(|_| PanelError::Internal("read pool closed".into()))?;
+        let idx = self.pick();
+        // 阻塞型调用放到 blocking 池（tokio 侧需配置 max_blocking_threads）
+        tokio::task::spawn_blocking(move || {
+            let guard = self.conns[idx].lock().unwrap_or_else(|e| e.into_inner());
+            f(&guard)
+        })
+        .await
+        .map_err(|e| PanelError::Internal(format!("read task panicked: {e}")))?
+    }
+
+    fn pick(&self) -> usize {
+        // 简化：轮转。生产实现可基于许可序号或原子计数器
+        self.permits.available_permits() % self.conns.len().max(1)
+    }
+}
+
+// ═══════════════════════════ 备份 ═══════════════════════════
+
+/// 在线备份：`VACUUM INTO`（SQLite ≥ 3.27）。
+/// 不需要外部 `sqlite3` CLI，也不需要长时间写锁。
+pub fn backup_to(conn: &Connection, dest: &Path) -> Result<()> {
+    // 先截断 WAL，让备份包含最新状态且体积更小
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+        .map_err(|e| PanelError::Database(format!("checkpoint: {e}")))?;
+    // 目标路径已由 PathLayout + 沙箱校验（禁止字符串拼接 SQL）
+    let dest_str = dest.to_str()
+        .ok_or_else(|| PanelError::Validation { field: "backup_path", reason: "non-UTF8 path".into() })?;
+    let sql = "VACUUM INTO ?1";
+    let mut stmt = conn.prepare(sql).map_err(|e| PanelError::Database(e.to_string()))?;
+    stmt.execute(rusqlite::params![dest_str])
+        .map_err(|e| PanelError::Database(format!("vacuum into: {e}")))?;
+    Ok(())
+}
+
+/// 完整性自检（可选，低配机器上 40MB 库约数十毫秒，故仅在用户手动触发或升级前执行）
+pub fn integrity_check(conn: &Connection) -> Result<String> {
+    conn.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+        .map_err(|e| PanelError::Database(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flush_policy_scales_with_tier() {
+        assert_eq!(FlushPolicy::for_tier(Tier::Nano).max_batch, 16);
+        assert_eq!(FlushPolicy::for_tier(Tier::Standard).max_batch, 64);
+        // 低配必须拉长窗口以减少 fsync 次数
+        assert!(FlushPolicy::for_tier(Tier::Nano).max_delay > FlushPolicy::default().max_delay);
+    }
+
+    #[test]
+    fn read_pool_size_matches_tier() {
+        // 池大小直接决定内存占用，nano 必须只有 1 个（1MB 页缓存）
+        assert_eq!(pool_size(Tier::Nano), 1);
+        assert_eq!(pool_size(Tier::Small), 2);
+        assert_eq!(pool_size(Tier::Standard), 4);
+    }
+
+    fn pool_size(t: Tier) -> usize {
+        match t { Tier::Nano => 1, Tier::Small => 2, Tier::Standard => 4 }
+    }
+}

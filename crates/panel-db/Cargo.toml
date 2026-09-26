@@ -1,0 +1,17 @@
+[package]
+name = "panel-db"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SQLite 数据层：单写 actor、分层指标存储、迁移、备份、分档清理"
+
+[dependencies]
+panel-core = { path = "../panel-core" }
+# bundled：静态编译 sqlite3 C 源码，目标机无需 libsqlite3
+rusqlite = { version = "0.32", features = ["bundled"] }
+tokio    = { workspace = true }
+arc-swap = "1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

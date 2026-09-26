@@ -1,0 +1,126 @@
+//! Linux 平台实现：当前唯一完整实现（设计方案 §0.3.3）。
+//!
+//! 已实现（骨架内可运行）：metrics、process、storage、services。
+//! 其余 provider 为**显式 stub**，返回 `Unsupported` 而非 panic —— 这样
+//! 能力矩阵能正确置灰 UI，也给出清晰的接入清单（对应里程碑 M2~M5）。
+
+pub mod files;
+pub mod metrics;
+pub mod services;
+pub mod stub;
+
+use crate::{
+    paths::LinuxPathLayout,
+    traits::*,
+};
+use panel_core::{PlatformInfo, Result};
+use std::sync::Arc;
+
+/// 平台能力聚合（进程内单例，注入给业务层）
+pub struct LinuxOsAdapter {
+    pub paths: Arc<LinuxPathLayout>,
+    pub metrics: Arc<metrics::LinuxMetrics>,
+    pub services: Arc<services::LinuxServices>,
+    pub firewall: Arc<stub::LinuxFirewall>,
+    pub packages: Arc<stub::LinuxPackages>,
+    pub logs: Arc<stub::LinuxLogs>,
+    pub scheduler: Arc<stub::LinuxScheduler>,
+    pub webserver: Arc<stub::LinuxWebServer>,
+    pub databases: Arc<stub::LinuxDatabases>,
+    pub users: Arc<stub::LinuxUsers>,
+    pub network: Arc<stub::LinuxNetwork>,
+    pub storage: Arc<stub::LinuxStorage>,
+    pub files: Arc<files::LinuxFileProvider>,
+    pub platform: PlatformInfo,
+}
+
+impl LinuxOsAdapter {
+    pub fn new() -> Self {
+        Self {
+            paths: Arc::new(LinuxPathLayout::default()),
+            metrics: Arc::new(metrics::LinuxMetrics::new()),
+            services: Arc::new(services::LinuxServices::detect()),
+            firewall: Arc::new(stub::LinuxFirewall::detect()),
+            packages: Arc::new(stub::LinuxPackages::detect()),
+            logs: Arc::new(stub::LinuxLogs::default()),
+            scheduler: Arc::new(stub::LinuxScheduler::default()),
+            webserver: Arc::new(stub::LinuxWebServer::detect()),
+            databases: Arc::new(stub::LinuxDatabases::default()),
+            users: Arc::new(stub::LinuxUsers::default()),
+            network: Arc::new(stub::LinuxNetwork::default()),
+            storage: Arc::new(stub::LinuxStorage),
+            files: Arc::new(files::LinuxFileProvider),
+            platform: detect_platform(),
+        }
+    }
+}
+
+impl LinuxOsAdapter {
+    pub fn files(&self) -> &Arc<files::LinuxFileProvider> { &self.files }
+}
+
+impl Default for LinuxOsAdapter { fn default() -> Self { Self::new() } }
+
+/// 读取 /etc/os-release，避免硬编码发行版分支
+pub fn detect_platform() -> PlatformInfo {
+    let distro = std::fs::read_to_string("/etc/os-release").ok().and_then(|s| {
+        let mut id = None; let mut ver = None;
+        for line in s.lines() {
+            if let Some(v) = line.strip_prefix("ID=") { id = Some(v.trim_matches('"').to_string()); }
+            if let Some(v) = line.strip_prefix("VERSION_ID=") { ver = Some(v.trim_matches('"').to_string()); }
+        }
+        match (id, ver) { (Some(i), Some(v)) => Some(format!("{i}:{v}")), _ => None }
+    });
+    let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease").ok().map(|s| s.trim().to_string());
+    PlatformInfo {
+        os: panel_core::Os::Linux,
+        arch: match std::env::consts::ARCH {
+            "x86_64" => panel_core::Arch::X86_64,
+            "aarch64" => panel_core::Arch::Aarch64,
+            "arm" => panel_core::Arch::Armv7,
+            _ => panel_core::Arch::X86,
+        },
+        init: services::LinuxServices::detect().init_system(),
+        distro,
+        kernel,
+    }
+}
+
+/// 宿主规模探测（内存 MB / CPU 数）。只读 procfs，零子进程。
+pub fn host_profile() -> (u64, u32) {
+    let mem_mb = std::fs::read_to_string("/proc/meminfo").ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("MemTotal:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse::<u64>().ok()))
+        .map(|kb| kb / 1024)
+        .unwrap_or(1024);
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get() as u32).unwrap_or(1);
+    (mem_mb, cpus)
+}
+
+/// 数据目录文件系统检查：网络文件系统上 WAL 不可靠，必须拒绝启动（设计方案 §1.4-7）
+pub fn check_data_dir_fs(path: &std::path::Path) -> Result<(String, bool)> {
+    use std::ffi::CString;
+    let Ok(c) = CString::new(path.to_string_lossy().as_bytes()) else {
+        return Err(panel_core::PanelError::Internal("bad path".into()));
+    };
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
+        return Err(panel_core::PanelError::Internal("statfs failed".into()));
+    }
+    // 魔数：NFS_SUPER_MAGIC 0x6969 / CIFS 0xFF534D42 / 9P 0x01021997 / OVERLAYFS 0x794c7630
+    let is_network = matches!(st.f_type as u64,
+        0x6969 | 0xFF534D42 | 0x01021997 | 0x517B | 0xFE534D42);
+    let name = match st.f_type as u64 {
+        0xEF53 => "ext4/ext3/ext2",
+        0x9123683E => "btrfs",
+        0x58465342 => "xfs",
+        0x794c7630 => "overlayfs",
+        0x6969 => "nfs",
+        0xFF534D42 => "cifs",
+        _ => "unknown",
+    };
+    Ok((name.to_string(), is_network))
+}
+pub use files::{LinuxFileProvider, is_sensitive_path};

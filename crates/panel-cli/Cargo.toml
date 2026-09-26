@@ -1,0 +1,45 @@
+[package]
+name = "panel-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "面板可执行文件：init / doctor / migrate / serve / backup"
+
+[dependencies]
+panel-core = { path = "../panel-core" }
+panel-os   = { path = "../panel-os" }
+panel-db   = { path = "../panel-db" }
+panel-api  = { path = "../panel-api" }
+panel-task = { path = "../panel-task" }
+
+axum       = { version = "0.8", default-features = false, features = ["http1", "json", "macros"] }
+tokio      = { workspace = true }
+clap       = { version = "4", features = ["derive"] }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+toml       = "0.8"
+tracing    = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+rand       = "0.8"
+rusqlite   = { workspace = true }
+
+# 静态资源内嵌：运行期零 Node、零外部文件依赖
+rust-embed = { version = "8", features = ["mime-guess", "compression"] }
+
+# 可选 TLS。默认关闭：多数部署由前置 nginx/Caddy 终止 TLS，
+# 关闭可省下 rustls 及其依赖带来的数百 KB 体积。
+axum-server = { version = "0.7", optional = true }
+rustls      = { version = "0.23", optional = true }
+rustls-pemfile = { version = "2", optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+
+# 开发期从磁盘读取 web/dist，避免每次改前端都重编译二进制
+[features]
+default = []
+tls = ["axum-server", "rustls", "rustls-pemfile", "tokio-rustls"]
+dev-assets = []
+
+[[bin]]
+name = "panel"
+path = "src/main.rs"

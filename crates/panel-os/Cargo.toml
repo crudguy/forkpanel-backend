@@ -1,0 +1,24 @@
+[package]
+name = "panel-os"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "OS 抽象层：trait 契约 + Linux 实现 + 内存 mock（用于一致性测试）"
+
+[dependencies]
+panel-core = { path = "../panel-core" }
+async-trait = { workspace = true }
+tokio      = { workspace = true }
+libc       = { workspace = true }
+tracing    = "0.1"
+
+[features]
+default = []
+# Windows 只读能力先行（设计方案 §0.4.2 Step 2）
+os-windows = []
+# 强制使用内存实现（CI / 非 Linux 开发环境）
+force-mock = []
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

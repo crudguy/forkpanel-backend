@@ -1,0 +1,16 @@
+[package]
+name = "panel-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "领域模型、错误类型与能力矩阵（零 IO 依赖）"
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+# 应用层加密：SSL 私钥 / 数据库口令入库前用主密钥加密（关闭 M0 阻塞项）
+aes-gcm = "0.10"
+rand = "0.8"
+
+[dev-dependencies]

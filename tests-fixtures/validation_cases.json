@@ -1,0 +1,92 @@
+{
+  "unit_name": {
+    "valid": [
+      "nginx.service",
+      "panel@1.service",
+      "sshd",
+      "mysql_1.service",
+      "a.b-c@d"
+    ],
+    "invalid": [
+      "nginx; rm -rf /",
+      "../../etc/passwd",
+      "$(id)",
+      "`id`",
+      "-bad",
+      "a..b",
+      "",
+      "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "nginx|cat /etc/shadow",
+      "nginx\nrm -rf /",
+      "unit&id"
+    ]
+  },
+  "domain": {
+    "valid": [
+      "example.com",
+      "a.b.c.example.org",
+      "xn--fiqs8s",
+      "s1.example.com",
+      "1.2.3.4"
+    ],
+    "invalid": [
+      "-a.com",
+      "a-.com",
+      ".com",
+      "exa mple.com",
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "",
+      "a..b",
+      "example.com;rm -rf /",
+      "example.com\nSet-Cookie:x",
+      "$(id).com"
+    ]
+  },
+  "system_user": {
+    "valid": [
+      "www-data",
+      "_apps",
+      "nginx1"
+    ],
+    "invalid": [
+      "-root",
+      "root;id",
+      "",
+      "Root",
+      "user name",
+      "uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu",
+      "user$(id)"
+    ]
+  },
+  "db_name": {
+    "valid": [
+      "wp_db1",
+      "Panel",
+      "a"
+    ],
+    "invalid": [
+      "wp-db",
+      "db;drop table",
+      "db'or 1=1--",
+      "",
+      "db`x",
+      "ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    ]
+  },
+  "path_segment": {
+    "valid": [
+      "site-a",
+      "index.html",
+      "a b"
+    ],
+    "invalid": [
+      "..",
+      ".",
+      "a/b",
+      "a\u0000b",
+      "a\\b",
+      "",
+      "ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss"
+    ]
+  }
+}

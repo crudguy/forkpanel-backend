@@ -1,0 +1,31 @@
+# ── Rust 构建产物 ──
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# ── 内嵌前端产物（由前端仓库构建后提供，运行期内嵌不入库）──
+crates/panel-cli/embed/assets/
+web-dist/
+
+# ── 本地运行数据（绝不入库）──
+*.db
+*.db-wal
+*.db-shm
+/var/
+/data/
+*.bak
+
+# ── 密钥与证书 ──
+master.key
+*.pem
+*.key
+tls/
+
+# ── 编辑器 / OS 噪声 ──
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# ── CI 运行缓存 ──
+ci/.cache/

@@ -1,0 +1,1270 @@
+openapi: 3.1.0
+info:
+  title: 轻量 Linux 服务器管理面板 · API
+  version: "1.0"
+  description: |
+    前后端唯一接口契约（事实源）。前端（panel-frontend）只通过本契约与后端（panel-backend）通信。
+
+    设计要点（见《设计方案》§3.4）：
+    - REST over HTTPS，JSON；统一前缀 `/api/v1`。
+    - 统一响应信封 `Envelope`：`{code,message,data,request_id[,detail]}`。
+    - 写操作（POST/PUT/PATCH/DELETE）必须带 `X-CSRF-Token` 头（双提交校验）+ `Origin` 白名单。
+    - 所有耗时 > 1s 的操作返回 `202 Accepted` + `{task_id}`，通过 `GET /api/v1/tasks/{id}` 或 SSE `tasks` 频道获取进度。
+    - 能力矩阵驱动：若某能力 `supported=false`，对应接口返回 `10009 unsupported`（而非伪造数据）。
+  contact:
+    name: panel-backend
+
+servers:
+  - url: https://localhost:2083
+    description: 单文件二进制（rustls 或前置反代）
+
+tags:
+  - { name: auth,        description: 认证 / 会话 / 密码 }
+  - { name: system,      description: 能力矩阵 / 概览 / 指标 }
+  - { name: processes,   description: 进程列表与信号 }
+  - { name: services,    description: 服务（systemd 等）管理 }
+  - { name: packages,    description: 软件包安装 / 卸载 }
+  - { name: sites,       description: 站点与 SSL 证书 }
+  - { name: files,       description: 文件管理（沙箱化） }
+  - { name: db,          description: 数据库引擎接入 / 备份还原 }
+  - { name: firewall,    description: 防火墙与安全基线 }
+  - { name: security,    description: 登录安全 / 会话 / MFA }
+  - { name: cron,        description: 计划任务 }
+  - { name: logs,        description: 统一日志浏览器 }
+  - { name: tasks,       description: 异步任务中心 }
+  - { name: settings,    description: 面板设置 }
+  - { name: users,       description: 用户与角色 }
+  - { name: audit,       description: 审计日志 }
+  - { name: events,      description: SSE 实时频道 }
+
+security:
+  - cookieAuth: []
+
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: panel_sid
+      description: |
+        服务端会话 Cookie。属性：HttpOnly; Secure; SameSite=Strict; Path=/。
+        空闲 30min / 绝对 12h 过期；登录后轮换 sid（防固定攻击）。
+    csrfHeader:
+      type: apiKey
+      in: header
+      name: X-CSRF-Token
+      description: |
+        双提交 CSRF token。值取自可读 Cookie `panel_csrf`，写操作必须同源回传。
+        与 Cookie 值一致性 + `Origin` 白名单双重校验。
+
+  parameters:
+    Page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+      description: 页码（从 1 开始）
+    PageSize:
+      name: page_size
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    Sort:
+      name: sort
+      in: query
+      schema: { type: string }
+      description: 排序字段；`-` 前缀表示降序，如 `-created_at`。
+    Q:
+      name: q
+      in: query
+      schema: { type: string }
+      description: 关键字过滤。
+
+  schemas:
+    Envelope:
+      type: object
+      required: [code, message, data, request_id]
+      properties:
+        code:       { type: integer, example: 0, description: "0=成功；10xxx 通用 / 2xxxx 系统 / 3xxxx 服务 / 4xxxx 站点证书 / 5xxxx 文件 / 6xxxx 数据库 / 7xxxx 防火墙 / 8xxxx 任务 / 9xxxx 日志设置" }
+        message:    { type: string, example: ok }
+        data:       { description: 业务数据；失败时为 null }
+        request_id: { type: string, example: nK8fA2xQ }
+        detail:     { type: object, description: 失败时的字段级明细（如 {required, hint}） }
+
+    ErrorEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+      description: 失败时 `data` 为 null，含 `detail`。
+
+    LogRead:
+      type: object
+      properties:
+        source: { type: string }
+        lines:  { type: array, items: { $ref: '#/components/schemas/LogLine' } }
+        capped: { type: boolean, description: 是否因行数上限被截断 }
+
+    LogLine:
+      type: object
+      properties:
+        ts:    { type: [integer, 'null'] }
+        level: { type: ['string', 'null'] }
+        text:  { type: string }
+
+    # ───────────── 能力矩阵 ─────────────
+    Capability:
+      type: object
+      required: [supported]
+      properties:
+        supported: { type: boolean }
+        backend:   { type: [string, "null"], description: 实际后端，如 "systemd"/"nftables"/"apt" }
+        reason:    { type: [string, "null"], enum: [null, not_implemented, binary_missing, no_package_manager, init_unknown, unsupported_os] }
+    PlatformInfo:
+      type: object
+      properties:
+        os:      { type: string, example: linux }
+        arch:    { type: string, example: x86_64 }
+        init:    { type: string, example: systemd }
+        distro:  { type: [string, "null"], example: "debian:12" }
+        kernel:  { type: [string, "null"], example: "6.1.0" }
+    CapabilitiesResponse:
+      type: object
+      properties:
+        platform:   { $ref: '#/components/schemas/PlatformInfo' }
+        tier:       { type: string, enum: [nano, small, standard], example: standard }
+        polling:    { type: boolean, description: "true=前端应退化为轮询（nano 档位无 SSE）" }
+        features:   { type: object, additionalProperties: { $ref: '#/components/schemas/Capability' } }
+
+    # ───────────── 认证 ─────────────
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: { type: string }
+        password: { type: string }
+        totp:     { type: string, description: 启用 MFA 时必填 }
+    MeResponse:
+      type: object
+      properties:
+        user:         { type: string }
+        role:         { type: string, enum: [owner, admin, operator, viewer] }
+        permissions:   { type: array, items: { type: string } }
+        capabilities: { $ref: '#/components/schemas/CapabilitiesResponse' }
+        tier:         { type: string, enum: [nano, small, standard] }
+        polling:      { type: boolean }
+    ChangePasswordRequest:
+      type: object
+      required: [old, new]
+      properties:
+        old: { type: string }
+        new: { type: string }
+
+    # ───────────── 系统 / 指标 ─────────────
+    Overview:
+      type: object
+      properties:
+        cpu_pct:       { type: number, example: 12.4 }
+        mem_used_kib:  { type: integer }
+        mem_total_kib: { type: integer }
+        swap_used_kib: { type: integer }
+        disk_used_bytes:  { type: integer }
+        disk_total_bytes: { type: integer }
+        net_in_bps:    { type: integer }
+        net_out_bps:   { type: integer }
+        load1:         { type: number }
+        uptime_sec:    { type: integer }
+        degraded:      { type: boolean, description: "true=已触发低配降频" }
+        alerts:        { type: array, items: { $ref: '#/components/schemas/Alert' } }
+    Alert:
+      type: object
+      properties:
+        level: { type: string, enum: [info, warn, danger] }
+        text:  { type: string, example: "证书 example.com 30 天内到期" }
+    MetricSample:
+      type: object
+      properties:
+        ts:        { type: integer }
+        cpu_pct:   { type: number }
+        mem_used_kib: { type: integer }
+        mem_total_kib: { type: integer }
+        net_in_bps:  { type: integer }
+        net_out_bps: { type: integer }
+        load1: { type: number }
+    HistoryPoint:
+      type: object
+      properties:
+        ts: { type: integer }
+        cpu_pct: { type: number }
+        mem_used_kib: { type: integer }
+        net_in_bps: { type: integer }
+        net_out_bps: { type: integer }
+
+    # ───────────── 进程 ─────────────
+    Process:
+      type: object
+      properties:
+        pid:  { type: integer }
+        name: { type: string }
+        cpu_pct: { type: number }
+        mem_rss_kib: { type: integer }
+        user: { type: string }
+        cmdline: { type: string }
+    KillRequest:
+      type: object
+      required: [signal]
+      properties:
+        signal: { type: string, enum: [term, kill, int, hup], description: "term=SIGTERM(5s 后 SIGKILL 两步)；kill=SIGKILL" }
+
+    # ───────────── 服务 ─────────────
+    ServiceUnit:
+      type: object
+      properties:
+        name:   { type: string, example: nginx.service }
+        state:  { type: string, enum: [active, inactive, failed, activating, deactivating, unknown] }
+        enabled: { type: boolean }
+        sub:    { type: string }
+        desc:   { type: string }
+    ServiceStatus:
+      type: object
+      properties:
+        name: { type: string }
+        state: { type: string }
+        active_since: { type: [integer, "null"] }
+        pid:  { type: [integer, "null"] }
+    EnabledRequest:
+      required: [enabled]
+      type: object
+      properties: { enabled: { type: boolean } }
+
+    # ───────────── 软件包 ─────────────
+    Package:
+      type: object
+      properties:
+        name:    { type: string }
+        version: { type: [string, "null"] }
+        manager: { type: [string, "null"], example: apt }
+        path:    { type: [string, "null"] }
+
+    # ───────────── 站点 / SSL ─────────────
+    Site:
+      type: object
+      properties:
+        id:       { type: integer }
+        name:     { type: string }
+        domains:  { type: array, items: { type: string } }
+        root:     { type: string }
+        kind:     { type: string, enum: [static, proxy] }
+        enabled:  { type: boolean }
+        tls:      { type: boolean }
+    SiteCreate:
+      type: object
+      required: [name, domains]
+      properties:
+        name:    { type: string }
+        domains: { type: array, items: { type: string } }
+        root:    { type: [string, "null"] }
+        php:     { type: boolean }
+    SitePatch:
+      type: object
+      properties:
+        domains: { type: array, items: { type: string } }
+        root:    { type: string }
+        enabled: { type: boolean }
+        force_https: { type: boolean }
+    SiteApply:
+      type: object
+      required: [name, domains, root]
+      properties:
+        name:        { type: string }
+        domains:     { type: array, items: { type: string } }
+        root:        { type: string }
+        force_https: { type: boolean }
+    Cert:
+      type: object
+      properties:
+        id:          { type: integer }
+        domain:      { type: string }
+        issuer:      { type: [string, "null"] }
+        not_after:   { type: [integer, "null"] }
+        days_left:   { type: [integer, "null"] }
+        auto_renew:  { type: boolean }
+        renew_state: { type: string, enum: [idle, pending, ok, failed] }
+    SslApply:
+      type: object
+      required: [domains, method]
+      properties:
+        domains: { type: array, items: { type: string } }
+        method:  { type: string, enum: [http-01, dns-01], default: http-01 }
+        email:   { type: [string, "null"] }
+
+    # ───────────── 文件 ─────────────
+    FileEntry:
+      type: object
+      properties:
+        name:     { type: string }
+        path:     { type: string }
+        is_dir:   { type: boolean }
+        size:     { type: integer }
+        mode:     { type: string, example: "0644" }
+        owner:    { type: string }
+        mtime:    { type: integer }
+        sensitive: { type: boolean, description: "位于敏感黑名单（/etc/shadow 等）时为 true，禁止读取/下载" }
+    FileList:
+      type: object
+      properties:
+        path:  { type: string }
+        items: { type: array, items: { $ref: '#/components/schemas/FileEntry' } }
+        page:  { type: integer }
+        total: { type: integer }
+    FileAction:
+      type: object
+      required: [op]
+      properties:
+        op:   { type: string, enum: [move, copy, delete, chmod, rename, compress, extract] }
+        path: { type: string }
+        target: { type: string }
+        name: { type: string }
+        mode: { type: string }
+
+    # ───────────── 数据库 ─────────────
+    DbConnection:
+      type: object
+      required: [name, engine]
+      properties:
+        id:         { type: integer }
+        name:       { type: string }
+        engine:     { type: string, enum: [sqlite, mysql, postgres] }
+        host:       { type: [string, "null"] }
+        port:       { type: [integer, "null"] }
+        username:   { type: [string, "null"] }
+        default_db: { type: [string, "null"] }
+        tls_mode:   { type: string, enum: [disable, prefer, require], default: prefer }
+    DbConnectionCreate:
+      required: [name, engine]
+      type: object
+      properties:
+        name: { type: string }
+        engine: { type: string, enum: [sqlite, mysql, postgres] }
+        host: { type: string }
+        port: { type: integer }
+        username: { type: string }
+        password: { type: string, description: "明文传输，后端用主密钥加密存储" }
+        default_db: { type: string }
+        tls_mode: { type: string, enum: [disable, prefer, require] }
+    DbTable:
+      type: object
+      properties:
+        name: { type: string }
+        rows: { type: integer }
+        engine: { type: [string, "null"] }
+    DbRowPreview:
+      type: object
+      properties:
+        columns: { type: array, items: { type: string } }
+        rows: { type: array, items: { type: array, items: {} } }
+        page: { type: integer }
+        total: { type: integer }
+
+    # ───────────── 防火墙 ─────────────
+    FirewallStatus:
+      type: object
+      properties:
+        active:  { type: boolean }
+        backend: { type: [string, "null"], example: nftables }
+        snapshot_id: { type: [string, "null"], description: "最近一次规则快照，用于应急恢复" }
+    FirewallRule:
+      type: object
+      properties:
+        id:      { type: string }
+        port:    { type: string, example: "443" }
+        proto:   { type: string, enum: [tcp, udp] }
+        direction: { type: string, enum: [in, out] }
+        action:  { type: string, enum: [allow, deny] }
+        source:  { type: [string, "null"], description: "CIDR 或 null=任意" }
+        note:    { type: [string, "null"] }
+    FirewallRuleCreate:
+      required: [port, action]
+      type: object
+      properties:
+        port: { type: string }
+        proto: { type: string, enum: [tcp, udp], default: tcp }
+        direction: { type: string, enum: [in, out], default: in }
+        action: { type: string, enum: [allow, deny] }
+        source: { type: [string, "null"] }
+        note: { type: string }
+
+    # ───────────── 安全 ─────────────
+    SecurityBaselineItem:
+      type: object
+      properties:
+        key: { type: string, example: ssh.permit_root_login }
+        title: { type: string }
+        ok: { type: boolean }
+        current: { type: string, example: "yes" }
+        expected: { type: string, example: "no" }
+        advice: { type: string }
+        applicable: { type: boolean, description: "该平台是否适用（如非 systemd 则 false）" }
+    SessionInfo:
+      type: object
+      properties:
+        id: { type: string }
+        user: { type: string }
+        ip: { type: [string, "null"] }
+        ua: { type: [string, "null"] }
+        created_at: { type: integer }
+        last_seen_at: { type: integer }
+
+    # ───────────── 计划任务 ─────────────
+    CronJob:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        expr: { type: string, example: "0 3 * * *" }
+        kind: { type: string, enum: [script, backup, cert_renew, internal] }
+        enabled: { type: boolean }
+        timeout_sec: { type: integer }
+        next_runs: { type: array, items: { type: integer }, description: "下次 N 次执行时间戳（服务端计算）" }
+        last_status: { type: [string, "null"], enum: [ok, failed, running, null] }
+    CronJobCreate:
+      required: [name, expr, kind]
+      type: object
+      properties:
+        name: { type: string }
+        expr: { type: string }
+        kind: { type: string, enum: [script, backup, cert_renew, internal] }
+        payload: { type: object }
+        timeout_sec: { type: integer, default: 1800 }
+    CronRun:
+      type: object
+      properties:
+        id: { type: string }
+        started_at: { type: integer }
+        finished_at: { type: [integer, "null"] }
+        exit_code: { type: [integer, "null"] }
+        output_path: { type: [string, "null"] }
+
+    # ───────────── 日志 ─────────────
+    LogSource:
+      type: object
+      properties:
+        id: { type: string, example: panel }
+        label: { type: string }
+        readable: { type: boolean }
+    LogQuery:
+      type: object
+      properties:
+        source: { type: string }
+        filter: { type: [string, "null"], description: "服务端字面量子串过滤（刻意不支持正则）" }
+        level:  { type: [string, "null"], enum: [debug, info, warn, error, null] }
+        since:  { type: [integer, "null"] }
+        until:  { type: [integer, "null"] }
+        follow: { type: boolean, default: false }
+        limit:  { type: integer, maximum: 2000, default: 200 }
+
+    # ───────────── 任务中心 ─────────────
+    Task:
+      type: object
+      properties:
+        id: { type: string }
+        kind: { type: string }
+        state: { type: string, enum: [queued, running, ok, failed, canceled, interrupted] }
+        progress: { type: integer, minimum: 0, maximum: 100 }
+        stage: { type: [string, "null"] }
+        started_at: { type: [integer, "null"] }
+        finished_at: { type: [integer, "null"] }
+        exit_code: { type: [integer, "null"] }
+
+    # ───────────── 设置 / 用户 / 审计 ─────────────
+    Settings:
+      type: object
+      description: 面板设置（端口/绑定/TLS/档位/语言/主题等），具体字段见 config.toml
+      additionalProperties: true
+    User:
+      type: object
+      properties:
+        id: { type: integer }
+        username: { type: string }
+        role: { type: string, enum: [owner, admin, operator, viewer] }
+        allowed_roots: { type: array, items: { type: string } }
+        mfa_enabled: { type: boolean }
+        disabled: { type: boolean }
+        created_at: { type: integer }
+        last_login_at: { type: [integer, "null"] }
+    UserCreate:
+      required: [username, password, role]
+      type: object
+      properties:
+        username: { type: string }
+        password: { type: string, description: "最小长度 10 + 弱口令字典检查" }
+        role: { type: string, enum: [admin, operator, viewer] }
+        allowed_roots: { type: array, items: { type: string } }
+    UserPatch:
+      type: object
+      properties:
+        role: { type: string, enum: [admin, operator, viewer] }
+        allowed_roots: { type: array, items: { type: string } }
+        disabled: { type: boolean }
+        password: { type: string }
+    AuditEntry:
+      type: object
+      properties:
+        id: { type: integer }
+        ts: { type: integer }
+        actor: { type: string }
+        actor_ip: { type: [string, "null"] }
+        action: { type: string }
+        target: { type: [string, "null"] }
+        result: { type: string, enum: [ok, denied, error] }
+        detail_json: { type: [string, "null"] }
+
+    TaskAccepted:
+      type: object
+      properties:
+        task_id: { type: string }
+
+paths:
+  # ───────── 版本 / 认证 ─────────
+  /api/v1/version:
+    get:
+      tags: [system]
+      security: []
+      summary: 版本与契约协商
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  api: { type: string, example: "1.0" }
+                  app: { type: string, example: "0.4.2" }
+                  build: { type: string }
+
+  /api/v1/auth/login:
+    post:
+      tags: [auth]
+      security: []
+      summary: 登录（204 + Set-Cookie）
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/LoginRequest' } } } }
+      responses:
+        '204': { description: 成功，Set-Cookie: panel_sid / panel_csrf }
+        '401': { description: 认证失败（含防暴力退避） }
+
+  /api/v1/auth/logout:
+    post:
+      tags: [auth]
+      summary: 登出（清会话）
+      responses: { '204': { description: ok } }
+
+  /api/v1/auth/me:
+    get:
+      tags: [auth]
+      summary: 当前用户 + 权限 + 能力矩阵
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/MeResponse' } } }
+
+  /api/v1/auth/password:
+    post:
+      tags: [auth]
+      summary: 修改密码（需 CSRF）
+      security: [cookieAuth, csrfHeader]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ChangePasswordRequest' } } } }
+      responses: { '204': { description: ok }, '403': { description: 旧密码错误 } }
+
+  # ───────── 系统 / 能力 / 指标 ─────────
+  /api/v1/system/capabilities:
+    get:
+      tags: [system]
+      summary: 能力矩阵（前端菜单唯一开关）
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/CapabilitiesResponse' } } }
+
+  /api/v1/system/overview:
+    get:
+      tags: [system]
+      summary: 一次性快照（仪表盘卡片）
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/Overview' } } }
+
+  /api/v1/metrics/realtime:
+    get:
+      tags: [system]
+      summary: 内存环形缓冲最近 N 秒
+      parameters:
+        - { name: since, in: query, schema: { type: integer, default: 60 }, description: 秒数 }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/MetricSample' } } } }
+
+  /api/v1/metrics/history:
+    get:
+      tags: [system]
+      summary: 历史聚合（nano 档位不落盘 → 返回 empty）
+      parameters:
+        - { name: range, in: query, schema: { type: string, enum: [1h, 24h, 7d], default: 24h } }
+        - { name: gran,  in: query, schema: { type: string, enum: [1m, 1h], default: 1m } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/HistoryPoint' } } } }
+
+  # ───────── 进程 ─────────
+  /api/v1/processes:
+    get:
+      tags: [processes]
+      summary: 进程列表（Top N by CPU）
+      parameters:
+        - { name: sort, in: query, schema: { type: string, enum: [cpu, mem], default: cpu } }
+        - { name: limit, in: query, schema: { type: integer, default: 10 } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/Process' } } } }
+
+  /api/v1/processes/{pid}/kill:
+    post:
+      tags: [processes]
+      summary: 发送信号（禁止 pid 1 与面板自身）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: pid, in: path, required: true, schema: { type: integer } }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/KillRequest' } } } }
+      responses: { '204': { description: ok }, '400': { description: 拒绝杀 pid 1 / 自身 } }
+
+  # ───────── 服务 ─────────
+  /api/v1/services:
+    get:
+      tags: [services]
+      summary: 服务列表
+      parameters:
+        - { name: filter, in: query, schema: { type: string } }
+        - { name: state,  in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/ServiceUnit' } } } }
+
+  /api/v1/services/{unit}/status:
+    get:
+      tags: [services]
+      parameters: [{ name: unit, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/ServiceStatus' } } }
+
+  /api/v1/services/{unit}/start:
+    post:
+      tags: [services]
+      summary: 启动
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: unit, in: path, required: true, schema: { type: string } }]
+      responses: { '204': { description: ok } }
+  /api/v1/services/{unit}/stop:
+    post:
+      tags: [services]
+      summary: 停止
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: unit, in: path, required: true, schema: { type: string } }]
+      responses: { '204': { description: ok } }
+  /api/v1/services/{unit}/restart:
+    post:
+      tags: [services]
+      summary: 重启
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: unit, in: path, required: true, schema: { type: string } }]
+      responses: { '204': { description: ok } }
+
+  /api/v1/services/{unit}/enabled:
+    put:
+      tags: [services]
+      summary: 开机自启开关
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: unit, in: path, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/EnabledRequest' } } } }
+      responses: { '204': { description: ok } }
+
+  /api/v1/services/{unit}/journal:
+    get:
+      tags: [services]
+      summary: 服务日志（最近 N 行）
+      parameters:
+        - { name: unit, in: path, required: true, schema: { type: string } }
+        - { name: lines, in: query, schema: { type: integer, default: 500 } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: string } } }
+
+  # ───────── 软件包 ─────────
+  /api/v1/packages:
+    get:
+      tags: [packages]
+      summary: 已探测软件（名称/版本/路径）
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/Package' } } } }
+  /api/v1/packages/install:
+    post:
+      tags: [packages]
+      summary: 安装（任务化 → 202）
+      security: [cookieAuth, csrfHeader]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [name], properties: { name: { type: string } } }
+      responses:
+        '202': { description: 已入队, content: { application/json: { schema: { $ref: '#/components/schemas/TaskAccepted' } } } }
+        '80001': { description: 队列满 }
+  /api/v1/packages/{name}:
+    delete:
+      tags: [packages]
+      summary: 卸载（任务化 → 202）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: name, in: path, required: true, schema: { type: string } }]
+      responses: { '202': { description: 已入队 } }
+
+  # ───────── 站点 / SSL ─────────
+  /api/v1/sites:
+    get:
+      tags: [sites]
+      summary: 站点列表
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/Site' } } } }
+    post:
+      tags: [sites]
+      summary: 新建站点（配置闭环：render→validate→deploy→reload→落库）
+      security: [cookieAuth, csrfHeader]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SiteCreate' } } } }
+      responses: { '201': { description: 已创建 }, '40002': { description: 配置校验失败（已回滚） } }
+  /api/v1/sites/apply:
+    post:
+      tags: [sites]
+      summary: 应用站点配置（配置闭环：render→validate→deploy→reload→落库）
+      security: [cookieAuth, csrfHeader]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SiteApply' } } } }
+      responses:
+        '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope' } } } }
+        '40002': { description: 配置校验失败（已回滚，旧配置原封不动） }
+  /api/v1/sites/{id}:
+    get:
+      tags: [sites]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/Site' } } } } } } }
+    patch:
+      tags: [sites]
+      summary: 更新站点
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SitePatch' } } } }
+      responses: { '204': { description: ok } }
+    delete:
+      tags: [sites]
+      summary: 删除站点（可选保留根目录）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses: { '204': { description: ok } }
+  /api/v1/sites/{id}/reload:
+    post:
+      tags: [sites]
+      summary: 重新生成配置并 reload（先 nginx -t 校验）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses: { '204': { description: ok } }
+  /api/v1/sites/{id}/logs:
+    get:
+      tags: [sites]
+      summary: 站点访问/错误日志（SSE，kind=access|error）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+        - { name: kind, in: query, schema: { type: string, enum: [access, error] } }
+        - { name: follow, in: query, schema: { type: boolean, default: true } }
+      responses: { '200': { description: text/event-stream } }
+  /api/v1/sites/{id}/ssl/apply:
+    post:
+      tags: [sites]
+      summary: 申请/续期证书（任务化 → 202）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SslApply' } } } }
+      responses: { '202': { description: 已入队 } }
+
+  /api/v1/certs:
+    get:
+      tags: [sites]
+      summary: 证书列表（含到期倒计时）
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/Cert' } } } }
+  /api/v1/certs/{id}/renew:
+    post:
+      tags: [sites]
+      summary: 手动续期（任务化 → 202）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses: { '202': { description: 已入队 } }
+  /api/v1/certs/{id}:
+    delete:
+      tags: [sites]
+      summary: 删除证书
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses: { '204': { description: ok } }
+
+  # ───────── 文件 ─────────
+  /api/v1/files/list:
+    get:
+      tags: [files]
+      summary: 文件列表（分页 + 排序 + 隐藏文件开关）
+      parameters:
+        - { name: path, in: query, schema: { type: string }, description: 允许根内绝对/相对路径 }
+        - { name: show_hidden, in: query, schema: { type: boolean, default: false } }
+        - { $ref: '#/components/parameters/Page' }
+        - { $ref: '#/components/parameters/PageSize' }
+        - { $ref: '#/components/parameters/Sort' }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/FileList' } } }
+        '50001': { description: 路径越界 }
+  /api/v1/files/stat:
+    get:
+      tags: [files]
+      summary: 单文件/目录元信息
+      parameters: [{ name: path, in: query, required: true, schema: { type: string } }]
+      responses: { '200': { description: ok } }
+  /api/v1/files/upload:
+    put:
+      tags: [files]
+      summary: 流式上传（octet-stream，分片 5MB）
+      security: [cookieAuth, csrfHeader]
+      parameters:
+        - { name: path, in: query, required: true, schema: { type: string } }
+        - { name: name, in: query, required: true, schema: { type: string } }
+      responses: { '204': { description: ok } }
+  /api/v1/files/download:
+    get:
+      tags: [files]
+      summary: 下载（一次性签名 token，60s 有效，绑定会话）
+      parameters: [{ name: token, in: query, required: true, schema: { type: string } }]
+      responses: { '200': { description: application/octet-stream }, '401': { description: token 失效 } }
+  /api/v1/files/read:
+    get:
+      tags: [files]
+      summary: 文本读取（≤2MB，二进制拒绝）
+      parameters: [{ name: path, in: query, required: true, schema: { type: string } }]
+      responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: string } } } } } } }
+  /api/v1/files/write:
+    put:
+      tags: [files]
+      summary: 保存文本（生成 .bak）
+      security: [cookieAuth, csrfHeader]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [path, content], properties: { path: { type: string }, content: { type: string } } }
+      responses: { '204': { description: ok } }
+  /api/v1/files/mkdir:
+    post:
+      tags: [files]
+      security: [cookieAuth, csrfHeader]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [path, name], properties: { path: { type: string }, name: { type: string } } } } } }
+      responses: { '204': { description: ok } }
+  /api/v1/files/delete:
+    post:
+      tags: [files]
+      security: [cookieAuth, csrfHeader]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [path], properties: { path: { type: string } } } } } }
+      responses: { '204': { description: ok } }
+  /api/v1/files/rename:
+    post:
+      tags: [files]
+      security: [cookieAuth, csrfHeader]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [path, name], properties: { path: { type: string }, name: { type: string } } } } } }
+      responses: { '204': { description: ok } }
+  /api/v1/files/chmod:
+    post:
+      tags: [files]
+      security: [cookieAuth, csrfHeader]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [path, mode], properties: { path: { type: string }, mode: { type: string, example: "0644" } } } } } }
+      responses: { '204': { description: ok } }
+  /api/v1/files/action:
+    post:
+      tags: [files]
+      summary: 批量操作（move/copy/compress/extract）
+      security: [cookieAuth, csrfHeader]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/FileAction' } } } }
+      responses: { '202': { description: 大目录走后台任务 } }
+
+  # ───────── 数据库 ─────────
+  /api/v1/db/connections:
+    get:
+      tags: [db]
+      summary: 数据库引擎连接列表
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/DbConnection' } } } }
+    post:
+      tags: [db]
+      summary: 新增连接（口令主密钥加密存储）
+      security: [cookieAuth, csrfHeader]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/DbConnectionCreate' } } } }
+      responses: { '201': { description: 已创建 } }
+  /api/v1/db/{conn}/databases:
+    get:
+      tags: [db]
+      parameters: [{ name: conn, in: path, required: true, schema: { type: integer } }]
+      responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { type: string } } } } } } } }
+  /api/v1/db/{conn}/{db}/tables:
+    get:
+      tags: [db]
+      parameters:
+        - { name: conn, in: path, required: true, schema: { type: integer } }
+        - { name: db, in: path, required: true, schema: { type: string } }
+      responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/DbTable' } } } } } } } }
+  /api/v1/db/{conn}/{db}/{table}/rows:
+    get:
+      tags: [db]
+      summary: 数据预览（只读，分页 50 行）
+      parameters:
+        - { name: conn, in: path, required: true, schema: { type: integer } }
+        - { name: db, in: path, required: true, schema: { type: string } }
+        - { name: table, in: path, required: true, schema: { type: string } }
+        - { $ref: '#/components/parameters/Page' }
+        - { $ref: '#/components/parameters/PageSize' }
+      responses: { '200': { description: ok } }
+  /api/v1/db/{conn}/backup:
+    post:
+      tags: [db]
+      summary: 备份（任务化 → 202）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: conn, in: path, required: true, schema: { type: integer } }]
+      responses: { '202': { description: 已入队 } }
+  /api/v1/db/{conn}/restore:
+    post:
+      tags: [db]
+      summary: 还原（二次确认 + 自动先备份当前库）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: conn, in: path, required: true, schema: { type: integer } }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [file, confirm_token], properties: { file: { type: string }, confirm_token: { type: string } } } } } }
+      responses: { '202': { description: 已入队 } }
+
+  # ───────── 防火墙 ─────────
+  /api/v1/firewall/status:
+    get:
+      tags: [firewall]
+      summary: 防火墙开关与后端
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/FirewallStatus' } } }
+  /api/v1/firewall/enabled:
+    put:
+      tags: [firewall]
+      summary: 开关（大按钮 + 二次确认防误关）
+      security: [cookieAuth, csrfHeader]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [enabled], properties: { enabled: { type: boolean } } } } } }
+      responses: { '204': { description: ok } }
+  /api/v1/firewall/rules:
+    get:
+      tags: [firewall]
+      summary: 端口规则列表
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/FirewallRule' } } } }
+    post:
+      tags: [firewall]
+      summary: 应用规则（声明式 RulePlan）
+      security: [cookieAuth, csrfHeader]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/FirewallRuleCreate' } } } }
+      responses: { '201': { description: 已创建 } }
+  /api/v1/firewall/rules/{id}:
+    delete:
+      tags: [firewall]
+      summary: 删除规则
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '204': { description: ok } }
+
+  # ───────── 安全 ─────────
+  /api/v1/security/baseline:
+    get:
+      tags: [security]
+      summary: SSH / 系统安全基线检查（只读）
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/SecurityBaselineItem' } } } }
+  /api/v1/security/baseline/apply:
+    post:
+      tags: [security]
+      summary: 应用某项基线修复（自动先备份 + diff）
+      security: [cookieAuth, csrfHeader]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [key], properties: { key: { type: string } } } } } }
+      responses: { '204': { description: ok } }
+  /api/v1/security/sessions:
+    get:
+      tags: [security]
+      summary: 当前活跃会话（可踢下线）
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/SessionInfo' } } } }
+  /api/v1/security/sessions/{id}:
+    delete:
+      tags: [security]
+      summary: 踢下线
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '204': { description: ok } }
+
+  # ───────── 计划任务 ─────────
+  /api/v1/cron/jobs:
+    get:
+      tags: [cron]
+      summary: 计划任务列表
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/CronJob' } } } }
+    post:
+      tags: [cron]
+      summary: 新建（表达式服务端校验）
+      security: [cookieAuth, csrfHeader]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CronJobCreate' } } } }
+      responses: { '201': { description: 已创建 }, '80002': { description: 表达式非法 } }
+  /api/v1/cron/jobs/{id}:
+    get:
+      tags: [cron]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: ok } }
+    patch:
+      tags: [cron]
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { enabled: { type: boolean }, expr: { type: string }, timeout_sec: { type: integer } } } } } }
+      responses: { '204': { description: ok } }
+    delete:
+      tags: [cron]
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '204': { description: ok } }
+  /api/v1/cron/jobs/{id}/run:
+    post:
+      tags: [cron]
+      summary: 手动执行（任务化）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '202': { description: 已入队 } }
+  /api/v1/cron/jobs/{id}/runs:
+    get:
+      tags: [cron]
+      summary: 执行记录（最近 100 条/任务）
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/CronRun' } } } } } } } }
+  /api/v1/cron/preview:
+    post:
+      tags: [cron]
+      summary: 下次 5 次执行时间预览
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [expr], properties: { expr: { type: string } } } } } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { type: integer } } } }
+
+  # ───────── 日志 ─────────
+  /api/v1/logs/sources:
+    get:
+      tags: [logs]
+      summary: 日志来源（panel/system/service/site-access/site-error/custom）
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/LogSource' } } } }
+  /api/v1/logs/stream:
+    get:
+      tags: [logs]
+      summary: 统一日志浏览器（SSE，服务端过滤）
+      parameters:
+        - { name: source, in: query, schema: { type: string } }
+        - { name: filter, in: query, schema: { type: string } }
+        - { name: level, in: query, schema: { type: string, enum: [debug, info, warn, error] } }
+        - { name: since, in: query, schema: { type: integer } }
+        - { name: until, in: query, schema: { type: integer } }
+        - { name: follow, in: query, schema: { type: boolean, default: true } }
+        - { name: limit, in: query, schema: { type: integer, maximum: 2000, default: 200 } }
+      responses: { '200': { description: text/event-stream } }
+  /api/v1/logs/download:
+    get:
+      tags: [logs]
+      summary: 日志下载（限大小）
+      parameters:
+        - { name: source, in: query, schema: { type: string } }
+        - { name: range, in: query, schema: { type: string } }
+      responses: { '200': { description: text/plain' } }
+
+  /api/v1/logs/{id}:
+    get:
+      tags: [logs]
+      summary: 读取单个日志源（行数上限 2000，grep 字面量非正则）
+      parameters:
+        - $ref: '#/components/parameters/LogId'
+        - { name: lines, in: query, schema: { type: integer, maximum: 2000, default: 200 } }
+        - { name: grep, in: query, schema: { type: string } }
+        - { name: level, in: query, schema: { type: string, enum: [debug, info, warn, error] } }
+        - { name: since, in: query, schema: { type: integer } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/LogRead' } } }
+
+  # ───────── 任务中心 ─────────
+  /api/v1/tasks:
+    get:
+      tags: [tasks]
+      summary: 任务列表（进行中/完成/失败）
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/Task' } } } }
+  /api/v1/tasks/{id}:
+    get:
+      tags: [tasks]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/Task' } } } } } } }
+  /api/v1/tasks/{id}/cancel:
+    post:
+      tags: [tasks]
+      summary: 取消（终止子进程组）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '204': { description: ok } }
+  /api/v1/tasks/{id}/output:
+    get:
+      tags: [tasks]
+      summary: 任务输出尾部读取
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: string } } } } } } }
+
+  # ───────── 设置 / 用户 / 审计 ─────────
+  /api/v1/settings:
+    get:
+      tags: [settings]
+      summary: 面板设置
+      responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/Settings' } } } } } } }
+    patch:
+      tags: [settings]
+      summary: 修改设置（端口/绑定/TLS/档位/语言/主题/通知）
+      security: [cookieAuth, csrfHeader]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+      responses: { '204': { description: ok } }
+  /api/v1/users:
+    get:
+      tags: [users]
+      summary: 用户列表
+      responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/User' } } } } } } } }
+    post:
+      tags: [users]
+      summary: 新建用户
+      security: [cookieAuth, csrfHeader]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/UserCreate' } } } }
+      responses: { '201': { description: 已创建 } }
+  /api/v1/users/{id}:
+    patch:
+      tags: [users]
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/UserPatch' } } } }
+      responses: { '204': { description: ok } }
+    delete:
+      tags: [users]
+      summary: 删除用户（owner 不可删）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses: { '204': { description: ok } }
+  /api/v1/audit:
+    get:
+      tags: [audit]
+      summary: 审计日志查询
+      parameters:
+        - { $ref: '#/components/parameters/Page' }
+        - { $ref: '#/components/parameters/PageSize' }
+        - { name: action, in: query, schema: { type: string } }
+        - { name: actor, in: query, schema: { type: string } }
+      responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/AuditEntry' } } } } } } } }
+
+  # ───────── SSE 实时频道 ─────────
+  /api/v1/events/metrics:
+    get:
+      tags: [events]
+      summary: SSE：指标推送（nano 档位关闭，前端改轮询）
+      responses: { '200': { description: text/event-stream } }
+  /api/v1/events/tasks:
+    get:
+      tags: [events]
+      summary: SSE：任务进度/输出推送
+      responses: { '200': { description: text/event-stream } }
+  /api/v1/events/logs:
+    get:
+      tags: [events]
+      summary: SSE：日志增量推送
+      responses: { '200': { description: text/event-stream } }

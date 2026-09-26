@@ -1,0 +1,25 @@
+[package]
+name = "panel-task"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "任务中心：长任务编排、并发与幂等控制、进度广播、内部周期调度"
+
+[dependencies]
+panel-core = { path = "../panel-core" }
+panel-os   = { path = "../panel-os" }
+panel-db   = { path = "../panel-db" }
+
+tokio      = { workspace = true }
+async-trait = { workspace = true }
+thiserror  = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+rusqlite   = { workspace = true }
+arc-swap   = { workspace = true }
+tokio-util = "0.7"
+tracing    = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

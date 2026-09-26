@@ -1,0 +1,31 @@
+[package]
+name = "panel-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "HTTP 层：路由、鉴权与 RBAC、CSRF、SSE、统一响应 envelope"
+
+[dependencies]
+panel-core = { path = "../panel-core" }
+panel-os   = { path = "../panel-os" }
+panel-db   = { path = "../panel-db" }
+panel-task = { path = "../panel-task" }
+
+axum       = { version = "0.8", default-features = false, features = ["http1", "json", "macros"] }
+tokio      = { workspace = true }
+tower      = { version = "0.5", features = ["limit"] }
+async-stream = "0.3"
+futures-util = "0.3"
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+argon2     = "0.5"          # 密码哈希；登录时瞬时占用 8~19MB（按档位）
+rand       = "0.8"
+hmac       = "0.12"
+sha2       = "0.10"
+time       = { version = "0.3", features = ["formatting", "parsing"] }
+rusqlite   = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
