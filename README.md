@@ -1,8 +1,8 @@
-# panel-backend · 轻量 Linux 服务器管理面板 · 后端
+# ForkPanel（叉叉面板）· 轻量 Linux 服务器管理面板 · 后端
 
 **技术栈**：Rust（edition 2021，MSRV 1.75）+ axum + rusqlite(SQLite) + tokio
 **形态**：单文件静态二进制，内嵌前端产物，无运行时依赖，面向低配 Linux VPS 单机部署
-**配套前端**：[panel-frontend](https://github.com/your-org/panel-frontend)（独立仓库）
+**配套前端**：[fork-panel-frontend](https://github.com/your-org/fork-panel-frontend)（独立仓库）
 
 ---
 
