@@ -3,6 +3,7 @@
 //! **这也是一致性测试的对象**：任何新平台实现都必须能在同一套契约测试上跑通
 //! （设计方案 §0.3.5），避免口头声称支持。
 
+use crate::mock_files; // Rust 2018+：兄弟模块必须走 crate:: 前缀，裸 `mock_files::` 解析不到
 use crate::traits::*;
 use async_trait::async_trait;
 use panel_core::{

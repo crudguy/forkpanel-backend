@@ -34,10 +34,15 @@ impl MetricsProvider for LinuxMetrics {
         let netdev = read_str("/proc/net/dev").await?;
         let uptime = read_str("/proc/uptime").await?;
 
-        let mut prev = self.prev.lock().unwrap_or_else(|e| e.into_inner());
-        let cpu = parse_cpu(&stat, &mut prev);
+        // 关键：std::sync::MutexGuard 不是 Send，绝不能跨 .await 持有。
+        // 先在块内完成需要 prev 的增量计算，guard 在块尾即释放，之后才 await。
+        let (cpu, nets) = {
+            let mut prev = self.prev.lock().unwrap_or_else(|e| e.into_inner());
+            let cpu = parse_cpu(&stat, &mut prev);
+            let nets = parse_netdev(&netdev, &mut prev);
+            (cpu, nets)
+        };
         let mem = parse_meminfo(&meminfo);
-        let nets = parse_netdev(&netdev, &mut prev);
         let disks = read_mounts().await?;
 
         Ok(SystemSnapshot {

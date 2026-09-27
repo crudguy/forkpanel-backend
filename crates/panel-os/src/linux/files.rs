@@ -54,8 +54,9 @@ impl FileProvider for LinuxFileProvider {
                 let e = entry.map_err(|e| PanelError::Io(e.to_string()))?;
                 let name = e.file_name().to_string_lossy().to_string();
                 if !opt.show_hidden && name.starts_with('.') { continue; }
-                // 关键：symlink_metadata，不跟随链接（防沙箱绕过）
-                let md = match e.symlink_metadata() {
+                // 关键：symlink_metadata，不跟随链接（防沙箱绕过）。
+                // 注意：DirEntry 上没有 symlink_metadata 方法，需对 path 调用 std::fs 版本。
+                let md = match std::fs::symlink_metadata(e.path()) {
                     Ok(m) => m,
                     Err(_) => continue,   // 断裂链接等，跳过而非报错
                 };
@@ -138,7 +139,10 @@ impl FileProvider for LinuxFileProvider {
             }
             let mut f = std::fs::File::open(&p)
                 .map_err(|e| PanelError::Io(format!("open {}: {e}", p.display())))?;
-            if offset > 0 { f.seek(SeekFrom::Start(offset))?; }
+            if offset > 0 {
+                f.seek(SeekFrom::Start(offset))
+                    .map_err(|e| PanelError::Io(format!("seek {}: {e}", p.display())))?;
+            }
             let mut buf = vec![0u8; len];
             let n = f.read(&mut buf).map_err(|e| PanelError::Io(e.to_string()))?;
             buf.truncate(n);

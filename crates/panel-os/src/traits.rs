@@ -17,7 +17,8 @@ use tokio::sync::mpsc::Receiver;
 
 // ═══════════════════════════ 指标 ═══════════════════════════
 
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+// 注意：含 Option<Vec<f32>>，故不可派生 Copy（Vec 非 Copy）；需要复制时用 .clone()。
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct CpuSample {
     /// 总体使用率 0.0~100.0
     pub total_pct: f32,
@@ -83,7 +84,8 @@ pub trait MetricsProvider: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessSort { Cpu, Memory, Pid }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// 注意：cpu_pct 为 f32，不实现 Eq，故只派生 PartialEq。
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProcessInfo {
     pub pid: i32,
     pub ppid: i32,

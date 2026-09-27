@@ -62,7 +62,8 @@ impl Bin {
     }
 }
 
-#[derive(Debug, Clone)]
+// on_line 为 `dyn Fn`，不实现 Debug，故手写 Debug（保留 Clone 派生）。
+#[derive(Clone)]
 pub struct CmdOpt {
     pub timeout: Duration,
     /// stdout/stderr 各自的最大字节数，超出即截断
@@ -74,6 +75,19 @@ pub struct CmdOpt {
     pub run_as: Option<String>,
     /// 逐行回调，用于任务实时输出
     pub on_line: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
+}
+
+impl std::fmt::Debug for CmdOpt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CmdOpt")
+            .field("timeout", &self.timeout)
+            .field("max_output", &self.max_output)
+            .field("working_dir", &self.working_dir)
+            .field("env", &self.env)
+            .field("run_as", &self.run_as)
+            .field("on_line", &self.on_line.as_ref().map(|_| "<callback>"))
+            .finish()
+    }
 }
 
 impl Default for CmdOpt {

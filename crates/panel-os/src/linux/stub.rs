@@ -48,6 +48,7 @@ impl ProcessProvider for crate::linux::metrics::LinuxMetrics {
 
 // ───────────────── 网络 ─────────────────
 
+#[derive(Default)]
 pub struct LinuxNetwork;
 
 #[async_trait]
