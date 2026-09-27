@@ -164,6 +164,97 @@ fn tier_name(t: panel_core::Tier) -> &'static str {
               panel_core::Tier::Standard => "standard" }
 }
 
+// ═══════════════════ 首启引导（无 owner 时建第一个账号）═══════════════════
+
+#[derive(Debug, Serialize)]
+pub struct BootstrapStatus {
+    /// 数据库尚无 owner 账号 → 前端显示首启向导而非登录表单
+    pub needs_bootstrap: bool,
+    /// 引导令牌是否仍有效（false = 未生成或已过期，需重启 serve 重新打印）
+    pub token_active: bool,
+}
+
+/// 首启状态（公开、幂等、无敏感信息）。
+async fn owner_count(state: &AppState) -> ApiResult<i64> {
+    state.pool.with(|conn| {
+        conn.query_row("SELECT COUNT(*) FROM users WHERE role = 'owner'", [], |r| r.get(0))
+            .map_err(|e| panel_core::PanelError::Database(e.to_string()))
+    }).await.map_err(ApiError::from)
+}
+
+pub async fn bootstrap_status(State(state): State<Shared>) -> ApiResult<Json<serde_json::Value>> {
+    let n = owner_count(&state).await?;
+    Ok(ok(BootstrapStatus { needs_bootstrap: n == 0, token_active: state.bootstrap.active() }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BootstrapReq {
+    pub token: String,
+    pub username: String,
+    pub password: String,
+}
+
+/// 首启创建 owner（公开端点，唯一入口）。
+///
+/// 设计取舍：不开放常驻注册——建号能力必须等价于"看过 serve 首启终端输出"，
+/// 与 CLI init 同级；令牌一次性、30 分钟有效、只存内存、只存哈希。
+/// 副作用顺序纪律：**所有无副作用校验（owner 检查 / 输入策略 / 哈希）先行，
+/// 令牌消费（唯一不可逆步骤）放最后**——否则用户首次提交弱口令失败后，
+/// 令牌已被焚，第二次正确提交只能得到 401（实测踩过的坑）。
+pub async fn bootstrap(
+    State(state): State<Shared>,
+    Json(req): Json<BootstrapReq>,
+) -> ApiResult<StatusCode> {
+    // 1) 已有 owner → 409（只读检查；防重放，后写事务还会再查一次）
+    if owner_count(&state).await? > 0 {
+        return Err(ApiError::conflict("owner"));
+    }
+
+    // 2) 输入校验（只读，与 CLI create_owner 同一规则）
+    let username = auth::validate_username(&req.username).map_err(ApiError::from)?;
+    auth::check_password_policy(&req.password).map_err(ApiError::from)?;
+
+    // 3) argon2 较贵（最高 19MiB 瞬时内存），放 blocking 池（同 login）；只读计算
+    let tier = state.tier;
+    let pwd = req.password.clone();
+    let hash = tokio::task::spawn_blocking(move || {
+        auth::hash_password(&pwd, &auth::HashParams::for_tier(tier))
+    })
+    .await
+    .map_err(|e| ApiError::new(10999, StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+
+    // 4) 令牌校验并消费（唯一不可逆步骤；Mutex take 原子化并发竞态）
+    if !state.bootstrap.take_if_valid(&req.token) {
+        return Err(ApiError::bootstrap_invalid());
+    }
+
+    // 5) 单写事务：事务内复查 owner（防极端竞态）→ INSERT → 同事务落审计
+    let uname = username.clone();
+    let now = crate::now_unix();
+    state.db.exec(move |conn| {
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM users WHERE role = 'owner'", [], |r| r.get(0),
+        ).map_err(|e| panel_core::PanelError::Database(e.to_string()))?;
+        if n > 0 {
+            return Err(panel_core::PanelError::Conflict("owner".into()));
+        }
+        conn.execute(
+            "INSERT INTO users(username, pwd_hash, role, allowed_roots, created_at)
+             VALUES (?1, ?2, 'owner', '[]', ?3)",
+            rusqlite::params![uname, hash, now],
+        ).map_err(|e| panel_core::PanelError::Database(e.to_string()))?;
+        conn.execute(
+            "INSERT INTO audit_log(ts, actor, actor_ip, action, target, result, detail_json)
+             VALUES (?1, ?2, '', 'auth.bootstrap', ?2, 'ok', '{}')",
+            rusqlite::params![now, uname],
+        ).map_err(|e| panel_core::PanelError::Database(e.to_string()))?;
+        Ok(panel_db::WriteAck { rows_changed: 2 })
+    }).await.map_err(ApiError::from)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// 取客户端 IP。**注意**：只有在受信任反代后才应读取 X-Forwarded-For，
 /// 否则该头可伪造（会导致防暴力失效）。默认只认 X-Real-IP（由前置反代设置）。
 fn client_ip(h: &HeaderMap) -> String {

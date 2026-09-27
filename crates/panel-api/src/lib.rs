@@ -30,6 +30,8 @@ pub struct AppState {
     pub capabilities: CapabilityMap,
     pub sessions: Arc<crate::auth::SessionCache>,
     pub logins: Arc<crate::auth::LoginGuard>,
+    /// 首启引导令牌（一次性、只存内存）。serve 首启无 owner 时生成。
+    pub bootstrap: Arc<crate::auth::BootstrapGuard>,
     /// 主密钥（32 字节，内存常驻，不落库）。为 None 时所有"写入真实秘密"的操作被拒绝。
     pub master_key: Option<MasterKey>,
     pub started_at: i64,
@@ -48,6 +50,7 @@ impl AppState {
                 std::time::Duration::from_secs(12 * 3600),
             )),
             logins: Arc::new(crate::auth::LoginGuard::new()),
+            bootstrap: Arc::new(crate::auth::BootstrapGuard::new()),
             master_key,
             started_at: now_unix(),
         }

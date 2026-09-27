@@ -51,6 +51,10 @@ impl ApiError {
     pub fn unsupported(what: impl Into<String>) -> Self {
         Self::new(10009, StatusCode::NOT_IMPLEMENTED, what.into())
     }
+    /// 首启引导令牌无效/已过期/已使用（10010 已预留给 MFA 动态口令）
+    pub fn bootstrap_invalid() -> Self {
+        Self::new(10011, StatusCode::UNAUTHORIZED, "bootstrap token invalid or expired")
+    }
 }
 
 /// 领域错误 → HTTP 错误的**唯一**映射点，保证错误码在前后端一致

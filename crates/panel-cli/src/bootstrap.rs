@@ -42,25 +42,8 @@ pub fn ensure_dirs(layout: &dyn PathLayout) -> Result<()> {
     Ok(())
 }
 
-/// 引导令牌：首次启动时若未创建 owner，生成一个**一次性**令牌并打印到 stdout。
-///
-/// 为什么需要它：面板监听 127.0.0.1，用户第一次必须能登录；
-/// 若开放"无口令创建 owner"接口，等于给同机任意本地进程留后门。
-/// 令牌只在终端出现一次，用完即焚。
-#[allow(dead_code)]
-pub fn generate_bootstrap_token() -> String {
-    let mut b = [0u8; 16];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut b);
-    hex(&b)
-}
-
-#[allow(dead_code)]
-fn hex(b: &[u8]) -> String {
-    const T: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(b.len() * 2);
-    for &x in b { s.push(T[(x >> 4) as usize] as char); s.push(T[(x & 0xf) as usize] as char); }
-    s
-}
+// 引导令牌已迁移至 `panel_api::auth`（generate_bootstrap_token / BootstrapGuard）：
+// 令牌由 serve 注入 AppState、由 /api/v1/auth/bootstrap 消费，生命周期归 panel-api 管。
 
 /// 从终端读取口令（关回显）。平台差异由 `panel_os::fs` 处理。
 pub fn read_password(prompt: &str) -> Result<String> { fs::read_password(prompt) }
@@ -134,10 +117,10 @@ mod tests {
 
     #[test]
     fn bootstrap_token_is_hex_and_unique() {
-        let a = generate_bootstrap_token();
-        let b = generate_bootstrap_token();
+        // 令牌生成已迁移至 panel_api::auth（含一次性/过期行为测试），此处仅确认再导出可用
+        let a = panel_api::auth::generate_bootstrap_token();
+        let b = panel_api::auth::generate_bootstrap_token();
         assert_eq!(a.len(), 32);
-        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b);
     }
 

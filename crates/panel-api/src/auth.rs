@@ -72,6 +72,79 @@ pub fn check_password_policy(pwd: &str) -> Result<()> {
     Ok(())
 }
 
+// ═══════════════════════════ 引导令牌 ═══════════════════════════
+
+/// 一次性引导令牌（128-bit 随机 → 32 位 hex）。
+/// serve 首启发现数据库无 owner 时生成并打印到终端，用户在 Web 首启向导提交。
+pub fn generate_bootstrap_token() -> String {
+    let mut b = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut b);
+    hex(&b)
+}
+
+/// 内存中的一次性引导令牌守卫。
+///
+/// 安全模型：能创建 owner 的前提 = 看过 serve 首启的终端输出（与 CLI init 等价），
+/// 不开放常驻注册接口，避免给同机任意本地进程留后门。
+/// - 只存 sha256 哈希（对齐 `SessionCache` 只存 sid 哈希的纪律）
+/// - 常数时间比较，防时序侧信道
+/// - 正确即焚；错误候选**不**消耗令牌（128-bit 枚举不可行，无需失败计数）
+/// - 只存内存：重启即重新生成，不落库
+pub struct BootstrapGuard {
+    inner: Mutex<Option<BootstrapSecret>>,
+}
+
+#[derive(Clone)]
+struct BootstrapSecret {
+    hash: String,
+    expires_at: Instant,
+}
+
+impl BootstrapGuard {
+    pub fn new() -> Self { Self { inner: Mutex::new(None) } }
+
+    /// 设置（或替换）令牌。每次 serve 启动若仍无 owner 则重新生成，旧令牌作废。
+    pub fn set(&self, token: &str, ttl: Duration) {
+        let s = BootstrapSecret { hash: sid_hash(token), expires_at: Instant::now() + ttl };
+        *self.inner.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
+    }
+
+    /// 校验并消费。正确且未过期 → 立即作废并返回 true。
+    pub fn take_if_valid(&self, candidate: &str) -> bool {
+        let mut m = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let valid = match m.as_ref() {
+            Some(s) => {
+                s.expires_at > Instant::now()
+                    && constant_time_eq(s.hash.as_bytes(), sid_hash(candidate).as_bytes())
+            }
+            None => false,
+        };
+        if valid { *m = None; }
+        valid
+    }
+
+    /// 令牌是否仍有效（status 接口用于提示"令牌已过期，重启 serve 重新生成"）。
+    pub fn active(&self) -> bool {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+            .map(|s| s.expires_at > Instant::now())
+            .unwrap_or(false)
+    }
+}
+
+impl Default for BootstrapGuard { fn default() -> Self { Self::new() } }
+
+/// 用户名校验（owner 与后续 M5 用户管理共用）：去首尾空白后 1..=64 字节。
+/// 返回归一化后的用户名。
+pub fn validate_username(name: &str) -> Result<String> {
+    let n = name.trim();
+    if n.is_empty() || n.len() > 64 {
+        return Err(PanelError::Validation {
+            field: "username", reason: "length must be 1..=64".into(),
+        });
+    }
+    Ok(n.to_string())
+}
+
 // ═══════════════════════════ 会话 ═══════════════════════════
 
 /// 会话只存 sid 的哈希：数据库泄露也不能直接劫持会话
@@ -386,5 +459,54 @@ mod tests {
         assert!(!csrf_ok(Some(&t), Some("x")));
         assert!(!csrf_ok(None, Some(&t)));
         assert!(!csrf_ok(Some(""), Some("")));
+    }
+
+    #[test]
+    fn bootstrap_token_is_hex_and_unique() {
+        let a = generate_bootstrap_token();
+        let b = generate_bootstrap_token();
+        assert_eq!(a.len(), 32);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn bootstrap_token_one_shot_wrong_candidate_keeps_token() {
+        let g = BootstrapGuard::new();
+        assert!(!g.active(), "未设置前必须无效");
+        g.set("abcd1234", Duration::from_secs(60));
+        assert!(g.active());
+        assert!(!g.take_if_valid("wrong-wrong-wrong"));
+        assert!(g.active(), "错误候选不应消耗令牌（128-bit 枚举不可行）");
+        assert!(g.take_if_valid("abcd1234"), "正确令牌应通过");
+        assert!(!g.active(), "用后即焚");
+        assert!(!g.take_if_valid("abcd1234"), "二次使用必须失败");
+        assert!(!g.take_if_valid(""), "空候选必须失败");
+    }
+
+    #[test]
+    fn bootstrap_token_expires() {
+        let g = BootstrapGuard::new();
+        g.set("abcd1234", Duration::ZERO);
+        assert!(!g.active(), "ttl=0 即立即过期");
+        assert!(!g.take_if_valid("abcd1234"), "过期令牌必须拒绝");
+    }
+
+    #[test]
+    fn bootstrap_token_replaced_by_latest() {
+        let g = BootstrapGuard::new();
+        g.set("aaaa", Duration::from_secs(60));
+        g.set("bbbb", Duration::from_secs(60));
+        assert!(!g.take_if_valid("aaaa"), "重复 set 应作废旧令牌");
+        assert!(g.take_if_valid("bbbb"));
+    }
+
+    #[test]
+    fn username_validation_bounds() {
+        assert_eq!(validate_username("  admin ").unwrap(), "admin");
+        assert!(validate_username("").is_err());
+        assert!(validate_username("   ").is_err());
+        assert!(validate_username(&"x".repeat(65)).is_err());
+        assert!(validate_username(&"x".repeat(64)).is_ok());
     }
 }

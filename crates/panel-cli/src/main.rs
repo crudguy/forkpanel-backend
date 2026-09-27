@@ -241,6 +241,29 @@ fn run(cli: Cli) -> Result<()> {
                     .fallback(embed::static_handler);
 
                 let addr = cfg.addr()?;
+
+                // ── 首启引导：数据库尚无 owner 时生成一次性令牌，打印到终端 ──
+                // 查询失败按"有 owner"处理（不打印横幅，避免误导；登录时会自然报错）
+                let has_owner = state.pool.with(|conn| {
+                    conn.query_row("SELECT COUNT(*) FROM users WHERE role = 'owner'", [], |r| r.get::<_, i64>(0))
+                        .map_err(|e| panel_core::PanelError::Database(e.to_string()))
+                }).await.unwrap_or(1);
+                if has_owner == 0 {
+                    let tok = panel_api::auth::generate_bootstrap_token();
+                    state.bootstrap.set(&tok, std::time::Duration::from_secs(30 * 60));
+                    eprintln!();
+                    eprintln!("════════════════════════════════════════════════════════");
+                    eprintln!(" 首次启动：尚无 owner 账号");
+                    eprintln!(" 打开面板完成初始设置，引导令牌（一次性，30 分钟内有效）：");
+                    eprintln!();
+                    eprintln!("     {tok}");
+                    eprintln!();
+                    eprintln!(" 面板地址：http://{addr}");
+                    eprintln!(" 远程访问：ssh -L 2083:127.0.0.1:2083 <user>@<server>");
+                    eprintln!(" 令牌过期/丢失：重启 panel serve 重新生成");
+                    eprintln!("════════════════════════════════════════════════════════");
+                }
+
                 println!("监听 {addr}（档位 {tier:?}）");
 
                 let listener = tokio::net::TcpListener::bind(addr).await
