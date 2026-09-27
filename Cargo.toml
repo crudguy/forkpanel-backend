@@ -44,6 +44,8 @@ inherits = "dev"
 debug    = 2
 
 # ============ 可选特性 ============
-# os-windows / os-macos：只读 trait 先行（见设计方案 §0.4.2 Step 2）
-# mimalloc：musl 下替换分配器（需实测 RSS 后决定是否默认）
-[workspace.features]
+# 注意：虚拟 workspace 不支持 [workspace.features]（cargo 会报 unused manifest key）。
+# 各 crate 的可选特性定义在自身 Cargo.toml 的 [features]：
+#   - panel-os: force-mock（无 Linux / 无 root 环境用内存 mock 适配器跑逻辑）
+#   - 未来 os-windows / os-macos：只读 trait 先行（见设计方案 §0.4.2 Step 2）
+#   - mimalloc：musl 下替换分配器（需实测 RSS 后决定是否默认）
