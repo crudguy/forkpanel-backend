@@ -148,6 +148,14 @@ fn parse_systemd_list(s: &str) -> Vec<ServiceUnit> {
     for line in s.lines() {
         let f: Vec<&str> = line.split_whitespace().collect();
         if f.len() < 4 { continue; }
+        // 结构校验：第二列必须是 systemd 的 LOAD 状态。
+        // 只校验单元名是不够的——畸形行（如 `bad name!!  loaded active running`）的第一个
+        // token 可能恰好是合法单元名（"bad"），从而被当成正常服务收进来。
+        // LOAD 取值是稳定且封闭的小集合，不认识即判定这行不是 systemctl 的正常输出。
+        const LOAD_STATES: &[&str] = &[
+            "loaded", "not-found", "bad-setting", "error", "masked", "stub", "alias", "generated",
+        ];
+        if !LOAD_STATES.contains(&f[1]) { continue; }
         let name = f[0].to_string();
         // 仅接受合法单元名：不合法即跳过，绝不进入后续命令
         let Ok(unit) = panel_core::unit_name(&name) else { continue };
