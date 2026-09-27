@@ -11,7 +11,11 @@ use panel_core::{crypto::MasterKey, PanelError, Result, Tier};
 // PathLayout 是 trait：只有引入作用域后，LinuxPathLayout 才能调用 data_dir()/log_dir()/
 // sqlite_path()/backup_dir() 等方法（否则会被误认为访问私有字段而报 E0599）。
 use panel_os::PathLayout;
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    io::{IsTerminal, Write},
+    path::PathBuf,
+    sync::Arc,
+};
 
 /// 加载主密钥：优先读已有 `master.key`（0600）；不存在则生成。
 /// 任意一步失败都返回 `None`（密钥加密存储降级关闭，绝不明文存秘密）。
@@ -55,7 +59,13 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// 首次初始化：目录、主密钥、owner、配置模板
-    Init { #[arg(long)] force: bool },
+    Init {
+        #[arg(long)] force: bool,
+        /// 非交互创建 owner 的用户名（缺省交互提示，默认 admin）
+        #[arg(long)] owner: Option<String>,
+        /// 非交互创建 owner 的口令（缺省交互关回显读取）
+        #[arg(long)] owner_pass: Option<String>,
+    },
     /// 启动自检（部署前必跑）
     Doctor,
     /// 执行数据库迁移（幂等）
@@ -87,27 +97,59 @@ fn run(cli: Cli) -> Result<()> {
     let os: Arc<dyn panel_os::OsAdapter> = panel_os::default_adapter();
 
     match cli.cmd {
-        Cmd::Init { force } => {
-            let layout = build_layout(&os, None);
+        Cmd::Init { force, ref owner, ref owner_pass } => {
+            let layout0 = build_layout(&os, None);
+            let cfg_path = cli.config.clone().unwrap_or_else(|| layout0.config_dir().join("config.toml"));
+
+            // 配置不存在 → 全新初始化（写模板）；存在 → 复用既有配置（不覆盖，避免改掉 [paths] 等设置）
+            let cfg = if !cfg_path.exists() {
+                bootstrap::ensure_dirs(&layout0)?;
+                let _key = bootstrap::ensure_master_key(&layout0.data_dir())?;
+                if let Some(p) = cfg_path.parent() { std::fs::create_dir_all(p).ok(); }
+                std::fs::write(&cfg_path, config::template(
+                    &layout0.config_dir(), &layout0.data_dir(), &layout0.site_root())).ok();
+                load_cfg(&cli, &layout0)?
+            } else {
+                if force {
+                    // --force 按平台默认路径重建配置（会清掉既有 [paths] 覆盖，属破坏性操作）
+                    bootstrap::ensure_dirs(&layout0)?;
+                    let _key = bootstrap::ensure_master_key(&layout0.data_dir())?;
+                    std::fs::write(&cfg_path, config::template(
+                        &layout0.config_dir(), &layout0.data_dir(), &layout0.site_root())).ok();
+                } else {
+                    println!("（配置已存在，复用 {}，不覆盖）", cfg_path.display());
+                }
+                load_cfg(&cli, &layout0)?
+            };
+
+            // 目录与主密钥以最终 layout（含配置中的 [paths] 覆盖）为准
+            let layout = build_layout(&os, Some(&cfg));
             bootstrap::ensure_dirs(&layout)?;
             let _key = bootstrap::ensure_master_key(&layout.data_dir())?;
 
-            let cfg_path = cli.config.clone().unwrap_or_else(|| layout.config_dir().join("config.toml"));
-            if cfg_path.exists() && !force {
-                return Err(PanelError::Conflict(
-                    format!("{} 已存在（加 --force 覆盖）", cfg_path.display())));
-            }
-            if let Some(p) = cfg_path.parent() { std::fs::create_dir_all(p).ok(); }
-            std::fs::write(&cfg_path, config::template(
-                &layout.config_dir(), &layout.data_dir(), &layout.site_root())).ok();
+            let tier = detect_tier(&*os, &cfg);
+            let db_path = layout.sqlite_path();
+            let mut conn = panel_db::open(&db_path, tier)?;
+            panel_db::migrate::apply(&mut conn)?;
 
-            let token = bootstrap::generate_bootstrap_token();
+            // 幂等：已有 owner 则跳过
+            let owner_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM users WHERE role = 'owner'",
+                [],
+                |r| r.get(0),
+            ).map_err(|e| PanelError::Database(e.to_string()))?;
+            if owner_count == 0 {
+                create_owner(&mut conn, tier, owner.clone(), owner_pass.clone())?;
+            } else {
+                println!("（已有 owner 账号，跳过创建）");
+            }
+            drop(conn);
+
             println!("初始化完成");
             println!("  配置文件：{}", cfg_path.display());
             println!("  数据目录：{}", layout.data_dir().display());
             println!();
-            println!("引导令牌（仅显示一次）：{token}");
-            println!("在首次登录页面使用此令牌创建 owner 账号。");
+            println!("可用 owner 账号登录面板（前端 http://127.0.0.1:5173，后端 127.0.0.1:2083）。");
             Ok(())
         }
 
@@ -444,6 +486,72 @@ async fn register_internal_jobs(
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// 交互式（或经 `--owner`/`--owner-pass` 非交互）创建首个 owner 账号。
+///
+/// 设计取舍：原方案是 `init` 打印一次性引导令牌、登录页用令牌建 owner，
+/// 但后端消费令牌的接口与前端令牌 UI 均未实现（M0/M5 未完工），导致首个账号
+/// 无从创建、面板无法登录。此处改为 `init` 阶段直接落库 owner，本地可立即登录，
+/// 且同样要求有终端/CLI 权限（同机任意本地进程拿不到你的口令），安全等效。
+fn create_owner(
+    conn: &mut rusqlite::Connection,
+    tier: Tier,
+    owner: Option<String>,
+    owner_pass: Option<String>,
+) -> Result<()> {
+    let interactive = std::io::stdin().is_terminal();
+
+    // 用户名：命令行 > 交互提示（默认 admin）> 非交互报错
+    let username = match owner {
+        Some(u) => u.trim().to_string(),
+        None => {
+            if !interactive {
+                return Err(PanelError::Validation {
+                    field: "owner".into(),
+                    reason: "非交互环境请提供 --owner".into(),
+                });
+            }
+            print!("请输入 owner 用户名（默认 admin）：");
+            let _ = std::io::stdout().flush();
+            let mut s = String::new();
+            std::io::stdin().read_line(&mut s).map_err(|e| PanelError::Internal(format!("读用户名: {e}")))?;
+            let s = s.trim().to_string();
+            if s.is_empty() { "admin".to_string() } else { s }
+        }
+    };
+    if username.is_empty() || username.len() > 64 {
+        return Err(PanelError::Validation {
+            field: "username".into(),
+            reason: "用户名长度需在 1..=64".into(),
+        });
+    }
+
+    // 口令：命令行 > 交互关回显
+    let password = match owner_pass {
+        Some(p) => p,
+        None => {
+            if !interactive {
+                return Err(PanelError::Validation {
+                    field: "owner-pass".into(),
+                    reason: "非交互环境请提供 --owner-pass".into(),
+                });
+            }
+            bootstrap::read_password("请输入 owner 口令（≥10 位，含两类字符）：")?
+        }
+    };
+    panel_api::auth::check_password_policy(&password)?;
+
+    let hash = panel_api::auth::hash_password(&password, &panel_api::auth::HashParams::for_tier(tier))?;
+    let now = now_unix();
+    conn.execute(
+        "INSERT INTO users(username, pwd_hash, role, allowed_roots, created_at)
+         VALUES (?1, ?2, 'owner', '[]', ?3)",
+        rusqlite::params![username, hash, now],
+    ).map_err(|e| PanelError::Database(e.to_string()))?;
+
+    println!("owner 账号已创建：{username}");
+    Ok(())
 }
 
 fn load_cfg(cli: &Cli, layout: &dyn panel_os::PathLayout) -> Result<Config> {

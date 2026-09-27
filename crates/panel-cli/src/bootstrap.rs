@@ -47,12 +47,14 @@ pub fn ensure_dirs(layout: &dyn PathLayout) -> Result<()> {
 /// 为什么需要它：面板监听 127.0.0.1，用户第一次必须能登录；
 /// 若开放"无口令创建 owner"接口，等于给同机任意本地进程留后门。
 /// 令牌只在终端出现一次，用完即焚。
+#[allow(dead_code)]
 pub fn generate_bootstrap_token() -> String {
     let mut b = [0u8; 16];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut b);
     hex(&b)
 }
 
+#[allow(dead_code)]
 fn hex(b: &[u8]) -> String {
     const T: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(b.len() * 2);
