@@ -195,12 +195,14 @@ pub fn build_router(state: Shared) -> Router {
         .merge(cfg_r)
         .merge(sse_r)
         .layer(middleware::from_fn(crate::middleware::read_only_guard))
-        .layer(middleware::from_fn(crate::middleware::guard_write));
+        .layer(middleware::from_fn(crate::middleware::guard_write))
+        // 认证守卫只罩在 authed 上：public（登录/版本/健康检查/SPA）无需登录即可进入。
+        // 若误放到全局，登录接口会被自己的 401 挡在门外（历史 bug）。
+        .layer(middleware::from_fn_with_state(state.clone(), crate::middleware::require_auth));
 
     Router::new()
         .merge(public)
         .merge(authed)
-        .layer(middleware::from_fn_with_state(state.clone(), crate::middleware::require_auth))
         .layer(middleware::from_fn(crate::middleware::security_headers))
         // 兜底：未匹配路由返回结构化 404（不暴露路由表）
         .fallback(handler_404)

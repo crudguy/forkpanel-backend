@@ -112,11 +112,15 @@ pub async fn login(
 
     let csrf = auth::generate_csrf_token();
     let mut h = HeaderMap::new();
+    // Secure 仅在 TLS 下下发：本地 http 开发时浏览器会丢弃 Secure Cookie，导致会话无法持久。
+    // 生产部署设 PANEL_TLS=1 即恢复 Secure（配合 HSTS）。
+    let secure = std::env::var("PANEL_TLS").map(|v| v == "1").unwrap_or(false);
+    let sf = if secure { "; Secure" } else { "" };
     h.append(header::SET_COOKIE,
-             format!("panel_sid={sid}; HttpOnly; Secure; SameSite=Strict; Path=/").parse().unwrap());
+             format!("panel_sid={sid}; HttpOnly{sf}; SameSite=Strict; Path=/").parse().unwrap());
     // CSRF token 必须**可读**（前端要放进请求头），故不加 HttpOnly
     h.append(header::SET_COOKIE,
-             format!("panel_csrf={csrf}; Secure; SameSite=Strict; Path=/").parse().unwrap());
+             format!("panel_csrf={csrf}{sf}; SameSite=Strict; Path=/").parse().unwrap());
     Ok((h, StatusCode::NO_CONTENT))
 }
 
