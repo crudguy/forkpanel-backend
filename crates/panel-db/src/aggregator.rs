@@ -96,6 +96,10 @@ impl Aggregator {
         let n = stmt.execute(rusqlite::params![cutoff])
             .map_err(|e| PanelError::Database(format!("rollup: {e}")))?;
 
+        // Statement 持有 &Connection，其借用一直持续到析构；
+        // 必须先显式释放，才能把 conn 作为 &mut 交给 prune_metrics。
+        drop(stmt);
+
         crate::cleanup::prune_metrics(conn, self.retention)?;
         Ok(WriteAck { rows_changed: n })
     }

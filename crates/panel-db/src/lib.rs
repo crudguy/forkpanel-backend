@@ -75,7 +75,10 @@ pub fn open(path: &Path, tier: Tier) -> Result<Connection> {
 // 这是性能优化，不是代码洁癖 —— 请勿"优化"成并发写。
 
 /// 一条待写入操作。业务层把写请求投递给 actor，由 actor 串行执行。
-pub type WriteOp = Box<dyn FnOnce(&mut Connection) -> Result<WriteAck> + Send>;
+// 注意：签名是 `&Connection` 而非 `&mut Connection`。
+// rusqlite 的 Transaction 只实现 Deref（无 DerefMut），事务内拿不到 &mut Connection；
+// 且 Connection 的语句执行本就只需 &self（内部可变性），故写操作用 &Connection 即可。
+pub type WriteOp = Box<dyn FnOnce(&Connection) -> Result<WriteAck> + Send>;
 
 /// actor 执行完的回执
 pub struct WriteAck {
@@ -157,14 +160,23 @@ impl WriterActor {
                     };
                     batch.push(first);
 
-                    // 攒批：直到满足数量阈值或时间窗口
+                    // 攒批：直到满足数量阈值或时间窗口。
+                    //
+                    // 注意：tokio::sync::mpsc::Receiver **没有** recv_timeout / blocking_recv_timeout，
+                    // 且本线程是裸 std 线程（不在 tokio runtime 内），也无法用 tokio::time::timeout。
+                    // 因此以 try_recv + 短睡眠逼近 deadline：单片睡眠上限 1ms，对攒批延迟无实质影响；
+                    // 空闲等待首个 op 仍走 blocking_recv（无超时、不空转 CPU）。
                     let deadline = last_flush + policy.max_delay;
                     while batch.len() < policy.max_batch {
                         let now = std::time::Instant::now();
                         if now >= deadline { break; }
-                        match rx.recv_timeout(deadline - now) {
+                        match rx.try_recv() {
                             Ok(v) => batch.push(v),
-                            Err(_) => break,   // 超时 → 立即 flush
+                            Err(mpsc::error::TryRecvError::Empty) => {
+                                std::thread::sleep((deadline - now).min(Duration::from_millis(1)));
+                            }
+                            // 所有 sender 已释放 → 立即 flush 剩余批次
+                            Err(mpsc::error::TryRecvError::Disconnected) => break,
                         }
                     }
 
@@ -172,20 +184,24 @@ impl WriterActor {
                     let drained = std::mem::take(&mut batch);
                     let txn_result = conn.transaction();
                     match txn_result {
-                        Ok(mut txn) => {
+                        Ok(txn) => {
+                            // FnOnce 只能按值调用：必须把 op 从 drained 里 move 出来，
+                            // 因此这里按值遍历，并把 reply 收集起来供提交结果回传。
                             let mut results = Vec::with_capacity(drained.len());
-                            for (op, _) in &drained {
-                                results.push(op(&mut txn));
+                            let mut replies = Vec::with_capacity(drained.len());
+                            for (op, reply) in drained {
+                                results.push(op(&txn));
+                                replies.push(reply);
                             }
                             match txn.commit() {
                                 Ok(()) => {
-                                    for ((_, reply), r) in drained.into_iter().zip(results) {
+                                    for (reply, r) in replies.into_iter().zip(results) {
                                         let _ = reply.send(r);
                                     }
                                 }
                                 Err(e) => {
                                     let err = PanelError::Database(format!("commit: {e}"));
-                                    for (_, reply) in drained {
+                                    for reply in replies {
                                         let _ = reply.send(Err(clone_err(&err)));
                                     }
                                 }
@@ -214,7 +230,7 @@ impl WriterActor {
     /// 且 busy_timeout 不足时直接抛 `database is locked`。
     pub async fn exec<F>(&self, op: F) -> Result<WriteAck>
     where
-        F: FnOnce(&mut Connection) -> Result<WriteAck> + Send + 'static,
+        F: FnOnce(&Connection) -> Result<WriteAck> + Send + 'static,
     {
         let (reply, rx) = oneshot::channel();
         self.tx.send((Box::new(op), reply)).await
@@ -235,7 +251,9 @@ fn clone_err(e: &PanelError) -> PanelError {
 /// （nano 1MB / small 2MB / standard 4MB）。nano 档位**只开 1 个读连接**，
 /// 这是"常驻 RSS ≤12MB"预算能否达标的关键旋钮。
 pub struct ReadPool {
-    conns: Vec<std::sync::Mutex<Connection>>,
+    // 用 Arc 持有：spawn_blocking 的闭包要求 'static，不能直接借用 &self，
+    // 取用时克隆对应下标的 Arc 移入闭包（连接本身仍由池独占，不改变单连接复用语义）。
+    conns: Vec<Arc<std::sync::Mutex<Connection>>>,
     permits: Arc<Semaphore>,
 }
 
@@ -251,7 +269,7 @@ impl ReadPool {
             let c = open(path, tier)?;
             // 只读连接不需要 WAL 写侧资源
             let _ = c.pragma_update(None, "query_only", "ON");
-            conns.push(std::sync::Mutex::new(c));
+            conns.push(Arc::new(std::sync::Mutex::new(c)));
         }
         Ok(Self { conns, permits: Arc::new(Semaphore::new(n)) })
     }
@@ -266,8 +284,9 @@ impl ReadPool {
             .map_err(|_| PanelError::Internal("read pool closed".into()))?;
         let idx = self.pick();
         // 阻塞型调用放到 blocking 池（tokio 侧需配置 max_blocking_threads）
+        let conn = Arc::clone(&self.conns[idx]); // 克隆 Arc，避免把 &self 带进 'static 闭包
         tokio::task::spawn_blocking(move || {
-            let guard = self.conns[idx].lock().unwrap_or_else(|e| e.into_inner());
+            let guard = conn.lock().unwrap_or_else(|e| e.into_inner());
             f(&guard)
         })
         .await

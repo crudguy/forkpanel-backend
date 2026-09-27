@@ -6,15 +6,19 @@
 //! 因此这里**必须**是 `#[repr(C)]` 的定长数组，**不能**是 `Vec<HashMap<..>>` 或 `Vec<SampleEnum>`。
 //!
 //! 单条记录 72 字节（实测口径）：
-//!   ts:i64(8) cpu:f32(4) mem_used:u64(8) mem_total:u64(8) swap_used:u64(8)
-//!   disk_used:u64(8) disk_total:u64(8) net_in:u64(8) net_out:u64(8) load1:f32(4)
+//!   ts:i64(8) + 7×u64(56) + 2×f32(8) = 72
+//!
+//! # 字段顺序即内存布局（勿随意调整）
+//! 8 字节字段必须排在前、两个 f32 排在最后。**不可**把 f32 插在 i64 与 u64 之间：
+//! 那会让编译器为满足 8 字节对齐而插入 4 字节填充，并在尾部再补齐到 8 的倍数，
+//! 实测会把结构体撑到 80 字节（3600 点从 253KB 涨到 281KB）。
+//! `size_of::<Sample>() == 72` 的编译期断言即此纪律的守卫。
 
-/// 单条采样。字段顺序即内存布局，改动需同步更新 `SIZE` 断言。
+/// 单条采样。字段顺序即内存布局，改动需同步更新下面的 size 断言。
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Sample {
     pub ts: i64,
-    pub cpu_pct: f32,
     pub mem_used_kib: u64,
     pub mem_total_kib: u64,
     pub swap_used_kib: u64,
@@ -22,6 +26,8 @@ pub struct Sample {
     pub disk_total_bytes: u64,
     pub net_in_bps: u64,
     pub net_out_bps: u64,
+    // 两个 4 字节字段收尾，与前面对齐边界之间无填充
+    pub cpu_pct: f32,
     pub load1: f32,
 }
 
@@ -50,7 +56,11 @@ impl MetricsRing {
     }
 
     /// 按时间顺序遍历（最旧 → 最新）
-    pub fn iter(&self) -> impl Iterator<Item = &Sample> {
+    // 返回类型必须声明 DoubleEndedIterator：底层 Map<Range<usize>, _> 本身支持双端遍历，
+    // 但若写成 `impl Iterator` 会把该能力擦除，导致 last_n 里的 .rev() 编译失败。
+    // ExactSizeIterator 也是必需的：last_n 里 .take(n) 之后要 .rev()，
+    // 而 Take<I> 仅在 I: DoubleEndedIterator + ExactSizeIterator 时才实现 DoubleEndedIterator。
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &Sample> + ExactSizeIterator + '_ {
         let start = if self.len == self.buf.len() { self.head } else { 0 };
         (0..self.len).map(move |i| &self.buf[(start + i) % self.buf.len()])
     }

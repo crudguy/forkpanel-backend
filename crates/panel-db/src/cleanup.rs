@@ -32,7 +32,7 @@ pub fn batch_for(estimated_rows: u64) -> Option<usize> {
 }
 
 /// 清理指标表。行数已知（由保留策略推算），无需 COUNT 全表。
-pub fn prune_metrics(conn: &mut Connection, r: crate::aggregator::Retention) -> Result<WriteAck> {
+pub fn prune_metrics(conn: &Connection, r: crate::aggregator::Retention) -> Result<WriteAck> {
     let now = now_unix();
     let mut changed = 0usize;
 
@@ -54,7 +54,7 @@ pub fn prune_metrics(conn: &mut Connection, r: crate::aggregator::Retention) -> 
 /// # 为什么默认是 90 天而不是 180 天（实测修正）
 /// 180 天 × 200 条/天 = 36,000 行 = **4.12 MB**（含 ts 索引），是分层后指标体积（668KB）的 **6 倍**。
 /// 90 天 × 50 条/天 = 360 KB。故默认收紧为 90 天 + 5 万行上限。
-pub fn prune_audit(conn: &mut Connection, retention_days: u32, max_rows: u64) -> Result<WriteAck> {
+pub fn prune_audit(conn: &Connection, retention_days: u32, max_rows: u64) -> Result<WriteAck> {
     let mut changed = 0usize;
     let cutoff = now_unix() - (retention_days as i64) * 86_400;
     changed += conn.execute("DELETE FROM audit_log WHERE ts < ?1", rusqlite::params![cutoff])
@@ -82,7 +82,7 @@ pub fn prune_audit(conn: &mut Connection, retention_days: u32, max_rows: u64) ->
 }
 
 /// 清理任务执行记录（同审计策略）
-pub fn prune_task_runs(conn: &mut Connection, retention_days: u32) -> Result<WriteAck> {
+pub fn prune_task_runs(conn: &Connection, retention_days: u32) -> Result<WriteAck> {
     let cutoff = now_unix() - (retention_days as i64) * 86_400;
     let n = conn.execute("DELETE FROM task_runs WHERE started_at < ?1", rusqlite::params![cutoff])
         .map_err(|e| PanelError::Database(format!("prune task_runs: {e}")))?;
@@ -138,7 +138,9 @@ mod tests {
         let mut c = Connection::open_in_memory().unwrap();
         c.execute_batch("CREATE TABLE audit_log(id INTEGER PRIMARY KEY, ts INTEGER)").unwrap();
         let now = now_unix();
-        for i in 0..100u32 {
+        // 插入 1~100 天前的 100 条（刻意不含"今天"，这样保留 90 天时被删的正好是
+        // 91~100 天前那 10 条；若从 0 开始则只有 9 条，与保留语义对不上）
+        for i in 1..=100u32 {
             c.execute("INSERT INTO audit_log(ts) VALUES(?1)",
                       rusqlite::params![now - i as i64 * 86_400]).unwrap();
         }
