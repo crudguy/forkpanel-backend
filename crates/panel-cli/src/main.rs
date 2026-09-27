@@ -76,8 +76,12 @@ enum Cmd {
     Backup { #[arg(long)] out: Option<PathBuf> },
     /// 重建数据库（回收空间）
     Vacuum,
-    /// 修改用户口令
-    Passwd { user: String },
+    /// 修改用户口令（仅改已存在用户；建号只能走 init / 首启引导令牌）
+    Passwd {
+        user: String,
+        /// 非交互指定新口令（缺省交互关回显读取）
+        #[arg(long)] pass: Option<String>,
+    },
     /// 输出 systemd 单元文件
     SystemdUnit { #[arg(long)] install: bool },
     /// 打印能力矩阵（供脚本判断环境）
@@ -303,9 +307,63 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
 
-        Cmd::Passwd { user } => {
-            // 完整实现（M0 收尾）：校验策略 → 档位参数哈希 → 单写事务更新
-            println!("(尚未接线) 将修改用户 {user} 的口令");
+        Cmd::Passwd { ref user, ref pass } => {
+            let layout0 = build_layout(&os, None);
+            let cfg = load_cfg(&cli, &layout0)?;
+            let layout = build_layout(&os, Some(&cfg));
+            let tier = detect_tier(&*os, &cfg);
+            let mut conn = panel_db::open(&layout.sqlite_path(), tier)?;
+
+            // 只改**已存在**用户的口令：passwd 不得具备建号能力，
+            // 否则同机任意能执行 CLI 的进程都能给自己开账号（等于绕过引导令牌）。
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM users WHERE username = ?1",
+                    rusqlite::params![user],
+                    |r| r.get(0),
+                )
+                .map_err(|e| PanelError::Database(e.to_string()))?;
+            if exists == 0 {
+                return Err(PanelError::Validation {
+                    field: "user".into(),
+                    reason: format!("用户 {user} 不存在"),
+                });
+            }
+
+            // 口令：命令行 > 交互关回显（--pass 会进 shell history / ps，仅脚本场景使用）
+            let password = match pass.clone() {
+                Some(p) => p,
+                None => {
+                    if !std::io::stdin().is_terminal() {
+                        return Err(PanelError::Validation {
+                            field: "pass".into(),
+                            reason: "非交互环境请提供 --pass".into(),
+                        });
+                    }
+                    bootstrap::read_password("请输入新口令（≥10 位，含两类字符）：")?
+                }
+            };
+            panel_api::auth::check_password_policy(&password)?;
+            let hash =
+                panel_api::auth::hash_password(&password, &panel_api::auth::HashParams::for_tier(tier))?;
+            let now = now_unix();
+
+            // 单写事务：更新口令 + 审计要么都成，要么都不成
+            let tx = conn.transaction().map_err(|e| PanelError::Database(e.to_string()))?;
+            tx.execute(
+                "UPDATE users SET pwd_hash = ?1 WHERE username = ?2",
+                rusqlite::params![hash, user],
+            )
+            .map_err(|e| PanelError::Database(e.to_string()))?;
+            tx.execute(
+                "INSERT INTO audit_log(ts, actor, actor_ip, action, target, result, detail_json)
+                 VALUES (?1, ?2, 'cli', 'auth.passwd', ?2, 'ok', '{}')",
+                rusqlite::params![now, user],
+            )
+            .map_err(|e| PanelError::Database(e.to_string()))?;
+            tx.commit().map_err(|e| PanelError::Database(e.to_string()))?;
+
+            println!("用户 {user} 的口令已更新");
             Ok(())
         }
 
