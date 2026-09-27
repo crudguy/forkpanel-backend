@@ -22,7 +22,7 @@ pub mod scheduler;
 
 use panel_core::{PanelError, Result, Tier};
 pub use progress::{Progress, ProgressBus, TaskEvent};
-pub use scheduler::{InternalScheduler, Schedule};
+pub use scheduler::{builtin_schedules, InternalScheduler, Schedule};
 use panel_db::WriterActor;
 use std::{
     collections::HashMap,
@@ -64,7 +64,9 @@ impl TaskState {
 }
 
 /// 任务种类。决定重试策略与是否需要并发互斥。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// 需可序列化：`progress::TaskEvent::Finished` 携带 kind 并经 SSE 广播给前端。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TaskKind {
     /// 软件安装/卸载：副作用不可回滚，失败不自动重试
     Package,
@@ -191,15 +193,20 @@ impl TaskRunner {
     /// 上一个任务已是终态 → 允许重新提交（用户确实想再来一次）。
     pub async fn submit(&self, req: TaskRequest, body: impl TaskBody + 'static) -> Result<(i64, bool)> {
         // 1) 幂等检查
-        {
+        //
+        // 关键：std::sync::MutexGuard 不是 Send，**绝不能跨 .await 持有**。
+        // 这里先在块内取出既有 id 并让 guard 立即释放，再去做 await 的终态判定；
+        // 否则 submit 的 future 非 Send，所有 await 它的 axum handler 都会
+        // 因 `Handler` 要求 Future: Send 而编译失败。
+        let existing: Option<i64> = {
             let mut m = self.idempotency.lock().unwrap_or_else(|e| e.into_inner());
             // 顺带清理超过 1 小时的记录，避免 map 无限增长
             m.retain(|_, (_, t)| t.elapsed() < std::time::Duration::from_secs(3600));
-            if let Some((id, _)) = m.get(&req.idempotency_key) {
-                let existing = *id;
-                if !self.is_terminal(existing).await? {
-                    return Ok((existing, false));
-                }
+            m.get(&req.idempotency_key).map(|(id, _)| *id)
+        };
+        if let Some(existing) = existing {
+            if !self.is_terminal(existing).await? {
+                return Ok((existing, false));
             }
         }
 
