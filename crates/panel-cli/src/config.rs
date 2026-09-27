@@ -33,7 +33,10 @@ pub struct Config {
     pub tier: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+// 注意：这里**不能**派生 Default。派生会给 bind=""、port=0、localhost_only=false，
+// 与 serde 的 default_* 不一致（localhost_only 默认应为 true —— 面板默认只监听回环）。
+// 与各 Db/Security/Audit 保持一致：手写 Default，复用同一批 default_* 函数。
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Server {
     #[serde(default = "default_bind")]
@@ -121,6 +124,12 @@ impl Default for Security {
 impl Default for Audit {
     fn default() -> Self { Self { retention_days: default_retention(), max_rows: default_max_rows() } }
 }
+impl Default for Server {
+    fn default() -> Self {
+        Self { bind: default_bind(), port: default_port(),
+               localhost_only: default_true(), tls: None }
+    }
+}
 impl Default for Config {
     fn default() -> Self {
         Self { server: Server::default(), paths: PathsOverride::default(),
@@ -186,6 +195,11 @@ pub fn template(config_dir: &std::path::Path, data_dir: &std::path::Path,
 #
 # 修改后执行 `panel doctor` 校验，再重启服务。
 
+# auto | nano | small | standard（auto 依据内存与 CPU 探测）
+# 注意：tier 是**根级**键，必须写在任何 [table] 之前 —— 放在 [audit] 之后
+# 会被 TOML 解析成 audit 的字段，而 Audit 是 deny_unknown_fields，直接导致配置无法解析。
+tier = "auto"
+
 [server]
 bind = "127.0.0.1"
 port = 2083
@@ -217,9 +231,6 @@ read_only = false
 # 默认 90 天：实测 180 天 × 200 条/天 ≈ 4.12MB，是分层后指标体积的 6 倍
 retention_days = 90
 max_rows = 50000
-
-# auto | nano | small | standard（auto 依据内存与 CPU 探测）
-tier = "auto"
 "#, cfg = cfg, data = data, site = site)
 }
 

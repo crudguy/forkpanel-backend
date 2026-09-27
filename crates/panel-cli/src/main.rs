@@ -8,6 +8,9 @@ mod embed;
 use clap::{Parser, Subcommand};
 use config::Config;
 use panel_core::{crypto::MasterKey, PanelError, Result, Tier};
+// PathLayout 是 trait：只有引入作用域后，LinuxPathLayout 才能调用 data_dir()/log_dir()/
+// sqlite_path()/backup_dir() 等方法（否则会被误认为访问私有字段而报 E0599）。
+use panel_os::PathLayout;
 use std::{path::PathBuf, sync::Arc};
 
 /// 加载主密钥：优先读已有 `master.key`（0600）；不存在则生成。
@@ -155,35 +158,8 @@ fn run(cli: Cli) -> Result<()> {
             std::fs::create_dir_all(&task_out).ok();
             let tasks = Arc::new(panel_task::TaskRunner::new(writer.clone(), tier, task_out));
 
-            // 上次进程遗留的 running/queued 一律标记 interrupted，**不自动恢复**
-            let orphans = tasks.reap_orphans().await?;
-            if orphans > 0 {
-                tracing::warn!("发现 {orphans} 个中断任务，需在界面上人工确认后重试");
-            }
-
-            let metrics = Arc::new(std::sync::Mutex::new(panel_db::aggregator::Aggregator::new(tier)));
-
-            // ── 主密钥：SSL 私钥 / 数据库口令的 AES-256-GCM 加密密钥（M0 阻塞项已关闭）──
-            // 内存常驻、不落库；缺失则密钥加密存储不可用（对应操作被拒绝，而非明文入库）。
-            let master_key = load_master_key(&layout.data_dir());
-
-            let state = Arc::new(panel_api::AppState::new(
-                os.clone(), writer.clone(), pool, tasks.clone(), metrics.clone(), tier, master_key));
-
-            // ── 内部周期任务 ──
-            let sched = Arc::new(panel_task::InternalScheduler::new());
-            register_internal_jobs(&sched, &os, writer.clone(), metrics.clone(), &layout, &cfg, tier).await;
-            sched.start(panel_task::builtin_schedules(tier)).await;
-            tracing::info!("内部调度器已启动（{} 个周期任务）",
-                           panel_task::builtin_schedules(tier).len());
-
-            let app = panel_api::routes::build_router(state.clone())
-                .route("/healthz", axum::routing::get(embed::healthz))
-                .fallback(embed::static_handler);
-
-            let addr = cfg.addr()?;
-            println!("监听 {addr}（档位 {tier:?}）");
-
+            // run() 是同步函数，所有 .await 都必须发生在 runtime 的 block_on 之内，
+            // 因此 runtime 要在异步初始化之前就构建好。
             let rt = tokio::runtime::Builder::new_multi_thread()
                 // 低配机器上异步线程数也要收窄：每线程默认栈 2MB
                 .worker_threads(match tier { Tier::Nano => 2, Tier::Small => 3, _ => 4 })
@@ -192,7 +168,39 @@ fn run(cli: Cli) -> Result<()> {
                 .build()
                 .map_err(|e| PanelError::Internal(format!("runtime: {e}")))?;
 
+            let sched = Arc::new(panel_task::InternalScheduler::new());
+            let sched_in = Arc::clone(&sched);
+
             let r = rt.block_on(async move {
+                // 上次进程遗留的 running/queued 一律标记 interrupted，**不自动恢复**
+                let orphans = tasks.reap_orphans().await?;
+                if orphans > 0 {
+                    tracing::warn!("发现 {orphans} 个中断任务，需在界面上人工确认后重试");
+                }
+
+                let metrics = Arc::new(std::sync::Mutex::new(panel_db::aggregator::Aggregator::new(tier)));
+
+                // ── 主密钥：SSL 私钥 / 数据库口令的 AES-256-GCM 加密密钥（M0 阻塞项已关闭）──
+                // 内存常驻、不落库；缺失则密钥加密存储不可用（对应操作被拒绝，而非明文入库）。
+                let master_key = load_master_key(&layout.data_dir());
+
+                let state = Arc::new(panel_api::AppState::new(
+                    os.clone(), writer.clone(), pool, tasks.clone(), metrics.clone(), tier, master_key));
+
+                // ── 内部周期任务 ──
+                register_internal_jobs(&sched_in, &os, writer.clone(), metrics.clone(), &layout, &cfg, tier).await;
+                let schedules = panel_task::builtin_schedules(tier);
+                let n_sched = schedules.len();
+                sched_in.start(schedules).await;
+                tracing::info!("内部调度器已启动（{} 个周期任务）", n_sched);
+
+                let app = panel_api::routes::build_router(state.clone())
+                    .route("/healthz", axum::routing::get(embed::healthz))
+                    .fallback(embed::static_handler);
+
+                let addr = cfg.addr()?;
+                println!("监听 {addr}（档位 {tier:?}）");
+
                 let listener = tokio::net::TcpListener::bind(addr).await
                     .map_err(|e| PanelError::Internal(format!("bind {addr}: {e}")))?;
                 axum::serve(listener, app).await
@@ -202,11 +210,13 @@ fn run(cli: Cli) -> Result<()> {
             r
         }
 
-        Cmd::Backup { out } => {
+        // 用 ref 绑定：若写成 `Cmd::Backup { out }` 会按值移出 cli 的字段，
+        // 之后再 `load_cfg(&cli, ...)` 就变成"部分移动后借用"（E0382）。
+        Cmd::Backup { ref out } => {
             let layout0 = build_layout(&os, None);
             let cfg = load_cfg(&cli, &layout0)?;
             let layout = build_layout(&os, Some(&cfg));
-            let dest = out.unwrap_or_else(|| {
+            let dest = out.clone().unwrap_or_else(|| {
                 let ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
                 std::fs::create_dir_all(layout.backup_dir()).ok();
@@ -309,8 +319,9 @@ async fn register_internal_jobs(
                     swap_used_kib: snap.mem.swap_used_kib,
                     disk_used_bytes: snap.disks.first().map(|d| d.used_bytes).unwrap_or(0),
                     disk_total_bytes: snap.disks.first().map(|d| d.total_bytes).unwrap_or(0),
-                    net_in_bps: snap.net.iter().map(|n| n.rx_bps).sum(),
-                    net_out_bps: snap.net.iter().map(|n| n.tx_bps).sum(),
+                    // SystemSnapshot 字段是 nets（复数）；NetSample 速率字段是 rx/tx_rate_bps
+                    net_in_bps: snap.nets.iter().map(|n| n.rx_rate_bps).sum(),
+                    net_out_bps: snap.nets.iter().map(|n| n.tx_rate_bps).sum(),
                     load1: snap.cpu.load1,
                 });
                 Ok(())

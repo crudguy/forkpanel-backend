@@ -9,6 +9,7 @@ use axum::{
     body::Body,
     http::{header, StatusCode, Uri},
     response::{IntoResponse, Response},
+    Json,
 };
 
 /// 构建期内嵌。`dev-assets` 特性下改为从磁盘读取，避免改前端就要重编译。
@@ -19,12 +20,14 @@ use axum::{
 struct Assets;
 
 #[cfg(not(feature = "dev-assets"))]
-fn get(path: &str) -> Option<(Vec<u8>, &'static str)> {
-    Assets::get(path).map(|f| (f.data.into_owned(), f.metadata.mimetype()))
+// 返回 String 而非 &'static str：rust-embed 的 mimetype() 借用自局部 EmbeddedFile，
+// 不能把它的引用返回出去（E0515），故转成自有字符串。
+fn get(path: &str) -> Option<(Vec<u8>, String)> {
+    Assets::get(path).map(|f| (f.data.into_owned(), f.metadata.mimetype().to_string()))
 }
 
 #[cfg(feature = "dev-assets")]
-fn get(path: &str) -> Option<(Vec<u8>, &'static str)> {
+fn get(path: &str) -> Option<(Vec<u8>, String)> {
     let root = std::env::var("PANEL_WEB_DIST").unwrap_or_else(|_| "web/dist".into());
     let p = std::path::PathBuf::from(root).join(path);
     let data = std::fs::read(&p).ok()?;
@@ -37,7 +40,7 @@ fn get(path: &str) -> Option<(Vec<u8>, &'static str)> {
         Some("woff2") => "font/woff2",
         _ => "application/octet-stream",
     };
-    Some((data, mime))
+    Some((data, mime.to_string()))
 }
 
 fn is_hashed(p: &str) -> bool {
@@ -48,8 +51,12 @@ fn is_hashed(p: &str) -> bool {
 
 /// 静态资源 handler
 pub async fn static_handler(uri: Uri) -> Response {
-    let path = uri.path().trim_start_matches('/');
-    let path = if path.is_empty() { "index.html" } else { path };
+    let raw = uri.path().trim_start_matches('/');
+    // 关键：**/api 路径绝不回退成 index.html**。
+    // fallback 会兜住所有未匹配路由（含 /api/v1/xxx 的 404），若回退成 HTML，
+    // 前端 client.ts 会把 HTML 当 JSON 解析，报出与真实原因无关的错。
+    let is_api = raw == "api" || raw.starts_with("api/");
+    let path = if raw.is_empty() { "index.html" } else { raw };
 
     match get(path) {
         Some((data, mime)) => {
@@ -70,6 +77,15 @@ pub async fn static_handler(uri: Uri) -> Response {
             res
         }
         None => {
+            // API 未命中 → 结构化 404（沿用 /api 的错误信封），绝不回退 HTML
+            if is_api {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "code": 10004, "message": "not found", "data": null, "detail": null,
+                    })),
+                ).into_response();
+            }
             // SPA 回退：仅对非 API 路径生效
             match get("index.html") {
                 Some((data, _)) => {
@@ -101,9 +117,32 @@ mod tests {
         assert!(!is_hashed("favicon.ico"));
     }
 
-    #[test]
-    fn api_paths_are_never_fallback_targets() {
-        // 路由层保证 /api 前缀不匹配 static_handler；此处断言约定本身
-        assert!(!"/api/v1/system/overview".starts_with("/assets"));
+    /// /api 未命中必须返回结构化 404 JSON，**绝不能**回退成 index.html：
+    /// 否则前端 client.ts 会把 HTML 当 JSON 解析，报错与真实原因完全无关。
+    #[tokio::test]
+    async fn api_paths_are_never_fallback_targets() {
+        let res = static_handler(Uri::from_static("/api/v1/does-not-exist")).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let ctype = res.headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(ctype.starts_with("application/json"),
+                "/api 未命中必须返回 JSON，实际为 {ctype:?}");
+    }
+
+    /// 非 API 的未知路径才走 SPA 回退（返回 index.html）。
+    #[tokio::test]
+    async fn non_api_paths_fall_back_to_spa() {
+        let res = static_handler(Uri::from_static("/some/spa/route")).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let ctype = res.headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(ctype.starts_with("text/html"),
+                "SPA 回退应返回 HTML，实际为 {ctype:?}");
     }
 }
