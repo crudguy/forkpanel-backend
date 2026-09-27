@@ -4,14 +4,14 @@
 //! （终止 SSH/关键进程需 UI 二次确认，防失联）。本期返回结构化 501，
 //! 绝不以假数据填充（面板纪律：能力缺失 = 明确告知，而非伪装成功）。
 
-use crate::{auth::perm, error::ApiError, routes::{Auth, Shared}};
+use crate::{auth::perm, error::{ApiError, ApiResult}, routes::{Auth, Shared}};
 use axum::extract::{Path as AxPath, State};
 use axum::Json;
 
 pub async fn list(
     State(_): State<Shared>,
     Auth(s): Auth,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SYSTEM_VIEW)?;
     Err(ApiError::unsupported("process.list (M2: 进程快照尚未接入)"))
 }
@@ -20,7 +20,7 @@ pub async fn kill(
     State(_): State<Shared>,
     Auth(s): Auth,
     AxPath(_pid): AxPath<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SYSTEM_MANAGE)?;
     Err(ApiError::unsupported(
         "process.kill (M2: 终止进程走任务队列且需二次确认，尚未接入)"))

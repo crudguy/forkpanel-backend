@@ -12,7 +12,7 @@
 
 use crate::{
     auth::perm,
-    error::{ok, ApiError},
+    error::{ok, ApiError, ApiResult},
     routes::{audit, Auth, Shared},
 };
 use axum::{
@@ -40,7 +40,7 @@ pub struct JobDto {
 
 pub async fn list(
     State(state): State<Shared>, Auth(s): Auth,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::CRON_VIEW)?;
     if !state.capabilities.get(cap_keys::SCHEDULER_MANAGE).map(|c| c.supported).unwrap_or(false) {
         return Err(ApiError::unsupported("scheduler.manage"));
@@ -100,7 +100,7 @@ pub struct CreateReq {
 
 pub async fn create(
     State(state): State<Shared>, Auth(s): Auth, Json(req): Json<CreateReq>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::CRON_MANAGE)?;
     if !state.capabilities.get(cap_keys::SCHEDULER_MANAGE).map(|c| c.supported).unwrap_or(false) {
         return Err(ApiError::unsupported("scheduler.manage"));
@@ -152,7 +152,7 @@ pub async fn create(
 
 pub async fn remove(
     State(state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::CRON_MANAGE)?;
     state.os.scheduler().remove(&id).await?;
     let name = id.clone();
@@ -168,7 +168,7 @@ pub async fn remove(
 /// 执行历史（最近 N 次）
 pub async fn runs(
     State(state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::CRON_VIEW)?;
     let runs = state.os.scheduler().runs(&id, 50).await?;
     let dtos: Vec<_> = runs.into_iter().map(|r| serde_json::json!({
@@ -188,7 +188,7 @@ fn truncate(s: &str, n: usize) -> String {
 
 pub async fn get_job(
     State(state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::CRON_VIEW)?;
     let _ = (state, id);
     Err(ApiError::unsupported("cron.job.get (M3)"))
@@ -196,7 +196,7 @@ pub async fn get_job(
 
 pub async fn patch_job(
     State(state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::CRON_MANAGE)?;
     let _ = (state, id);
     Err(ApiError::unsupported("cron.job.patch (M3)"))
@@ -204,7 +204,7 @@ pub async fn patch_job(
 
 pub async fn run(
     State(state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::CRON_MANAGE)?;
     let _ = (state, id);
     Err(ApiError::unsupported("cron.job.run (M3: 手动触发走任务队列尚未接入)"))
@@ -212,7 +212,7 @@ pub async fn run(
 
 pub async fn preview(
     State(state): State<Shared>, Auth(s): Auth,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::CRON_VIEW)?;
     let _ = state;
     Err(ApiError::unsupported("cron.preview (M3: 下次执行预览已由 list 返回 next[])"))

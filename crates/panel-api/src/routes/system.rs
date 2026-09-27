@@ -2,7 +2,7 @@
 
 use crate::{
     auth::perm,
-    error::{ok, ApiError},
+    error::{ok, ApiError, ApiResult},
     routes::{Auth, Shared},
 };
 use axum::{extract::{Query, State}, Json};
@@ -50,7 +50,7 @@ pub struct OverviewResp {
 }
 
 /// 一次性快照（仪表盘卡片数据）。
-pub async fn overview(State(state): State<Shared>, Auth(s): Auth) -> Result<Json<serde_json::Value>, ApiError> {
+pub async fn overview(State(state): State<Shared>, Auth(s): Auth) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SYSTEM_VIEW)?;
     let snap = state.os.metrics().snapshot().await?;
     Ok(ok(OverviewResp {
@@ -78,7 +78,7 @@ pub async fn realtime(
     State(state): State<Shared>,
     Auth(s): Auth,
     Query(q): Query<RealtimeQ>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SYSTEM_VIEW)?;
     let n = q.since.unwrap_or(60).clamp(1, 3600);   // 上限保护：防止一次拉取全部缓冲
     let samples: Vec<_> = {
@@ -105,7 +105,7 @@ pub async fn history(
     State(state): State<Shared>,
     Auth(s): Auth,
     Query(q): Query<HistoryQ>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SYSTEM_VIEW)?;
     let gran = q.gran.unwrap_or_else(|| "1m".into());
     if !matches!(gran.as_str(), "1m" | "1h") {

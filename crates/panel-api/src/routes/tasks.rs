@@ -2,7 +2,7 @@
 
 use crate::{
     auth::perm,
-    error::{ok, ApiError},
+    error::{ok, ApiError, ApiResult},
     routes::{audit, Auth, Shared},
 };
 use axum::{
@@ -22,7 +22,7 @@ pub async fn list(
     State(state): State<Shared>,
     Auth(s): Auth,
     Query(q): Query<ListQ>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::TASK_VIEW)?;
     let limit = q.limit.unwrap_or(50).min(200) as i64;
     let rows = state.pool.with(move |conn| {
@@ -61,7 +61,7 @@ pub async fn cancel(
     State(state): State<Shared>,
     Auth(s): Auth,
     AxPath(id): AxPath<i64>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::TASK_VIEW)?;
     // 只置状态位；任务体在检查点优雅退出（强杀会留下半个副作用）
     state.tasks.cancel(id).await.map_err(ApiError::from)?;
@@ -78,7 +78,7 @@ pub async fn output(
     Auth(s): Auth,
     AxPath(id): AxPath<i64>,
     Query(q): Query<OutputQ>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::TASK_VIEW)?;
     let n = q.lines.unwrap_or(200).min(2000);
     let path = state.pool.with(move |conn| {
@@ -107,7 +107,7 @@ pub async fn output(
 
 pub async fn get(
     State(state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<i64>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::TASK_VIEW)?;
     let _ = (state, id);
     Err(ApiError::unsupported("task.get (使用 /tasks?state= 过滤；单体详情 M2 接入)"))

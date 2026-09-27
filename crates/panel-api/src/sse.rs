@@ -6,7 +6,7 @@
 //! 3. **客户端上限**：nano 3 / small 10 / standard 50（超出返回 503 + 明确提示）。
 //! 4. 订阅频道按权限过滤：无 `log.read` 则拒绝订阅日志频道。
 
-use crate::{auth::Session, error::ApiError, AppState};
+use crate::{auth::Session, error::ApiError, routes::MaybeAuth, AppState};
 use axum::{
     extract::State,
     response::{
@@ -38,7 +38,9 @@ const BACKLOG: usize = 64;
 
 pub async fn metrics_stream(
     State(state): State<Arc<AppState>>,
-    session: Option<Session>,
+    // Session 未实现 FromRequestParts，不能直接用 Option<Session> 作提取器；
+    // MaybeAuth 即为此设计（Rejection 为 Infallible）。
+    MaybeAuth(session): MaybeAuth,
 ) -> axum::response::Response {
     // 指标属于敏感信息（可推断负载与业务量），必须登录后按权限订阅
     match &session {
@@ -70,7 +72,9 @@ pub async fn metrics_stream(
             // 读共享环形缓冲的最新点：**不触发采集**（采集由内部调度器统一做）
             let payload = {
                 let g = metrics.lock().unwrap_or_else(|e| e.into_inner());
-                match g.ring().iter().next_back() {
+                // 必须先绑定到局部变量再作为块尾：块尾表达式里的临时迭代器
+                // 会在局部变量 g 之后才析构，导致 "g does not live long enough"。
+                let x = match g.ring().iter().next_back() {
                     Some(s) => serde_json::json!({
                         "ts": s.ts,
                         "cpu": s.cpu_pct,
@@ -80,7 +84,8 @@ pub async fn metrics_stream(
                     }),
                     None => serde_json::json!({ "ts": now_unix(), "cpu": 0.0,
                                                 "mem_used_kib": 0, "mem_total_kib": 0, "load1": 0.0 }),
-                }
+                };
+                x
             };
             let ev = Event::default().event("metrics").data(payload.to_string());
             // try_send：满即丢弃（慢消费者），这是刻意的背压策略
@@ -107,7 +112,9 @@ pub async fn metrics_stream(
 /// 任务进度频道：订阅需 `task.view`
 pub async fn task_stream(
     State(state): State<Arc<AppState>>,
-    session: Option<Session>,
+    // Session 未实现 FromRequestParts，不能直接用 Option<Session> 作提取器；
+    // MaybeAuth 即为此设计（Rejection 为 Infallible）。
+    MaybeAuth(session): MaybeAuth,
 ) -> axum::response::Response {
     if let Some(s) = &session {
         if crate::auth::require(s, crate::auth::perm::TASK_VIEW).is_err() {
@@ -156,7 +163,9 @@ pub async fn task_stream(
 /// 日志跟随频道：订阅需 `log.view`（权限过滤示例）
 pub async fn log_stream(
     State(state): State<Arc<AppState>>,
-    session: Option<Session>,
+    // Session 未实现 FromRequestParts，不能直接用 Option<Session> 作提取器；
+    // MaybeAuth 即为此设计（Rejection 为 Infallible）。
+    MaybeAuth(session): MaybeAuth,
 ) -> axum::response::Response {
     match &session {
         Some(s) => {
@@ -172,11 +181,11 @@ pub async fn log_stream(
     }
     let (tx, mut rx) = mpsc::channel::<Event>(BACKLOG);
     drop(tx);
-    let s: axum::response::sse::Sse<impl Stream<Item = Result<Event, Infallible>>> =
-        Sse::new(async_stream::stream! {
-            while let Some(ev) = rx.recv().await { yield Ok::<_, Infallible>(ev); }
-        });
-    s.into_response()
+    // 注意：不能写成 `let s: Sse<impl Stream<...>> = ...`
+    // —— `impl Trait` 不允许出现在 let 绑定的类型标注上（E0562）。直接构造并转换即可。
+    Sse::new(async_stream::stream! {
+        while let Some(ev) = rx.recv().await { yield Ok::<_, Infallible>(ev); }
+    }).into_response()
 }
 
 fn now_unix() -> i64 {

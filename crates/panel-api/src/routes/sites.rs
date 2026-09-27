@@ -1,7 +1,7 @@
 //! 站点与 SSL 证书（设计方案 §2.4）。
 //!
 //! # 核心闭环：配置变更必须"先校验，后生效"
-//! ```
+//! ```text
 //! 渲染配置 → validate（nginx -t）→ 失败则中止   → 成功则原子替换 → reload
 //!                                    ↑ 旧配置未动，站点不受影响
 //! ```
@@ -14,7 +14,7 @@
 
 use crate::{
     auth::perm,
-    error::{ok, ApiError},
+    error::{ok, ApiError, ApiResult},
     routes::{audit, Auth, Shared},
 };
 use axum::{
@@ -42,7 +42,7 @@ pub struct SiteDto {
 pub async fn list(
     State(state): State<Shared>,
     Auth(s): Auth,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SITE_VIEW)?;
     let name = s.username.clone();
     // 站点列表走读连接池（管理员看全部，普通用户只看自己的）
@@ -89,7 +89,7 @@ pub async fn create(
     State(state): State<Shared>,
     Auth(s): Auth,
     Json(req): Json<CreateReq>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SITE_MANAGE)?;
     let _ = (&state, &s, &req);
     // M3 完整实现：校验域名 → 建目录 → 渲染配置 → validate → 落库 → reload
@@ -111,7 +111,7 @@ pub async fn apply(
     State(state): State<Shared>,
     Auth(s): Auth,
     Json(req): Json<ApplyReq>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SITE_MANAGE)?;
     if !state.capabilities.get(cap_keys::WEBSERVER_MANAGE)
         .map(|c| c.supported).unwrap_or(false) {
@@ -156,7 +156,7 @@ pub async fn apply(
     // 6) reload。失败时配置已写入但服务未加载 —— 这是可恢复的（配置语法已校验过）
     if let Err(e) = state.os.webserver().reload().await {
         return Err(ApiError::from(PanelError::Command {
-            bin: "reload", detail: format!("配置已写入但 reload 失败：{e}") }));
+            bin: "reload".to_string(), detail: format!("配置已写入但 reload 失败：{e}") }));
     }
 
     // 7) 落库：此时系统已处于期望状态
@@ -205,7 +205,7 @@ pub struct CertDto {
 pub async fn certs(
     State(state): State<Shared>,
     Auth(s): Auth,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SITE_VIEW)?;
     let rows = state.pool.with(|conn| {
         let mut st = conn.prepare(
@@ -238,7 +238,7 @@ pub async fn issue(
     State(state): State<Shared>,
     Auth(s): Auth,
     Json(req): Json<IssueReq>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SSL_MANAGE)?;
     if !state.capabilities.get(cap_keys::SSL_ACME).map(|c| c.supported).unwrap_or(false) {
         return Err(ApiError::unsupported("ssl.acme"));
@@ -259,7 +259,7 @@ pub async fn issue(
 
 pub async fn get(
     State(state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<i64>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SITE_VIEW)?;
     let _ = id;
     Err(ApiError::unsupported("site.get (M3: 单体站点详情尚未接入)"))
@@ -267,7 +267,7 @@ pub async fn get(
 
 pub async fn patch(
     State(state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<i64>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SITE_MANAGE)?;
     let _ = id;
     Err(ApiError::unsupported("site.patch (M3)"))
@@ -275,7 +275,7 @@ pub async fn patch(
 
 pub async fn delete(
     State(state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<i64>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SITE_MANAGE)?;
     let _ = id;
     Err(ApiError::unsupported("site.delete (M3: 删除需先停站点并备份配置)"))
@@ -283,7 +283,7 @@ pub async fn delete(
 
 pub async fn reload(
     State(state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<i64>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SITE_MANAGE)?;
     if !state.capabilities.get(cap_keys::WEBSERVER_MANAGE).map(|c| c.supported).unwrap_or(false) {
         return Err(ApiError::unsupported("webserver.manage"));
@@ -294,7 +294,7 @@ pub async fn reload(
 
 pub async fn logs(
     State(state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<i64>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SITE_VIEW)?;
     let _ = id;
     Err(ApiError::unsupported("site.logs (M3: 站点访问/错误日志 SSE 尚未接入)"))
@@ -302,7 +302,7 @@ pub async fn logs(
 
 pub async fn ssl_apply(
     State(state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<i64>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SSL_MANAGE)?;
     let _ = id;
     Err(ApiError::unsupported("ssl.apply (M3: ACME 签发任务尚未接入；加密前提已就绪)"))
@@ -310,7 +310,7 @@ pub async fn ssl_apply(
 
 pub async fn cert_renew(
     State(state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<i64>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SSL_MANAGE)?;
     let _ = id;
     Err(ApiError::unsupported("cert.renew (M3)"))
@@ -318,7 +318,7 @@ pub async fn cert_renew(
 
 pub async fn cert_delete(
     State(state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<i64>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SSL_MANAGE)?;
     let _ = id;
     Err(ApiError::unsupported("cert.delete (M3: 撤销需清理自动续期定时器)"))

@@ -12,7 +12,7 @@
 
 use crate::{
     auth::perm,
-    error::{ok, ApiError},
+    error::{ok, ApiError, ApiResult},
     routes::{audit, Auth, Shared},
 };
 use axum::{
@@ -88,7 +88,7 @@ pub async fn list(
     State(state): State<Shared>,
     Auth(s): Auth,
     Query(q): Query<ListQ>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FILE_READ)?;
     let p = resolve(&state, &s, q.path.as_deref().unwrap_or("/"))?;
 
@@ -152,7 +152,7 @@ pub async fn read(
     State(state): State<Shared>,
     Auth(s): Auth,
     Query(q): Query<ReadQ>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FILE_READ)?;
     let p = resolve(&state, &s, &q.path)?;
     ensure_not_sensitive(&state, &p)?;
@@ -194,7 +194,7 @@ pub async fn write(
     State(state): State<Shared>,
     Auth(s): Auth,
     Json(req): Json<WriteReq>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FILE_WRITE)?;
     let p = resolve(&state, &s, &req.path)?;
     ensure_not_sensitive(&state, &p)?;
@@ -228,7 +228,7 @@ pub struct MkdirReq { pub path: String, pub recursive: Option<bool> }
 
 pub async fn mkdir(
     State(state): State<Shared>, Auth(s): Auth, Json(req): Json<MkdirReq>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FILE_WRITE)?;
     let p = resolve(&state, &s, &req.path)?;
     state.os.files().create_dir(&p, req.recursive.unwrap_or(true)).await?;
@@ -241,7 +241,7 @@ pub struct DeleteReq { pub path: String, pub allow_dir: Option<bool> }
 
 pub async fn remove(
     State(state): State<Shared>, Auth(s): Auth, Json(req): Json<DeleteReq>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FILE_WRITE)?;
     let p = resolve(&state, &s, &req.path)?;
     ensure_not_sensitive(&state, &p)?;
@@ -258,7 +258,7 @@ pub struct RenameReq { pub from: String, pub to: String, pub copy: Option<bool> 
 
 pub async fn rename(
     State(state): State<Shared>, Auth(s): Auth, Json(req): Json<RenameReq>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FILE_WRITE)?;
     let from = resolve(&state, &s, &req.from)?;
     let to = resolve(&state, &s, &req.to)?;
@@ -281,7 +281,7 @@ pub struct ChmodReq { pub path: String, pub mode: String, pub recursive: Option<
 
 pub async fn chmod(
     State(state): State<Shared>, Auth(s): Auth, Json(req): Json<ChmodReq>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FILE_WRITE)?;
     let p = resolve(&state, &s, &req.path)?;
 
@@ -307,28 +307,28 @@ pub async fn chmod(
 
 pub async fn stat(
     State(_): State<Shared>, Auth(s): Auth,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FILE_READ)?;
     Err(ApiError::unsupported("file.stat (M2: 独立 stat 端点尚未接入；可用 /files/list 获取目录元数据)"))
 }
 
 pub async fn upload(
     State(_): State<Shared>, Auth(s): Auth,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FILE_WRITE)?;
     Err(ApiError::unsupported("file.upload (M2: 流式上传尚未接入；可用 /files/write 写入文本)"))
 }
 
 pub async fn download(
     State(_): State<Shared>, Auth(s): Auth,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FILE_READ)?;
     Err(ApiError::unsupported("file.download (M2: 分块下载尚未接入)"))
 }
 
 pub async fn action(
     State(_): State<Shared>, Auth(s): Auth,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FILE_WRITE)?;
     Err(ApiError::unsupported("file.action (M2: 批量/归档动作尚未接入)"))
 }

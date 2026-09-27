@@ -4,7 +4,7 @@
 
 use crate::{
     auth::{self, Session, SessionCache},
-    error::ApiError,
+    error::{ApiError, ApiResult},
     AppState,
 };
 use axum::{
@@ -85,7 +85,7 @@ fn req_uses_https() -> bool {
 }
 
 /// 从扩展中取出会话，缺失即 401（供需要登录但不需特定权限的读接口使用）
-pub fn session_of(req: &Request) -> Result<Session, ApiError> {
+pub fn session_of(req: &Request) -> ApiResult<Session> {
     req.extensions().get::<Session>().cloned().ok_or_else(ApiError::unauthorized)
 }
 

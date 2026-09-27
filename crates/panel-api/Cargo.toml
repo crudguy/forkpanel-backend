@@ -12,8 +12,11 @@ panel-os   = { path = "../panel-os" }
 panel-db   = { path = "../panel-db" }
 panel-task = { path = "../panel-task" }
 
-axum       = { version = "0.8", default-features = false, features = ["http1", "json", "macros"] }
+# 注意：axum 0.8 把 Query 提取器放到了 `query` feature 之后；
+# 本仓刻意关掉默认特性控体积，故必须显式开启，否则 axum::extract::Query 不存在。
+axum       = { version = "0.8", default-features = false, features = ["http1", "json", "macros", "query", "tokio"] }
 tokio      = { workspace = true }
+async-trait = { workspace = true }
 tower      = { version = "0.5", features = ["limit"] }
 async-stream = "0.3"
 futures-util = "0.3"

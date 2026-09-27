@@ -78,32 +78,32 @@ pub fn build_router(state: Shared) -> Router {
     // ── 进程（M2） ──
     let proc_r = Router::new()
         .route("/api/v1/processes", get(processes::list))
-        .route("/api/v1/processes/:pid/kill", post(processes::kill));
+        .route("/api/v1/processes/{pid}/kill", post(processes::kill));
 
     // ── 软件与服务 ──
     let svc_r = Router::new()
         .route("/api/v1/services", get(services::list))
-        .route("/api/v1/services/:unit/status", get(services::status))
-        .route("/api/v1/services/:unit/start", post(services::start))
-        .route("/api/v1/services/:unit/stop", post(services::stop))
-        .route("/api/v1/services/:unit/restart", post(services::restart))
-        .route("/api/v1/services/:unit/enabled", put(services::set_enabled))
-        .route("/api/v1/services/:unit/journal", get(services::journal))
+        .route("/api/v1/services/{unit}/status", get(services::status))
+        .route("/api/v1/services/{unit}/start", post(services::start))
+        .route("/api/v1/services/{unit}/stop", post(services::stop))
+        .route("/api/v1/services/{unit}/restart", post(services::restart))
+        .route("/api/v1/services/{unit}/enabled", put(services::set_enabled))
+        .route("/api/v1/services/{unit}/journal", get(services::journal))
         .route("/api/v1/packages", get(services::packages_list))
         .route("/api/v1/packages/install", post(services::install))
-        .route("/api/v1/packages/:name", delete(services::package_remove));
+        .route("/api/v1/packages/{name}", delete(services::package_remove));
 
     // ── 站点与 SSL ──
     let site_r = Router::new()
         .route("/api/v1/sites", get(sites::list).post(sites::create))
         .route("/api/v1/sites/apply", post(sites::apply))
-        .route("/api/v1/sites/:id", get(sites::get).patch(sites::patch).delete(sites::delete))
-        .route("/api/v1/sites/:id/reload", post(sites::reload))
-        .route("/api/v1/sites/:id/logs", get(sites::logs))
-        .route("/api/v1/sites/:id/ssl/apply", post(sites::ssl_apply))
+        .route("/api/v1/sites/{id}", get(sites::get).patch(sites::patch).delete(sites::delete))
+        .route("/api/v1/sites/{id}/reload", post(sites::reload))
+        .route("/api/v1/sites/{id}/logs", get(sites::logs))
+        .route("/api/v1/sites/{id}/ssl/apply", post(sites::ssl_apply))
         .route("/api/v1/certs", get(sites::certs))
-        .route("/api/v1/certs/:id/renew", post(sites::cert_renew))
-        .route("/api/v1/certs/:id", delete(sites::cert_delete));
+        .route("/api/v1/certs/{id}/renew", post(sites::cert_renew))
+        .route("/api/v1/certs/{id}", delete(sites::cert_delete));
 
     // ── 文件 ──
     let file_r = Router::new()
@@ -122,31 +122,31 @@ pub fn build_router(state: Shared) -> Router {
     // ── 数据库 ──
     let db_r = Router::new()
         .route("/api/v1/db/connections", get(databases::list).post(databases::create))
-        .route("/api/v1/db/:conn/databases", get(databases::databases_of))
-        .route("/api/v1/db/:conn/:db/tables", get(databases::tables))
-        .route("/api/v1/db/:conn/:db/:table/rows", get(databases::rows))
-        .route("/api/v1/db/:conn/backup", post(databases::backup))
-        .route("/api/v1/db/:conn/restore", post(databases::restore));
+        .route("/api/v1/db/{conn}/databases", get(databases::databases_of))
+        .route("/api/v1/db/{conn}/{db}/tables", get(databases::tables))
+        .route("/api/v1/db/{conn}/{db}/{table}/rows", get(databases::rows))
+        .route("/api/v1/db/{conn}/backup", post(databases::backup))
+        .route("/api/v1/db/{conn}/restore", post(databases::restore));
 
     // ── 防火墙 ──
     let fw_r = Router::new()
         .route("/api/v1/firewall/status", get(firewall::status))
         .route("/api/v1/firewall/enabled", put(firewall::set_enabled))
         .route("/api/v1/firewall/rules", get(firewall::list).post(firewall::apply))
-        .route("/api/v1/firewall/rules/:id", delete(firewall::delete_rule));
+        .route("/api/v1/firewall/rules/{id}", delete(firewall::delete_rule));
 
     // ── 安全中心 ──
     let sec_r = Router::new()
         .route("/api/v1/security/baseline", get(security::baseline).post(security::baseline_apply))
         .route("/api/v1/security/sessions", get(security::sessions))
-        .route("/api/v1/security/sessions/:id", delete(security::revoke_session));
+        .route("/api/v1/security/sessions/{id}", delete(security::revoke_session));
 
     // ── 计划任务 ──
     let cron_r = Router::new()
         .route("/api/v1/cron/jobs", get(cron::list).post(cron::create))
-        .route("/api/v1/cron/jobs/:id", get(cron::get_job).patch(cron::patch_job).delete(cron::remove))
-        .route("/api/v1/cron/jobs/:id/run", post(cron::run))
-        .route("/api/v1/cron/jobs/:id/runs", get(cron::runs))
+        .route("/api/v1/cron/jobs/{id}", get(cron::get_job).patch(cron::patch_job).delete(cron::remove))
+        .route("/api/v1/cron/jobs/{id}/run", post(cron::run))
+        .route("/api/v1/cron/jobs/{id}/runs", get(cron::runs))
         .route("/api/v1/cron/preview", post(cron::preview));
 
     // ── 日志 ──
@@ -154,20 +154,20 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/logs/sources", get(logs::sources))
         .route("/api/v1/logs/stream", get(logs::stream))
         .route("/api/v1/logs/download", get(logs::download))
-        .route("/api/v1/logs/:id", get(logs::read));
+        .route("/api/v1/logs/{id}", get(logs::read));
 
     // ── 任务中心 ──
     let task_r = Router::new()
         .route("/api/v1/tasks", get(tasks::list))
-        .route("/api/v1/tasks/:id", get(tasks::get))
-        .route("/api/v1/tasks/:id/cancel", post(tasks::cancel))
-        .route("/api/v1/tasks/:id/output", get(tasks::output));
+        .route("/api/v1/tasks/{id}", get(tasks::get))
+        .route("/api/v1/tasks/{id}/cancel", post(tasks::cancel))
+        .route("/api/v1/tasks/{id}/output", get(tasks::output));
 
     // ── 设置 / 用户 / 审计 ──
     let cfg_r = Router::new()
         .route("/api/v1/settings", get(settings::get).patch(settings::patch))
         .route("/api/v1/users", get(users::list).post(users::create))
-        .route("/api/v1/users/:id", patch(users::patch).delete(users::delete))
+        .route("/api/v1/users/{id}", patch(users::patch).delete(users::delete))
         .route("/api/v1/audit", get(audit::list));
 
     // ── SSE：多频道 ──

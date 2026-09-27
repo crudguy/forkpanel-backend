@@ -11,7 +11,7 @@
 
 use crate::{
     auth::perm,
-    error::{ok, ApiError},
+    error::{ok, ApiError, ApiResult},
     routes::{audit, Auth, Shared},
 };
 use axum::{
@@ -48,7 +48,7 @@ pub async fn list(
     State(state): State<Shared>,
     Auth(s): Auth,
     Query(q): Query<ListQ>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SERVICE_VIEW)?;
     if !state.capabilities.get(cap_keys::SERVICE_MANAGE)
         .map(|c| c.supported).unwrap_or(false) {
@@ -56,26 +56,38 @@ pub async fn list(
         return Err(ApiError::unsupported("service.manage"));
     }
 
+    // ServiceFilter 是**结构体**（name_contains / state / only_panel_managed），不是枚举，
+    // 故按字段组装；未指定的字段走 Default。
     let filter = match q.filter.as_deref() {
-        Some("running") => panel_os::ServiceFilter::Running,
-        Some("failed") => panel_os::ServiceFilter::Failed,
-        Some(text) => panel_os::ServiceFilter::NameContains(text.to_string()),
-        None => panel_os::ServiceFilter::All,
+        Some("running") => panel_os::ServiceFilter {
+            state: Some(panel_os::ServiceState::Active), ..Default::default()
+        },
+        Some("failed") => panel_os::ServiceFilter {
+            state: Some(panel_os::ServiceState::Failed), ..Default::default()
+        },
+        Some(text) => panel_os::ServiceFilter {
+            name_contains: Some(text.to_string()), ..Default::default()
+        },
+        None => panel_os::ServiceFilter::default(),
     };
+    let filter = panel_os::ServiceFilter { only_panel_managed: q.managed_only.unwrap_or(false), ..filter };
     let units = state.os.services().list(filter).await?;
 
     let dtos: Vec<ServiceDto> = units.into_iter().map(|u| ServiceDto {
-        managed: is_managed(&u.name),
-        name: u.name,
+        // UnitName 是强类型标识，需 as_str() 取内部字符串
+        managed: is_managed(u.name.as_str()),
+        name: u.name.as_str().to_string(),
         state: match u.state {
             panel_os::ServiceState::Active => "active",
             panel_os::ServiceState::Inactive => "inactive",
             panel_os::ServiceState::Failed => "failed",
             panel_os::ServiceState::Activating => "activating",
+            panel_os::ServiceState::Deactivating => "deactivating",
             panel_os::ServiceState::Unknown => "unknown",
         },
         enabled: u.enabled,
-        description: u.description,
+        // ServiceUnit.description 是 String，DTO 字段是 Option<String>（无描述时为 None）
+        description: if u.description.is_empty() { None } else { Some(u.description) },
     }).collect();
 
     Ok(ok(serde_json::json!({
@@ -90,7 +102,7 @@ fn init_name(i: panel_core::InitSystem) -> &'static str {
         panel_core::InitSystem::SysV => "sysv",
         panel_core::InitSystem::OpenRc => "openrc",
         panel_core::InitSystem::Launchd => "launchd",
-        panel_core::InitSystem::WindowsService => "scm",
+        panel_core::InitSystem::Scm => "scm",
         panel_core::InitSystem::Unknown => "unknown",
     }
 }
@@ -122,7 +134,7 @@ pub async fn act(
     Auth(s): Auth,
     AxPath(name): AxPath<String>,
     Json(req): Json<ActionReq>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SERVICE_MANAGE)?;
 
     // 强类型构造点：UnitName 必须由校验器产出，不能直接用路径参数
@@ -159,7 +171,7 @@ pub async fn status(
     State(state): State<Shared>,
     Auth(s): Auth,
     AxPath(name): AxPath<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SERVICE_VIEW)?;
     let unit = panel_core::unit_name(&name)
         .map_err(|_| ApiError::bad_request("name", "invalid unit name"))?;
@@ -186,7 +198,7 @@ pub async fn install(
     State(state): State<Shared>,
     Auth(s): Auth,
     Json(req): Json<InstallReq>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::PACKAGE_MANAGE)?;
     if !state.capabilities.get(cap_keys::PACKAGE_INSTALL)
         .map(|c| c.supported).unwrap_or(false) {
@@ -290,27 +302,27 @@ fn percent_from_lines(n: usize) -> u8 {
 /// 收敛单元动作到 `act`，避免 start/stop/restart 三套重复校验。
 async fn do_unit_action(
     state: Shared, s: crate::auth::Session, name: String, action: &str,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     act(State(state), Auth(s), AxPath(name), Json(ActionReq { action: action.into(), enable: None })).await
 }
 
 pub async fn start(
     State(state): State<Shared>, Auth(s): Auth, AxPath(name): AxPath<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SERVICE_MANAGE)?;
     do_unit_action(state, s, name, "start").await
 }
 
 pub async fn stop(
     State(state): State<Shared>, Auth(s): Auth, AxPath(name): AxPath<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SERVICE_MANAGE)?;
     do_unit_action(state, s, name, "stop").await
 }
 
 pub async fn restart(
     State(state): State<Shared>, Auth(s): Auth, AxPath(name): AxPath<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SERVICE_MANAGE)?;
     do_unit_action(state, s, name, "restart").await
 }
@@ -321,7 +333,7 @@ pub struct EnabledReq { pub enabled: bool }
 pub async fn set_enabled(
     State(state): State<Shared>, Auth(s): Auth,
     AxPath(name): AxPath<String>, Json(req): Json<EnabledReq>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SERVICE_MANAGE)?;
     let unit = panel_core::unit_name(&name)
         .map_err(|_| ApiError::bad_request("name", "invalid unit name"))?;
@@ -332,7 +344,7 @@ pub async fn set_enabled(
 
 pub async fn journal(
     State(state): State<Shared>, Auth(s): Auth, AxPath(name): AxPath<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SERVICE_VIEW)?;
     if !state.capabilities.get(cap_keys::SERVICE_MANAGE).map(|c| c.supported).unwrap_or(false) {
         return Err(ApiError::unsupported("service.manage"));
@@ -343,7 +355,7 @@ pub async fn journal(
 
 pub async fn packages_list(
     State(state): State<Shared>, Auth(s): Auth,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::PACKAGE_MANAGE)?;
     if !state.capabilities.get(cap_keys::PACKAGE_INSTALL).map(|c| c.supported).unwrap_or(false) {
         return Err(ApiError::unsupported("package.install"));
@@ -353,7 +365,7 @@ pub async fn packages_list(
 
 pub async fn package_remove(
     State(state): State<Shared>, Auth(s): Auth, AxPath(name): AxPath<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::PACKAGE_MANAGE)?;
     let _ = name;
     Err(ApiError::unsupported("package.remove (M2: 卸载走任务队列，尚未接入)"))

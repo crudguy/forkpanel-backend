@@ -2,7 +2,7 @@
 
 use crate::{
     auth::{self, perm, Session},
-    error::{ok, ApiError},
+    error::{ok, ApiError, ApiResult},
     routes::{audit, Auth, MaybeAuth, Shared},
     AppState,
 };
@@ -36,7 +36,7 @@ pub async fn login(
     State(state): State<Shared>,
     headers: HeaderMap,
     Json(req): Json<LoginReq>,
-) -> Result<(HeaderMap, StatusCode), ApiError> {
+) -> ApiResult<(HeaderMap, StatusCode)> {
     if req.username.is_empty() || req.password.is_empty() {
         return Err(ApiError::bad_request("username", "required"));
     }
@@ -146,7 +146,7 @@ pub async fn change_password(
     State(state): State<Shared>,
     Auth(s): Auth,
     Json(req): Json<PwdReq>,
-) -> Result<StatusCode, ApiError> {
+) -> ApiResult<StatusCode> {
     auth::check_password_policy(&req.new)?;
     let _ = (&state, &s, &req);
     // 完整实现（M0 收尾）：校验 old → 用档位参数哈希 new → 单写事务更新 → 强制其他会话下线

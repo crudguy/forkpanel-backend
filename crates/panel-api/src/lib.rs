@@ -11,7 +11,6 @@ pub mod error;
 pub mod middleware;
 pub mod routes;
 pub mod sse;
-pub mod routes;
 
 use error::{ApiError, ApiResult};
 use panel_core::{crypto::MasterKey, CapabilityMap, Tier};
@@ -55,7 +54,7 @@ impl AppState {
     }
 
     /// 需要写入/读取真实秘密（SSL 私钥、数据库口令）时调用；无主密钥则拒绝。
-    pub fn require_secret_key(&self) -> Result<MasterKey, ApiError> {
+    pub fn require_secret_key(&self) -> ApiResult<MasterKey> {
         self.master_key.ok_or_else(|| {
             ApiError::unsupported("secret storage unavailable: master key not loaded (检查 /etc/panel/master.key 权限 0600)")
         })
@@ -86,7 +85,7 @@ impl<T: serde::Serialize> Envelope<T> {
     }
 }
 
-/// 把 `Result<T, ApiError>` 转成 HTTP 响应（IntoResponse 在 error.rs 中实现）
+/// 把 `ApiResult<T>` 转成 HTTP 响应（IntoResponse 在 error.rs 中实现）
 pub type HandlerResult<T> = ApiResult<T>;
 
 #[allow(dead_code)]

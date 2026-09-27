@@ -4,7 +4,7 @@
 //! （列：ts, actor, actor_ip, action, target, result, detail_json）。
 //! 本端点提供只读回溯，复用既有的读连接池模式。
 
-use crate::{auth::perm, error::{ok, ApiError}, routes::{Auth, Shared}};
+use crate::{auth::perm, error::{ok, ApiError, ApiResult}, routes::{Auth, Shared}};
 use axum::extract::{Query, State};
 use axum::Json;
 use panel_core::PanelError;
@@ -19,7 +19,7 @@ pub async fn list(
     State(state): State<Shared>,
     Auth(s): Auth,
     Query(q): Query<AuditQ>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::AUDIT_VIEW)?;
     // 服务端硬上限：避免一次性拉取全量审计表撑爆内存
     let limit = (q.limit.unwrap_or(100)).min(1000) as i64;

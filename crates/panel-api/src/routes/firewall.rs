@@ -11,7 +11,7 @@
 
 use crate::{
     auth::perm,
-    error::{ok, ApiError},
+    error::{ok, ApiError, ApiResult},
     routes::{audit, Auth, Shared},
 };
 use axum::{extract::{Path as AxPath, State}, Json};
@@ -38,7 +38,7 @@ pub struct RuleDto {
 pub async fn list(
     State(state): State<Shared>,
     Auth(s): Auth,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FIREWALL_VIEW)?;
     if !state.capabilities.get(cap_keys::FIREWALL_MANAGE).map(|c| c.supported).unwrap_or(false) {
         // 明确 501 而非空列表：让用户知道"没装防火墙"而不是"没规则"
@@ -142,7 +142,7 @@ pub async fn apply(
     State(state): State<Shared>,
     Auth(s): Auth,
     Json(req): Json<ApplyReq>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FIREWALL_MANAGE)?;
     if !state.capabilities.get(cap_keys::FIREWALL_MANAGE).map(|c| c.supported).unwrap_or(false) {
         return Err(ApiError::unsupported("firewall.manage"));
@@ -248,7 +248,7 @@ pub struct ActiveReq { pub active: bool }
 
 pub async fn set_active(
     State(state): State<Shared>, Auth(s): Auth, Json(req): Json<ActiveReq>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FIREWALL_MANAGE)?;
     // 关闭防火墙会暴露所有端口 —— 这是高危操作，必须留痕
     state.os.firewall().set_active(req.active).await?;
@@ -261,7 +261,7 @@ pub async fn set_active(
 
 pub async fn status(
     State(state): State<Shared>, Auth(s): Auth,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FIREWALL_VIEW)?;
     if !state.capabilities.get(cap_keys::FIREWALL_MANAGE).map(|c| c.supported).unwrap_or(false) {
         return Err(ApiError::unsupported("firewall.manage"));
@@ -278,14 +278,14 @@ pub struct EnabledReq { pub enabled: bool }
 
 pub async fn set_enabled(
     State(state): State<Shared>, Auth(s): Auth, Json(req): Json<EnabledReq>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FIREWALL_MANAGE)?;
     set_active(State(state), Auth(s), Json(ActiveReq { active: req.enabled })).await
 }
 
 pub async fn delete_rule(
     State(state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FIREWALL_MANAGE)?;
     let _ = (state, id);
     Err(ApiError::unsupported("firewall.rule.delete (M2: 仅支持按面板标记删除自己创建的规则，尚未接入)"))

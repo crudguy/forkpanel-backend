@@ -9,7 +9,7 @@
 
 use crate::{
     auth::perm,
-    error::{ok, ApiError},
+    error::{ok, ApiError, ApiResult},
     routes::{audit, Auth, Shared},
 };
 use axum::{
@@ -40,7 +40,7 @@ pub struct LineDto {
 
 pub async fn sources(
     State(state): State<Shared>, Auth(s): Auth,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::LOG_VIEW)?;
     if !state.capabilities.get(cap_keys::LOGS_READ).map(|c| c.supported).unwrap_or(false) {
         return Err(ApiError::unsupported("logs.read"));
@@ -67,8 +67,8 @@ fn log_backend_name(b: panel_core::LogBackend) -> &'static str {
         panel_core::LogBackend::Journald => "journald",
         panel_core::LogBackend::File => "file",
         panel_core::LogBackend::EventLog => "eventlog",
-        panel_core::LogBackend::Unified => "unified",
-        panel_core::LogBackend::None => "none",
+        // LogBackend 的实际变体为 Journald / File / EventLog / OsLog（无 Unified / None）
+        panel_core::LogBackend::OsLog => "oslog",
     }
 }
 
@@ -77,7 +77,7 @@ pub async fn read(
     Auth(s): Auth,
     AxPath(id): AxPath<String>,
     Query(q): Query<ReadQ>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::LOG_VIEW)?;
 
     let src = find_source(&state, &id).await?;
@@ -122,7 +122,7 @@ async fn find_source(state: &Shared, id: &str) -> Result<panel_os::LogSource> {
 /// 清空面板自身日志（系统日志不允许清）
 pub async fn clear_panel(
     State(state): State<Shared>, Auth(s): Auth,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::LOG_VIEW)?;
     // 只允许清面板自己的日志：清系统日志会破坏审计链
     audit(&state, &s, "log.clear", "panel", "ok").await;
@@ -133,7 +133,7 @@ pub async fn clear_panel(
 
 pub async fn stream(
     State(state): State<Shared>, Auth(s): Auth,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::LOG_VIEW)?;
     let _ = state;
     Err(ApiError::unsupported("logs.stream (M3: 日志跟随 SSE 尚未接入；可用 /events/logs)"))
@@ -141,7 +141,7 @@ pub async fn stream(
 
 pub async fn download(
     State(state): State<Shared>, Auth(s): Auth,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::LOG_VIEW)?;
     let _ = state;
     Err(ApiError::unsupported("logs.download (M3)"))

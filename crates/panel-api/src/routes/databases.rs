@@ -13,10 +13,11 @@
 
 use crate::{
     auth::perm,
-    error::{ok, ApiError},
+    error::{ok, ApiError, ApiResult},
     routes::{audit, Auth, Shared},
 };
-use axum::{extract::State, Json};
+// Path 与 std::path::PathBuf 同名，按全仓约定别名成 AxPath
+use axum::{extract::{Path as AxPath, State}, Json};
 use panel_core::{cap_keys, PanelError, Result, SafePath};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -37,7 +38,7 @@ pub struct ConnDto {
 
 pub async fn list(
     State(state): State<Shared>, Auth(s): Auth,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_VIEW)?;
 
     let rows = state.pool.with(|conn| {
@@ -57,17 +58,17 @@ pub async fn list(
     let mut dtos = Vec::new();
     for (id, name, engine, host, port, database, pwd) in rows {
         let eng = match engine.as_str() {
-            "mysql" => panel_core::DbEngine::MySql,
-            "postgres" => panel_core::DbEngine::Postgres,
-            _ => panel_core::DbEngine::Sqlite,
+            "mysql" => panel_os::DbEngine::MySql,
+            "postgres" => panel_os::DbEngine::Postgres,
+            _ => panel_os::DbEngine::Sqlite,
         };
         // 可用性逐个探测（外部客户端可能缺失）
         let available = state.os.databases().available().await.unwrap_or(false);
         dtos.push(ConnDto {
             id, name,
-            engine: match eng { panel_core::DbEngine::MySql => "mysql",
-                                panel_core::DbEngine::Postgres => "postgres",
-                                panel_core::DbEngine::Sqlite => "sqlite" },
+            engine: match eng { panel_os::DbEngine::MySql => "mysql",
+                                panel_os::DbEngine::Postgres => "postgres",
+                                panel_os::DbEngine::Sqlite => "sqlite" },
             host, port, database,
             available: available && state.capabilities
                 .get(cap_keys::DBMS_MANAGE).map(|c| c.supported).unwrap_or(false),
@@ -90,7 +91,7 @@ pub struct CreateReq {
 
 pub async fn create(
     State(state): State<Shared>, Auth(s): Auth, Json(req): Json<CreateReq>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_MANAGE)?;
 
     // 库名校验（强类型构造点，防 `db; DROP`）
@@ -142,7 +143,7 @@ pub struct BackupReq { pub id: i64, pub out: String }
 
 pub async fn backup(
     State(state): State<Shared>, Auth(s): Auth, Json(req): Json<BackupReq>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_MANAGE)?;
 
     // 输出路径必须在允许根内（防把备份写到 /etc 覆盖配置）
@@ -190,7 +191,7 @@ impl panel_task::TaskBody for DbBackupTask {
         // 完整实现应读出连接信息并解密口令后构造 DbTarget；
         // 骨架阶段 DbTarget 用本地默认值，M4 接线真实凭据。
         let t = panel_os::DbTarget {
-            engine: panel_core::DbEngine::Sqlite,
+            engine: panel_os::DbEngine::Sqlite,
             host: None, port: None, user: None, password: None, database: None,
         };
         let p = progress.clone();
@@ -212,7 +213,7 @@ pub struct RestoreReq { pub id: i64, pub from: String }
 
 pub async fn restore(
     State(state): State<Shared>, Auth(s): Auth, Json(req): Json<RestoreReq>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_MANAGE)?;
     let _ = resolve_out(&state, &s, &req.from)?;
     // 恢复是破坏性操作：**必须走任务且要求幂等键不同**（防误触两次）
@@ -224,7 +225,7 @@ pub async fn restore(
 
 pub async fn databases_of(
     State(state): State<Shared>, Auth(s): Auth, AxPath(conn): AxPath<i64>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_VIEW)?;
     let _ = (state, conn);
     Err(ApiError::unsupported("db.databases (M4)"))
@@ -233,7 +234,7 @@ pub async fn databases_of(
 pub async fn tables(
     State(state): State<Shared>, Auth(s): Auth,
     AxPath((conn, db)): AxPath<(i64, String)>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_VIEW)?;
     let _ = (state, conn, db);
     Err(ApiError::unsupported("db.tables (M4)"))
@@ -242,7 +243,7 @@ pub async fn tables(
 pub async fn rows(
     State(state): State<Shared>, Auth(s): Auth,
     AxPath((conn, db, table)): AxPath<(i64, String, String)>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_VIEW)?;
     let _ = (state, conn, db, table);
     Err(ApiError::unsupported("db.rows (M4: 仅预览，禁止 Web SQL 终端)"))
