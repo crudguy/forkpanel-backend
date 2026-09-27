@@ -1,0 +1,34 @@
+# ForkPanel 生产默认配置（由 deploy/install.sh 安装为 /etc/forkpanel/config.toml）
+#
+# 修改后执行 systemctl restart panel 生效。
+
+# auto | nano | small | standard（auto 依据内存与 CPU 探测；不确定就留 auto）
+tier = "auto"
+
+[server]
+bind = "127.0.0.1"
+port = 2083
+# ★ 面板默认只监听回环：不要改成 0.0.0.0。
+#   远程访问请用 SSH 隧道：ssh -L 2083:127.0.0.1:2083 <user>@<server>
+#   确需公网暴露时，先接 TLS 再改，并自行承担暴露面。
+localhost_only = true
+
+[paths]
+config    = "/etc/forkpanel"
+data      = "/var/lib/forkpanel"
+log       = "/var/log/forkpanel"
+site_root = "/var/www"
+
+[db]
+synchronous = "NORMAL"
+daily_backup = true
+
+[security]
+session_idle = "30m"
+session_absolute = "12h"
+max_login_attempts = 5
+read_only = false
+
+[audit]
+retention_days = 90
+max_rows = 50000
