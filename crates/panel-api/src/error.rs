@@ -8,6 +8,8 @@ use axum::{
 use panel_core::PanelError;
 use serde_json::json;
 
+/// handler 统一返回类型。注意：**不是** `panel_core::Result`（它只有 1 个泛型参数，
+/// 固定第二参数为 PanelError）。handler 必须把领域错误经 `From<PanelError>` 转成 ApiError。
 pub type ApiResult<T> = Result<T, ApiError>;
 
 /// 统一错误：携带错误码、人类可读消息与可选明细
@@ -64,6 +66,7 @@ impl From<PanelError> for ApiError {
             30000 => StatusCode::BAD_GATEWAY,      // 外部命令失败
             40002 => StatusCode::UNPROCESSABLE_ENTITY, // 配置校验失败（nginx -t）
             50001 => StatusCode::BAD_REQUEST,      // 路径越界
+            50002 => StatusCode::INTERNAL_SERVER_ERROR, // 文件 / IO 失败
             60000 => StatusCode::INTERNAL_SERVER_ERROR,
             80003 => StatusCode::GATEWAY_TIMEOUT,
             10999 => StatusCode::INTERNAL_SERVER_ERROR,

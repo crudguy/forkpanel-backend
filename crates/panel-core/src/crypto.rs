@@ -47,7 +47,8 @@ impl MasterKey {
         let mut nonce = [0u8; NONCE_LEN];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
         let ct = cipher
-            .encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext, aad: None })
+            // aead::Payload.aad 固定为 `&[u8]`（非 Option）；不使用关联数据时传空切片。
+            .encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext, aad: b"" })
             .map_err(|e| PanelError::Internal(format!("aes-gcm encrypt: {e}")))?;
         let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
         out.extend_from_slice(&nonce);
@@ -63,7 +64,7 @@ impl MasterKey {
         let (nonce, ct) = blob.split_at(NONCE_LEN);
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.0));
         cipher
-            .decrypt(Nonce::from_slice(nonce), Payload { msg: ct, aad: None })
+            .decrypt(Nonce::from_slice(nonce), Payload { msg: ct, aad: b"" })
             .map_err(|e| PanelError::Internal(format!("aes-gcm decrypt: {e}")))
     }
 }

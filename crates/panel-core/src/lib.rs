@@ -22,6 +22,10 @@ pub enum PanelError {
     #[error("path escapes allowed root: {0}")]
     PathEscape(String),
 
+    /// 文件 / 进程 IO 失败（OS 抽象层 std::io::Error 的统一收口，映射 HTTP 50002）
+    #[error("io: {0}")]
+    Io(String),
+
     /// 当前平台未实现该能力（对应能力矩阵 supported=false）
     #[error("unsupported on this platform: {0}")]
     Unsupported(&'static str),
@@ -68,6 +72,7 @@ impl PanelError {
             Conflict(_) => 10005,
             Unsupported(_) => 10009,
             PathEscape(_) => 50001,
+            Io(_) => 50002,
             Timeout(_) => 80003,
             ConfigInvalid { .. } => 40002,
             Command { .. } => 30000,
@@ -287,10 +292,15 @@ pub mod rules {
         s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
     }
 
+    /// 路径段（cron 任务名 / 脚本文件名 / 站点名等）合法性。
+    ///
+    /// **必须白名单，不能黑名单**：该名字会进入文件名、crontab 行与命令行，
+    /// 只排除 `\0 / \\` 会放过空格、`;`、`$`、反引号、引号等 ——
+    /// 空格会破坏 crontab 的字段切分，`;` 与 `$()` 则可被 shell 解释（注入）。
     pub fn is_valid_path_segment(s: &str) -> bool {
-        !s.is_empty() && s.len() <= 255
-            && !s.contains('\0') && !s.contains('/') && !s.contains('\\')
-            && s != "." && s != ".."
+        if s.is_empty() || s.len() > 255 { return false; }
+        if s == "." || s == ".." { return false; }
+        s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     }
 }
 
