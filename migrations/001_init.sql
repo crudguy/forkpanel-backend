@@ -197,10 +197,7 @@ INSERT INTO settings(key, value_json) VALUES
     ('max_login_attempts', '5'),
     ('read_only', 'false');
 
-CREATE TABLE schema_migrations (
-    version    INTEGER PRIMARY KEY,
-    applied_at INTEGER NOT NULL,
-    checksum   TEXT    NOT NULL
-);
-INSERT INTO schema_migrations(version, applied_at, checksum) VALUES
-    (1, strftime('%s','now'), '001_init');
+-- 迁移记账表**不在这里创建**：migrate::apply() 会先建 schema_migrations 再执行本文件，
+-- 本文件若再 CREATE TABLE 会报 "table already exists" 使首次迁移直接失败；
+-- 对应的版本行也由 apply() 以 FNV 校验和统一写入（这里手写 '001_init' 只会与之冲突）。
+-- 结论：迁移脚本只负责业务 schema，记账交给 apply()。
