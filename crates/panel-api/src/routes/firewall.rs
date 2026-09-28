@@ -15,9 +15,9 @@ use crate::{
     routes::{audit, Auth, Shared},
 };
 use axum::{extract::{Path as AxPath, State}, Json};
-use panel_core::{cap_keys, Result};
+use panel_core::cap_keys;
 use serde::{Deserialize, Serialize};
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 
 /// 受保护端口：**永远不能封**。22 是 SSH，面板自身端口由配置注入。
 const PROTECTED_PORTS: &[u16] = &[22];

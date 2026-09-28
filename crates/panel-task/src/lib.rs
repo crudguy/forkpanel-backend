@@ -168,7 +168,9 @@ pub struct TaskRunner {
     slots: Arc<Semaphore>,
     /// 幂等键 → 已提交任务。窗口期内的重复提交直接返回既有任务 id。
     idempotency: Arc<Mutex<HashMap<String, (i64, std::time::Instant)>>>,
-    /// 输出目录（来自 PathLayout，不由任务中心自己拼）
+    /// 输出目录（来自 PathLayout，不由任务中心自己拼）。
+    /// 任务输出落盘功能接入前未读取；构造签名保留该参数以维持注入契约。
+    #[allow(dead_code)]
     output_dir: PathBuf,
 }
 
@@ -238,7 +240,6 @@ impl TaskRunner {
         let slots = self.slots.clone();
         let bus = self.bus.clone();
         let writer = self.writer.clone();
-        let output_dir = self.output_dir.clone();
         let timeout = req.timeout;
         let rkind = req.kind;
 

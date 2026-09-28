@@ -178,7 +178,7 @@ pub async fn apply(
     })))
 }
 
-fn resolve_root(state: &Shared, s: &crate::auth::Session, input: &str) -> Result<SafePath> {
+fn resolve_root(_state: &Shared, s: &crate::auth::Session, input: &str) -> Result<SafePath> {
     let mut last = None;
     for r in &s.allowed_roots {
         match panel_os::paths::resolve_within(&PathBuf::from(r), input) {
@@ -258,7 +258,7 @@ pub async fn issue(
 // ─────────────── 文档式细粒度站点端点（M3 占位） ───────────────
 
 pub async fn get(
-    State(state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<i64>,
+    State(_state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SITE_VIEW)?;
     let _ = id;
@@ -266,7 +266,7 @@ pub async fn get(
 }
 
 pub async fn patch(
-    State(state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<i64>,
+    State(_state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SITE_MANAGE)?;
     let _ = id;
@@ -274,7 +274,7 @@ pub async fn patch(
 }
 
 pub async fn delete(
-    State(state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<i64>,
+    State(_state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SITE_MANAGE)?;
     let _ = id;
@@ -293,7 +293,7 @@ pub async fn reload(
 }
 
 pub async fn logs(
-    State(state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<i64>,
+    State(_state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SITE_VIEW)?;
     let _ = id;
@@ -301,7 +301,7 @@ pub async fn logs(
 }
 
 pub async fn ssl_apply(
-    State(state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<i64>,
+    State(_state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SSL_MANAGE)?;
     let _ = id;
@@ -309,7 +309,7 @@ pub async fn ssl_apply(
 }
 
 pub async fn cert_renew(
-    State(state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<i64>,
+    State(_state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SSL_MANAGE)?;
     let _ = id;
@@ -317,7 +317,7 @@ pub async fn cert_renew(
 }
 
 pub async fn cert_delete(
-    State(state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<i64>,
+    State(_state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SSL_MANAGE)?;
     let _ = id;

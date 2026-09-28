@@ -18,11 +18,15 @@ use axum::{
     extract::{Path as AxPath, Query, State},
     Json,
 };
-use panel_core::{cap_keys, PanelError, Result};
+use panel_core::{cap_keys, Result};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-/// 超过这个时长的操作必须走任务队列
+/// 超过这个时长的操作必须走任务队列。
+///
+/// 域规则备忘：同步接口必须秒级返回，长操作接入时以此为分流阈值；
+/// 测试已锁定该值，接口落地前 `allow(dead_code)` 抑制未用告警。
+#[allow(dead_code)]
 const SYNC_LIMIT: Duration = Duration::from_secs(2);
 
 // ─────────────── 服务列表 ───────────────
@@ -263,8 +267,8 @@ impl panel_task::TaskBody for PackageTask {
                 let _ = tx_for_cb.send(line);
             }))
             .await;
-        drop(result.is_ok());   // 显式丢弃 sender 以让消费者退出
-        // 上面 send 的所有权已移入闭包；这里需要再 drop 一次才能关闭通道
+        // tx 已随上方回调闭包一起释放（闭包所有权在 install 内），通道关闭后
+        // 消费者 recv() 返回 None 自然退出；这里只需等消费者收尾。
         let _ = consumer.await;
 
         match result {
@@ -364,7 +368,7 @@ pub async fn packages_list(
 }
 
 pub async fn package_remove(
-    State(state): State<Shared>, Auth(s): Auth, AxPath(name): AxPath<String>,
+    State(_state): State<Shared>, Auth(s): Auth, AxPath(name): AxPath<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::PACKAGE_MANAGE)?;
     let _ = name;

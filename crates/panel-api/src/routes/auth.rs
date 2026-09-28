@@ -1,9 +1,9 @@
 //! 认证相关 handler。
 
 use crate::{
-    auth::{self, perm, Session},
+    auth::{self, Session},
     error::{ok, ApiError, ApiResult},
-    routes::{audit, Auth, MaybeAuth, Shared},
+    routes::{audit, Auth, Shared},
     AppState,
 };
 use axum::{

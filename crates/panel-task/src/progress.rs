@@ -102,7 +102,11 @@ impl Progress {
         self.canceled.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    pub(crate) fn mark_canceled(&self) {
+    /// 置位取消标记（由任务取消接口调用；取消 API 落地前仅测试使用）。
+    ///
+    /// 设计契约：任务体只通过 [`Self::is_canceled`] 在检查点轮询后优雅退出，
+    /// 绝不强杀子进程（强杀会留下半个副作用）。
+    pub fn mark_canceled(&self) {
         self.canceled.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 

@@ -6,7 +6,7 @@
 //! 3. **客户端上限**：nano 3 / small 10 / standard 50（超出返回 503 + 明确提示）。
 //! 4. 订阅频道按权限过滤：无 `log.read` 则拒绝订阅日志频道。
 
-use crate::{auth::Session, error::ApiError, routes::MaybeAuth, AppState};
+use crate::{error::ApiError, routes::MaybeAuth, AppState};
 use axum::{
     extract::State,
     response::{
@@ -14,7 +14,7 @@ use axum::{
         IntoResponse,
     },
 };
-use futures_util::stream::{Stream, StreamExt};
+use futures_util::stream::StreamExt;
 use panel_core::Tier;
 use std::{
     convert::Infallible,

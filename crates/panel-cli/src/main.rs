@@ -644,8 +644,10 @@ fn load_cfg(cli: &Cli, layout: &dyn panel_os::PathLayout) -> Result<Config> {
 }
 
 /// 用配置文件中的覆盖值构造路径布局。
-/// 关键：覆盖之后仍然只通过 `PathLayout` trait 访问，业务层不出现路径字面量。
-fn build_layout(os: &Arc<dyn panel_os::OsAdapter>, cfg: Option<&Config>) -> panel_os::paths::LinuxPathLayout {
+/// 关键：覆盖之后仍然只通过 `PathLayout` 访问，业务层不出现路径字面量。
+/// `os` 参数暂未使用（LinuxPathLayout 尚不依赖运行时探测），保留以维持
+/// 「布局由平台适配器注入」的签名契约，多平台接入时启用。
+fn build_layout(_os: &Arc<dyn panel_os::OsAdapter>, cfg: Option<&Config>) -> panel_os::paths::LinuxPathLayout {
     let base = panel_os::paths::LinuxPathLayout::default();
     match cfg {
         None => base,

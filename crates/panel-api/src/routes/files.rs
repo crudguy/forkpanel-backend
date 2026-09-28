@@ -32,7 +32,7 @@ const MAX_READ_BYTES: usize = 2 * 1024 * 1024;
 /// 解析用户传入的路径。**所有文件 handler 都必须经此函数**。
 ///
 /// 返回 SafePath 意味着已通过：canonicalize + 允许根前缀断言。
-fn resolve(state: &Shared, s: &crate::auth::Session, input: &str) -> Result<SafePath> {
+fn resolve(_state: &Shared, s: &crate::auth::Session, input: &str) -> Result<SafePath> {
     // 空路径视为根
     let input = if input.is_empty() { "/" } else { input };
     let mut last_err = None;

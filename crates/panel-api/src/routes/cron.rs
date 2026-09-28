@@ -19,7 +19,7 @@ use axum::{
     extract::{Path as AxPath, State},
     Json,
 };
-use panel_core::{cap_keys, PanelError, Result};
+use panel_core::{cap_keys, PanelError};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize)]

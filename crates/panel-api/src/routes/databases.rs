@@ -167,7 +167,7 @@ pub async fn backup(
     Ok(ok(serde_json::json!({ "task_id": id })))
 }
 
-fn resolve_out(state: &Shared, s: &crate::auth::Session, input: &str) -> Result<SafePath> {
+fn resolve_out(_state: &Shared, s: &crate::auth::Session, input: &str) -> Result<SafePath> {
     let mut last = None;
     for r in &s.allowed_roots {
         match panel_os::paths::resolve_within(&PathBuf::from(r), input) {

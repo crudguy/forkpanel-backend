@@ -18,7 +18,7 @@ use std::{
 use tokio::sync::mpsc::{channel, Receiver};
 
 #[derive(Default)]
-struct State {
+pub(crate) struct State {
     service_states: BTreeMap<String, ServiceState>,
     rules: BTreeMap<String, FirewallRule>,
     apply_calls: usize,
@@ -26,7 +26,6 @@ struct State {
 
 /// 一个覆盖全部 trait 的内存实现
 pub struct MockOsAdapter {
-    state: Arc<Mutex<State>>,
     services: Arc<MockServices>,
     firewall: Arc<MockFirewall>,
     files: Arc<mock_files::MockFiles>,
@@ -40,13 +39,10 @@ impl MockOsAdapter {
         mem.seed("/var/www/index.html", b"<h1>hello</h1>");
         Self {
             services: Arc::new(MockServices::new(state.clone())),
-            firewall: Arc::new(MockFirewall::new(state.clone())),
+            firewall: Arc::new(MockFirewall::new(state)),
             files: Arc::new(mock_files::MockFiles::new(Arc::new(Mutex::new(mem)))),
-            state,
         }
     }
-    /// 服务状态机句柄，供测试断言
-    pub fn state(&self) -> Arc<Mutex<State>> { self.state.clone() }
 }
 
 impl Default for MockOsAdapter { fn default() -> Self { Self::new() } }
@@ -115,7 +111,7 @@ impl ProcessProvider for MockProcesses {
 pub struct MockServices { state: Arc<Mutex<State>> }
 
 impl MockServices {
-    pub fn new(state: Arc<Mutex<State>>) -> Self { Self { state } }
+    pub(crate) fn new(state: Arc<Mutex<State>>) -> Self { Self { state } }
 }
 
 #[async_trait]
@@ -143,7 +139,7 @@ impl ServiceProvider for MockServices {
     async fn start(&self, name: &UnitName) -> Result<()> { self.set(name, ServiceState::Active) }
     async fn stop(&self, name: &UnitName) -> Result<()> { self.set(name, ServiceState::Inactive) }
     async fn restart(&self, name: &UnitName) -> Result<()> { self.set(name, ServiceState::Active) }
-    async fn reload(&self, name: &UnitName) -> Result<()> { Ok(()) }
+    async fn reload(&self, _name: &UnitName) -> Result<()> { Ok(()) }
     async fn set_enabled(&self, _n: &UnitName, _e: bool) -> Result<()> { Ok(()) }
 
     async fn journal(&self, _n: &UnitName, q: JournalQuery) -> Result<Receiver<String>> {
@@ -167,7 +163,7 @@ impl MockServices {
 
 pub struct MockFirewall { state: Arc<Mutex<State>> }
 
-impl MockFirewall { pub fn new(state: Arc<Mutex<State>>) -> Self { Self { state } } }
+impl MockFirewall { pub(crate) fn new(state: Arc<Mutex<State>>) -> Self { Self { state } } }
 
 #[async_trait]
 impl FirewallProvider for MockFirewall {

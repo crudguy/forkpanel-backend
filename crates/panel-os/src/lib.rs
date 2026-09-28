@@ -19,7 +19,7 @@ pub use fs::{ensure_dir, is_root, mode_of, read_password, set_mode, write_privat
 pub use paths::{resolve_within, PathLayout};
 pub use traits::*;
 
-use panel_core::{cap_keys, Capability, CapabilityMap, PlatformInfo};
+use panel_core::{Capability, CapabilityMap, PlatformInfo};
 use std::sync::Arc;
 
 /// 平台能力聚合入口。**新增平台 = 新增一个 impl，业务层零改动。**
@@ -123,6 +123,7 @@ pub fn startup_fs_check(paths: &dyn PathLayout) -> panel_core::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use panel_core::cap_keys;
 
     #[test]
     fn adapter_exposes_capability_matrix() {

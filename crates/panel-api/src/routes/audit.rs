@@ -4,7 +4,7 @@
 //! （列：ts, actor, actor_ip, action, target, result, detail_json）。
 //! 本端点提供只读回溯，复用既有的读连接池模式。
 
-use crate::{auth::perm, error::{ok, ApiError, ApiResult}, routes::{Auth, Shared}};
+use crate::{auth::perm, error::{ok, ApiResult}, routes::{Auth, Shared}};
 use axum::extract::{Query, State};
 use axum::Json;
 use panel_core::PanelError;

@@ -168,7 +168,11 @@ impl Config {
     }
 }
 
-/// 解析 "30m" / "12h" / "90s" 形式的时长
+/// 解析 "30m" / "12h" / "90s" 形式的时长。
+///
+/// serve 接入会话超时（session_idle/session_absolute → 实际过期逻辑）前
+/// 仅测试使用；届时此函数是唯一解析入口，勿在别处另写。
+#[allow(dead_code)]
 pub fn parse_duration(s: &str) -> Result<std::time::Duration> {
     let s = s.trim();
     let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));

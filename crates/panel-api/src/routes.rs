@@ -25,7 +25,7 @@ pub mod audit;
 
 use crate::{auth::Session, error::ApiError, AppState, Envelope};
 use axum::{
-    extract::{FromRequestParts, Request, State},
+    extract::{FromRequestParts, Request},
     http::{request::Parts, StatusCode},
     middleware,
     routing::{delete, get, patch, post, put},
