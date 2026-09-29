@@ -88,7 +88,10 @@ else
 fi
 
 echo "== [5] SQL 拼接 =="
-SQL_HITS=$(grep -rn --include="*.rs" -E 'execute\(&format!|prepare\(&format!|query_row\(&format!' crates/ 2>/dev/null)
+# 规则：值必须走绑定参数。**例外**：表名/库名等 SQL 标识符无法参数化，
+# 只能经专门的转义函数（`quote_ident`，双引号翻倍）拼接 —— 这类安全用法豁免。
+SQL_HITS=$(grep -rn --include="*.rs" -E 'execute\(&format!|prepare\(&format!|query_row\(&format!' crates/ 2>/dev/null \
+  | grep -v 'quote_ident' || true)
 if [ -n "$SQL_HITS" ]; then
   note_fail "存在 SQL 字符串拼接（必须使用绑定参数）："
   echo "$SQL_HITS" | sed 's/^/      /'
