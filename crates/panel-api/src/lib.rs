@@ -11,6 +11,7 @@ pub mod error;
 pub mod middleware;
 pub mod routes;
 pub mod sse;
+pub mod totp;
 
 use error::{ApiError, ApiResult};
 use panel_core::{crypto::MasterKey, CapabilityMap, Tier};
@@ -43,11 +44,15 @@ impl AppState {
                metrics: Arc<std::sync::Mutex<panel_db::aggregator::Aggregator>>,
                tier: Tier, master_key: Option<MasterKey>) -> Self {
         let capabilities = os.capabilities();
+        // 会话持久化：把写者交给 SessionCache（`sessions` 表 001 已定义、此前无人使用）。
+        // 先 clone——下方 struct 字面量会把 db move 进字段。
+        let sessions_db = db.clone();
         Self {
             os, db, pool, tasks, metrics, tier, capabilities,
-            sessions: Arc::new(crate::auth::SessionCache::new(
+            sessions: Arc::new(crate::auth::SessionCache::new_with_db(
                 std::time::Duration::from_secs(30 * 60),
                 std::time::Duration::from_secs(12 * 3600),
+                sessions_db,
             )),
             logins: Arc::new(crate::auth::LoginGuard::new()),
             bootstrap: Arc::new(crate::auth::BootstrapGuard::new()),

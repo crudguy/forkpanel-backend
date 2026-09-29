@@ -218,16 +218,103 @@ impl panel_task::TaskBody for DbBackupTask {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct RestoreReq { pub id: i64, pub from: String }
+pub struct RestoreReq {
+    /// 备份文件路径（必须在当前用户 allowed_roots 之内）
+    pub file: String,
+    /// 二次确认词（与备份恢复同源）
+    pub confirm_token: String,
+}
 
+/// 库还原：**高危**（覆盖当前库）。
+///
+/// 闸门：①确认词 ②源文件沙箱（`resolve_out`，与备份出口同一纪律）③自动先备份当前库。
+/// SQLite 可立即恢复；mysql/pg 需 `mysql`/`psql` 外部客户端，缺失时诚实 501。
 pub async fn restore(
-    State(state): State<Shared>, Auth(s): Auth, Json(req): Json<RestoreReq>,
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    AxPath(conn): AxPath<i64>,
+    Json(req): Json<RestoreReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_MANAGE)?;
-    let _ = resolve_out(&state, &s, &req.from)?;
-    // 恢复是破坏性操作：**必须走任务且要求幂等键不同**（防误触两次）
-    return Err(ApiError::unsupported(
-        "数据恢复为破坏性操作，M4 接入（需先完成凭据加密与二次确认流程）"));
+
+    let word = crate::routes::backups::RESTORE_CONFIRM_WORD;
+    if req.confirm_token.trim() != word {
+        return Err(ApiError::bad_request(
+            "confirm_token",
+            format!("请输入确认词「{word}」以继续"),
+        ));
+    }
+
+    // 源文件必须落在允许根内 —— 否则可指定任意路径造成越权读取
+    let src = resolve_out(&state, &s, &req.file)?;
+    if !src.as_path().is_file() {
+        return Err(ApiError::not_found("backup file"));
+    }
+
+    let t = load_target(&state, conn, None).await?;
+    let db_path = match t.engine {
+        panel_os::DbEngine::Sqlite => t
+            .database
+            .clone()
+            .ok_or_else(|| ApiError::bad_request("conn", "该连接未指定库文件路径"))?,
+        panel_os::DbEngine::MySql | panel_os::DbEngine::Postgres => {
+            return Err(ApiError::unsupported(
+                "mysql/postgres 还原需外部客户端（mysql / psql），本环境不可用",
+            ))
+        }
+    };
+
+    let job = DbRestoreTask { src: src.as_path().to_path_buf(), dst: PathBuf::from(db_path) };
+    let (tid, _) = state
+        .tasks
+        .submit(
+            panel_task::TaskRequest {
+                idempotency_key: format!("restore:db:{conn}:{}", req.file),
+                kind: panel_task::TaskKind::Restore,
+                label: format!("还原连接 #{conn}"),
+                timeout: std::time::Duration::from_secs(1800),
+            },
+            job,
+        )
+        .await
+        .map_err(ApiError::from)?;
+    Ok(ok(serde_json::json!({ "task_id": tid })))
+}
+
+/// 库还原任务体：**先备份当前库再覆盖**，失败即中止。
+struct DbRestoreTask {
+    src: PathBuf,
+    dst: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl panel_task::TaskBody for DbRestoreTask {
+    async fn run(&self, progress: panel_task::Progress) -> Result<panel_task::TaskOutcome> {
+        progress.set(20, "备份当前库").await;
+        // 当前库不存在时跳过备份（首次还原），存在则必先留快照
+        let safety = if self.dst.is_file() {
+            let bak = PathBuf::from(format!(
+                "{}.bak-{}",
+                self.dst.display(),
+                crate::now_unix()
+            ));
+            std::fs::copy(&self.dst, &bak).map_err(|e| PanelError::Io(e.to_string()))?;
+            Some(bak)
+        } else {
+            None
+        };
+
+        progress.set(70, "写入还原").await;
+        std::fs::copy(&self.src, &self.dst).map_err(|e| PanelError::Io(e.to_string()))?;
+
+        progress.set(100, "完成").await;
+        Ok(panel_task::TaskOutcome {
+            state: panel_task::TaskState::Ok,
+            exit_code: Some(0),
+            // 指向还原前的快照，出问题可据此回滚
+            output_path: safety,
+        })
+    }
 }
 
 // ─────────────── 浏览（连接 → 库 → 表 → 行预览，**只读**） ───────────────

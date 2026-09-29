@@ -16,6 +16,7 @@ pub mod databases;
 pub mod files;
 pub mod firewall;
 pub mod logs;
+pub mod notifications;
 pub mod services;
 pub mod sites;
 pub mod system;
@@ -181,6 +182,15 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/logs/{id}/download", get(logs::download))
         .route("/api/v1/logs/{id}", get(logs::read));
 
+    // ── 站内通知 ──
+    // 查看/标记已读属"看得见"层级（system.view）；删除属管理动作（system.manage）
+    let notify_r = Router::new()
+        .route("/api/v1/notifications", get(notifications::list))
+        .route("/api/v1/notifications/unread-count", get(notifications::unread_count))
+        .route("/api/v1/notifications/read-all", post(notifications::read_all))
+        .route("/api/v1/notifications/{id}/read", post(notifications::mark_read))
+        .route("/api/v1/notifications/{id}", delete(notifications::remove));
+
     // ── 备份计划（本地） ──
     let backup_r = Router::new()
         .route("/api/v1/backups", get(backups::list).post(backups::create))
@@ -238,6 +248,10 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/auth/logout", post(auth::logout))
         .route("/api/v1/auth/me", get(auth::me))
         .route("/api/v1/auth/password", post(auth::change_password))
+        // MFA（TOTP）：三条都需登录—— enroll 属"给自己绑定"，不能是公开端点
+        .route("/api/v1/auth/mfa/enroll", post(auth::mfa_enroll))
+        .route("/api/v1/auth/mfa/verify", post(auth::mfa_verify))
+        .route("/api/v1/auth/mfa/disable", post(auth::mfa_disable))
         .merge(system_r)
         .merge(proc_r)
         .merge(svc_r)
@@ -249,6 +263,7 @@ pub fn build_router(state: Shared) -> Router {
         .merge(sec_r)
         .merge(cron_r)
         .merge(log_r)
+        .merge(notify_r)
         .merge(backup_r)
         .merge(container_r)
         .merge(task_r)

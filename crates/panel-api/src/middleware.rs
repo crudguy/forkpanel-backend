@@ -23,7 +23,12 @@ pub async fn require_auth(
     next: Next,
 ) -> Response {
     let sid = extract_cookie(&req.headers(), "panel_sid");
-    let session = sid.as_ref().and_then(|s| state.sessions.get(s));
+    // 惰性恢复：内存未命中时按 sid_hash 查库重建 —— 面板重启后会话仍有效
+    // （库里只有哈希，故只能验证重建，符合「凭据不落库」纪律）
+    let session = match sid.as_ref() {
+        Some(s) => state.sessions.get_or_restore(s, &state.pool).await,
+        None => None,
+    };
     match session {
         Some(s) => {
             // sid 一并透出：会话管理需区分「自己」（CurrentSid 提取器）

@@ -181,11 +181,40 @@ pub struct SessionCache {
     inner: Mutex<HashMap<String, Session>>,
     idle_timeout: Duration,
     absolute_timeout: Duration,
+    /// 持久化后端：会话落 `sessions` 表（该表 001 即已定义，**此前无人使用**）。
+    /// 有它 → 面板重启后会话仍在（不再全员登出）；`None` → 纯内存（测试/无 DB）。
+    db: Option<std::sync::Arc<panel_db::WriterActor>>,
 }
 
 impl SessionCache {
+    /// 纯内存（无持久化）。测试与无 DB 场景使用。
     pub fn new(idle: Duration, absolute: Duration) -> Self {
-        Self { inner: Mutex::new(HashMap::new()), idle_timeout: idle, absolute_timeout: absolute }
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            idle_timeout: idle,
+            absolute_timeout: absolute,
+            db: None,
+        }
+    }
+
+    /// 带持久化：变更同步到 `sessions` 表，启动时可用 [`Self::restore_from_db`] 恢复。
+    pub fn new_with_db(
+        idle: Duration,
+        absolute: Duration,
+        db: std::sync::Arc<panel_db::WriterActor>,
+    ) -> Self {
+        Self { inner: Mutex::new(HashMap::new()), idle_timeout: idle, absolute_timeout: absolute, db: Some(db) }
+    }
+
+    /// 把 DB 写入丢给 runtime：**绝不持 MutexGuard 跨 await**（本 crate 已踩过两次）。
+    /// 无 runtime（如单测/启动早期）时静默降级为纯内存。
+    fn sync_db<F>(&self, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        if let Ok(h) = tokio::runtime::Handle::try_current() {
+            h.spawn(fut);
+        }
     }
 
     pub fn get(&self, sid: &str) -> Option<Session> {
@@ -207,12 +236,34 @@ impl SessionCache {
         let now = now_unix();
         s.created_at = now; s.last_seen = now;
         s.expires_at = now + self.idle_timeout.as_secs() as i64;
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).insert(sid, s);
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).insert(sid.clone(), s.clone());
+
+        if let Some(db) = self.db.clone() {
+            let h = sid_hash(&sid);
+            let uid = s.user_id;
+            let exp = s.expires_at;
+            self.sync_db(async move {
+                let _ = db
+                    .exec(move |conn| {
+                        conn.execute(
+                            "INSERT OR REPLACE INTO sessions\
+                             (sid_hash, user_id, ip, ua, created_at, last_seen_at, expires_at) \
+                             VALUES(?1, ?2, NULL, NULL, ?3, ?3, ?4)",
+                            rusqlite::params![h, uid, now, exp],
+                        )
+                        .map(|_| panel_db::WriteAck { rows_changed: 1 })
+                        .map_err(|e| PanelError::Database(e.to_string()))
+                    })
+                    .await;
+            });
+        }
     }
 
-    /// 登录成功后轮换 sid（防会话固定）
+    /// 登录成功后轮换 sid（防会话固定）。
+    /// 走 `self.remove` 而非直接摘 map —— 让旧 sid 的库记录一并删除。
     pub fn rotate(&self, old: &str) -> Option<(String, Session)> {
-        let s = { self.inner.lock().unwrap_or_else(|e| e.into_inner()).remove(old)? };
+        let s = { self.inner.lock().unwrap_or_else(|e| e.into_inner()).get(old).cloned() }?;
+        self.remove(old);
         let new = generate_sid();
         self.insert(new.clone(), s.clone());
         Some((new, s))
@@ -220,7 +271,22 @@ impl SessionCache {
 
     /// 吊销指定会话。返回是否存在（供「吊销不存在的会话」→ 404 判定）。
     pub fn remove(&self, sid: &str) -> bool {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).remove(sid).is_some()
+        let existed = self.inner.lock().unwrap_or_else(|e| e.into_inner()).remove(sid).is_some();
+        if existed {
+            if let Some(db) = self.db.clone() {
+                let h = sid_hash(sid);
+                self.sync_db(async move {
+                    let _ = db
+                        .exec(move |conn| {
+                            conn.execute("DELETE FROM sessions WHERE sid_hash = ?1", [h])
+                                .map(|_| panel_db::WriteAck { rows_changed: 1 })
+                                .map_err(|e| PanelError::Database(e.to_string()))
+                        })
+                        .await;
+                });
+            }
+        }
+        existed
     }
 
     /// 在线会话快照（管理员视图）：sid → Session。锁内克隆，绝不外借引用。
@@ -236,6 +302,17 @@ impl SessionCache {
     /// 按用户 id 清除其所有会话（禁用/删除用户时立即踢下线）
     pub fn remove_by_user(&self, uid: i64) {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, s| s.user_id != uid);
+        if let Some(db) = self.db.clone() {
+            self.sync_db(async move {
+                let _ = db
+                    .exec(move |conn| {
+                        conn.execute("DELETE FROM sessions WHERE user_id = ?1", [uid])
+                            .map(|_| panel_db::WriteAck { rows_changed: 1 })
+                            .map_err(|e| PanelError::Database(e.to_string()))
+                    })
+                    .await;
+            });
+        }
     }
 
     /// 按用户清除其**除 keep_sid 外**的全部会话（改密强制其他端下线，当前端不踢）。
@@ -244,7 +321,26 @@ impl SessionCache {
         let mut m = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let before = m.len();
         m.retain(|sid, s| s.user_id != uid || sid == keep_sid);
-        before - m.len()
+        let n = before - m.len();
+        drop(m); // 先放锁，再派发 DB 写入
+        if n > 0 {
+            if let Some(db) = self.db.clone() {
+                let keep = sid_hash(keep_sid);
+                self.sync_db(async move {
+                    let _ = db
+                        .exec(move |conn| {
+                            conn.execute(
+                                "DELETE FROM sessions WHERE user_id = ?1 AND sid_hash <> ?2",
+                                rusqlite::params![uid, keep],
+                            )
+                            .map(|_| panel_db::WriteAck { rows_changed: 1 })
+                            .map_err(|e| PanelError::Database(e.to_string()))
+                        })
+                        .await;
+                });
+            }
+        }
+        n
     }
 
     /// 定时清理过期会话（合并进统一调度器，避免独立定时器）
@@ -253,7 +349,82 @@ impl SessionCache {
         let mut m = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let before = m.len();
         m.retain(|_, s| s.expires_at > now);
-        before - m.len()
+        let n = before - m.len();
+        drop(m);
+        if let Some(db) = self.db.clone() {
+            self.sync_db(async move {
+                let _ = db
+                    .exec(move |conn| {
+                        conn.execute("DELETE FROM sessions WHERE expires_at <= ?1", [now])
+                            .map(|_| panel_db::WriteAck { rows_changed: 1 })
+                            .map_err(|e| PanelError::Database(e.to_string()))
+                    })
+                    .await;
+            });
+        }
+        n
+    }
+
+    /// 先查内存；未命中则按 `sid_hash` 查库并**惰性重建**（面板重启后会话仍有效）。
+    ///
+    /// 库里只有哈希，无法还原 sid 本身——只能"验证并重建"，这正好守住
+    /// 「凭据不落库」纪律：库泄露也拿不到可直接使用的 sid。
+    /// 用户资料以**当前 `users` 表**为准：重启期间若被改权/禁用，恢复后即生效。
+    pub async fn get_or_restore(&self, sid: &str, pool: &crate::ReadPool) -> Option<Session> {
+        if let Some(s) = self.get(sid) {
+            return Some(s);
+        }
+        if self.db.is_none() {
+            return None;
+        }
+        let h = sid_hash(sid);
+        let now = now_unix();
+        // 注：`.ok().flatten()?` 已解包 Option，故类型注解是**元组**本身
+        let row: (i64, String, String, String, i64, i64) = pool
+            .with(move |conn| {
+                let mut st = conn
+                    .prepare(
+                        "SELECT s.user_id, u.username, u.role, u.allowed_roots, s.created_at, s.expires_at \
+                         FROM sessions s JOIN users u ON u.id = s.user_id \
+                         WHERE s.sid_hash = ?1 AND s.expires_at > ?2 AND u.disabled = 0",
+                    )
+                    .map_err(|e| PanelError::Database(e.to_string()))?;
+                let mut it = st
+                    .query_map(rusqlite::params![h, now], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, i64>(4)?,
+                            r.get::<_, i64>(5)?,
+                        ))
+                    })
+                    .map_err(|e| PanelError::Database(e.to_string()))?;
+                Ok(it.next().transpose().map_err(|e| PanelError::Database(e.to_string()))?)
+            })
+            .await
+            .ok()
+            .flatten()?;
+
+        let (user_id, username, role, roots_json, created_at, expires_at) = row;
+        let allowed_roots: Vec<String> = serde_json::from_str(&roots_json).unwrap_or_default();
+        let s = Session {
+            user_id,
+            username,
+            permissions: permissions_for_role(&role),
+            role,
+            allowed_roots,
+            created_at,
+            last_seen: now,
+            expires_at,
+        };
+        // 直接放回内存走后续快路径；**不用 insert**——那会重置到期时间并重复写库
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(sid.to_string(), s.clone());
+        Some(s)
     }
 }
 

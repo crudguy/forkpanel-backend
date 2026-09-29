@@ -1,13 +1,15 @@
 //! 安全中心（设计方案 §2.10）：基线检查、在线会话管理。
 //!
 //! `baseline` 为**只读**扫描，输出契约 `SecurityBaselineItem[]`（分级发现项）。
-//! 一键修复（`baseline_apply`）属高危写操作，未实装前诚实 501。
-//! 会话管理：数据源是**内存 SessionCache**（非 DB）——重启后面板会话自然清零，
-//! 列表与吊销都只对当前存活会话生效，这是如实行为而非缺陷。
+//! 一键修复（`baseline_apply`）已实装但**仅限 sshd 三项白名单**：
+//! 先备份 → 写 → `sshd -t` 校验 → 不通过回滚；校验器不可用则拒绝修改（绝不把人锁在门外）。
+//! 会话管理：SessionCache 以内存为快路径，同时落 `sessions` 表 **（只存 sid 哈希）**；
+//! 面板重启后按哈希惰性重建，会话**不再**全员登出。
 
 use crate::{auth::perm, error::{ok, ApiError, ApiResult}, routes::{audit, Auth, CurrentSid, Shared}};
 use axum::extract::{Path as AxPath, State};
 use axum::{Json, http::StatusCode};
+use serde::Deserialize;
 use serde_json::json;
 
 /// 只读安全基线扫描。
@@ -34,13 +36,45 @@ pub async fn baseline(
 
 /// 一键修复：**高危**（写回系统安全配置，需 root + 二次确认 + 先备份）。
 /// 未实装前诚实 501 —— 绝不静默半吊子写入把系统/SSH 锁死。
+/// 一键修复的二次确认词（写回系统配置属高危，必须手输确认）
+pub const APPLY_CONFIRM_WORD: &str = "确认修复";
+
+#[derive(Debug, Deserialize)]
+pub struct BaselineApplyReq {
+    /// 基线项 key；**白名单**由 provider 层判定（ssh.permit_root_login / ssh.password_auth / ssh.pubkey_auth）
+    pub key: String,
+    /// 二次确认词，须等于 [`APPLY_CONFIRM_WORD`]
+    pub confirm_token: String,
+}
+
+/// 一键修复指定基线项（**高危写**）。
+///
+/// 安全网全部在 provider 层（`panel-os/linux/security.rs`）：
+/// 先备份 → 写 → `sshd -t` 校验 → 不通过立刻回滚；**校验器不可用时拒绝修改**。
+/// 这里只做权限、确认词与审计。
 pub async fn baseline_apply(
-    State(_): State<Shared>,
+    State(state): State<Shared>,
     Auth(s): Auth,
+    Json(req): Json<BaselineApplyReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SECURITY_MANAGE)?;
-    Err(ApiError::unsupported(
-        "security.baseline.apply：一键修复会写回系统安全配置（需 root + 二次确认 + 先备份），尚未接入"))
+    if req.confirm_token.trim() != APPLY_CONFIRM_WORD {
+        return Err(ApiError::bad_request(
+            "confirm_token",
+            format!("请输入确认词「{APPLY_CONFIRM_WORD}」以继续"),
+        ));
+    }
+
+    let r = state.os.security().apply(&req.key).await.map_err(ApiError::from)?;
+    audit(
+        &state,
+        &s,
+        "security.baseline.apply",
+        &req.key,
+        if r.changed { "changed" } else { "unchanged" },
+    )
+    .await;
+    Ok(ok(r))
 }
 
 /// 在线会话列表（管理员视图，数据源=内存 SessionCache）。

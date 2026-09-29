@@ -92,6 +92,74 @@ pub async fn login(
         return Err(ApiError::unauthorized());
     }
 
+    // ── 第二因子：口令对了还不够，启用 MFA 的账户还必须出示动态口令 ──
+    let uid_for_mfa = uid;
+    let mfa_row = state
+        .pool
+        .with(move |conn| {
+            let r = conn.query_row(
+                "SELECT mfa_enabled_at, mfa_secret_enc, mfa_recovery_codes FROM users WHERE id = ?1",
+                [uid_for_mfa],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<i64>>(0)?,
+                        r.get::<_, Option<Vec<u8>>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            );
+            match r {
+                Ok(v) => Ok(v),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok((None, None, None)),
+                Err(e) => Err(panel_core::PanelError::Database(e.to_string())),
+            }
+        })
+        .await?;
+
+    if let (Some(_enabled_at), secret_enc, codes_json) = mfa_row {
+        let input = req.totp.clone().unwrap_or_default();
+        if input.is_empty() {
+            // 明确告知缺什么，而不是笼统 401——否则前端无法区分"密码错"与"缺验证码"
+            return Err(ApiError::bad_request("totp", "该账户已启用 MFA，请提供动态口令"));
+        }
+        let Some(blob) = secret_enc else {
+            return Err(ApiError::unsupported("MFA 数据缺失，请联系管理员重置"));
+        };
+        let master = state.require_secret_key()?;
+        let secret = master.decrypt(&blob).map_err(ApiError::from)?;
+
+        if crate::totp::verify(&secret, &input, crate::now_unix()) {
+            // 动态口令通过
+        } else {
+            // 退而校验**一次性恢复码**：命中即用掉一个（不重复使用）
+            let given = crate::totp::hash_recovery_code(&input);
+            let mut codes: Vec<String> = codes_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                .unwrap_or_default();
+            if let Some(pos) = codes.iter().position(|c| c == &given) {
+                codes.remove(pos);
+                let remain = serde_json::to_string(&codes).unwrap_or_else(|_| "[]".into());
+                let uid2 = uid;
+                let _ = state
+                    .db
+                    .exec(move |conn| {
+                        conn.execute(
+                            "UPDATE users SET mfa_recovery_codes = ?1 WHERE id = ?2",
+                            rusqlite::params![remain, uid2],
+                        )
+                        .map(|_| panel_db::WriteAck { rows_changed: 1 })
+                        .map_err(|e| panel_core::PanelError::Database(e.to_string()))
+                    })
+                    .await;
+            } else {
+                // 第二因子错误同样计入防暴力（否则可无限爆破 6 位码）
+                state.logins.record_failure(&key);
+                return Err(ApiError::unauthorized());
+            }
+        }
+    }
+
     state.logins.reset(&key);
 
     let permissions = auth::permissions_for_role(&role);
@@ -262,6 +330,172 @@ pub struct BootstrapReq {
 /// 副作用顺序纪律：**所有无副作用校验（owner 检查 / 输入策略 / 哈希）先行，
 /// 令牌消费（唯一不可逆步骤）放最后**——否则用户首次提交弱口令失败后，
 /// 令牌已被焚，第二次正确提交只能得到 401（实测踩过的坑）。
+// ─────────────── MFA（TOTP，RFC 6238） ───────────────
+
+#[derive(Debug, Serialize)]
+pub struct MfaEnrollResp {
+    /// base32 密钥（手工录入用）
+    pub secret: String,
+    /// 验证器扫码用
+    pub otpauth_uri: String,
+    /// **一次性返回**的恢复码明文；库里只存哈希，此后**无法再取回**
+    pub recovery_codes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MfaCodeReq {
+    /// 6 位动态口令，或一次性恢复码
+    pub code: String,
+}
+
+/// 取当前用户的 MFA 材料：(secret 密文, 恢复码哈希列表, 启用时间)
+async fn mfa_material(
+    state: &AppState,
+    uid: i64,
+) -> ApiResult<(Option<Vec<u8>>, Vec<String>, Option<i64>)> {
+    let row = state
+        .pool
+        .with(move |conn| {
+            conn.query_row(
+                "SELECT mfa_secret_enc, mfa_recovery_codes, mfa_enabled_at FROM users WHERE id = ?1",
+                [uid],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<Vec<u8>>>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .map_err(|e| panel_core::PanelError::Database(e.to_string()))
+        })
+        .await?;
+    let codes: Vec<String> = row
+        .1
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+        .unwrap_or_default();
+    Ok((row.0, codes, row.2))
+}
+
+/// 统一的第二因子校验：动态口令**或**恢复码任一命中即可。
+fn factor_ok(secret: Option<&[u8]>, codes: &[String], input: &str) -> bool {
+    if let Some(s) = secret {
+        if crate::totp::verify(s, input, crate::now_unix()) {
+            return true;
+        }
+    }
+    let given = crate::totp::hash_recovery_code(input);
+    codes.iter().any(|c| c == &given)
+}
+
+/// POST /auth/mfa/enroll —— 生成密钥与恢复码。**此刻尚未生效**，须 verify 通过才启用；
+/// 这样即使 enroll 后用户没完成绑定，也不会把自己锁在门外。
+pub async fn mfa_enroll(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+) -> ApiResult<Json<serde_json::Value>> {
+    let (_, _, enabled) = mfa_material(&state, s.user_id).await?;
+    if enabled.is_some() {
+        return Err(ApiError::bad_request("mfa", "已启用 MFA；如需更换请先关闭"));
+    }
+    let master = state.require_secret_key()?;
+    let secret = crate::totp::gen_secret();
+    let b32 = crate::totp::base32_encode(&secret);
+    let codes = crate::totp::gen_recovery_codes(crate::totp::RECOVERY_CODE_COUNT);
+    let hashed: Vec<String> = codes.iter().map(|c| crate::totp::hash_recovery_code(c)).collect();
+    let enc = master.encrypt(&secret).map_err(ApiError::from)?;
+    let codes_json = serde_json::to_string(&hashed).unwrap_or_else(|_| "[]".into());
+    let uid = s.user_id;
+    state
+        .db
+        .exec(move |conn| {
+            conn.execute(
+                "UPDATE users SET mfa_secret_enc = ?1, mfa_recovery_codes = ?2 WHERE id = ?3",
+                rusqlite::params![enc, codes_json, uid],
+            )
+            .map(|_| panel_db::WriteAck { rows_changed: 1 })
+            .map_err(|e| panel_core::PanelError::Database(e.to_string()))
+        })
+        .await?;
+
+    Ok(ok(MfaEnrollResp {
+        otpauth_uri: crate::totp::otpauth_uri(&s.username, &b32),
+        secret: b32,
+        recovery_codes: codes,
+    }))
+}
+
+/// POST /auth/mfa/verify —— 用动态口令确认绑定后正式启用。
+pub async fn mfa_verify(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    Json(req): Json<MfaCodeReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let (secret_enc, codes, enabled) = mfa_material(&state, s.user_id).await?;
+    if enabled.is_some() {
+        return Err(ApiError::bad_request("mfa", "MFA 已启用"));
+    }
+    let Some(blob) = secret_enc else {
+        return Err(ApiError::bad_request("mfa", "请先调用 enroll 生成密钥"));
+    };
+    let master = state.require_secret_key()?;
+    let secret = master.decrypt(&blob).map_err(ApiError::from)?;
+    // 绑定时只认动态口令（不认恢复码）——恢复码是"逃生通道"，不能用来完成绑定
+    if !crate::totp::verify(&secret, &req.code, crate::now_unix()) {
+        return Err(ApiError::bad_request("code", "动态口令不正确"));
+    }
+    let uid = s.user_id;
+    let now = crate::now_unix();
+    state
+        .db
+        .exec(move |conn| {
+            conn.execute(
+                "UPDATE users SET mfa_enabled_at = ?1 WHERE id = ?2",
+                rusqlite::params![now, uid],
+            )
+            .map(|_| panel_db::WriteAck { rows_changed: 1 })
+            .map_err(|e| panel_core::PanelError::Database(e.to_string()))
+        })
+        .await?;
+    audit(&state, &s, "auth.mfa.enable", &s.username, "ok").await;
+    Ok(ok(true))
+}
+
+/// POST /auth/mfa/disable —— 关闭 MFA。**必须出示第二因子**，
+/// 否则一个被劫持的会话就能顺手关掉受害者账户的 MFA。
+pub async fn mfa_disable(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    Json(req): Json<MfaCodeReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let (secret_enc, codes, enabled) = mfa_material(&state, s.user_id).await?;
+    if enabled.is_none() {
+        return Err(ApiError::bad_request("mfa", "MFA 未启用"));
+    }
+    let secret = match (&secret_enc, &state.master_key) {
+        (Some(blob), Some(master)) => master.decrypt(blob).ok(),
+        _ => None,
+    };
+    if !factor_ok(secret.as_deref(), &codes, &req.code) {
+        return Err(ApiError::bad_request("code", "动态口令或恢复码不正确"));
+    }
+    let uid = s.user_id;
+    state
+        .db
+        .exec(move |conn| {
+            conn.execute(
+                "UPDATE users SET mfa_secret_enc = NULL, mfa_recovery_codes = NULL, mfa_enabled_at = NULL WHERE id = ?1",
+                [uid],
+            )
+            .map(|_| panel_db::WriteAck { rows_changed: 1 })
+            .map_err(|e| panel_core::PanelError::Database(e.to_string()))
+        })
+        .await?;
+    audit(&state, &s, "auth.mfa.disable", &s.username, "ok").await;
+    Ok(ok(true))
+}
+
 pub async fn bootstrap(
     State(state): State<Shared>,
     Json(req): Json<BootstrapReq>,

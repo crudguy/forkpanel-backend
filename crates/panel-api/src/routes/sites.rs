@@ -729,12 +729,55 @@ pub async fn ssl_apply(
     let method = req.method.clone().unwrap_or_else(|| "self-signed".into());
     match method.as_str() {
         "self-signed" => {}
-        "http-01" | "dns-01" => {
+        "http-01" => {
             if !state.capabilities.get(cap_keys::SSL_ACME).map(|c| c.supported).unwrap_or(false) {
                 return Err(ApiError::unsupported("ssl.acme"));
             }
-            // 能力位为 yes 时才轮到此分支（#61 接入 ACME 任务后替换）
-            return Err(ApiError::unsupported("ACME 签发任务尚未接入"));
+            // ACME 需要真实账户邮箱（CA 用它发到期/异常通知）——没有就明确报错，
+            // 绝不静默填一个假地址（那会让用户收不到任何到期提醒）。
+            let email = req
+                .email
+                .as_deref()
+                .map(str::trim)
+                .filter(|e| !e.is_empty())
+                .ok_or_else(|| ApiError::bad_request("email", "http-01 签发需要账户邮箱"))?
+                .to_string();
+            // 注：certbot 回退路线目前只签**主域名**（多域名 SAN 待扩展）
+            let webroot = resolve_site_root(&state, &site.root, &site.name)?
+                .as_path()
+                .to_path_buf();
+            let (crt_p, key_p) = cert_paths_for(&state, &domains);
+            let job = AcmeTask {
+                mode: AcmeMode::Issue,
+                site_id: id,
+                domains: domains.clone(),
+                email,
+                webroot,
+                crt_p,
+                key_p,
+                master: state.require_secret_key()?,
+                db: state.db.clone(),
+            };
+            let (tid, _) = state
+                .tasks
+                .submit(
+                    panel_task::TaskRequest {
+                        idempotency_key: format!("cert:{id}:{}", domains.join(",")),
+                        kind: panel_task::TaskKind::CertIssue,
+                        label: format!("ACME 签发证书（{}）", domains.join(", ")),
+                        timeout: std::time::Duration::from_secs(900),
+                    },
+                    job,
+                )
+                .await
+                .map_err(ApiError::from)?;
+            audit(&state, &s, "ssl.apply", &id.to_string(), "queued").await;
+            return Ok(ok(serde_json::json!({ "task_id": tid, "source": "acme" })));
+        }
+        "dns-01" => {
+            return Err(ApiError::unsupported(
+                "dns-01 需 DNS 提供商 API（设计 §2.4 列为 M5）；certbot 回退路线当前仅实现 http-01",
+            ))
         }
         other => return Err(ApiError::bad_request("method", format!("unsupported method: {other}"))),
     }
@@ -787,6 +830,86 @@ pub async fn ssl_apply(
     })))
 }
 
+// ─────────────── ACME 任务体（签发 / 续期） ───────────────
+
+/// certbot 默认有效期（天），用于写 `not_after` 供到期提醒与续期判定。
+/// **未从 PEM 解析**——那要引入 X.509 解析依赖（预算不允）；certbot 默认即 90 天。
+const ACME_DAYS: i64 = 90;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcmeMode {
+    Issue,
+    Renew,
+}
+
+/// ACME 证书任务：调 certbot → 落盘 → **私钥加密入库**。
+///
+/// 与自签走同一条纪律：私钥**绝不明文入库**（库泄露 ≠ 私钥泄露）。
+pub struct AcmeTask {
+    pub mode: AcmeMode,
+    pub site_id: i64,
+    pub domains: Vec<String>,
+    /// 账户邮箱（仅 Issue 使用；Renew 沿用 certbot 已有账户）
+    pub email: String,
+    /// http-01 校验目录（站点根目录）
+    pub webroot: std::path::PathBuf,
+    pub crt_p: std::path::PathBuf,
+    pub key_p: std::path::PathBuf,
+    pub master: crate::MasterKey,
+    pub db: std::sync::Arc<panel_db::WriterActor>,
+}
+
+#[async_trait::async_trait]
+impl panel_task::TaskBody for AcmeTask {
+    async fn run(&self, progress: panel_task::Progress) -> Result<panel_task::TaskOutcome> {
+        progress.set(10, "调用 certbot").await;
+        // 注：certbot 回退路线目前只签**主域名**（多域名 SAN 待扩展）
+        let primary = self
+            .domains
+            .first()
+            .cloned()
+            .ok_or_else(|| PanelError::Internal("证书域名为空".into()))?;
+        let (cert_pem, key_pem) = match self.mode {
+            AcmeMode::Issue => tls::issue_acme(&primary, &self.email, &self.webroot).await?,
+            AcmeMode::Renew => tls::renew_acme(&primary).await?,
+        };
+
+        progress.set(70, "落盘与入库").await;
+        write_cert_files(&self.crt_p, &self.key_p, &cert_pem, &key_pem)?;
+        let key_enc = self
+            .master
+            .encrypt(key_pem.as_bytes())
+            .map_err(|e| PanelError::Internal(format!("加密私钥失败：{e}")))?;
+
+        let now = crate::now_unix();
+        let not_after = now + ACME_DAYS * 86_400;
+        let site_id = self.site_id;
+        let dj = serde_json::to_string(&self.domains).unwrap_or_else(|_| "[]".into());
+        let issuer = "ACME (certbot)".to_string();
+        let cert = cert_pem;
+        self.db
+            .exec(move |conn| {
+                conn.execute("DELETE FROM ssl_certs WHERE site_id = ?1", [site_id])
+                    .map_err(|e| PanelError::Database(e.to_string()))?;
+                conn.execute(
+                    "INSERT INTO ssl_certs(site_id, domains, issuer, not_after, source, key_enc, cert, renew_state, created_at) \
+                     VALUES(?1, ?2, ?3, ?4, 'acme', ?5, ?6, 'ok', ?7)",
+                    rusqlite::params![site_id, dj, issuer, not_after, key_enc, cert, now],
+                )
+                .map_err(|e| PanelError::Database(e.to_string()))?;
+                Ok(panel_db::WriteAck { rows_changed: 1 })
+            })
+            .await?;
+
+        progress.set(100, "完成").await;
+        Ok(panel_task::TaskOutcome {
+            state: panel_task::TaskState::Ok,
+            exit_code: Some(0),
+            output_path: Some(self.crt_p.clone()),
+        })
+    }
+}
+
 /// 手动续期：自签证书重新生成并覆盖；ACME 证书走 `ssl.acme`（未接入时诚实 501）。
 pub async fn cert_renew(
     State(state): State<Shared>,
@@ -814,7 +937,37 @@ pub async fn cert_renew(
         if !state.capabilities.get(cap_keys::SSL_ACME).map(|c| c.supported).unwrap_or(false) {
             return Err(ApiError::unsupported("ssl.acme"));
         }
-        return Err(ApiError::unsupported("ACME 续期任务尚未接入"));
+        // ACME 续期同样走任务：certbot 可能耗时，且 CA 有限流（LE 5 次/小时/域名）
+        let domains: Vec<String> = serde_json::from_str(&domains_json).unwrap_or_default();
+        let (crt_p, key_p) = cert_paths_for(&state, &domains);
+        let job = AcmeTask {
+            mode: AcmeMode::Renew,
+            site_id: id,
+            domains,
+            // renew 沿用 certbot 既有账户，无需邮箱与 webroot
+            email: String::new(),
+            webroot: std::path::PathBuf::new(),
+            crt_p,
+            key_p,
+            master: state.require_secret_key()?,
+            db: state.db.clone(),
+        };
+        let (tid, _) = state
+            .tasks
+            .submit(
+                panel_task::TaskRequest {
+                    // 幂等键按小时：同一小时内重复提交返回同一任务，天然规避 CA 限流
+                    idempotency_key: format!("cert-renew:{id}:{}", crate::now_unix() / 3600),
+                    kind: panel_task::TaskKind::CertIssue,
+                    label: format!("ACME 续期证书（站点 #{id}）"),
+                    timeout: std::time::Duration::from_secs(900),
+                },
+                job,
+            )
+            .await
+            .map_err(ApiError::from)?;
+        audit(&state, &s, "ssl.renew", &id.to_string(), "queued").await;
+        return Ok(ok(serde_json::json!({ "task_id": tid, "source": "acme" })));
     }
     if !state.capabilities.get(cap_keys::SSL_SELFSIGNED).map(|c| c.supported).unwrap_or(false) {
         return Err(ApiError::unsupported("ssl.selfsigned"));

@@ -6,7 +6,9 @@
 //!
 //! **产物命名**：`plan<id>-<unix>.<ext>`，因此「某计划的产物」= 目录内前缀匹配。
 //! **沙箱**：产物目录必须落在面板 `backup_dir()` 之内（`resolve_within` 校验）。
-//! **恢复**是高危写操作（覆盖当前数据），未实装前诚实 501 —— 需二次确认 + 先备份当前态。
+//! **恢复**（`kind=site`）已实装：确认词 + 产物名白名单 + **自动先备份当前态** + 归档逃逸校验，
+//! 全程走任务中心（`TaskKind::Restore`，破坏性操作不自动重试）。
+//! `kind=panel` 保持诚实 501：面板库是自身运行中的库，在线覆盖会损坏 SQLite WAL。
 
 use crate::{
     auth::perm,
@@ -252,6 +254,8 @@ struct BackupJob {
     kind: String,
     root: Option<PathBuf>,
     dest: PathBuf,
+    /// 保留份数：成功后按此裁剪最旧产物（防止低配盘被备份撑爆）
+    keep_count: i64,
     /// 面板 SQLite 路径（panel 备份用；独立连接，绕开写者事务）
     db_path: PathBuf,
     writer: std::sync::Arc<panel_db::WriterActor>,
@@ -264,6 +268,24 @@ impl panel_task::TaskBody for BackupJob {
             Ok(o) => Ok(o),
             Err(e) => {
                 eprintln!("[panel] 备份计划 #{} 失败: {e}", self.id);
+                // 备份**静默失败等于没有备份** —— 必须让人知道，否则出事才发现无退路。
+                // 按天去重：同一计划当天只报一条，避免每次调度都刷屏。
+                let msg = e.to_string();
+                crate::routes::notifications::push(
+                    &self.writer,
+                    crate::routes::notifications::NewNotification {
+                        level: "crit",
+                        source: "backup",
+                        title: format!("备份计划 #{} 执行失败", self.id),
+                        body: Some(msg),
+                        dedup_key: Some(format!(
+                            "backup:{}:fail:{}",
+                            self.id,
+                            crate::now_unix() / 86_400
+                        )),
+                    },
+                )
+                .await;
                 Err(e)
             }
         }
@@ -309,6 +331,15 @@ impl BackupJob {
                 .map_err(|e| PanelError::Database(e.to_string()))
             })
             .await?;
+
+        // 成功后按 keep_count 裁剪最旧产物（保留含本次在内的最新 keep 份）。
+        // 不清理会让备份产物无限累加，最终撑爆低配盘——备份反而成了故障源。
+        let pruned = prune_old_artifacts(&self.dest, self.id, self.keep_count);
+        if pruned > 0 {
+            eprintln!("[panel] 备份计划 #{} 按 keep_count={} 清理了 {pruned} 份旧产物",
+                self.id, self.keep_count);
+        }
+
         progress.set(100, "完成").await;
         Ok(panel_task::TaskOutcome {
             state: panel_task::TaskState::Ok,
@@ -342,6 +373,7 @@ pub async fn run(
         kind: plan.kind.clone(),
         root,
         dest,
+        keep_count: plan.keep_count,
         db_path: state.os.paths().sqlite_path(),
         writer: state.db.clone(),
     };
@@ -393,13 +425,276 @@ pub async fn artifacts(
     Ok(ok(items))
 }
 
-/// 从产物恢复：**高危**（覆盖当前数据），未实装前诚实 501。
+/// 恢复的二次确认词。前端 ConfirmDialog 必须让用户手输该词才能提交。
+pub const RESTORE_CONFIRM_WORD: &str = "覆盖恢复";
+
+#[derive(Debug, Deserialize)]
+pub struct RestoreReq {
+    /// 产物文件名（取自 `artifacts` 列表），**不接受路径**
+    pub artifact: String,
+    /// 二次确认词，必须等于 [`RESTORE_CONFIRM_WORD`]
+    pub confirm_token: String,
+}
+
+/// 从产物恢复：**高危**（覆盖当前数据）。
+///
+/// 三道闸门（缺一不可）：
+/// 1. **二次确认词** `confirm_token` —— 防误点；
+/// 2. **产物名白名单** —— 必须属本计划前缀且真实存在，不接受 `/` 与 `..`；
+/// 3. **自动先备份当前态** —— 任务内第一步（见 `RestoreJob`），失败即中止、绝不裸覆盖。
+///
+/// `kind=panel` 例外：面板库是面板自身运行的库，在线覆盖会让 SQLite WAL 损坏，
+/// 诚实 501 并给出停服后手动替换的指引——不提供"看起来能点"的危险按钮。
 pub async fn restore(
-    State(_): State<Shared>,
+    State(state): State<Shared>,
     Auth(s): Auth,
-    AxPath(_id): AxPath<i64>,
+    AxPath(id): AxPath<i64>,
+    Json(req): Json<RestoreReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::BACKUP_MANAGE)?;
-    Err(ApiError::unsupported(
-        "backup.restore：恢复会覆盖当前数据（高危），需二次确认 + 自动先备份当前态，尚未接入"))
+    if !state.capabilities.get(cap_keys::BACKUP_MANAGE).map(|c| c.supported).unwrap_or(false) {
+        return Err(ApiError::unsupported("backup.manage"));
+    }
+
+    // 闸门 1：确认词
+    if req.confirm_token.trim() != RESTORE_CONFIRM_WORD {
+        return Err(ApiError::bad_request(
+            "confirm_token",
+            format!("请输入确认词「{RESTORE_CONFIRM_WORD}」以继续"),
+        ));
+    }
+
+    let plan = fetch_plan(&state, id).await?.ok_or_else(|| ApiError::not_found("backup plan"))?;
+    if plan.kind == "panel" {
+        return Err(ApiError::unsupported(
+            "面板数据库为面板自身运行中的库：在线覆盖会损坏 SQLite WAL。请先停止 panel 服务，再用产物文件手动替换数据目录内的库文件。",
+        ));
+    }
+
+    // 闸门 2：产物名白名单（目录内前缀匹配 + 禁止路径成分）
+    let prefix = format!("plan{id}-");
+    let name = req.artifact.trim();
+    if !name.starts_with(&prefix) || name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err(ApiError::bad_request("artifact", "产物名不属于本计划或含非法路径成分"));
+    }
+    let dest = resolve_dest(&state, &plan.dest_dir)?;
+    let archive = dest.as_path().join(name);
+    if !archive.is_file() {
+        return Err(ApiError::not_found("artifact"));
+    }
+
+    let root = PathBuf::from(
+        site_root_by_name(&state, &plan.target)
+            .await?
+            .ok_or_else(|| ApiError::bad_request("target", "site not found"))?,
+    );
+
+    let job = RestoreJob {
+        id,
+        root,
+        archive: archive.as_path().to_path_buf(),
+        safety_dir: dest.as_path().to_path_buf(),
+        writer: state.db.clone(),
+    };
+    // 幂等键含产物名：同一产物重复提交返回同一任务，天然防误触两次
+    let (tid, _) = state
+        .tasks
+        .submit(
+            panel_task::TaskRequest {
+                idempotency_key: format!("restore:{id}:{name}"),
+                kind: panel_task::TaskKind::Restore,
+                label: format!("恢复计划 #{id}（{name}）"),
+                timeout: Duration::from_secs(3600),
+            },
+            job,
+        )
+        .await
+        .map_err(ApiError::from)?;
+    // 注：audit 的 result 形参是 &'static str，故产物名走 target（动态），result 用字面量
+    audit(&state, &s, "backup.restore", &format!("{id}:{name}"), "queued").await;
+    Ok(ok(serde_json::json!({ "task_id": tid })))
+}
+
+// ─────────────── 恢复任务体 ───────────────
+
+struct RestoreJob {
+    id: i64,
+    /// 站点根目录（恢复目标）
+    root: PathBuf,
+    /// 归档产物绝对路径
+    archive: PathBuf,
+    /// 安全快照落点（= 产物目录）
+    safety_dir: PathBuf,
+    /// 写者：失败时落站内通知
+    writer: std::sync::Arc<panel_db::WriterActor>,
+}
+
+#[async_trait::async_trait]
+impl panel_task::TaskBody for RestoreJob {
+    async fn run(&self, progress: panel_task::Progress) -> Result<panel_task::TaskOutcome> {
+        match self.execute(progress).await {
+            Ok(o) => Ok(o),
+            Err(e) => {
+                eprintln!("[panel] 恢复计划 #{} 失败: {e}", self.id);
+                // 恢复失败意味着现场可能处于"已备份未覆盖"或"部分覆盖"的中间态，
+                // 必须立即告知人工确认——不去重（每次失败都是独立事件）。
+                let msg = e.to_string();
+                crate::routes::notifications::push(
+                    &self.writer,
+                    crate::routes::notifications::NewNotification {
+                        level: "crit",
+                        source: "restore",
+                        title: format!("恢复计划 #{} 失败，请人工确认现场状态", self.id),
+                        body: Some(msg),
+                        dedup_key: None,
+                    },
+                )
+                .await;
+                Err(e)
+            }
+        }
+    }
+}
+
+impl RestoreJob {
+    async fn execute(&self, progress: panel_task::Progress) -> Result<panel_task::TaskOutcome> {
+        // ① 解压前校验归档条目：拒绝 `../` 逃逸与绝对路径
+        progress.set(10, "校验归档").await;
+        let entries = panel_os::backup::list_tar_entries(&self.archive).await?;
+        if let Some(bad) = entries.iter().find(|e| !panel_os::backup::is_safe_entry(e)) {
+            return Err(PanelError::Validation {
+                field: "archive".into(),
+                reason: format!("归档含不安全条目，已中止：{bad}"),
+            });
+        }
+
+        // ② 自动先备份当前态：这是"恢复"唯一的安全网，失败即中止、绝不裸覆盖
+        progress.set(30, "先备份当前态").await;
+        std::fs::create_dir_all(&self.safety_dir)
+            .map_err(|e| PanelError::Internal(e.to_string()))?;
+        let ts = crate::now_unix();
+        let safety = self.safety_dir.join(format!("safety-plan{}-{}.tar.gz", self.id, ts));
+        panel_os::backup::tar_gz(&self.root, &safety).await?;
+
+        // ③ 解包覆盖（归档内含顶层目录名，故解压到父目录）
+        progress.set(70, "解压覆盖").await;
+        let parent = self
+            .root
+            .parent()
+            .ok_or_else(|| PanelError::Internal("站点目录无父目录".into()))?
+            .to_path_buf();
+        panel_os::backup::untar_gz(&self.archive, &parent).await?;
+
+        progress.set(100, "完成").await;
+        // output_path 指向**恢复前的快照**：出问题可据此回滚
+        Ok(panel_task::TaskOutcome {
+            state: panel_task::TaskState::Ok,
+            exit_code: Some(0),
+            output_path: Some(safety),
+        })
+    }
+}
+
+// ─────────────── 保留份数裁剪 ───────────────
+
+/// 按 `keep_count` 裁剪本计划的旧产物：保留**最新** keep 份，删除更旧的。
+///
+/// 只认 `plan<id>-` 前缀（不误伤其他计划与其他文件）；按文件名排序——
+/// 文件名形如 `plan1-1700000000.db`，时间戳为定长 unix 秒，字典序即时间序。
+///
+/// **返回被删除的数量**。单点删除失败只记日志、不向上抛错：
+/// 产物清理失败不该把一次「备份已成功」翻转为失败。
+fn prune_old_artifacts(dest: &std::path::Path, plan_id: i64, keep: i64) -> usize {
+    let keep = keep.max(1) as usize;
+    let prefix = format!("plan{plan_id}-");
+    let mut names: Vec<String> = match std::fs::read_dir(dest) {
+        Ok(rd) => rd
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with(&prefix))
+            .collect(),
+        Err(_) => return 0,
+    };
+    if names.len() <= keep {
+        return 0;
+    }
+    names.sort(); // 升序 → 前面是最旧的
+    let drop_n = names.len() - keep;
+    let mut removed = 0usize;
+    for n in names.into_iter().take(drop_n) {
+        match std::fs::remove_file(dest.join(&n)) {
+            Ok(()) => removed += 1,
+            Err(e) => eprintln!("[panel] 清理旧备份产物失败 {}: {e}", dest.join(&n).display()),
+        }
+    }
+    removed
+}
+
+#[cfg(test)]
+mod prune_tests {
+    use super::prune_old_artifacts;
+    use std::fs;
+
+    fn mk(dir: &std::path::Path, name: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join(name), b"x").unwrap();
+    }
+
+    fn ls(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn keeps_only_the_newest_n_artifacts() {
+        let d = std::env::temp_dir().join(format!("panel-prune-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        for i in 1..=5 {
+            mk(&d, &format!("plan7-100000000{i}.db"));
+        }
+        let removed = prune_old_artifacts(&d, 7, 2);
+        assert_eq!(removed, 3, "5 份保留 2 → 应删 3");
+        assert_eq!(
+            ls(&d),
+            vec!["plan7-1000000004.db".to_string(), "plan7-1000000005.db".to_string()],
+            "应只保留最新的两份"
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn does_not_touch_other_plans_or_unrelated_files() {
+        let d = std::env::temp_dir().join(format!("panel-prune2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        mk(&d, "plan7-1.db");
+        mk(&d, "plan7-2.db");
+        mk(&d, "plan7-3.db");
+        mk(&d, "plan8-1.db"); // 别的计划
+        mk(&d, "unrelated.txt");
+        let removed = prune_old_artifacts(&d, 7, 1);
+        assert_eq!(removed, 2, "只应删 plan7- 的旧产物");
+        assert_eq!(ls(&d), vec!["plan7-3.db".to_string(), "plan8-1.db".to_string(), "unrelated.txt".to_string()]);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn noop_when_under_budget() {
+        let d = std::env::temp_dir().join(format!("panel-prune3-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        mk(&d, "plan9-1.db");
+        assert_eq!(prune_old_artifacts(&d, 9, 7), 0, "份数未超不应删");
+        assert_eq!(ls(&d).len(), 1);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn missing_dir_is_not_an_error() {
+        let d = std::env::temp_dir().join(format!("panel-prune4-nope-{}", std::process::id()));
+        assert_eq!(prune_old_artifacts(&d, 1, 3), 0, "目录不存在应静默返回 0");
+    }
 }
