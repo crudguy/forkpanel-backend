@@ -24,27 +24,51 @@ use tokio::{
 pub enum Bin {
     Systemctl, Service, RcService,      // 服务
     Nft, Iptables, Ufw, FirewallCmd,    // 防火墙
-    Apt, Dnf, Yum, Apk, Zypper,         // 包管理
+    Apt, Dnf, Yum, Apk, Zypper, Dpkg,   // 包管理
     Journalctl,                         // 日志
+    Crontab,                            // 计划任务（用户 crontab）
     Nginx, Caddy,                       // Web 服务器
+    /// 容器管理（**只读列举 + 生命周期**）。安全评估：
+    /// - argv 直传不经 shell；子命令由 provider 侧**编译期写死**（ps/images/start/stop/restart/rm），
+    ///   不存在用户可控的子命令或选项；
+    /// - 容器名/ID 经 `rules::is_valid_container_ref` 白名单校验（含禁止首字符 `-`，防参数注入）；
+    /// - **不提供** `docker run`（等价宿主机任意代码执行，需独立风险设计与审批，见 #47 说明）。
+    /// 注意：docker CLI 连 `/var/run/docker.sock`，即**面板进程身份**决定可达性；
+    /// 因此该能力默认大概率不可用（不在 docker 组），能力位据此诚实置灰。
+    Docker,
+    OpenSsl,                            // TLS 自签证书生成（仅签发，不参与其它任何用途）
     MySql, MySqlDump, Psql, PgDump,     // 数据库（可选能力）
     Tar, Gzip,                          // 备份打包
     UserAdd, GroupAdd, Chown, Chmod,    // 用户与权限
     Df, Stat,                           // 探测类（回退路径）
+    /// 交互式登录 shell（Web 终端用）。**不经任何 shell 解释**——由 `spawn_pty`
+    /// 以 argv 直接 exec；用户输入只写进 PTY 的 master，不参与本进程的 argv。
+    ///
+    /// 它本身就是"任意命令执行"的合法入口，这是终端的**功能**而非缺陷；因此防线
+    /// 放在**会话建立那一刻**（能力位 + SYSTEM_MANAGE 权限 + 只读模式拒绝 + 并发上限 +
+    /// 空闲超时 + 审计），而不是去解析每条命令。绝不接受把用户输入拼进 argv。
+    Bash,
+    /// 用户脚本的唯一出口：cron/手动触发的 command 是任意 shell 串，
+    /// 不能也不该塞进上面的白名单——统一经 `sh -c` 走这里，保留超时与降权。
+    Sh,
 }
 
 impl Bin {
     pub fn as_str(self) -> &'static str {
         use Bin::*;
         match self {
+            Bash => "bash",
             Systemctl => "systemctl", Service => "service", RcService => "rc-service",
             Nft => "nft", Iptables => "iptables", Ufw => "ufw", FirewallCmd => "firewall-cmd",
-            Apt => "apt-get", Dnf => "dnf", Yum => "yum", Apk => "apk", Zypper => "zypper",
-            Journalctl => "journalctl", Nginx => "nginx", Caddy => "caddy",
+            Apt => "apt-get", Dnf => "dnf", Yum => "yum", Apk => "apk", Zypper => "zypper", Dpkg => "dpkg-query",
+            Journalctl => "journalctl", Crontab => "crontab", Nginx => "nginx", Caddy => "caddy",
+            Docker => "docker",
+            OpenSsl => "openssl",
             MySql => "mysql", MySqlDump => "mysqldump", Psql => "psql", PgDump => "pg_dump",
             Tar => "tar", Gzip => "gzip",
             UserAdd => "useradd", GroupAdd => "groupadd", Chown => "chown", Chmod => "chmod",
             Df => "df", Stat => "stat",
+            Sh => "sh",
         }
     }
 
@@ -60,6 +84,9 @@ impl Bin {
         }
         Err(PanelError::Unsupported(name))
     }
+
+    /// 该二进制是否存在于安全 PATH（能力位判定用）。**只做文件存在性检查，不执行任何命令。**
+    pub fn available(self) -> bool { self.resolved().is_ok() }
 }
 
 // on_line 为 `dyn Fn`，不实现 Debug，故手写 Debug（保留 Clone 派生）。
@@ -266,6 +293,203 @@ fn truncate(s: &str, n: usize) -> String {
     if s.len() <= n { s.to_string() } else { format!("{}…(truncated)", &s[..n]) }
 }
 
+// ═══════════════════════ 交互式 PTY（Web 终端） ═══════════════════════
+//
+// 为什么必须放在本文件：这里的"全项目唯一子进程出口"是一条硬不变量
+// （CI 门禁 [1]）。PTY 同样要 fork/exec，因此它是**第二个**原语，也归这里。
+
+/// PTY slave 设备名缓冲（内核保证 `/dev/pts/N` 远短于该长度）
+const PTY_NAME_MAX: usize = 128;
+/// 子进程环境里的安全 PATH（与 `run()` 保持一致，不复用调用方 PATH）
+const PTY_SAFE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// PTY 的**读半边**：独占 master 原件，交给专门的读任务。
+/// 单独成类型是为了能安全地 `split`——Rust 里无法在同一个 `select!` 中
+/// 同时持有同一个 `&mut File` 的两个 future（读与写）。
+pub struct PtyReader(pub tokio::fs::File);
+
+/// PTY 的**写/控制半边**：master 的 `dup` 副本 + 子进程句柄。
+///
+/// 读用原件、写用副本是 POSIX 下的常规做法：两个 fd 指向同一个终端，
+/// 因此可以在两个任务里分别 `&mut`，互不冲突。
+pub struct PtyTx {
+    master: tokio::fs::File,
+    child: tokio::process::Child,
+}
+
+/// 一个已建立的交互式伪终端会话。
+pub struct PtySession {
+    reader: PtyReader,
+    tx: PtyTx,
+}
+
+impl PtySession {
+    pub fn pid(&self) -> u32 { self.tx.child.id().unwrap_or(0) }
+
+    /// 拆成读半边（移入读任务）与写/控制半边（留在会话循环）。
+    pub fn split(self) -> (PtyReader, PtyTx) { (self.reader, self.tx) }
+}
+
+impl PtyTx {
+    /// 写用户输入（原始字节：可能是任意 UTF-8 片段或单个控制字符）。
+    pub async fn write(&mut self, data: &[u8]) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+        self.master.write_all(data).await.map_err(|e| PanelError::Io(e.to_string()))?;
+        self.master.flush().await.map_err(|e| PanelError::Io(e.to_string()))
+    }
+
+    /// 同步窗口尺寸。内核随后给前台进程组发 SIGWINCH，全屏程序据此重排。
+    pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&self.master);
+        set_winsize(fd, cols, rows)
+    }
+
+    /// 结束会话：**先给整个进程组发 SIGHUP**，再兜底强杀。
+    ///
+    /// `setsid` 之后 shell 即会话/进程组组长，因此 `kill(-pid, SIGHUP)` 能连带
+    /// 清掉它启动的前台程序（`top`、`tail -f` 之类）。只 kill 直接子进程会把它们
+    /// 留成孤儿——这正是"退出清理"要避免的。
+    pub async fn shutdown(&mut self) {
+        let pid = self.child.id().unwrap_or(0) as i32;
+        if pid > 0 {
+            // SAFETY: 仅为发信号，负 pid 表示进程组
+            unsafe { libc::kill(-pid, libc::SIGHUP); }
+        }
+        // 给前台程序一点收尾窗口，超时则强杀兜底（避免僵尸残留）
+        if tokio::time::timeout(Duration::from_millis(300), self.child.wait()).await.is_err() {
+            let _ = self.child.start_kill();
+            let _ = self.child.wait().await;
+        }
+    }
+}
+
+/// `TIOCSWINSZ`：设置终端窗口尺寸（列/行），0 视为非法值按 1 处理。
+fn set_winsize(fd: std::os::unix::io::RawFd, cols: u16, rows: u16) -> Result<()> {
+    let ws = libc::winsize {
+        ws_row: rows.max(1), ws_col: cols.max(1), ws_xpixel: 0, ws_ypixel: 0,
+    };
+    // SAFETY: fd 来自本模块持有的 master；ioctl 参数与 TIOCSWINSZ 约定一致
+    let r = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &ws) };
+    if r != 0 {
+        return Err(PanelError::Io(format!("TIOCSWINSZ 失败: {}", std::io::Error::last_os_error())));
+    }
+    Ok(())
+}
+
+/// 打开一对 PTY，返回 `(master_fd, slave_file)`；任一步失败都不泄漏已开的 fd。
+fn open_pty(cols: u16, rows: u16) -> std::io::Result<(i32, std::fs::File)> {
+    use std::os::unix::io::FromRawFd;
+    // SAFETY: 全是标准 POSIX PTY 调用；每个失败分支都显式 close(master)
+    unsafe {
+        let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        if master < 0 { return Err(std::io::Error::last_os_error()); }
+
+        if libc::grantpt(master) != 0 {
+            let e = std::io::Error::last_os_error(); libc::close(master); return Err(e);
+        }
+        if libc::unlockpt(master) != 0 {
+            let e = std::io::Error::last_os_error(); libc::close(master); return Err(e);
+        }
+        let mut name = [0 as libc::c_char; PTY_NAME_MAX];
+        if libc::ptsname_r(master, name.as_mut_ptr(), name.len()) != 0 {
+            let e = std::io::Error::last_os_error(); libc::close(master); return Err(e);
+        }
+        // 先设初始尺寸：否则首个程序会按默认 80x24 排版，前端 fit 之后再抖动一次
+        set_winsize(master, cols, rows).ok();
+
+        let slave = libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+        if slave < 0 {
+            let e = std::io::Error::last_os_error(); libc::close(master); return Err(e);
+        }
+        Ok((master, std::fs::File::from_raw_fd(slave)))
+    }
+}
+
+/// 启动交互式 PTY 会话（argv 直传，**不经 shell**）。
+///
+/// 两个刻意选择：
+/// 1. slave 通过 `pre_exec` 里的 `dup2` 接管 0/1/2，而不是 `Stdio::from(fd)`——
+///    后者的父进程关闭时机依赖 `Command` 的 drop 顺序，一旦父进程残留 slave fd，
+///    子进程退出时 master 就**读不到 EOF**，会话会永远挂着。这里显式 `drop(slave)`。
+/// 2. `setsid` + `TIOCSCTTY` 必须在 pre_exec 里做，否则 Ctrl-C/Ctrl-Z（作业控制）
+///    与 SIGWINCH（窗口尺寸变化）都不会生效——终端会"能打字但按不了 Ctrl-C"。
+pub fn spawn_pty(shell: Bin, cols: u16, rows: u16, cwd: Option<&std::path::Path>) -> Result<PtySession> {
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    let program = shell.resolved()?;
+
+    let (master, slave) = open_pty(cols, rows)
+        .map_err(|e| PanelError::Internal(format!("openpty 失败: {e}")))?;
+    let slave_fd = slave.as_raw_fd();
+
+    // 继承面板自身的 HOME/USER/SHELL：`env_clear` 之后若没有 HOME，
+    // `~` 不展开、`cd` 无默认目录，交互体验会明显不对。
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let sh = std::env::var("SHELL").unwrap_or_else(|_| format!("/usr/bin/{}", shell.as_str()));
+
+    let mut cmd = Command::new(program);
+    // 先全部置 null，随后在 pre_exec 里用 dup2 把 slave 抢到 0/1/2
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.env_clear();
+    cmd.env("PATH", PTY_SAFE_PATH);
+    cmd.env("HOME", home);
+    cmd.env("USER", user);
+    cmd.env("SHELL", sh);
+    // 与前端 xterm 的 termName 匹配；否则颜色/光标/按键能力会退化
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("LANG", "C.UTF-8");
+    cmd.env("LC_ALL", "C.UTF-8");
+    if let Some(d) = cwd { cmd.current_dir(d); }
+
+    // SAFETY: pre_exec 内只调用 async-signal-safe 的系统调用（setsid/dup2/close/ioctl）
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::setsid();
+            if libc::dup2(slave_fd, 0) < 0
+                || libc::dup2(slave_fd, 1) < 0
+                || libc::dup2(slave_fd, 2) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            if slave_fd > 2 { libc::close(slave_fd); }
+            // 接管控制终端；失败不致命（如已存在控制终端），故忽略返回值
+            libc::ioctl(0, libc::TIOCSCTTY, 0);
+            Ok(())
+        });
+    }
+
+    let child = cmd.spawn().map_err(|e| PanelError::Command {
+        bin: shell.as_str().into(),
+        detail: format!("pty spawn 失败: {e}"),
+    })?;
+    // 父进程立刻放开 slave：子进程退出后 master 才会读到 EOF（会话收尾依赖它）
+    drop(slave);
+
+    // 写半边用 master 的 dup 副本：读/写分属不同 fd，才能在两处各自 &mut
+    let write_fd = dup_fd(master)?;
+    // SAFETY: 两个 fd 都来自本函数刚打开的 PTY master（原件 + dup），
+    // 各自只被包进一个 File，所有权唯一，不存在重复关闭。
+    Ok(unsafe {
+        PtySession {
+            reader: PtyReader(tokio::fs::File::from_std(std::fs::File::from_raw_fd(master))),
+            tx: PtyTx {
+                master: tokio::fs::File::from_std(std::fs::File::from_raw_fd(write_fd)),
+                child,
+            },
+        }
+    })
+}
+
+/// `dup` 一个 fd，失败即报错（不静默降级）。
+fn dup_fd(fd: i32) -> Result<i32> {
+    // SAFETY: dup 只复制 fd
+    let n = unsafe { libc::dup(fd) };
+    if n < 0 {
+        return Err(PanelError::Io(format!("dup 失败: {}", std::io::Error::last_os_error())));
+    }
+    Ok(n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,6 +499,71 @@ mod tests {
         // 白名单是封闭枚举：不存在从字符串构造的入口（这是防注入的根本）
         assert_eq!(Bin::Nft.as_str(), "nft");
         assert_eq!(Bin::Systemctl.as_str(), "systemctl");
+        assert_eq!(Bin::Bash.as_str(), "bash");
+    }
+
+    // ── PTY：真机集成测试（无 bash / 无 PTY 的环境自动跳过，不假绿）──
+
+    /// 在 PTY 上跑一行命令并收集输出，直到出现 `needle` 或超时。
+    async fn pty_collect(needle: &str, cmds: &[&str]) -> Option<String> {
+        use tokio::io::AsyncReadExt;
+        if !Bin::Bash.available() { return None; }
+        let session = spawn_pty(Bin::Bash, 80, 24, None).ok()?;
+        let (PtyReader(mut rx), mut tx) = session.split();
+        for c in cmds { tx.write(c.as_bytes()).await.ok()?; }
+
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(300), rx.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => break,
+                Ok(Ok(n)) => {
+                    out.extend_from_slice(&buf[..n]);
+                    if String::from_utf8_lossy(&out).contains(needle) { break; }
+                }
+                Err(_) => {}
+            }
+        }
+        tx.shutdown().await;
+        Some(String::from_utf8_lossy(&out).to_string())
+    }
+
+    #[tokio::test]
+    async fn pty_runs_interactive_shell() {
+        // 关键断言：shell **求值**了算术（输出 42），而不是原样回显命令。
+        // 这能同时证明：slave 接对了 0/1/2、fd 没串、shell 真的在跑。
+        let Some(out) = pty_collect("PANEL_PTY_42", &["echo PANEL_PTY_$((6*7))\n"]).await
+            else { return };
+        assert!(out.contains("PANEL_PTY_42"),
+            "shell 未求值命令（可能 stdin/stdout 未接到 pty）: {}", out.escape_debug());
+    }
+
+    #[tokio::test]
+    async fn pty_shutdown_releases_reader() {
+        // 退出清理：shutdown 之后读半边必须收到 EOF/错误。若这里挂住，
+        // 生产上的表现就是"关掉终端页后服务端线程/子进程泄漏"。
+        use tokio::io::AsyncReadExt;
+        if !Bin::Bash.available() { return; }
+        let Ok(session) = spawn_pty(Bin::Bash, 80, 24, None) else { return };
+        let (PtyReader(mut rx), mut tx) = session.split();
+        tx.shutdown().await;
+
+        let mut buf = [0u8; 256];
+        let mut closed = false;
+        for _ in 0..25 {
+            match tokio::time::timeout(Duration::from_millis(200), rx.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => { closed = true; break }
+                _ => {}
+            }
+        }
+        assert!(closed, "shutdown 后读半边未关闭 → 会话泄漏");
+    }
+
+    #[test]
+    fn winsize_rejects_bad_fd() {
+        // 非法 fd 必须报错，不能静默成功（否则"resize 生效了"是假象）
+        assert!(set_winsize(-1, 80, 24).is_err());
     }
 
     #[tokio::test]

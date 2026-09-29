@@ -149,6 +149,14 @@ impl ServiceProvider for MockServices {
         }
         Ok(rx)
     }
+
+    async fn config_read(&self, _n: &UnitName) -> Result<ServiceConfig> {
+        Err(panel_core::PanelError::Unsupported("service.config (mock adapter has no real unit files)"))
+    }
+
+    async fn config_write(&self, _n: &UnitName, _content: &str, _restart: bool) -> Result<()> {
+        Err(panel_core::PanelError::Unsupported("service.config (mock adapter has no real unit files)"))
+    }
 }
 
 impl MockServices {
@@ -197,6 +205,12 @@ impl FirewallProvider for MockFirewall {
         if data.is_empty() { return Err(PanelError::Validation { field: "snapshot", reason: "empty".into() }); }
         Ok(())
     }
+
+    async fn delete_rule(&self, id: &str) -> Result<()> {
+        let mut st = self.state.lock().unwrap();
+        if st.rules.remove(id).is_some() { Ok(()) }
+        else { Err(PanelError::NotFound(format!("firewall rule `{id}`"))) }
+    }
 }
 
 // ───────────────────────── 其余：显式不支持 ─────────────────────────
@@ -214,6 +228,7 @@ mock_unsupported!(MockLogs, LogProvider);
 mock_unsupported!(MockScheduler, SchedulerProvider);
 mock_unsupported!(MockWebServer, WebServerProvider);
 mock_unsupported!(MockDatabases, DatabaseProvider);
+mock_unsupported!(MockSecurity, SecurityProvider);
 
 #[async_trait]
 impl PackageProvider for MockPackages {
@@ -305,12 +320,81 @@ impl WebServerProvider for MockWebServer {
 impl DatabaseProvider for MockDatabases {
     fn engine(&self) -> DbEngine { DbEngine::Sqlite }
     async fn available(&self) -> Result<bool> { Ok(true) }
+    fn supports(&self, e: DbEngine) -> bool { matches!(e, DbEngine::Sqlite) }
     async fn databases(&self, _t: &DbTarget) -> Result<Vec<String>> { Ok(vec!["panel".into()]) }
-    async fn tables(&self, _t: &DbTarget) -> Result<Vec<String>> { Ok(vec!["sites".into()]) }
+    async fn tables(&self, _t: &DbTarget) -> Result<Vec<DbTable>> {
+        Ok(vec![DbTable { name: "sites".into(), rows: 3 }])
+    }
+    async fn rows(&self, _t: &DbTarget, _table: &str, _limit: usize, _offset: usize) -> Result<DbRows> {
+        Ok(DbRows {
+            columns: vec!["id".into(), "name".into()],
+            rows: vec![
+                vec![Some("1".into()), Some("demo".into())],
+                vec![Some("2".into()), None],
+            ],
+            total: 2,
+        })
+    }
     async fn backup(&self, _t: &DbTarget, _o: &SafePath, cb: Box<dyn Fn(String) + Send + Sync>) -> Result<()> {
         cb("mock: dump complete".into()); Ok(())
     }
     async fn restore(&self, _t: &DbTarget, _f: &SafePath) -> Result<()> { Ok(()) }
+}
+
+// ═══════════════ 容器（模拟器） ═══════════════
+//
+// 定位说明：Mock 平台（非 Linux 目标 / `force-mock` 构建）本就以"固定样例数据"
+// 驱动前端联调（与 MockDatabases 同性质），不是生产路径上的"假装成功"。
+
+pub struct MockContainers;
+
+#[async_trait]
+impl ContainerProvider for MockContainers {
+    fn engine(&self) -> ContainerEngine { ContainerEngine::Docker }
+    fn available(&self) -> bool { true }
+    fn unavailable_reason(&self) -> Option<&'static str> { None }
+
+    async fn list(&self) -> Result<Vec<ContainerSummary>> {
+        Ok(vec![ContainerSummary {
+            id: "3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a".into(),
+            name: "web-proxy".into(),
+            image: "nginx:1.27-alpine".into(),
+            state: "running".into(),
+            status: "Up 9 days".into(),
+            ports: "0.0.0.0:80->80/tcp".into(),
+            created: "2026-09-20 08:12:33 +0800 CST".into(),
+        }])
+    }
+
+    async fn images(&self) -> Result<Vec<ImageSummary>> {
+        Ok(vec![ImageSummary {
+            id: "sha256:1111111111111111111111111111111111111111111111111111111111111111".into(),
+            repository: "nginx".into(),
+            tag: "1.27-alpine".into(),
+            size: "55.3MB".into(),
+            created: "2026-07-11 10:00:00 +0800 CST".into(),
+        }])
+    }
+
+    async fn act(&self, _action: ContainerAction, _id: &str) -> Result<()> { Ok(()) }
+}
+
+#[async_trait]
+impl SecurityProvider for MockSecurity {
+    async fn baseline(&self) -> Result<Vec<SecurityCheck>> {
+        Ok(vec![
+            SecurityCheck {
+                key: "ssh.permit_root_login".into(), title: "SSH 禁止 root 直接登录".into(),
+                ok: true, current: "PermitRootLogin no".into(), expected: "no".into(),
+                advice: String::new(), applicable: true,
+            },
+            SecurityCheck {
+                key: "service.fail2ban".into(), title: "部署 fail2ban 防暴力破解".into(),
+                ok: false, current: "未安装".into(), expected: "已安装并启用 fail2ban".into(),
+                advice: "apt install fail2ban".into(), applicable: true,
+            },
+        ])
+    }
 }
 
 // ───────────────────────── 路径布局（内存视图） ─────────────────────────
@@ -330,7 +414,24 @@ impl crate::PathLayout for MockPathLayout {
     fn cron_dir(&self) -> PathBuf { PathBuf::from("/mock/etc/cron.d") }
     fn script_dir(&self) -> PathBuf { self.data_dir().join("scripts") }
     fn backup_dir(&self) -> PathBuf { self.data_dir().join("backups") }
+    fn container_socket(&self) -> PathBuf { PathBuf::from("/mock/var/run/docker.sock") }
     fn default_web_user(&self) -> &'static str { "www-data" }
+}
+
+// ═══════════════ 终端（模拟器） ═══════════════
+
+/// Mock 终端：声明可用但不提供真实 PTY。
+///
+/// 注意：`cmd::spawn_pty` 是 Linux 实现（openpty 是 POSIX 专有），
+/// 因此 mock 平台下开启终端会话会在 `spawn_pty` 处失败——这是**真实**的失败，
+/// 不会伪装成成功。能力位在此仍报 yes，是为了让前端可以走通页面与置灰逻辑。
+#[derive(Debug, Default)]
+pub struct MockTerminal;
+
+impl TerminalProvider for MockTerminal {
+    fn available(&self) -> bool { true }
+    // 测试用：能力位需要"有 shell"才置 yes，这里给一个恒可用的 Bin。
+    fn shell(&self) -> Option<crate::cmd::Bin> { Some(crate::cmd::Bin::Sh) }
 }
 
 // ───────────────────────── 聚合 ─────────────────────────
@@ -350,7 +451,8 @@ impl crate::OsAdapter for MockOsAdapter {
         for k in [cap_keys::METRICS_READ, cap_keys::PROCESS_LIST, cap_keys::PROCESS_SIGNAL,
                   cap_keys::SERVICE_MANAGE, cap_keys::PACKAGE_INSTALL, cap_keys::FIREWALL_MANAGE,
                   cap_keys::WEBSERVER_MANAGE, cap_keys::SCHEDULER_MANAGE, cap_keys::LOGS_READ,
-                  cap_keys::DBMS_MANAGE, cap_keys::SSL_ACME] {
+                  cap_keys::DBMS_MANAGE, cap_keys::SSL_ACME, cap_keys::CONTAINER_MANAGE,
+                  cap_keys::TERMINAL_MANAGE] {
             m.insert(k.into(), Capability::yes("mock"));
         }
         m
@@ -369,4 +471,7 @@ impl crate::OsAdapter for MockOsAdapter {
     fn scheduler(&self) -> &dyn SchedulerProvider { &MockScheduler }
     fn webserver(&self) -> &dyn WebServerProvider { &MockWebServer }
     fn databases(&self) -> &dyn DatabaseProvider { &MockDatabases }
+    fn security(&self) -> &dyn SecurityProvider { &MockSecurity }
+    fn containers(&self) -> &dyn ContainerProvider { &MockContainers }
+    fn terminal(&self) -> &dyn TerminalProvider { &MockTerminal }
 }

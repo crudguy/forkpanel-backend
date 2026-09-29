@@ -8,7 +8,7 @@
 use crate::{
     cmd::{self, Bin, CmdOpt},
     traits::{
-        JournalQuery, ServiceFilter, ServiceProvider, ServiceState, ServiceUnit,
+        JournalQuery, ServiceConfig, ServiceFilter, ServiceProvider, ServiceState, ServiceUnit,
     },
 };
 use async_trait::async_trait;
@@ -120,6 +120,79 @@ impl ServiceProvider for LinuxServices {
         // follow 模式：走 cmd 唯一出口的流式变体（禁止在此处直接 spawn）
         let args = [unit.as_str(), "-n", lines.as_str(), "-f", "--no-pager", "-o", "cat"];
         return cmd::spawn_stream(Bin::Journalctl, &args, 64);
+    }
+
+    async fn config_read(&self, name: &UnitName) -> Result<ServiceConfig> {
+        match self.init {
+            InitSystem::Systemd => {
+                let out = cmd::run(
+                    Bin::Systemctl,
+                    &["show", "-p", "FragmentPath", "--value", name.as_str()],
+                    CmdOpt { timeout: Duration::from_secs(5), ..Default::default() },
+                ).await?;
+                let path = out.stdout.trim().to_string();
+                if path.is_empty() {
+                    // 生成型单元（如 some.service 由其他 unit 反代）没有独立文件
+                    return Err(panel_core::PanelError::Unsupported(
+                        "service has no fragment path (generated unit?)"));
+                }
+                // 防御：只接受绝对路径且不含路径穿越（FragmentPath 来自 systemctl，
+                // 理论上安全，但写操作前必须再校验一次，绝不信任外部字符串拼路径）
+                if !path.starts_with('/') || path.contains("..") {
+                    return Err(panel_core::PanelError::Unsupported(
+                        "service config path is not a safe absolute path"));
+                }
+                let content = tokio::fs::read_to_string(&path).await
+                    .map_err(|e| panel_core::PanelError::Io(
+                        format!("read {path}: {e}")))?;
+                // 仅 /etc/systemd/ 下为可覆盖目录；/lib、/usr/lib 下是发行版文件，
+                // 直接改会在包升级时被覆盖，前端据此提示改用 drop-in。
+                let writable = path.starts_with("/etc/systemd/");
+                Ok(ServiceConfig { path, content, writable })
+            }
+            _ => Err(panel_core::PanelError::Unsupported("service.config_read requires systemd")),
+        }
+    }
+
+    async fn config_write(&self, name: &UnitName, content: &str, restart: bool) -> Result<()> {
+        match self.init {
+            InitSystem::Systemd => {
+                // 先确认真实 FragmentPath，禁止把任意 content 写到任意文件
+                let out = cmd::run(
+                    Bin::Systemctl,
+                    &["show", "-p", "FragmentPath", "--value", name.as_str()],
+                    CmdOpt { timeout: Duration::from_secs(5), ..Default::default() },
+                ).await?;
+                let path = out.stdout.trim().to_string();
+                if path.is_empty() || !path.starts_with('/') || path.contains("..") {
+                    return Err(panel_core::PanelError::Unsupported(
+                        "service config path is not a safe absolute path"));
+                }
+
+                // 原子替换：先备份为 .panel.bak（best-effort），再写临时文件并 rename。
+                // 不原地写——半写状态会让 unit 文件损坏、该服务再也起不来。
+                let _ = tokio::fs::copy(&path, format!("{path}.panel.bak")).await;
+                let tmp = format!("{path}.panel.tmp");
+                tokio::fs::write(&tmp, content.as_bytes()).await
+                    .map_err(|e| panel_core::PanelError::Io(format!("write {tmp}: {e}")))?;
+                tokio::fs::rename(&tmp, &path).await
+                    .map_err(|e| panel_core::PanelError::Io(format!("rename to {path}: {e}")))?;
+
+                // 重新加载 systemd 单元（不重启服务本身，避免误杀在线连接）
+                cmd::run_checked(
+                    Bin::Systemctl, &["daemon-reload"],
+                    CmdOpt { timeout: Duration::from_secs(15), ..Default::default() },
+                ).await.map_err(|e| panel_core::PanelError::Command {
+                    bin: "systemctl".into(), detail: format!("daemon-reload: {e}"),
+                })?;
+
+                if restart {
+                    self.restart(name).await?;
+                }
+                Ok(())
+            }
+            _ => Err(panel_core::PanelError::Unsupported("service.config_write requires systemd")),
+        }
     }
 }
 

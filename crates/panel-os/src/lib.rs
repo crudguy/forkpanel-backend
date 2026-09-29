@@ -6,12 +6,14 @@
 //! if os.capabilities()["firewall.manage"].supported { /* UI 才显示防火墙页 */ }
 //! ```
 
+pub mod backup;
 pub mod cmd;
 pub mod fs;
 pub mod linux;
 pub mod mock_files;
 pub mod mock;
 pub mod paths;
+pub mod tls;
 pub mod traits;
 
 pub use cmd::{run, run_checked, spawn_stream, Bin, CmdOpt, CmdOutput};
@@ -45,6 +47,9 @@ pub trait OsAdapter: Send + Sync + 'static {
     fn scheduler(&self) -> &dyn SchedulerProvider;
     fn webserver(&self) -> &dyn WebServerProvider;
     fn databases(&self) -> &dyn DatabaseProvider;
+    fn security(&self) -> &dyn SecurityProvider;
+    fn containers(&self) -> &dyn ContainerProvider;
+    fn terminal(&self) -> &dyn TerminalProvider;
 }
 
 /// 按编译目标选择实现。Windows/macOS 接入时在此追加分支（设计方案 §0.4.2）。
@@ -54,6 +59,35 @@ pub fn default_adapter() -> Arc<dyn OsAdapter> {
 
     #[cfg(any(not(target_os = "linux"), feature = "force-mock"))]
     { Arc::new(mock::MockOsAdapter::new()) }
+}
+
+/// 由配置覆盖构造适配器（**跨平台入口**，供 CLI 的 `serve` 使用）。
+///
+/// 为什么必须有这个入口，而不是让 CLI 直接 `Arc::new(linux::LinuxOsAdapter::with_paths(..))`：
+/// 1. **可移植性**：业务层一旦引用 `panel_os::linux::*` 就绑死在 Linux，
+///    非 Linux 目标编译不过（CI 门禁 [4c] 正是拦这个）。
+/// 2. **`force-mock` 会失效**：`serve` 绕过 `default_adapter()` 直接起真实平台适配器，
+///    于是"无 Linux / 无 root 环境下用 mock 跑逻辑"这一已声明的能力形同虚设。
+///
+/// 入参是**值**而非平台类型，具体用哪个 `PathLayout` 实现由本函数内部决定。
+pub fn adapter_with_overrides(
+    config_dir: Option<std::path::PathBuf>,
+    site_root: Option<std::path::PathBuf>,
+    data_dir: Option<std::path::PathBuf>,
+    log_dir: Option<std::path::PathBuf>,
+) -> Arc<dyn OsAdapter> {
+    #[cfg(all(target_os = "linux", not(feature = "force-mock")))]
+    {
+        let layout = paths::LinuxPathLayout::default()
+            .with_overrides(config_dir, site_root, data_dir, log_dir);
+        Arc::new(linux::LinuxOsAdapter::with_paths(Arc::new(layout)))
+    }
+    #[cfg(any(not(target_os = "linux"), feature = "force-mock"))]
+    {
+        // mock 布局是内存视图，配置覆盖无意义；显式丢弃以避免"看起来生效了"
+        let _ = (config_dir, site_root, data_dir, log_dir);
+        Arc::new(mock::MockOsAdapter::new())
+    }
 }
 
 impl OsAdapter for linux::LinuxOsAdapter {
@@ -82,15 +116,57 @@ impl OsAdapter for linux::LinuxOsAdapter {
         m.insert(k::FILE_READ.into(), Capability::yes("posix"));
         m.insert(k::FILE_WRITE.into(), Capability::yes("posix"));
         m.insert(k::FIREWALL_MANAGE.into(), self.firewall.capability());
+        // 仅 nginx 已实装渲染/下发；caddy 已探测但 render 未实现，
+        // 不能"探测到就报 yes"——那正是"假装可移植"。诚实置 no 并给出原因。
         m.insert(k::WEBSERVER_MANAGE.into(), match self.webserver.name() {
-            "none" => Capability::no("binary_missing"),
-            n => Capability::yes(n),
+            "nginx" => Capability::yes("nginx"),
+            "caddy" => Capability::no("caddy_render_not_implemented"),
+            _ => Capability::no("binary_missing"),
         });
+        // scheduler 已随 crontab 落地，能力位必须跟着实现走（不要写死 no）
+        m.insert(k::SCHEDULER_MANAGE.into(), self.scheduler.capability());
         // 以下为 M4/M5 待实现：显式 no，UI 自动置灰
-        m.insert(k::SCHEDULER_MANAGE.into(), Capability::no("not_implemented"));
-        m.insert(k::LOGS_READ.into(), Capability::no("not_implemented"));
-        m.insert(k::DBMS_MANAGE.into(), Capability::no("not_implemented"));
+        // 日志：有 journald 或站点日志文件即可读（诚实：无任何源则 no）
+        m.insert(k::LOGS_READ.into(), if self.logs.available() {
+            Capability::yes(match self.logs.backend() {
+                panel_core::LogBackend::Journald => "journald",
+                panel_core::LogBackend::File => "file",
+                panel_core::LogBackend::EventLog => "eventlog",
+                panel_core::LogBackend::OsLog => "oslog",
+            })
+        } else {
+            Capability::no("no_log_source")
+        });
+        // 数据库浏览：SQLite 内建引擎已实装 → yes；mysql/postgres 未实装，逐连接再判
+        m.insert(k::DBMS_MANAGE.into(), if self.databases.supports(DbEngine::Sqlite) {
+            Capability::yes("sqlite")
+        } else {
+            Capability::no("no_engine")
+        });
         m.insert(k::SSL_ACME.into(), Capability::no("not_implemented"));
+        // 面板自签：本机有 openssl 即可（离线可用），与 ACME 相互独立
+        m.insert(k::SSL_SELFSIGNED.into(), if tls::available() {
+            Capability::yes("openssl")
+        } else {
+            Capability::no("openssl_missing")
+        });
+        // 备份计划：面板内建（SQLite 在线备份 + tar），与平台能力无关
+        m.insert(k::BACKUP_MANAGE.into(), Capability::yes("builtin"));
+        // 容器：**看守护进程可达性，不看二进制存在性**。
+        // 装好 docker 但面板身份连不上 socket 是常态（不在 docker 组 / daemon 未跑）；
+        // 若按"二进制存在"就报 yes，用户会得到一个点了必报错的假按钮。
+        m.insert(k::CONTAINER_MANAGE.into(), match self.containers.unavailable_reason() {
+            None => Capability::yes(self.containers.engine().as_str()),
+            Some(reason) => Capability::no(reason),
+        });
+        // 终端：本机有可用交互 shell 即可。**能力位只管"能不能开"**，
+        // 真正的准入还叠加 SYSTEM_MANAGE 权限 + 只读模式拒绝（见 routes/terminal.rs）。
+        m.insert(k::TERMINAL_MANAGE.into(), match self.terminal.shell() {
+            Some(sh) => Capability::yes(sh.as_str()),
+            None => Capability::no("binary_missing"),
+        });
+        // 用户与角色管理是面板内建功能，与操作系统能力无关，任何平台恒支持
+        m.insert(k::USER_MANAGE.into(), Capability::yes("builtin"));
         m
     }
 
@@ -107,6 +183,9 @@ impl OsAdapter for linux::LinuxOsAdapter {
     fn scheduler(&self) -> &dyn SchedulerProvider { &*self.scheduler }
     fn webserver(&self) -> &dyn WebServerProvider { &*self.webserver }
     fn databases(&self) -> &dyn DatabaseProvider { &*self.databases }
+    fn security(&self) -> &dyn SecurityProvider { &*self.security }
+    fn containers(&self) -> &dyn ContainerProvider { &*self.containers }
+    fn terminal(&self) -> &dyn TerminalProvider { &*self.terminal }
 }
 
 /// 启动自检：数据目录落在网络文件系统上时必须拒绝启动（WAL 不可用）

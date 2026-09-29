@@ -8,10 +8,15 @@ description = "OS 抽象层：trait 契约 + Linux 实现 + 内存 mock（用于
 
 [dependencies]
 panel-core = { path = "../panel-core" }
+serde       = { workspace = true }
 async-trait = { workspace = true }
 tokio      = { workspace = true }
 libc       = { workspace = true }
 tracing    = "0.1"
+# 内建 SQLite 浏览（面板自带引擎，无需外部客户端）；工作区已用同版本，不引入新外部 crate
+rusqlite   = { workspace = true }
+# 解析 journalctl -o json 每行（ts/message/priority）
+serde_json = { workspace = true }
 
 [features]
 default = []

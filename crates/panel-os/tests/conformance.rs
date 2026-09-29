@@ -116,6 +116,7 @@ async fn firewall_apply_is_idempotent() {
         direction: Direction::Inbound,
         source_cidr: None,
         comment: Some("conformance test".into()),
+        panel_managed: true,
     };
     let plan = RulePlan { rules: vec![rule], replace_panel_managed_only: true };
 

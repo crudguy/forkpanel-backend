@@ -8,6 +8,7 @@
 //! 4. 不支持的能力返回 `PanelError::Unsupported`，**绝不能 panic 或返回空数据假装成功**。
 
 use async_trait::async_trait;
+use serde::Serialize;
 use panel_core::{
     Capability, FirewallBackend, InitSystem, LogBackend, PlatformInfo, Result, SafePath,
     UnitName,
@@ -18,7 +19,7 @@ use tokio::sync::mpsc::Receiver;
 // ═══════════════════════════ 指标 ═══════════════════════════
 
 // 注意：含 Option<Vec<f32>>，故不可派生 Copy（Vec 非 Copy）；需要复制时用 .clone()。
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct CpuSample {
     /// 总体使用率 0.0~100.0
     pub total_pct: f32,
@@ -29,7 +30,7 @@ pub struct CpuSample {
     pub load15: f32,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct MemSample {
     pub total_kib: u64,
     pub used_kib: u64,
@@ -40,7 +41,7 @@ pub struct MemSample {
     pub swap_used_kib: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DiskSample {
     pub mount_point: PathBuf,
     pub device: String,
@@ -51,7 +52,7 @@ pub struct DiskSample {
     pub is_network_fs: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NetSample {
     pub iface: String,
     pub rx_bytes: u64,
@@ -62,7 +63,7 @@ pub struct NetSample {
 }
 
 /// 一次完整采样快照（单点写入 ArcSwap，多 SSE 客户端共享，设计方案 §3.6-7）
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct SystemSnapshot {
     pub ts_unix: i64,
     pub uptime_sec: u64,
@@ -85,7 +86,7 @@ pub trait MetricsProvider: Send + Sync {
 pub enum ProcessSort { Cpu, Memory, Pid }
 
 // 注意：cpu_pct 为 f32，不实现 Eq，故只派生 PartialEq。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ProcessInfo {
     pub pid: i32,
     pub ppid: i32,
@@ -147,6 +148,22 @@ impl Default for JournalQuery {
     }
 }
 
+/// 服务单元文件（配置）快照。
+///
+/// 对 systemd：来自 `systemctl show -p FragmentPath` 指向的文件。
+/// `writable=false` 表示该文件位于发行版目录（如 `/lib/systemd/system/`、
+/// `/usr/lib/systemd/system/`）——可直接改但**包升级时会被覆盖**，
+/// 业务层据此提示用户改用 drop-in（`/etc/systemd/system/<unit>.d/`）。
+#[derive(Debug, Clone)]
+pub struct ServiceConfig {
+    /// 单元文件绝对路径
+    pub path: String,
+    /// 文件内容（UTF-8；非 UTF-8 文件由底层转换为替换字符）
+    pub content: String,
+    /// 是否位于用户可覆盖目录（`/etc/systemd/` 下）
+    pub writable: bool,
+}
+
 #[async_trait]
 pub trait ServiceProvider: Send + Sync {
     fn init_system(&self) -> InitSystem;
@@ -159,6 +176,12 @@ pub trait ServiceProvider: Send + Sync {
     async fn set_enabled(&self, name: &UnitName, enabled: bool) -> Result<()>;
     /// 返回日志行接收端；调用方通过 SSE 转发
     async fn journal(&self, name: &UnitName, q: JournalQuery) -> Result<Receiver<String>>;
+    /// 读取服务单元文件内容（修改配置功能的数据源）。
+    /// 非 systemd 或无可编辑配置时返回 Unsupported。
+    async fn config_read(&self, name: &UnitName) -> Result<ServiceConfig>;
+    /// 写回单元文件并经 `daemon-reload` 重新加载；`restart` 为真时随后重启服务。
+    /// 写入前自动备份为 `<path>.panel.bak`，并原子替换（先写临时文件再 rename）。
+    async fn config_write(&self, name: &UnitName, content: &str, restart: bool) -> Result<()>;
 }
 
 // ═══════════════════════════ 软件包 ═══════════════════════════
@@ -209,6 +232,8 @@ pub struct FirewallRule {
     pub direction: Direction,
     pub source_cidr: Option<String>,
     pub comment: Option<String>,
+    /// 是否为面板自身写入的规则（"只删自己写的"守卫依据）
+    pub panel_managed: bool,
 }
 
 /// 期望的最终状态 —— 实现必须做到**幂等**（一致性测试会验证）
@@ -234,6 +259,9 @@ pub trait FirewallProvider: Send + Sync {
     async fn set_active(&self, active: bool) -> Result<()>;
     async fn list_rules(&self) -> Result<Vec<FirewallRule>>;
     async fn apply(&self, plan: RulePlan) -> Result<ApplyReport>;
+    /// 删除单条规则。`id` 来自 `list_rules` 返回的 `FirewallRule.id`。
+    /// 实现必须只允许删除面板自己创建的（由标记识别），拒绝删除用户既有规则。
+    async fn delete_rule(&self, id: &str) -> Result<()>;
     /// 规则快照用于"误操作应急恢复"（防 SSH 失联，设计方案 §4-M5）
     async fn snapshot(&self) -> Result<Vec<u8>>;
     async fn restore_snapshot(&self, data: &[u8]) -> Result<()>;
@@ -401,16 +429,168 @@ pub struct DbTarget {
     pub database: Option<String>,
 }
 
+/// 表元信息（浏览用）：表名 + 行数（估算；无法取得时为 -1）
+#[derive(Debug, Clone)]
+pub struct DbTable {
+    pub name: String,
+    pub rows: i64,
+}
+
+/// 只读数据预览（分页）。值一律**字符串化**（NULL → None），保持引擎无关，
+/// 避免在 OS 抽象层引入 JSON 类型；业务层按契约原样透出。
+#[derive(Debug, Clone, Default)]
+pub struct DbRows {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Option<String>>>,
+    /// 总行数（用于分页器）
+    pub total: i64,
+}
+
 #[async_trait]
 pub trait DatabaseProvider: Send + Sync {
     fn engine(&self) -> DbEngine;
     /// 外部客户端缺失时返回 Unsupported，前端据此置灰
     async fn available(&self) -> Result<bool>;
+    /// 该引擎是否**已实装**（用于逐连接可用性判定与能力位；未实装返回 false 而非撒谎）
+    fn supports(&self, e: DbEngine) -> bool;
     async fn databases(&self, t: &DbTarget) -> Result<Vec<String>>;
-    async fn tables(&self, t: &DbTarget) -> Result<Vec<String>>;
+    /// 表列表（含行数）
+    async fn tables(&self, t: &DbTarget) -> Result<Vec<DbTable>>;
+    /// **只读**数据预览（分页）。`table` 由业务层校验后传入，实现内部仍须安全加引号。
+    async fn rows(&self, t: &DbTarget, table: &str, limit: usize, offset: usize) -> Result<DbRows>;
     async fn backup(&self, t: &DbTarget, out: &SafePath,
                     on_line: Box<dyn Fn(String) + Send + Sync>) -> Result<()>;
     async fn restore(&self, t: &DbTarget, from: &SafePath) -> Result<()>;
+}
+
+// ═══════════════════════════ 安全基线 ═══════════════════════════
+
+/// 一条基线检查结果。`applicable=false` 表示**该环境不适用**（如未装 sshd），
+/// 与"通过"（`ok=true`）语义不同——UI 据此显示为灰色而非绿色。
+#[derive(Debug, Clone)]
+pub struct SecurityCheck {
+    /// 稳定标识（如 `ssh.permit_root_login`），一键修复按此定位
+    pub key: String,
+    pub title: String,
+    /// 是否满足安全期望（`applicable=false` 时此值无意义）
+    pub ok: bool,
+    /// 当前实际值（人类可读）
+    pub current: String,
+    /// 期望值（人类可读）
+    pub expected: String,
+    /// 修复建议
+    pub advice: String,
+    pub applicable: bool,
+}
+
+#[async_trait]
+pub trait SecurityProvider: Send + Sync {
+    /// **只读**安全基线扫描。实现**绝不修改系统**（修复是独立的高危操作）。
+    async fn baseline(&self) -> Result<Vec<SecurityCheck>>;
+}
+
+// ═══════════════════════════ 容器 ═══════════════════════════
+//
+// 关键诚实性约束：**CLI 二进制存在 ≠ 容器能力可用**。
+// 真实环境里最常见的失败不是"没装 docker"，而是"装了但当前身份连不上 daemon"
+// （不在 docker 组 / daemon 没起来）。所以能力判定看的是 **socket 可达性**，
+// 而不是二进制存在性——否则 UI 会给用户一个"能点但一点就报错"的假按钮。
+
+/// 容器引擎。只声明**已实装**的引擎：探测到别的（如仅 podman）应诚实置灰。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContainerEngine {
+    Docker,
+    None,
+}
+
+impl ContainerEngine {
+    pub fn as_str(self) -> &'static str {
+        match self { ContainerEngine::Docker => "docker", ContainerEngine::None => "none" }
+    }
+}
+
+/// 容器摘要（等价 `docker ps -a` 的关键列；状态字段直接取 CLI 的人类可读值，
+/// 不自行推算——`docker ps` 的 STATUS 已包含退出码与时长信息）。
+#[derive(Debug, Clone, Serialize)]
+pub struct ContainerSummary {
+    /// 完整 ID（短 ID 在 UI 层裁剪展示）
+    pub id: String,
+    pub name: String,
+    pub image: String,
+    /// 归一化状态：running / exited / created / paused / restarting / dead
+    pub state: String,
+    /// 人类可读状态描述（如 `Up 3 hours`、`Exited (0) 2 days ago`）
+    pub status: String,
+    pub ports: String,
+    pub created: String,
+}
+
+/// 镜像摘要（等价 `docker images`）。
+#[derive(Debug, Clone, Serialize)]
+pub struct ImageSummary {
+    pub id: String,
+    pub repository: String,
+    pub tag: String,
+    /// 人类可读体积（CLI 已格式化）
+    pub size: String,
+    pub created: String,
+}
+
+/// 容器生命周期动作。声明式——由平台实现翻译成具体 CLI 子命令，
+/// 业务层不出现 `start`/`stop` 之类命令字面量。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerAction {
+    Start,
+    Stop,
+    Restart,
+    Remove,
+}
+
+impl ContainerAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContainerAction::Start => "start",
+            ContainerAction::Stop => "stop",
+            ContainerAction::Restart => "restart",
+            ContainerAction::Remove => "remove",
+        }
+    }
+}
+
+#[async_trait]
+pub trait ContainerProvider: Send + Sync {
+    fn engine(&self) -> ContainerEngine;
+    /// 守护进程**真实可达**才为 true（socket 可连接）。
+    /// 同步且廉价：能力矩阵在启动时求值一次，此处只做一次 connect 尝试。
+    fn available(&self) -> bool;
+    /// 不可用原因（`binary_missing` / `daemon_unreachable`），可用时为 None。
+    /// UI 据此给出可操作的提示，而不是一句"不支持"。
+    fn unavailable_reason(&self) -> Option<&'static str>;
+    /// 列出全部容器（含已停止），等价 `docker ps -a`。
+    async fn list(&self) -> Result<Vec<ContainerSummary>>;
+    /// 列出镜像，等价 `docker images`。
+    async fn images(&self) -> Result<Vec<ImageSummary>>;
+    /// 执行生命周期动作。`id` 必须是容器 ID/名称，实现**必须**先校验字符集。
+    async fn act(&self, action: ContainerAction, id: &str) -> Result<()>;
+}
+
+// ═══════════════════════════ 终端 ═══════════════════════════
+//
+// 刻意**只**暴露"能不能开"与"用哪个 shell"，不暴露 PTY 本身：
+// PTY 的创建被收敛在 `cmd::spawn_pty`（全项目唯一子进程出口的不变量），
+// 平台实现的职责仅止于回答"这台机器上有没有可用的交互 shell"。
+
+/// 内置 Web 终端的后端能力。
+pub trait TerminalProvider: Send + Sync {
+    /// 是否具备可用的交互 shell（决定能力位与 UI 置灰）
+    fn available(&self) -> bool;
+    /// 首选的交互 shell；不可用时为 `None`。
+    ///
+    /// 返回 `Bin` 而**不是字符串**：保证"探测到的 shell"与"实际 spawn 的 shell"
+    /// 同源。若这里给字符串、调用方再按名字挑 `Bin`，两处优先级一旦不一致，
+    /// 就会出现"能力位说有 bash，实际用的却是 sh"这类静默漂移。
+    fn shell(&self) -> Option<crate::cmd::Bin>;
 }
 
 // ═══════════════════════════ 能力声明 ═══════════════════════════
