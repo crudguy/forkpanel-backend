@@ -620,15 +620,19 @@ components:
     # ───────────── 任务中心 ─────────────
     Task:
       type: object
+      description: task_runs 行实态（无 params/stage 列，不虚构）
       properties:
-        id: { type: string }
+        id: { type: integer }
+        key: { type: string, description: 任务体标识（task_id） }
         kind: { type: string }
         state: { type: string, enum: [queued, running, ok, failed, canceled, interrupted] }
         progress: { type: integer, minimum: 0, maximum: 100 }
-        stage: { type: [string, "null"] }
         started_at: { type: [integer, "null"] }
         finished_at: { type: [integer, "null"] }
         exit_code: { type: [integer, "null"] }
+        output_path: { type: [string, "null"] }
+        duration_secs: { type: [integer, "null"], description: 仅单体详情返回 }
+        needs_human: { type: boolean, description: interrupted 时为 true（UI 标红） }
 
     # ───────────── 设置 / 用户 / 审计 ─────────────
     SettingsReport:
@@ -1511,14 +1515,14 @@ paths:
   /api/v1/cron/preview:
     post:
       tags: [cron]
-      summary: 下次 5 次执行时间预览
+      summary: 下次 5 次执行时间预览（本地时区语义；next 可为空 = 一年内无命中）
       requestBody: { required: true, content: { application/json: { schema: { type: object, required: [expr], properties: { expr: { type: string } } } } } }
       responses:
         '200':
           description: ok
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { type: integer } } } }
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { expr: { type: string }, next: { type: array, items: { type: integer } } } } } }
 
   # ───────── 日志 ─────────
   /api/v1/logs/sources:
@@ -1544,14 +1548,24 @@ paths:
         - { name: follow, in: query, schema: { type: boolean, default: true } }
         - { name: limit, in: query, schema: { type: integer, maximum: 2000, default: 200 } }
       responses: { '200': { description: text/event-stream } }
-  /api/v1/logs/download:
+  /api/v1/logs/{id}/download:
     get:
       tags: [logs]
-      summary: 日志下载（限大小）
+      summary: 日志下载（text/plain 附件；行数 ≤10_000 且累计 ≤8MB，超限 X-Capped:1）
       parameters:
-        - { name: source, in: query, schema: { type: string } }
-        - { name: range, in: query, schema: { type: string } }
-      responses: { '200': { description: text/plain' } }
+        - { name: id, in: path, required: true, schema: { type: string }, description: 日志源 id }
+        - { name: lines, in: query, schema: { type: integer }, description: 尾部行数（默认 2000，上限 10000） }
+        - { name: grep, in: query, schema: { type: string }, description: 字面量子串过滤（非正则） }
+        - { name: level, in: query, schema: { type: string } }
+        - { name: since, in: query, schema: { type: integer }, description: unix 秒，只返回其后日志 }
+      responses:
+        '200':
+          description: ok
+          headers:
+            Content-Disposition: { schema: { type: string }, description: attachment; filename="<source>.log" }
+          content:
+            text/plain:
+              schema: { type: string }
 
   /api/v1/logs/{id}:
     get:
@@ -1584,7 +1598,8 @@ paths:
   /api/v1/tasks/{id}:
     get:
       tags: [tasks]
-      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      summary: 单任务详情（含 duration_secs 派生字段；404 对不存在任务）
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/Task' } } } } } } }
   /api/v1/tasks/{id}/cancel:
     post:

@@ -307,30 +307,55 @@ fn dow_from_days(z: i64) -> u8 {
     ((z % 7) + 4).rem_euclid(7) as u8
 }
 
+/// 本地时区相对 UTC 的偏移秒数（东八区 = +28800）。
+///
+/// crontab 的触发语义是**服务器本地时间**（`0 9 * * *` = 本地 09:00），而
+/// 纪元秒是世界时的——不做偏移换算，预览就会在非 UTC 机器上整体漂移
+/// （东八区差 8 小时，等于给用户看错的时刻）。用 libc `localtime_r`
+/// （线程安全版）读 `tm_gmtoff`；任何失败一律退回 0（退化为 UTC 语义，
+/// 不 panic 不阻塞）。
+fn local_utc_offset_secs_at(now_unix: i64) -> i64 {
+    let t = now_unix as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let ok = unsafe { libc::localtime_r(&t, &mut tm) };
+    if ok.is_null() { 0 } else { tm.tm_gmtoff as i64 }
+}
+
 /// 暴力枚举下 n 次触发（分钟粒度）。expr 非法或超出 1 年窗口返回空。
 fn next_fire_times(expr: &str, n: usize) -> Result<Vec<i64>> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    Ok(next_fire_times_from(expr, n, now, local_utc_offset_secs_at(now)))
+}
+
+/// 纯函数核心：`now_unix`（UTC 纪元秒）与 `off`（本地偏移秒）显式注入，
+/// 避开对系统时钟/时区的隐式依赖——回归测试才能钉死本地语义。
+/// 返回值仍是 **UTC 纪元秒**（与全仓时间戳约定一致，前端负责本地渲染）。
+fn next_fire_times_from(expr: &str, n: usize, now_unix: i64, off: i64) -> Vec<i64> {
     let f: Vec<&str> = expr.split_whitespace().collect();
-    if f.len() != 5 { return Ok(Vec::new()); }
+    if f.len() != 5 { return Vec::new(); }
     let mins = parse_field(f[0], 0, 59).unwrap_or_default();
     let hrs = parse_field(f[1], 0, 23).unwrap_or_default();
     let doms = parse_field(f[2], 1, 31).unwrap_or_default();
     let mons = parse_field(f[3], 1, 12).unwrap_or_default();
     let dows = parse_field(f[4], 0, 7).unwrap_or_default();
     if mins.is_empty() || hrs.is_empty() || doms.is_empty() || mons.is_empty() || dows.is_empty() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
     let dom_star = f[2] == "*";
     let dow_star = f[4] == "*";
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let mut cursor = (now / 60 + 1) * 60;   // 下一整分钟起
+    let mut cursor = (now_unix / 60 + 1) * 60;   // 下一整分钟起
     let mut out = Vec::new();
-    let limit = cursor + 366 * 24 * 3600;   // 最多看 1 年
+    let limit = cursor + 366 * 24 * 3600;        // 最多看 1 年
     while cursor < limit && out.len() < n {
-        let days = cursor / 86400;
-        let sec_of_day = cursor % 86400;
+        // civil 字段一律按**本地时间**取：cursor 是 UTC 纪元秒，
+        // 加偏移后才是「钟面时刻」；命中后推回的仍是 UTC 纪元秒。
+        let local = cursor + off;
+        let days = local.div_euclid(86400);
+        let sec_of_day = local.rem_euclid(86400);
         let (_y, mo, d) = ymd_from_days(days);
         let h = (sec_of_day / 3600) as u32;
         let mi = ((sec_of_day % 3600) / 60) as u32;
@@ -344,7 +369,7 @@ fn next_fire_times(expr: &str, n: usize) -> Result<Vec<i64>> {
         }
         cursor += 60;
     }
-    Ok(out)
+    out
 }
 
 #[allow(dead_code)]
@@ -372,5 +397,72 @@ impl Capable for LinuxScheduler {
         let found = SEARCH.iter()
             .any(|d| std::path::Path::new(d).join("crontab").is_file());
         if found { Capability::yes("crontab") } else { Capability::no("binary_missing") }
+    }
+}
+
+#[cfg(test)]
+mod tz_tests {
+    use super::next_fire_times_from;
+
+    const OFF8: i64 = 8 * 3600; // 东八区
+
+    /// 本地钟面渲染辅助：把 UTC 纪元秒按 offset 渲染成 (时, 分)
+    fn hm(t: i64, off: i64) -> (u32, u32) {
+        let s = (t + off).rem_euclid(86400);
+        ((s / 3600) as u32, ((s % 3600) / 60) as u32)
+    }
+
+    /// **回归（东八区漂移）**：`0 9 * * *` 的每次触发，按本地钟面必须是 09:00。
+    /// 旧实现按 UTC 取 civil 字段，本机渲染出的会是 17:00——crontab 真实
+    /// 触发却在本地 09:00，预览整体漂 8 小时。
+    #[test]
+    fn daily_9am_is_local_not_utc() {
+        // 固定 now：2026-01-15 00:00 UTC（避免依赖系统时钟）
+        let now: i64 = 17_684_448_000;
+        let out = next_fire_times_from("0 9 * * *", 5, now, OFF8);
+        assert_eq!(out.len(), 5, "应找出 5 次触发");
+        for t in &out {
+            assert!(*t > now, "触发时刻必须晚于 now");
+            assert_eq!(hm(*t, OFF8), (9, 0), "本地钟面必须是 09:00（UTC 渲染则会是 01:00）");
+        }
+        // 相邻触发间隔恰好 24h
+        assert_eq!(out[1] - out[0], 86_400);
+    }
+
+    /// 负偏移（西半球）同样成立：`30 22 * * *` → 本地 22:30
+    #[test]
+    fn negative_offset_also_local() {
+        let now: i64 = 17_684_448_000;
+        let off = -5 * 3600;
+        let out = next_fire_times_from("30 22 * * *", 3, now, off);
+        assert_eq!(out.len(), 3);
+        for t in &out {
+            assert_eq!(hm(*t, off), (22, 30));
+        }
+    }
+
+    /// 步进/列表/范围语法照常工作（本地语义下）
+    #[test]
+    fn step_and_list_syntax() {
+        let now: i64 = 17_684_448_000; // 周四
+        // 每 15 分钟：相邻间隔 900s
+        let out = next_fire_times_from("*/15 * * * *", 3, now, 0);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[1] - out[0], 900);
+        // 多值列表 0,30
+        let out = next_fire_times_from("0,30 12 * * *", 4, now, 0);
+        assert_eq!(out[1] - out[0], 1_800);
+        // dom 与 dow 同时非星号 → OR 语义（Vixie cron 约定）
+        let out = next_fire_times_from("0 0 13 * 5", 8, now, 0); // 13 号或周五
+        assert!(out.len() >= 2);
+    }
+
+    /// 永不触发的表达式：返回空（诚实预览），而不是死循环
+    #[test]
+    fn impossible_expr_returns_empty_within_window() {
+        let now: i64 = 17_684_448_000;
+        // 2 月 31 日不存在 → 1 年窗口内零命中
+        let out = next_fire_times_from("0 5 31 2 *", 5, now, 0);
+        assert!(out.is_empty());
     }
 }

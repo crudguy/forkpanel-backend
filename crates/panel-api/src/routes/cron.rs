@@ -435,12 +435,26 @@ impl panel_task::TaskBody for CronRunTask {
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PreviewReq {
+    pub expr: String,
+}
+
+/// 下次 5 次执行时间预览（编辑器里改表达式时先看会几点跑）。
+/// **纯计算零副作用**：表达式合法性仍由平台校验（与 create 同一入口），
+/// 时刻计算委托 provider 的 `next_fire_times`（本地时区语义，已回归测试钉死）。
 pub async fn preview(
-    State(state): State<Shared>, Auth(s): Auth,
+    State(state): State<Shared>, Auth(s): Auth, Json(req): Json<PreviewReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::CRON_VIEW)?;
-    let _ = state;
-    Err(ApiError::unsupported("cron.preview (M3: 下次执行预览已由 list 返回 next[])"))
+    if !state.capabilities.get(cap_keys::SCHEDULER_MANAGE).map(|c| c.supported).unwrap_or(false) {
+        return Err(ApiError::unsupported("scheduler.manage"));
+    }
+    state.os.scheduler().validate_expression(&req.expr)
+        .map_err(|e| ApiError::bad_request("expr", e.to_string()))?;
+    let next = state.os.scheduler().next_fire_times(&req.expr, 5).unwrap_or_default();
+    // 空 = 字段合法但 1 年内无命中（如 `0 5 31 2 *`）——诚实返回空数组，UI 负责解释
+    Ok(ok(serde_json::json!({ "expr": req.expr, "next": next })))
 }
 
 #[cfg(test)]

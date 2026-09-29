@@ -14,6 +14,8 @@ use crate::{
 };
 use axum::{
     extract::{Path as AxPath, Query, State},
+    http::header,
+    response::{IntoResponse, Response},
     Json,
 };
 use panel_core::{cap_keys, Result};
@@ -132,12 +134,73 @@ pub async fn clear_panel(
 // ─────────────── 文档式日志端点（M3 占位） ───────────────
 // 注：`/api/v1/logs/stream` 的实时跟随已实装，见 `crate::sse::log_stream`。
 
+/// 下载允许比在线读更大（全量消费场景），但仍有服务端硬上限：
+/// 行数 ≤10_000，**累计字节 ≤8MB**（防超长行把内存打爆）。
+const DOWNLOAD_MAX_LINES: usize = 10_000;
+const DOWNLOAD_MAX_LINE: usize = 16_384;
+const DOWNLOAD_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, Deserialize)]
+pub struct DownloadQ {
+    pub lines: Option<usize>,
+    pub grep: Option<String>,
+    pub level: Option<String>,
+    pub since: Option<i64>,
+}
+
+/// 日志下载：与 read 同参，但以 text/plain 附件返回（浏览器直接保存）。
 pub async fn download(
     State(state): State<Shared>, Auth(s): Auth,
-) -> ApiResult<Json<serde_json::Value>> {
+    AxPath(id): AxPath<String>, Query(q): Query<DownloadQ>,
+) -> ApiResult<Response> {
     crate::auth::require(&s, perm::LOG_VIEW)?;
-    let _ = state;
-    Err(ApiError::unsupported("logs.download (M3)"))
+    let src = find_source(&state, &id).await?;
+    let lines = q.lines.unwrap_or(2000).min(DOWNLOAD_MAX_LINES);
+    let grep = match q.grep {
+        Some(g) if g.len() > 256 =>
+            return Err(ApiError::bad_request("grep", "pattern too long (max 256)")),
+        Some(g) if g.is_empty() => None,
+        g => g,
+    };
+    let query = panel_os::LogQuery {
+        lines, grep, level: q.level, follow: false, since_unix: q.since,
+    };
+    let out = state.os.logs().read(&src, query).await?;
+
+    let mut body = String::new();
+    let mut hit_byte_cap = false;
+    for l in &out {
+        if body.len() >= DOWNLOAD_MAX_BYTES { hit_byte_cap = true; break; }
+        let t = if l.text.len() > DOWNLOAD_MAX_LINE {
+            format!("{}…(已截断)", &l.text[..DOWNLOAD_MAX_LINE])
+        } else {
+            l.text.clone()
+        };
+        body.push_str(&t);
+        body.push('\n');
+    }
+    let capped = hit_byte_cap || out.len() >= lines;
+
+    // 文件名：source id 由面板自产（panel / service:nginx / site:xxx），
+    // 非 [A-Za-z0-9._-] 一律替换为 _，避免 Content-Disposition 注入
+    let safe: String = id.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+        .collect();
+    let cd = format!("attachment; filename=\"{safe}.log\"");
+    let mut resp = (
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CONTENT_DISPOSITION, cd.as_str()),
+        ],
+        body,
+    ).into_response();
+    if capped {
+        resp.headers_mut().insert(
+            header::HeaderName::from_static("x-capped"),
+            header::HeaderValue::from_static("1"),
+        );
+    }
+    Ok(resp)
 }
 
 #[cfg(test)]

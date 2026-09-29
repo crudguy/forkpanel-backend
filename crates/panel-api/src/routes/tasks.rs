@@ -103,14 +103,41 @@ pub async fn output(
     Ok(ok(serde_json::json!({ "id": id, "lines": content })))
 }
 
-// ─────────────── 文档式任务端点（M2 占位） ───────────────
+// ─────────────── 单任务详情 ───────────────
 
+/// 单任务详情：列表已含全部列，这里补**派生字段**（duration_secs）并支持
+/// 按 id 单点轮询（前端弹层对 running 任务每 2s 拉一次进度，不必重拉全表）。
+/// 不虚构参数/历史字段——task_runs 表没有 params 列，契约已按实态对齐。
 pub async fn get(
     State(state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::TASK_VIEW)?;
-    let _ = (state, id);
-    Err(ApiError::unsupported("task.get (使用 /tasks?state= 过滤；单体详情 M2 接入)"))
+    let row = state.pool.with(move |conn| {
+        conn.query_row(
+            "SELECT id, task_id, kind, state, progress, started_at, finished_at, exit_code, output_path
+             FROM task_runs WHERE id = ?1",
+            rusqlite::params![id],
+            |r| Ok((
+                r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?, r.get::<_, i32>(4)?, r.get::<_, Option<i64>>(5)?,
+                r.get::<_, Option<i64>>(6)?, r.get::<_, Option<i32>>(7)?,
+                r.get::<_, Option<String>>(8)?,
+            )),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => PanelError::NotFound(format!("task {id}")),
+            other => PanelError::Database(other.to_string()),
+        })
+    }).await?;
+
+    let (id, key, kind, st, prog, sa, fa, ec, op) = row;
+    let duration = match (sa, fa) { (Some(a), Some(b)) => Some(b - a), _ => None };
+    Ok(ok(serde_json::json!({
+        "id": id, "key": key, "kind": kind, "state": st, "progress": prog,
+        "started_at": sa, "finished_at": fa, "exit_code": ec, "output_path": op,
+        "duration_secs": duration,
+        "needs_human": st == "interrupted",
+    })))
 }
 
 #[cfg(test)]

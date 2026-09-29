@@ -178,7 +178,7 @@ pub fn build_router(state: Shared) -> Router {
     let log_r = Router::new()
         .route("/api/v1/logs/sources", get(logs::sources))
         .route("/api/v1/logs/stream", get(crate::sse::log_stream))
-        .route("/api/v1/logs/download", get(logs::download))
+        .route("/api/v1/logs/{id}/download", get(logs::download))
         .route("/api/v1/logs/{id}", get(logs::read));
 
     // ── 备份计划（本地） ──
