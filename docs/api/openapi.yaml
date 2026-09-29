@@ -597,10 +597,38 @@ components:
         exit_code: { type: [integer, "null"] }
 
     # ───────────── 设置 / 用户 / 审计 ─────────────
-    Settings:
+    SettingsReport:
       type: object
-      description: 面板设置（端口/绑定/TLS/档位/语言/主题等），具体字段见 config.toml
-      additionalProperties: true
+      description: 三段诚实模型——runtime 可改即生效；deployment 只读展示实际生效值；reserved 种子预留未接线
+      properties:
+        runtime:
+          type: object
+          properties:
+            endpoint:     { type: [string, "null"], description: assistant.llm_endpoint }
+            model:        { type: [string, "null"], description: assistant.llm_model }
+            api_key_set:  { type: boolean, description: assistant.llm_api_key 是否已设置（永不明文） }
+        deployment:
+          type: object
+          description: 部署级只读展示（改 config.toml 并重启）
+          properties:
+            read_only: { type: boolean }
+            tier:      { type: string, enum: [nano, small, standard] }
+            hint:      { type: string }
+        reserved:
+          type: object
+          properties:
+            wired:  { type: boolean, enum: [false] }
+            note:   { type: string }
+            values: { type: object, additionalProperties: { type: string } }
+
+    SettingsPatch:
+      type: object
+      required: [settings]
+      properties:
+        settings:
+          type: object
+          description: 键值对；白名单=assistant.llm_endpoint/llm_model/llm_api_key；值 null=清除该键
+          additionalProperties: { type: [string, "null"] }
     User:
       type: object
       properties:
@@ -1516,14 +1544,19 @@ paths:
   /api/v1/settings:
     get:
       tags: [settings]
-      summary: 面板设置
-      responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/Settings' } } } } } } }
+      summary: 面板设置（三段诚实模型）
+      security: [cookieAuth]
+      responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/SettingsReport' } } } } } } }
     patch:
       tags: [settings]
-      summary: 修改设置（端口/绑定/TLS/档位/语言/主题/通知）
+      summary: 修改 runtime 设置（当前仅 AI 助手 LLM 三键；api_key 经主密钥加密，GET 永不明文）
+      description: |
+        白名单：`assistant.llm_endpoint`（http(s) URL）/ `assistant.llm_model` /
+        `assistant.llm_api_key`（值 null = 清除）。部署级键（read_only/tier/
+        max_login_attempts/session_idle_timeout）返回 400——请改 config.toml 并重启。
       security: [cookieAuth, csrfHeader]
-      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
-      responses: { '204': { description: ok } }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SettingsPatch' } } } }
+      responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/SettingsReport' } } } } } } }
   /api/v1/users:
     get:
       tags: [users]

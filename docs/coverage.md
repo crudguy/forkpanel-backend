@@ -123,7 +123,7 @@
 
 | 方法 + 路径 | 文档要求 | 后端状态 | 备注 | 前端视图 |
 |---|---|---|---|---|
-| GET `/settings` / PATCH `/settings` | 面板设置 | 🟡 | **全占位**（唯一「前端页在、后端全 501」模块）；未来 LLM key/webhook 落点 | SettingsView（未接后端） |
+| GET `/settings` / PATCH `/settings` | 面板设置 | ✅ | **三段诚实模型**：runtime（AI 助手 LLM 三键，api_key 主密钥加密、GET 永不明文）可改即生效；deployment（read_only/tier）只读展示；reserved 种子键如实标注未接线。PATCH 部署级键 400 | SettingsView |
 | GET/POST `/users` + PATCH/DELETE `/users/{id}` | 用户管理 | ✅ | 含降级/自操作守卫全套（13 项守卫冒烟通过） | UsersView |
 | GET `/audit` | 审计（分页/过滤） | ✅ | | AuditView |
 
@@ -146,7 +146,7 @@
 ## 覆盖结论（2026-09-29）
 
 - **契约完整度：100%**，且新增模块全部先进 `openapi.yaml` 再实现（前端副本按事实源同步）。
-- **剩余 🟡 清单**（结构化 501，均如实返回原因）：files stat/upload/download/action、settings 全部、security sessions/revoke、baseline/apply、tasks/{id}、cron/preview、logs/download、db 与备份的 restore、ACME。
+- **剩余 🟡 清单**（结构化 501，均如实返回原因）：files stat/upload/download/action、security sessions/revoke、baseline/apply、tasks/{id}、cron/preview、logs/download、db 与备份的 restore、ACME。
 - **🟠 真机验证项**：nginx 下发/reload、ufw、mysql/postgres 链路、ACME——能力位诚实置灰，沙箱内只验证降级路径。
 - **能力驱动 UI**：未支持能力一律 EmptyState/置灰 + 原因，绝不假装可用。
 
