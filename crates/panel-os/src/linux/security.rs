@@ -6,7 +6,7 @@
 
 use crate::traits::*;
 use async_trait::async_trait;
-use panel_core::Result;
+use panel_core::{PanelError, Result};
 use std::path::{Path, PathBuf};
 
 /// Linux 安全基线：读配置/探测既有事实，产出发现项。
@@ -122,6 +122,11 @@ fn ssh_checks(cfg: &Path) -> Vec<SecurityCheck> {
 
 #[async_trait]
 impl SecurityProvider for LinuxSecurity {
+    /// 一键修复：委托 [`apply_ssh_item`]（先备份 → 写 → `sshd -t` 校验 → 失败回滚）。
+    async fn apply(&self, key: &str) -> Result<crate::traits::SecurityApplyResult> {
+        apply_ssh_item(key).await
+    }
+
     async fn baseline(&self) -> Result<Vec<SecurityCheck>> {
         let mut out = Vec::new();
         let cfg = Self::sshd_config_path();
@@ -177,6 +182,122 @@ impl SecurityProvider for LinuxSecurity {
 
         Ok(out)
     }
+}
+
+// ─────────────── 一键修复（**高危写**：先备份 → 写 → 校验 → 失败回滚） ───────────────
+
+/// 基线项 → (sshd 指令名, 期望值)。**白名单以外一律不修**（未知项直接报错）。
+pub(crate) fn ssh_fix_target(key: &str) -> Option<(&'static str, &'static str)> {
+    match key {
+        "ssh.permit_root_login" => Some(("PermitRootLogin", "no")),
+        "ssh.password_auth" => Some(("PasswordAuthentication", "no")),
+        // PubkeyAuthentication **只允许设为 yes**：置 no 会把所有人（含面板自己）锁在门外
+        "ssh.pubkey_auth" => Some(("PubkeyAuthentication", "yes")),
+        _ => None,
+    }
+}
+
+/// 把 `Key <value>` 写入 sshd 配置文本：已存在则替换（保留注释行），否则追加。
+///
+/// **纯函数**——写盘前后各有备份与校验，但"生成什么内容"这件事必须可单测验证。
+pub(crate) fn apply_ssh_directive(content: &str, key: &str, value: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut replaced = false;
+    for line in content.lines() {
+        let t = line.trim();
+        let hit = !t.starts_with('#')
+            && t.split_whitespace()
+                .next()
+                .map(|w| w.eq_ignore_ascii_case(key))
+                .unwrap_or(false);
+        if hit {
+            out.push(format!("{key} {value}"));
+            replaced = true;
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    if !replaced {
+        out.push(format!("{key} {value}"));
+    }
+    let mut s = out.join("\n");
+    if !s.ends_with('\n') {
+        s.push('\n');
+    }
+    s
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 修复一项 sshd 基线。**校验器不可用时拒绝修改**——
+/// 宁可不修，也不写坏配置把人锁在服务器门外。
+pub(crate) async fn apply_ssh_item(key: &str) -> Result<SecurityApplyResult> {
+    let Some((directive, value)) = ssh_fix_target(key) else {
+        return Err(PanelError::Validation {
+            field: "key".into(),
+            reason: format!("不支持自动修复的基线项：{key}（仅支持 ssh.permit_root_login / ssh.password_auth / ssh.pubkey_auth）"),
+        });
+    };
+
+    if !crate::cmd::Bin::available(crate::cmd::Bin::Sshd) {
+        return Err(PanelError::Validation {
+            field: "sshd".into(),
+            reason: "sshd 不可用，无法校验配置语法 → 拒绝自动修改（避免写错导致无法登录）".into(),
+        });
+    }
+
+    let path = LinuxSecurity::sshd_config_path();
+    if !path.exists() {
+        return Err(PanelError::NotFound(format!("sshd 配置不存在：{}", path.display())));
+    }
+    let orig = std::fs::read_to_string(&path).map_err(|e| PanelError::Io(e.to_string()))?;
+    let next = apply_ssh_directive(&orig, directive, value);
+    if next == orig {
+        // 已符合预期：不写盘、不备份
+        return Ok(SecurityApplyResult { changed: false, backup: None, validated: true });
+    }
+
+    // ① 先备份
+    let backup = path.with_extension(format!("conf.panel.bak-{}", now_secs()));
+    std::fs::copy(&path, &backup).map_err(|e| PanelError::Io(e.to_string()))?;
+
+    // ② 写（失败则备份仍在、原文件未变）
+    if let Err(e) = std::fs::write(&path, &next) {
+        return Err(PanelError::Io(format!(
+            "写入失败，原配置未改动（备份 {}）：{e}",
+            backup.display()
+        )));
+    }
+
+    // ③ 校验：不通过立刻回滚
+    let out = crate::cmd::run(
+        crate::cmd::Bin::Sshd,
+        &["-t", "-f", &path.to_string_lossy()],
+        crate::cmd::CmdOpt { timeout: std::time::Duration::from_secs(10), ..Default::default() },
+    )
+    .await;
+    let ok = matches!(&out, Ok(o) if o.code == Some(0));
+    if !ok {
+        let _ = std::fs::copy(&backup, &path); // 回滚
+        let why = match out {
+            Ok(o) => o.stderr,
+            Err(e) => e.to_string(),
+        };
+        return Err(PanelError::Command {
+            bin: "sshd".into(),
+            detail: format!(
+                "配置校验未通过，已自动回滚（原配置已恢复，备份 {}）：{why}",
+                backup.display()
+            ),
+        });
+    }
+
+    Ok(SecurityApplyResult { changed: true, backup: Some(backup), validated: true })
 }
 
 #[cfg(test)]
@@ -248,6 +369,40 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn apply_replaces_existing_directive_and_keeps_comments() {
+        let src = "#PermitRootLogin yes\nPermitRootLogin yes\nPort 22\n";
+        let out = super::apply_ssh_directive(src, "PermitRootLogin", "no");
+        assert!(out.contains("PermitRootLogin no"));
+        assert!(out.contains("#PermitRootLogin yes"), "注释行必须保留，不得被顺手改写");
+        assert!(out.contains("Port 22"));
+        assert_eq!(out.matches("PermitRootLogin no").count(), 1, "不得产生两条生效指令");
+    }
+
+    #[test]
+    fn apply_appends_when_absent_and_ends_with_newline() {
+        let out = super::apply_ssh_directive("Port 22\n", "PasswordAuthentication", "no");
+        assert!(out.ends_with("PasswordAuthentication no\n"));
+    }
+
+    #[test]
+    fn apply_is_idempotent() {
+        let once = super::apply_ssh_directive("Port 22\n", "PubkeyAuthentication", "yes");
+        let twice = super::apply_ssh_directive(&once, "PubkeyAuthentication", "yes");
+        assert_eq!(once, twice, "重复修复不得重复追加同一指令");
+    }
+
+    #[test]
+    fn fix_target_whitelist_and_pubkey_guardrail() {
+        assert_eq!(super::ssh_fix_target("ssh.permit_root_login"), Some(("PermitRootLogin", "no")));
+        assert_eq!(super::ssh_fix_target("ssh.password_auth"), Some(("PasswordAuthentication", "no")));
+        // **护栏**：pubkey 只允许置 yes —— 置 no 会把所有人（含面板自己）锁在门外
+        assert_eq!(super::ssh_fix_target("ssh.pubkey_auth"), Some(("PubkeyAuthentication", "yes")));
+        // 白名单以外一律不修
+        assert!(super::ssh_fix_target("system.auto_updates").is_none());
+        assert!(super::ssh_fix_target("ssh.permit_root_login; rm -rf /").is_none());
+    }
+
     fn ssh_missing_config_is_not_applicable() {
         let items = ssh_checks(Path::new("/nonexistent/sshd_config"));
         assert!(items.iter().all(|c| !c.applicable), "缺配置应标不适用（而非通过）");

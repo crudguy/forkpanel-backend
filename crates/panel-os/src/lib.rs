@@ -143,7 +143,14 @@ impl OsAdapter for linux::LinuxOsAdapter {
         } else {
             Capability::no("no_engine")
         });
-        m.insert(k::SSL_ACME.into(), Capability::no("not_implemented"));
+        // ACME：按设计 §5.3 的"certbot 回退实现"路线（内置 instant-acme 留作后续，
+        // 需评估 DNS-01 与各家 CA 兼容性）。能力位看**二进制存在性**——
+        // 没有 certbot 就诚实置灰，绝不给出"能点但必失败"的假按钮。
+        m.insert(k::SSL_ACME.into(), if crate::cmd::Bin::Certbot.available() {
+            Capability::yes("certbot")
+        } else {
+            Capability::no("certbot_missing")
+        });
         // 面板自签：本机有 openssl 即可（离线可用），与 ACME 相互独立
         m.insert(k::SSL_SELFSIGNED.into(), if tls::available() {
             Capability::yes("openssl")

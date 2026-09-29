@@ -82,6 +82,8 @@ pub enum TaskKind {
     Database,
     /// 面板内部周期任务
     Internal,
+    /// 恢复（备份回写 / 数据库导入）：**覆盖当前数据，副作用不可回滚**
+    Restore,
 }
 
 impl TaskKind {
@@ -90,7 +92,7 @@ impl TaskKind {
             Self::Package => "package", Self::Backup => "backup",
             Self::CertIssue => "cert_issue", Self::ConfigApply => "config_apply",
             Self::Service => "service", Self::Database => "database",
-            Self::Internal => "internal",
+            Self::Internal => "internal", Self::Restore => "restore",
         }
     }
 
@@ -103,6 +105,8 @@ impl TaskKind {
             Self::Package => RetryPolicy { max_attempts: 1, base_delay: Duration::ZERO, max_delay: Duration::ZERO },
             Self::CertIssue => RetryPolicy { max_attempts: 3, base_delay: Duration::from_secs(60), max_delay: Duration::from_secs(900) },
             Self::ConfigApply | Self::Service => RetryPolicy { max_attempts: 2, base_delay: Duration::from_secs(2), max_delay: Duration::from_secs(10) },
+            // 恢复会覆盖当前数据：自动重试 = 再覆盖一次，绝不重试（与 Package 同纪律）
+            Self::Restore => RetryPolicy { max_attempts: 1, base_delay: Duration::ZERO, max_delay: Duration::ZERO },
             Self::Backup | Self::Database | Self::Internal => RetryPolicy { max_attempts: 3, base_delay: Duration::from_secs(5), max_delay: Duration::from_secs(60) },
         }
     }

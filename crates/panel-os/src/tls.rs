@@ -14,6 +14,68 @@ use std::time::Duration;
 /// openssl 是否可用（供能力位 `ssl.selfsigned` 判定）。只做存在性检查。
 pub fn available() -> bool { Bin::OpenSsl.available() }
 
+/// ACME 是否可用（certbot 存在）。与面板自签**相互独立**，各自置灰互不干扰。
+pub fn acme_available() -> bool { Bin::Certbot.available() }
+
+/// certbot 默认产物目录。签发/续期后从这里读回证书与私钥。
+fn acme_live_dir(domain: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("/etc/letsencrypt/live/{domain}"))
+}
+
+/// 以 **http-01 webroot** 方式用 certbot 签发证书。
+///
+/// 走 `cmd::run`（唯一子进程出口，argv 直传不经 shell）；域名与邮箱由调用方校验。
+/// 返回 `(fullchain, privkey)` 的 PEM 文本——落盘加密沿用自签的同一条路径。
+pub async fn issue_acme(
+    domain: &str,
+    email: &str,
+    webroot: &std::path::Path,
+) -> Result<(String, String)> {
+    let w = webroot
+        .to_str()
+        .ok_or_else(|| panel_core::PanelError::Internal("webroot 路径非 UTF-8".into()))?;
+    let out = crate::cmd::run(
+        Bin::Certbot,
+        &[
+            "certonly", "--webroot", "-w", w, "-d", domain,
+            "--non-interactive", "--agree-tos", "-m", email,
+            "--keep-until-expiring", "--quiet",
+        ],
+        crate::cmd::CmdOpt { timeout: std::time::Duration::from_secs(600), ..Default::default() },
+    )
+    .await?;
+    if out.code != Some(0) {
+        return Err(panel_core::PanelError::Command { bin: "certbot".into(), detail: out.stderr });
+    }
+    read_acme_pair(domain)
+}
+
+/// 续期：`certbot renew` 后重读该域名的证书对。
+/// 未到续期窗口时 certbot 会跳过（--keep-until-expiring），读到的仍是当前有效证书。
+pub async fn renew_acme(domain: &str) -> Result<(String, String)> {
+    let out = crate::cmd::run(
+        Bin::Certbot,
+        &["renew", "--non-interactive", "--quiet"],
+        crate::cmd::CmdOpt { timeout: std::time::Duration::from_secs(600), ..Default::default() },
+    )
+    .await?;
+    if out.code != Some(0) {
+        return Err(panel_core::PanelError::Command { bin: "certbot".into(), detail: out.stderr });
+    }
+    read_acme_pair(domain)
+}
+
+fn read_acme_pair(domain: &str) -> Result<(String, String)> {
+    let d = acme_live_dir(domain);
+    let cert = std::fs::read_to_string(d.join("fullchain.pem")).map_err(|e| {
+        panel_core::PanelError::Io(format!("读取证书失败 {}/fullchain.pem：{e}", d.display()))
+    })?;
+    let key = std::fs::read_to_string(d.join("privkey.pem")).map_err(|e| {
+        panel_core::PanelError::Io(format!("读取私钥失败 {}/privkey.pem：{e}", d.display()))
+    })?;
+    Ok((cert, key))
+}
+
 /// 为 `domains` 生成自签证书（RSA-2048，多域名写入 SAN）。返回 `(cert_pem, key_pem)`。
 ///
 /// `tmp_dir` 为中间产物目录（由调用方经 `PathLayout` 提供，避免此处硬编码平台路径）；

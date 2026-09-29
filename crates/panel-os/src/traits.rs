@@ -483,10 +483,30 @@ pub struct SecurityCheck {
     pub applicable: bool,
 }
 
+/// 一键修复的结果。**必须携带备份路径**——修复出事时可回滚。
+#[derive(Debug, Clone, Serialize)]
+pub struct SecurityApplyResult {
+    /// 是否实际改动（已符合预期时为 false，不写盘）
+    pub changed: bool,
+    /// 修改**前**的备份文件路径，用户可据此回滚
+    pub backup: Option<std::path::PathBuf>,
+    /// 是否通过了配置语法校验（如 `sshd -t`）
+    pub validated: bool,
+}
+
 #[async_trait]
 pub trait SecurityProvider: Send + Sync {
     /// **只读**安全基线扫描。实现**绝不修改系统**（修复是独立的高危操作）。
     async fn baseline(&self) -> Result<Vec<SecurityCheck>>;
+
+    /// **高危写操作**：一键修复指定基线项。
+    ///
+    /// 纪律（实现必须遵守）：
+    /// 1. **先备份**再写，备份路径回传；
+    /// 2. 写完**必须校验**（如 `sshd -t`），校验失败**立刻回滚**；
+    /// 3. 校验器不可用时应**拒绝修改**——宁可不修，也不制造"把人锁在门外"的配置；
+    /// 4. 只修白名单内的项，未知 key 直接报错。
+    async fn apply(&self, key: &str) -> Result<SecurityApplyResult>;
 }
 
 // ═══════════════════════════ 容器 ═══════════════════════════

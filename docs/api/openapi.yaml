@@ -220,6 +220,83 @@ components:
         net_in_bps: { type: integer }
         net_out_bps: { type: integer }
 
+    # ───────────── 原始采样快照（/metrics/snapshot） ─────────────
+    # 与 panel_os::SystemSnapshot 一一对应（未经聚合的完整一次采样）
+    SystemSnapshot:
+      type: object
+      properties:
+        ts_unix:    { type: integer }
+        uptime_sec: { type: integer }
+        cpu:        { $ref: '#/components/schemas/CpuSample' }
+        mem:        { $ref: '#/components/schemas/MemSample' }
+        disks:      { type: array, items: { $ref: '#/components/schemas/DiskSample' } }
+        nets:       { type: array, items: { $ref: '#/components/schemas/NetSample' } }
+        proc_count: { type: integer }
+        tcp_conns:  { type: integer }
+    CpuSample:
+      type: object
+      properties:
+        total_pct:    { type: number }
+        per_core_pct: { type: [array, "null"], items: { type: number }, description: "低配档位为 null" }
+        load1:        { type: number }
+        load5:        { type: number }
+        load15:       { type: number }
+    MemSample:
+      type: object
+      properties:
+        total_kib:     { type: integer }
+        used_kib:      { type: integer }
+        available_kib: { type: integer }
+        buffers_kib:   { type: integer }
+        cached_kib:    { type: integer }
+        swap_total_kib:{ type: integer }
+        swap_used_kib: { type: integer }
+    DiskSample:
+      type: object
+      properties:
+        mount_point:   { type: string }
+        device:        { type: string }
+        fs_type:       { type: string }
+        total_bytes:   { type: integer }
+        used_bytes:    { type: integer }
+        is_network_fs: { type: boolean }
+    NetSample:
+      type: object
+      properties:
+        iface:       { type: string }
+        rx_bytes:    { type: integer }
+        tx_bytes:    { type: integer }
+        rx_rate_bps: { type: integer }
+        tx_rate_bps: { type: integer }
+
+    # ───────────── 站内通知 ─────────────
+    Notification:
+      type: object
+      properties:
+        id:     { type: integer }
+        ts:     { type: integer }
+        level:  { type: string, enum: [info, warn, crit] }
+        source: { type: string, enum: [backup, restore, cert, task, security, system] }
+        title:  { type: string }
+        body:   { type: [string, "null"] }
+        read:   { type: boolean }
+
+    # ───────────── MFA ─────────────
+    MfaEnroll:
+      type: object
+      properties:
+        secret:         { type: string, description: "base32 密钥（手工录入用）" }
+        otpauth_uri:    { type: string, description: "otpauth:// URI（验证器扫码用）" }
+        recovery_codes: { type: array, items: { type: string }, description: "**一次性返回**，库里只存哈希，此后无法取回" }
+
+    # ───────────── 安全基线修复结果 ─────────────
+    SecurityApplyResult:
+      type: object
+      properties:
+        changed:   { type: boolean, description: "false=已符合预期，未写盘" }
+        backup:    { type: [string, "null"], description: "修改前的备份文件路径，可据此回滚" }
+        validated: { type: boolean, description: "是否通过配置语法校验" }
+
     # ───────────── 进程 ─────────────
     Process:
       type: object
@@ -790,6 +867,50 @@ paths:
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ChangePasswordRequest' } } } }
       responses: { '204': { description: ok }, '403': { description: 旧密码错误 } }
 
+  # ───────── MFA（TOTP，RFC 6238） ─────────
+  #
+  # 三条都需登录：enroll 是"给自己的账户绑定第二因子"，不能是公开端点。
+  # enroll 只生成密钥、**不立即生效**，须 verify 通过才启用——
+  # 否则用户 enroll 后没完成绑定就会把自己锁在门外。
+  /api/v1/auth/mfa/enroll:
+    post:
+      tags: [auth]
+      summary: 生成 TOTP 密钥与 10 个一次性恢复码（**尚未生效**）
+      security: [cookieAuth, csrfHeader]
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/MfaEnroll' } } }
+        '400': { description: 已启用 MFA（需先关闭才能更换） }
+  /api/v1/auth/mfa/verify:
+    post:
+      tags: [auth]
+      summary: 用动态口令确认绑定并正式启用（只认动态口令，不认恢复码）
+      security: [cookieAuth, csrfHeader]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [code], properties: { code: { type: string, description: "6 位动态口令" } } }
+      responses:
+        '200': { description: ok }
+        '400': { description: 动态口令不正确 / 尚未 enroll }
+  /api/v1/auth/mfa/disable:
+    post:
+      tags: [auth]
+      summary: 关闭 MFA（**必须出示**动态口令或恢复码，防被劫持会话顺手关闭）
+      security: [cookieAuth, csrfHeader]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [code], properties: { code: { type: string, description: "6 位动态口令或恢复码" } } }
+      responses:
+        '200': { description: ok }
+        '400': { description: 口令或恢复码不正确 / MFA 未启用 }
+
   # ───────── 系统 / 能力 / 指标 ─────────
   /api/v1/system/capabilities:
     get:
@@ -839,6 +960,20 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/HistoryPoint' } } } }
+
+  /api/v1/metrics/snapshot:
+    get:
+      tags: [system]
+      summary: 即时完整采样快照（未聚合的原始 SystemSnapshot）
+      description: >
+        ProfessionalView 使用：返回未经聚合的一次完整采样（含 CPU 每核、内存拆解、
+        各挂载点磁盘、各网卡速率）。与 /system/overview 的区别是 overview 为仪表盘聚合卡片。
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/SystemSnapshot' } } }
 
   # ───────── 进程 ─────────
   /api/v1/processes:
@@ -1314,10 +1449,31 @@ paths:
   /api/v1/backups/{id}/restore:
     post:
       tags: [backups]
-      summary: 从产物恢复（**高危**：需二次确认 + 自动先备份当前态）
+      summary: 从产物恢复（**高危**：确认词 + 产物名白名单 + 自动先备份当前态）
+      description: >
+        kind=site 可恢复；kind=panel 返回 501——面板库是面板自身运行中的库，
+        在线覆盖会损坏 SQLite WAL，需停服后手动替换。任务内先打包当前态为
+        safety-plan<id>-<ts>.tar.gz，output_path 指向该快照，可据此回滚。
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
-      responses: { '202': { description: 已入队 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [artifact, confirm_token]
+              properties:
+                artifact: { type: string, description: "产物文件名（取自 artifacts 列表），不接受路径" }
+                confirm_token: { type: string, description: "二次确认词，须等于「覆盖恢复」" }
+      responses:
+        '202':
+          description: 已入队
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { task_id: { type: string } } } } }
+        '400': { description: "确认词不符 / 产物名非法" }
+        '501': { description: "kind=panel（面板库不可在线覆盖）" }
 
   # ───────── 容器（Docker）─────────
   #
@@ -1443,10 +1599,31 @@ paths:
   /api/v1/security/baseline/apply:
     post:
       tags: [security]
-      summary: 应用某项基线修复（自动先备份 + diff）
+      summary: 应用某项基线修复（二次确认词 + 先备份 → 写 → sshd -t 校验 → 失败回滚）
+      description: >
+        仅支持 sshd 三项白名单；**sshd 不可用时拒绝修改**——宁可不修，
+        也不写坏配置把人锁在服务器门外。响应回传备份路径，出事可据此回滚。
       security: [cookieAuth, csrfHeader]
-      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [key], properties: { key: { type: string } } } } } }
-      responses: { '204': { description: ok } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key, confirm_token]
+              properties:
+                key:
+                  type: string
+                  enum: [ssh.permit_root_login, ssh.password_auth, ssh.pubkey_auth]
+                  description: "白名单；pubkey_auth 只能置 yes（置 no 会把所有人锁在门外）"
+                confirm_token: { type: string, description: "二次确认词，须等于「确认修复」" }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/SecurityApplyResult' } } }
+        '400': { description: "确认词不符 / 不支持的基线项 / sshd 不可用" }
   /api/v1/security/sessions:
     get:
       tags: [security]
@@ -1583,6 +1760,58 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/LogRead' } } }
+
+  # ───────── 站内通知 ─────────
+  #
+  # 先做站内、不做邮件/Webhook：外部通道需 reqwest/lettre，各占一个直接依赖位，
+  # 而依赖预算门禁 [8] 上限 38。站内通知零新增依赖，覆盖单机面板主要诉求。
+  /api/v1/notifications:
+    get:
+      tags: [notifications]
+      summary: 通知列表（时间倒序）
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 200 } }
+        - { name: unread_only, in: query, schema: { type: boolean, default: false } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/Notification' } } } }
+  /api/v1/notifications/unread-count:
+    get:
+      tags: [notifications]
+      summary: 未读条数（前端徽章用，单行聚合）
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { count: { type: integer } } } } }
+  /api/v1/notifications/read-all:
+    post:
+      tags: [notifications]
+      summary: 全部标记已读
+      security: [cookieAuth, csrfHeader]
+      responses: { '200': { description: ok } }
+  /api/v1/notifications/{id}/read:
+    post:
+      tags: [notifications]
+      summary: 单条标记已读
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: ok }
+        '404': { description: 通知不存在 }
+  /api/v1/notifications/{id}:
+    delete:
+      tags: [notifications]
+      summary: 删除通知（需 system.manage）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: ok }
+        '404': { description: 通知不存在 }
 
   # ───────── 任务中心 ─────────
   /api/v1/tasks:

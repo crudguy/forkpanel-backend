@@ -738,6 +738,83 @@ impl WebServerProvider for LinuxWebServer {
 pub struct LinuxDatabases;
 
 impl LinuxDatabases {
+    /// 用外部客户端执行一条**只读** SQL，按 TAB 分列返回结果行。
+    ///
+    /// **凭据经环境变量传递**（`MYSQL_PWD` / `PGPASSWORD`），绝不放 argv——
+    /// argv 会被同机任意用户的 `ps` 看到，等于直接泄露数据库口令。
+    /// 只用于只读浏览；面板不提供在线 SQL 编辑器（设计 §2.4 列为 M4 且默认关）。
+    pub(crate) async fn sql_query(t: &DbTarget, sql: &str) -> Result<Vec<Vec<String>>> {
+        let mut env: std::collections::HashMap<String, std::ffi::OsString> =
+            std::collections::HashMap::new();
+        let (bin, args): (crate::cmd::Bin, Vec<String>) = match t.engine {
+            DbEngine::MySql => {
+                let mut a = vec![
+                    "--batch".into(),
+                    "--raw".into(),
+                    "--skip-column-names".into(),
+                    "-h".into(),
+                    t.host.clone().unwrap_or_else(|| "127.0.0.1".into()),
+                ];
+                if let Some(p) = t.port { a.push("-P".into()); a.push(p.to_string()); }
+                if let Some(u) = &t.user { a.push("-u".into()); a.push(u.clone()); }
+                if let Some(d) = &t.database { a.push("-D".into()); a.push(d.clone()); }
+                a.push("-e".into());
+                a.push(sql.to_string());
+                if let Some(p) = &t.password {
+                    env.insert("MYSQL_PWD".into(), std::ffi::OsString::from(p));
+                }
+                (crate::cmd::Bin::MySql, a)
+            }
+            DbEngine::Postgres => {
+                let mut a = vec![
+                    "--no-psqlrc".into(),
+                    "--tuples-only".into(),
+                    "--no-align".into(),
+                    "--field-separator".into(),
+                    "\t".into(),
+                    "-h".into(),
+                    t.host.clone().unwrap_or_else(|| "127.0.0.1".into()),
+                ];
+                if let Some(p) = t.port { a.push("-p".into()); a.push(p.to_string()); }
+                if let Some(u) = &t.user { a.push("-U".into()); a.push(u.clone()); }
+                if let Some(d) = &t.database { a.push("-d".into()); a.push(d.clone()); }
+                a.push("-c".into());
+                a.push(sql.to_string());
+                if let Some(p) = &t.password {
+                    env.insert("PGPASSWORD".into(), std::ffi::OsString::from(p));
+                }
+                (crate::cmd::Bin::Psql, a)
+            }
+            DbEngine::Sqlite => {
+                return Err(panel_core::PanelError::Internal("SQLite 不走外部客户端".into()))
+            }
+        };
+
+        let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let out = crate::cmd::run(
+            bin,
+            &args_ref,
+            crate::cmd::CmdOpt {
+                timeout: std::time::Duration::from_secs(20),
+                env,
+                ..Default::default()
+            },
+        )
+        .await?;
+        if out.code != Some(0) {
+            return Err(panel_core::PanelError::Command {
+                bin: "mysql/psql".into(),
+                detail: out.stderr,
+            });
+        }
+        Ok(out
+            .stdout
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.split('\t').map(|c| c.to_string()).collect::<Vec<_>>())
+            .collect())
+    }
+
     /// 打开目标 SQLite 文件（只读）。SQLite 的“连接”就是一个文件路径（`database` 字段）。
     fn open_sqlite(t: &DbTarget) -> Result<rusqlite::Connection> {
         use rusqlite::OpenFlags;
@@ -779,11 +856,38 @@ fn value_to_string(v: rusqlite::types::ValueRef<'_>) -> Option<String> {
 impl DatabaseProvider for LinuxDatabases {
     fn engine(&self) -> DbEngine { DbEngine::Sqlite }
     async fn available(&self) -> Result<bool> { Ok(true) }   // SQLite 内建，始终可用
-    fn supports(&self, e: DbEngine) -> bool { matches!(e, DbEngine::Sqlite) }
+    /// 引擎可用性：SQLite 内建恒可用；mysql/pg **看客户端二进制是否存在**。
+    /// 客户端缺失就诚实报不可用——否则 UI 会给用户"能点但一点必失败"的假按钮。
+    fn supports(&self, e: DbEngine) -> bool {
+        match e {
+            DbEngine::Sqlite => true,
+            DbEngine::MySql => crate::cmd::Bin::MySql.available(),
+            DbEngine::Postgres => crate::cmd::Bin::Psql.available(),
+        }
+    }
 
     async fn databases(&self, t: &DbTarget) -> Result<Vec<String>> {
-        if !matches!(t.engine, DbEngine::Sqlite) {
-            return unsupported!("dbms.databases: 仅 SQLite 已实装");
+        match t.engine {
+            DbEngine::Sqlite => {}
+            DbEngine::MySql => {
+                // 系统库不展示：它们不是"用户的业务库"，列出来只会干扰
+                let rows = LinuxDatabases::sql_query(t, "SHOW DATABASES").await?;
+                return Ok(rows
+                    .into_iter()
+                    .filter_map(|r| r.into_iter().next())
+                    .filter(|n| {
+                        !matches!(n.as_str(), "information_schema" | "performance_schema" | "sys" | "mysql")
+                    })
+                    .collect());
+            }
+            DbEngine::Postgres => {
+                let rows = LinuxDatabases::sql_query(
+                    t,
+                    "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname",
+                )
+                .await?;
+                return Ok(rows.into_iter().filter_map(|r| r.into_iter().next()).collect());
+            }
         }
         let t = t.clone();
         tokio::task::spawn_blocking(move || {
@@ -802,8 +906,53 @@ impl DatabaseProvider for LinuxDatabases {
     }
 
     async fn tables(&self, t: &DbTarget) -> Result<Vec<DbTable>> {
-        if !matches!(t.engine, DbEngine::Sqlite) {
-            return unsupported!("dbms.tables: 仅 SQLite 已实装");
+        match t.engine {
+            DbEngine::Sqlite => {}
+            DbEngine::MySql => {
+                let db = t.database.clone().unwrap_or_default();
+                let names: Vec<String> = LinuxDatabases::sql_query(t, "SHOW TABLES")
+                    .await?
+                    .into_iter()
+                    .filter_map(|r| r.into_iter().next())
+                    .collect();
+                let mut out = Vec::with_capacity(names.len());
+                for n in names {
+                    let q = format!("SELECT COUNT(*) FROM `{}.`{}``", db.replace('`', "``"), n.replace('`', "``"));
+                    let rows = LinuxDatabases::sql_query(t, &q)
+                        .await
+                        .ok()
+                        .and_then(|r| r.into_iter().next())
+                        .and_then(|r| r.into_iter().next())
+                        .and_then(|s| s.trim().parse::<i64>().ok())
+                        .unwrap_or(-1); // 取不到行数诚实给 -1，不伪造成 0
+                    out.push(DbTable { name: n, rows });
+                }
+                return Ok(out);
+            }
+            DbEngine::Postgres => {
+                let names: Vec<String> = LinuxDatabases::sql_query(
+                    t,
+                    "SELECT table_name FROM information_schema.tables \
+                     WHERE table_schema = 'public' ORDER BY table_name",
+                )
+                .await?
+                .into_iter()
+                .filter_map(|r| r.into_iter().next())
+                .collect();
+                let mut out = Vec::with_capacity(names.len());
+                for n in names {
+                    let q = format!("SELECT COUNT(*) FROM public.\"{}\"", n.replace('"', "\"\""));
+                    let rows = LinuxDatabases::sql_query(t, &q)
+                        .await
+                        .ok()
+                        .and_then(|r| r.into_iter().next())
+                        .and_then(|r| r.into_iter().next())
+                        .and_then(|s| s.trim().parse::<i64>().ok())
+                        .unwrap_or(-1);
+                    out.push(DbTable { name: n, rows });
+                }
+                return Ok(out);
+            }
         }
         let t = t.clone();
         tokio::task::spawn_blocking(move || {
@@ -835,8 +984,76 @@ impl DatabaseProvider for LinuxDatabases {
     }
 
     async fn rows(&self, t: &DbTarget, table: &str, limit: usize, offset: usize) -> Result<DbRows> {
-        if !matches!(t.engine, DbEngine::Sqlite) {
-            return unsupported!("dbms.rows: 仅 SQLite 已实装");
+        match t.engine {
+            DbEngine::Sqlite => {}
+            DbEngine::MySql => {
+                let esc = table.replace('`', "``");
+                let total = LinuxDatabases::sql_query(t, &format!("SELECT COUNT(*) FROM `{esc}`"))
+                    .await
+                    .ok()
+                    .and_then(|r| r.into_iter().next())
+                    .and_then(|r| r.into_iter().next())
+                    .and_then(|s| s.trim().parse::<i64>().ok())
+                    .unwrap_or(-1);
+                // 列名单独取：`--skip-column-names` 模式下结果不含表头
+                let columns: Vec<String> =
+                    LinuxDatabases::sql_query(t, &format!("SHOW COLUMNS FROM `{esc}`"))
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|r| r.into_iter().next())
+                        .collect();
+                let rows = LinuxDatabases::sql_query(
+                    t,
+                    &format!("SELECT * FROM `{esc}` LIMIT {limit} OFFSET {offset}"),
+                )
+                .await?;
+                // 客户端模式下 NULL 与空串/字符串 "NULL" 无法可靠区分，
+                // 故一律按文本返回（**不伪造 NULL 语义**）——比错误映射更诚实。
+                return Ok(DbRows {
+                    columns,
+                    rows: rows.into_iter().map(|r| r.into_iter().map(Some).collect()).collect(),
+                    total,
+                });
+            }
+            DbEngine::Postgres => {
+                let esc = table.replace('"', "\"\"");
+                let total = LinuxDatabases::sql_query(
+                    t,
+                    &format!("SELECT COUNT(*) FROM public.\"{esc}\""),
+                )
+                .await
+                .ok()
+                .and_then(|r| r.into_iter().next())
+                .and_then(|r| r.into_iter().next())
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .unwrap_or(-1);
+                let lit = table.replace('\'', "''");
+                let columns: Vec<String> = LinuxDatabases::sql_query(
+                    t,
+                    &format!(
+                        "SELECT column_name FROM information_schema.columns \
+                         WHERE table_schema = 'public' AND table_name = '{lit}' ORDER BY ordinal_position"
+                    ),
+                )
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|r| r.into_iter().next())
+                .collect();
+                let rows = LinuxDatabases::sql_query(
+                    t,
+                    &format!("SELECT * FROM public.\"{esc}\" LIMIT {limit} OFFSET {offset}"),
+                )
+                .await?;
+                // 客户端模式下 NULL 与空串/字符串 "NULL" 无法可靠区分，
+                // 故一律按文本返回（**不伪造 NULL 语义**）——比错误映射更诚实。
+                return Ok(DbRows {
+                    columns,
+                    rows: rows.into_iter().map(|r| r.into_iter().map(Some).collect()).collect(),
+                    total,
+                });
+            }
         }
         let t = t.clone();
         let table = table.to_string();

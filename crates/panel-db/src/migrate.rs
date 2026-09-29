@@ -9,10 +9,12 @@ use rusqlite::Connection;
 /// 编译期内嵌的迁移脚本（每个版本一个事务）
 const MIGRATIONS: &[(u32, &str)] = &[
     (1, include_str!("../../../migrations/001_init.sql")),
+    (2, include_str!("../../../migrations/002_notifications.sql")),
+    (3, include_str!("../../../migrations/003_mfa.sql")),
 ];
 
 /// 当前 schema 版本
-pub const LATEST: u32 = 1;
+pub const LATEST: u32 = 3;
 
 pub fn apply(conn: &mut Connection) -> Result<u32> {
     conn.execute_batch(

@@ -39,6 +39,8 @@ pub enum Bin {
     OpenSsl,                            // TLS 自签证书生成（仅签发，不参与其它任何用途）
     MySql, MySqlDump, Psql, PgDump,     // 数据库（可选能力）
     Tar, Gzip,                          // 备份打包
+    Sshd,                               // sshd -t 配置校验：改 SSH 配置前的强制安全网
+    Certbot,                            // ACME 证书签发/续期（http-01 webroot）
     UserAdd, GroupAdd, Chown, Chmod,    // 用户与权限
     Df, Stat,                           // 探测类（回退路径）
     /// 交互式登录 shell（Web 终端用）。**不经任何 shell 解释**——由 `spawn_pty`
@@ -65,7 +67,8 @@ impl Bin {
             Docker => "docker",
             OpenSsl => "openssl",
             MySql => "mysql", MySqlDump => "mysqldump", Psql => "psql", PgDump => "pg_dump",
-            Tar => "tar", Gzip => "gzip",
+            Tar => "tar", Gzip => "gzip", Sshd => "sshd", Certbot => "certbot",
+            MySql => "mysql", Psql => "psql",
             UserAdd => "useradd", GroupAdd => "groupadd", Chown => "chown", Chmod => "chmod",
             Df => "df", Stat => "stat",
             Sh => "sh",

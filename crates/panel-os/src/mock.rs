@@ -381,6 +381,11 @@ impl ContainerProvider for MockContainers {
 
 #[async_trait]
 impl SecurityProvider for MockSecurity {
+    /// mock 不写盘：一律返回"未改动"。真实校验/回滚逻辑在 `linux/security.rs` 单测覆盖。
+    async fn apply(&self, _key: &str) -> Result<crate::traits::SecurityApplyResult> {
+        Ok(crate::traits::SecurityApplyResult { changed: false, backup: None, validated: true })
+    }
+
     async fn baseline(&self) -> Result<Vec<SecurityCheck>> {
         Ok(vec![
             SecurityCheck {
