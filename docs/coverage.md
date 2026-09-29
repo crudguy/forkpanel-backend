@@ -5,7 +5,7 @@
 > 判定方法：后端 `crates/panel-api/src/routes*.rs` 中凡返回 `ApiError::unsupported("…(Mx: …)")` 者记为「🟡 结构化 501」；
 > 其余返回 `ok(...)/Json(...)` 者记为「✅ 已实现」。前端是否调用由契约门禁校验（PASS）。
 >
-> **本版为 2026-09-29 刷新**：P0（站点/SSL、数据库、用户）与 P1（容器、安全基线、备份、日志 SSE）、
+> **本版为 2026-09-30 刷新**：P0（站点/SSL、数据库、用户）与 P1（容器、安全基线、备份、日志 SSE）、
 > P2（终端、AI 助手）已落地；本机不可验项（ACME/caddy/mysql-pg/ufw 真机）如实标注。
 
 ## 图例
@@ -58,7 +58,7 @@
 | GET/PATCH/DELETE `/sites/{id}` | 单体详情/更新/删除 | ✅ | 删除级联证书与磁盘 | SitesView |
 | POST `/sites/{id}/reload` | 重载 | 🟠 | `nginx -s reload`→回退 systemctl；沙箱不可验 | SitesView |
 | GET `/sites/{id}/logs` | 访问/错误日志 | ✅ | **SSE**（#59 并入日志实时流） | SitesView |
-| POST `/sites/{id}/ssl/apply` | 证书签发 | ✅ | **self-signed 同步签发**（openssl，key 经主密钥加密落盘 0600）；`method=acme` → 🟡 需 certbot + 公网（#61） | SitesView |
+| POST `/sites/{id}/ssl/apply` | 证书签发 | ✅ | **self-signed 同步签发**（openssl，key 经主密钥加密落盘 0600）；`method=http-01` → ✅ 走 certbot 任务（需账户邮箱，仅签主域名）；`method=dns-01` → 🟡 需 DNS 提供商 API（M5） | SitesView |
 | GET `/certs` / POST `/certs/{id}/renew` / DELETE `/certs/{id}` | 证书列表/续期/删除 | ✅ | 续期=自签重签；删除连磁盘文件清理 | SitesView |
 
 ## 6. 文件
@@ -77,10 +77,10 @@
 |---|---|---|---|---|
 | GET/POST `/db/connections` | 连接管理 | ✅ | **schema 对齐修复**：列名 `default_db`（原代码引用不存在的 `database` 列，CRUD 从未跑通） | DatabasesView |
 | GET `/db/{conn}/databases` | 库列表 | ✅ | SQLite 只读打开 | DatabasesView |
-| GET `/db/{conn}/{db}/tables` | 表列表（含行数） | ✅ | mysql/pg 🟡 需外部客户端 | DatabasesView |
-| GET `/db/{conn}/{db}/{table}/rows` | 行预览（分页，禁 Web SQL） | ✅ | NULL 保真；缺表/连接优雅 404 | DatabasesView |
+| GET `/db/{conn}/{db}/tables` | 表列表（含行数） | ✅ | mysql/pg ✅（客户端存在即启用；密码经 `MYSQL_PWD`/`PGPASSWORD` 传，**绝不进 argv**；行数取不到给 -1 不伪造） | DatabasesView |
+| GET `/db/{conn}/{db}/{table}/rows` | 行预览（分页，禁 Web SQL） | ✅ | NULL 保真；缺表/连接优雅 404；mysql/pg ✅（客户端模式下 NULL 与空串无法区分，一律按文本返回，**不伪造 NULL 语义**） | DatabasesView |
 | POST `/db/{conn}/backup` | 备份（→202 task） | ✅ | **VACUUM INTO 不可在写者事务内**——改独立连接备份（根因修复） | DatabasesView |
-| 🔵 POST `/db/{conn}/restore` | 恢复 | 🟡 | 破坏性操作，需先备份当前态 + 二次确认（原标 ✅ 系误标，纠正） | — |
+| 🔵 POST `/db/{conn}/restore` | 恢复 | ✅/🟡 | SQLite 已实装（任务化：确认词 + 自动先备份当前库 + 源文件沙箱校验）；mysql/pg 需外部客户端 → 🟡 | — |
 
 ## 8. 防火墙
 
@@ -93,7 +93,7 @@
 | 方法 + 路径 | 文档要求 | 后端状态 | 备注 | 前端视图 |
 |---|---|---|---|---|
 | GET `/security/baseline` | 基线检查 | ✅ | 6 项只读检查；OpenSSH 默认值语义已修正并有单测 | SecurityView |
-| POST `/security/baseline/apply` | 应用基线 | 🟡 | 写回系统安全配置属高危：需 root + 先备份 + 二次确认（未实装不硬上） | — |
+| POST `/security/baseline/apply` | 应用基线 | ✅ | 已实装（**仅限 sshd 三项白名单**）：确认词 + 先备份 → 写 → `sshd -t` 校验 → 不通过回滚；**sshd 不可用则拒绝修改**（宁可不修也不锁死 SSH） | SecurityView |
 | GET `/security/sessions` | 在线会话 | ✅ | 内存 SessionCache 快照（重启即清零，如实标注）；`current` 标记自己；**ip 刻意不采集**（无对端地址管道，返回 null 不伪造） | SecurityView |
 | DELETE `/security/sessions/{id}` | 吊销会话 | ✅ | 允许吊销自己的当前会话（=自我登出）；404 对不存在会话；审计只落 sid 前 8 位（sid=凭据不落库） | SecurityView |
 
@@ -140,14 +140,30 @@
 | GET `/containers`、`/containers/images`；POST `/{id}/start\|stop\|restart`；DELETE `/{id}` | 容器（#47） | ✅ | 能力位看**守护进程可达性**（socket EACCES→daemon_unreachable 501）；参数注入白名单（禁首字符 `-`）；**创建容器不做**（等价任意代码执行，待专项） |
 | GET `/api/v1/terminal`（WS） | Web 终端（#51） | ✅ | PTY 收敛 `spawn_pty`；八道卫士升级前判定；Origin 同源替代 CSRF；空闲 15min SIGHUP；并发 ≤4 |
 | POST `/api/v1/assistant/diagnose` | AI 助手（#52） | ✅ | 内置规则诊断（8 规则 + 关键词路由）；只读护栏（action 仅 navigate）；LLM 层待接入 |
-| `/api/v1/backups` CRUD + `/{id}/run` + `/{id}/artifacts` | 备份计划（#49） | ✅ | panel=独立连接快照 / site=tar.gz；**restore 🟡**；keep_count 自动清理待做 |
+| `/api/v1/backups` CRUD + `/{id}/run` + `/{id}/artifacts` | 备份计划（#49） | ✅ | panel=独立连接快照 / site=tar.gz；**restore ✅**（site：确认词 + 产物名白名单 + 自动先备份当前态 + 归档 `..` 逃逸校验；panel 库除外 → 🟡）；**keep_count 自动清理 ✅** |
 | `/api/v1/security/baseline` | 安全基线（#48） | ✅ | 见 §9 |
 
-## 覆盖结论（2026-09-29）
+## 16. 站内通知 / 会话持久化 / MFA（2026-09-30 补齐）
 
-- **契约完整度：100%**，且新增模块全部先进 `openapi.yaml` 再实现（前端副本按事实源同步）。
-- **剩余 🟡 清单**（结构化 501，均如实返回原因）：baseline/apply、db 与备份的 restore、ACME。
-- **🟠 真机验证项**：nginx 下发/reload、ufw、mysql/postgres 链路、ACME——能力位诚实置灰，沙箱内只验证降级路径。
+| 方法 + 路径 | 模块 | 后端状态 | 备注 |
+|---|---|---|---|
+| GET `/notifications`、`/notifications/unread-count`；POST `/{id}/read`、`/read-all`；DELETE `/{id}` | 站内通知 | ✅ | 002 表；`dedup_key` 唯一约束去重。**刻意不做邮件/Webhook**——需 reqwest/lettre，依赖预算上限 38、现 37。落点：备份失败（按天去重）、恢复失败（不去重） |
+| `sessions` 表落库（001 已定义、此前零引用） | 会话持久化 | ✅ | **只存 sid 哈希**；中间件 `get_or_restore` 惰性重建 → 重启不再全员登出；DB 写入 spawn 到 runtime，绝不持 MutexGuard 跨 await |
+| `/auth/mfa/{enroll,verify,disable}` + 登录第二因子 | MFA（TOTP） | ✅ | RFC 6238 HMAC-SHA1（验证器兼容档）+ 10 个恢复码（只存哈希，一次性消费）；**关闭 MFA 必须出示第二因子** |
+
+## 覆盖结论（2026-09-30 刷新）
+
+- **契约完整度：100%**，且新增端点全部**先写契约再实现**（前端副本按事实源同步）。
+  本轮补齐了 `metrics/snapshot`——它此前**代码已实装、前端已在调用，契约里却没有**，属契约漂移。
+- **已由 🟡 转 ✅**：备份/DB 恢复（任务化：确认词 + 产物名白名单 + 自动先备份当前态）、
+  备份 `keep_count` 自动清理、安全基线一键修复（sshd 三项）、ACME http-01（certbot）、
+  mysql/pg 只读浏览、MFA、会话持久化、站内通知。
+- **剩余 🟡 清单**（结构化 501，**均为刻意不做或需外部条件**，如实返回原因）：
+  - `dns-01`（需 DNS 提供商 API，设计列 M5）；
+  - 备份 `kind=panel` 的恢复（面板库在线覆盖会损坏 SQLite WAL，需停服手动替换）；
+  - mysql/pg 的**还原**（需外部客户端写路径）。
+- **🟠 真机验证项**：nginx 下发/reload、ufw、mysql/postgres 真连、ACME（需公网 80 + certbot）——
+  能力位按二进制/客户端存在性诚实置灰，沙箱内只验证降级路径。
 - **能力驱动 UI**：未支持能力一律 EmptyState/置灰 + 原因，绝不假装可用。
 
 > 按分工约定：AI 仅做本地 `git commit`，`push` 由用户自行执行。
