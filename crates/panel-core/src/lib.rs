@@ -151,6 +151,18 @@ pub mod cap_keys {
     pub const LOGS_READ: &str      = "logs.read";
     pub const DBMS_MANAGE: &str    = "dbms.manage";
     pub const SSL_ACME: &str       = "ssl.acme";
+    /// 面板自签证书：本机有 openssl 即可签发（离线可用），与 ACME 相互独立
+    pub const SSL_SELFSIGNED: &str = "ssl.selfsigned";
+    /// 备份计划（本地）：面板内建功能，任何平台恒支持
+    pub const BACKUP_MANAGE: &str  = "backup.manage";
+    /// 容器管理：依赖宿主 docker/podman **守护进程**可达（二进制存在 ≠ 可用，
+    /// 常见的是 socket 权限不足或 daemon 未运行）。
+    pub const CONTAINER_MANAGE: &str = "container.manage";
+    /// 内置 Web 终端：本机存在可用交互 shell（bash/sh）即可。**高危面**——
+    /// 能力位只管"能不能开"，真正的准入还叠加 SYSTEM_MANAGE 权限 + 只读拒绝。
+    pub const TERMINAL_MANAGE: &str = "terminal.manage";
+    /// 用户与角色管理：面板内建功能（非 OS 能力），任何平台恒支持
+    pub const USER_MANAGE: &str    = "user.manage";
 }
 
 pub type CapabilityMap = std::collections::BTreeMap<String, Capability>;
@@ -297,6 +309,16 @@ pub mod rules {
     /// **必须白名单，不能黑名单**：该名字会进入文件名、crontab 行与命令行，
     /// 只排除 `\0 / \\` 会放过空格、`;`、`$`、反引号、引号等 ——
     /// 空格会破坏 crontab 的字段切分，`;` 与 `$()` 则可被 shell 解释（注入）。
+    pub fn is_valid_container_ref(s: &str) -> bool {
+        // 容器 ID（hex）或名称（docker 允许 [a-zA-Z0-9][a-zA-Z0-9_.-]*）。
+        // 字符集沿用路径段白名单，但**必须额外禁止首字符 '-'**：
+        // 该值会作为 argv 传给 docker CLI，`--force` 之类会被当成选项解析
+        // （参数注入，与 shell 注入同源）。绝不接受。
+        if s.len() > 255 { return false; }
+        if s.starts_with('-') { return false; }
+        is_valid_path_segment(s)
+    }
+
     pub fn is_valid_path_segment(s: &str) -> bool {
         if s.is_empty() || s.len() > 255 { return false; }
         if s == "." || s == ".." { return false; }
@@ -340,5 +362,31 @@ mod tests {
         assert!(!is_valid_path_segment(".."));
         assert!(!is_valid_path_segment("a/b"));
         assert!(!is_valid_path_segment("a\0b"));
+    }
+
+    #[test]
+    fn container_ref_accepts_id_and_name() {
+        // 64 位 hex ID 与 docker 命名规则下的名称都应通过
+        assert!(is_valid_container_ref("3f2a1b0c9d8e7f6a"));
+        assert!(is_valid_container_ref("web-proxy"));
+        assert!(is_valid_container_ref("mysql_8.0"));
+        assert!(is_valid_container_ref("a"));
+    }
+
+    #[test]
+    fn container_ref_rejects_flag_injection_and_traversal() {
+        // 首字符 '-' 会被 docker CLI 当选项解析（`docker rm --force`）→ 必须拒绝
+        assert!(!is_valid_container_ref("-f"));
+        assert!(!is_valid_container_ref("--force"));
+        assert!(!is_valid_container_ref("--privileged"));
+        // 其余注入面
+        assert!(!is_valid_container_ref(""));
+        assert!(!is_valid_container_ref("a b"));      // 空格会被当第二个 argv
+        assert!(!is_valid_container_ref("a;b"));
+        assert!(!is_valid_container_ref("a$(id)"));
+        assert!(!is_valid_container_ref("a/b"));
+        assert!(!is_valid_container_ref(".."));
+        assert!(!is_valid_container_ref("a\0b"));
+        assert!(!is_valid_container_ref(&"x".repeat(256)));   // 超长
     }
 }
