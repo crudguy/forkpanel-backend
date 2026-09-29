@@ -31,11 +31,15 @@ tags:
   - { name: security,    description: 登录安全 / 会话 / MFA }
   - { name: cron,        description: 计划任务 }
   - { name: logs,        description: 统一日志浏览器 }
+  - { name: backups,     description: 备份计划与产物（本地） }
+  - { name: assistant,   description: AI 运维助手（内置规则诊断，只读） }
+  - { name: containers,  description: 容器（Docker）只读列举与生命周期 }
   - { name: tasks,       description: 异步任务中心 }
   - { name: settings,    description: 面板设置 }
   - { name: users,       description: 用户与角色 }
   - { name: audit,       description: 审计日志 }
   - { name: events,      description: SSE 实时频道 }
+  - { name: terminal,    description: 内置 Web 终端（WebSocket） }
 
 security:
   - cookieAuth: []
@@ -115,7 +119,7 @@ components:
       properties:
         supported: { type: boolean }
         backend:   { type: [string, "null"], description: 实际后端，如 "systemd"/"nftables"/"apt" }
-        reason:    { type: [string, "null"], enum: [null, not_implemented, binary_missing, no_package_manager, init_unknown, unsupported_os] }
+        reason:    { type: [string, "null"], enum: [null, not_implemented, binary_missing, daemon_unreachable, no_package_manager, init_unknown, unsupported_os, no_log_source, no_engine, openssl_missing, caddy_render_not_implemented], description: "不可用原因。`daemon_unreachable` 特指：二进制已安装但守护进程 socket 不可连（权限不足或未运行）——UI 应据此给出'加入 docker 组 / 启动服务'的可操作提示，而非笼统的'不支持'" }
     PlatformInfo:
       type: object
       properties:
@@ -131,6 +135,14 @@ components:
         tier:       { type: string, enum: [nano, small, standard], example: standard }
         polling:    { type: boolean, description: "true=前端应退化为轮询（nano 档位无 SSE）" }
         features:   { type: object, additionalProperties: { $ref: '#/components/schemas/Capability' } }
+
+    ServiceConfig:
+      type: object
+      required: [path, content, writable]
+      properties:
+        path:    { type: string, description: 单元文件绝对路径（systemd FragmentPath） }
+        content: { type: string, description: 文件内容（UTF-8） }
+        writable: { type: boolean, description: "false=位于发行版目录，修改可能在包升级时被覆盖，建议改用 drop-in" }
 
     # ───────────── 认证 ─────────────
     BootstrapRequest:
@@ -220,9 +232,12 @@ components:
         cmdline: { type: string }
     KillRequest:
       type: object
-      required: [signal]
       properties:
-        signal: { type: string, enum: [term, kill, int, hup], description: "term=SIGTERM(5s 后 SIGKILL 两步)；kill=SIGKILL" }
+        signal:
+          type: string
+          enum: [term, hup, kill]
+          default: term
+          description: "term=SIGTERM，允许进程正常收尾；hup=SIGHUP，常用于触发重载配置；kill=SIGKILL，立即终止且不给收尾机会。缺省 term —— 强制信号必须显式要求。"
 
     # ───────────── 服务 ─────────────
     ServiceUnit:
@@ -300,11 +315,18 @@ components:
         renew_state: { type: string, enum: [idle, pending, ok, failed] }
     SslApply:
       type: object
-      required: [domains, method]
+      required: [method]
       properties:
-        domains: { type: array, items: { type: string } }
-        method:  { type: string, enum: [http-01, dns-01], default: http-01 }
-        email:   { type: [string, "null"] }
+        domains:
+          type: array
+          items: { type: string }
+          description: 留空则沿用站点现有域名
+        method:
+          type: string
+          enum: [self-signed, http-01, dns-01]
+          default: self-signed
+          description: self-signed=面板自签（同步、离线可用，需 openssl）；http-01/dns-01=ACME
+        email: { type: [string, "null"] }
 
     # ───────────── 文件 ─────────────
     FileEntry:
@@ -373,6 +395,96 @@ components:
         rows: { type: array, items: { type: array, items: {} } }
         page: { type: integer }
         total: { type: integer }
+
+    # ───────────── 备份计划 ─────────────
+    BackupPlan:
+      type: object
+      required: [kind, target, dest_dir]
+      properties:
+        id:          { type: integer }
+        kind:        { type: string, enum: [panel, site], description: "panel=面板自身数据；site=站点文件" }
+        target:      { type: string, description: "panel 固定 'panel'；site 为站点名" }
+        cron_expr:   { type: [string, "null"], description: "留空=仅手动执行" }
+        keep_count:  { type: integer, default: 7 }
+        dest_dir:    { type: string, description: "产物目录，必须在面板 backup_dir 之内" }
+        enabled:     { type: boolean, default: true }
+        last_run_at: { type: [integer, "null"] }
+        last_result: { type: [string, "null"] }
+    BackupArtifact:
+      type: object
+      properties:
+        name:  { type: string }
+        size:  { type: integer }
+        mtime: { type: integer }
+
+    # ───────────── 容器 ─────────────
+    AssistantReport:
+      type: object
+      properties:
+        question:     { type: string }
+        scope:        { type: string, enum: [all, cpu, mem, disk, log, service, security, backup] }
+        generated_at: { type: integer }
+        summary:      { type: string }
+        findings:     { type: array, items: { $ref: '#/components/schemas/AssistantFinding' } }
+        ctx:          { $ref: '#/components/schemas/AssistantContext' }
+
+    AssistantFinding:
+      type: object
+      properties:
+        id:         { type: string, description: 稳定规则标识（如 cpu.high） }
+        severity:   { type: string, enum: [info, warn, crit] }
+        title:      { type: string }
+        evidence:   { type: array, items: { type: string }, description: 真实数据引用 }
+        suggestion: { type: string }
+        action:
+          nullable: true
+          allOf: [ { $ref: '#/components/schemas/AssistantAction' } ]
+
+    AssistantAction:
+      type: object
+      description: 仅导航语义——处置由用户在目标视图人工确认
+      properties:
+        kind: { type: string, enum: [navigate] }
+        view: { type: string, example: /services }
+
+    AssistantContext:
+      type: object
+      properties:
+        cpu_pct:      { type: number }
+        load1:        { type: number }
+        load5:        { type: number }
+        load15:       { type: number }
+        mem_used_kib: { type: integer }
+        mem_total_kib: { type: integer }
+        proc_count:   { type: integer }
+        uptime_sec:   { type: integer }
+        top_disk:
+          nullable: true
+          type: object
+          properties:
+            mount:    { type: string }
+            used_pct: { type: number }
+
+    ContainerSummary:
+      type: object
+      description: 等价 `docker ps -a` 的一行（含已停止容器）
+      properties:
+        id:      { type: string, description: 完整容器 ID（64 位 hex；UI 可裁剪展示） }
+        name:    { type: string, example: web-proxy }
+        image:   { type: string, example: "nginx:1.27-alpine" }
+        state:   { type: string, enum: [running, exited, created, paused, restarting, dead, removing] }
+        status:  { type: string, description: CLI 的人类可读状态，如 `Up 9 days`、`Exited (0) 2 hours ago` }
+        ports:   { type: string, example: "0.0.0.0:80->80/tcp" }
+        created: { type: string, description: 容器创建时间（CLI 原始格式，不做本地化推算） }
+    ContainerImage:
+      type: object
+      description: 等价 `docker images` 的一行（含悬空镜像 `<none>`）
+      properties:
+        id:         { type: string, example: "sha256:1111..." }
+        repository: { type: string, example: nginx }
+        tag:        { type: string, example: "1.27-alpine" }
+        size:       { type: string, description: CLI 已格式化的体积，如 `55.3MB` }
+        created:    { type: string }
 
     # ───────────── 防火墙 ─────────────
     FirewallStatus:
@@ -683,8 +795,11 @@ paths:
       summary: 发送信号（禁止 pid 1 与面板自身）
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: pid, in: path, required: true, schema: { type: integer } }]
-      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/KillRequest' } } } }
-      responses: { '204': { description: ok }, '400': { description: 拒绝杀 pid 1 / 自身 } }
+      requestBody: { required: false, content: { application/json: { schema: { $ref: '#/components/schemas/KillRequest' } } } }
+      responses:
+        '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { killed: { type: integer }, signal: { type: string } } } } } } } }
+        '400': { description: 非法 pid 或未知信号 }
+        '403': { description: 拒绝杀 pid 1 / 面板自身 }
 
   # ───────── 服务 ─────────
   /api/v1/services:
@@ -756,6 +871,32 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: string } } }
+
+  /api/v1/services/{unit}/config:
+    get:
+      tags: [services]
+      summary: 读取服务单元文件（systemd FragmentPath 指向的文件）
+      parameters: [{ name: unit, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/ServiceConfig' } } }
+        '10009': { description: 该平台/单元不支持配置编辑 }
+    put:
+      tags: [services]
+      summary: 写回单元文件并 daemon-reload（可选重启）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: unit, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [content], properties: { content: { type: string }, restart: { type: boolean, default: false } } }
+      responses:
+        '200': { description: 已保存并重新加载 }
+        '10009': { description: 该平台/单元不支持配置编辑 }
 
   # ───────── 软件包 ─────────
   /api/v1/packages:
@@ -852,11 +993,13 @@ paths:
   /api/v1/sites/{id}/ssl/apply:
     post:
       tags: [sites]
-      summary: 申请/续期证书（任务化 → 202）
+      summary: 申请证书（self-signed 同步完成 → 200；ACME 任务化 → 202）
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SslApply' } } } }
-      responses: { '202': { description: 已入队 } }
+      responses:
+        '200': { description: 自签证书已签发并落盘（含 cert_path / not_after / days_left） }
+        '202': { description: ACME 申请已入队 }
 
   /api/v1/certs:
     get:
@@ -871,10 +1014,12 @@ paths:
   /api/v1/certs/{id}/renew:
     post:
       tags: [sites]
-      summary: 手动续期（任务化 → 202）
+      summary: 手动续期（自签同步 → 200；ACME 任务化 → 202）
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
-      responses: { '202': { description: 已入队 } }
+      responses:
+        '200': { description: 自签证书已重新签发 }
+        '202': { description: ACME 续期已入队 }
   /api/v1/certs/{id}:
     delete:
       tags: [sites]
@@ -1026,6 +1171,130 @@ paths:
       parameters: [{ name: conn, in: path, required: true, schema: { type: integer } }]
       requestBody: { required: true, content: { application/json: { schema: { type: object, required: [file, confirm_token], properties: { file: { type: string }, confirm_token: { type: string } } } } } }
       responses: { '202': { description: 已入队 } }
+
+  # ───────── 备份计划（本地） ─────────
+  /api/v1/backups:
+    get:
+      tags: [backups]
+      summary: 备份计划列表
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/BackupPlan' } } } }
+    post:
+      tags: [backups]
+      summary: 新建备份计划（本地）
+      security: [cookieAuth, csrfHeader]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/BackupPlan' } } } }
+      responses: { '201': { description: 已创建 } }
+  /api/v1/backups/{id}:
+    patch:
+      tags: [backups]
+      summary: 更新备份计划
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses: { '200': { description: ok } }
+    delete:
+      tags: [backups]
+      summary: 删除备份计划（**不删产物**）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses: { '204': { description: ok } }
+  /api/v1/backups/{id}/run:
+    post:
+      tags: [backups]
+      summary: 立即执行备份（任务化 → 202）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses: { '202': { description: 已入队 } }
+  /api/v1/backups/{id}/artifacts:
+    get:
+      tags: [backups]
+      summary: 该计划的产物列表
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/BackupArtifact' } } } }
+  /api/v1/backups/{id}/restore:
+    post:
+      tags: [backups]
+      summary: 从产物恢复（**高危**：需二次确认 + 自动先备份当前态）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses: { '202': { description: 已入队 } }
+
+  # ───────── 容器（Docker）─────────
+  #
+  # 全组端点受能力位 `container.manage` 门禁：该位按 **daemon socket 可达性**判定
+  # （不是二进制存在性）。不满足时统一返回 501，且 `detail.reason` 给出
+  # `binary_missing` / `daemon_unreachable`，供前端直接显示可操作提示。
+  /api/v1/containers:
+    get:
+      tags: [containers]
+      summary: 容器列表（等价 `docker ps -a`，含已停止）
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/ContainerSummary' } } } }
+        '501': { description: "容器能力不可用（detail.reason：binary_missing / daemon_unreachable）" }
+  /api/v1/containers/images:
+    get:
+      tags: [containers]
+      summary: 镜像列表（等价 `docker images`，含悬空镜像）
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/ContainerImage' } } } }
+        '501': { description: 容器能力不可用 }
+  /api/v1/containers/{id}/start:
+    post:
+      tags: [containers]
+      summary: 启动容器
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: "容器 ID 或名称；白名单校验，禁止以 `-` 开头（防参数注入）" }]
+      responses:
+        '204': { description: ok }
+        '400': { description: ID/名称非法 }
+        '501': { description: 容器能力不可用 }
+  /api/v1/containers/{id}/stop:
+    post:
+      tags: [containers]
+      summary: 停止容器（优雅停机 10s 后强制）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        '204': { description: ok }
+        '400': { description: ID/名称非法 }
+        '501': { description: 容器能力不可用 }
+  /api/v1/containers/{id}/restart:
+    post:
+      tags: [containers]
+      summary: 重启容器
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        '204': { description: ok }
+        '400': { description: ID/名称非法 }
+        '501': { description: 容器能力不可用 }
+  /api/v1/containers/{id}:
+    delete:
+      tags: [containers]
+      summary: 删除容器（**刻意不带 -f**：运行中的容器会被拒绝，需先停止）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        '204': { description: ok }
+        '400': { description: ID/名称非法 }
+        '501': { description: 容器能力不可用 }
 
   # ───────── 防火墙 ─────────
   /api/v1/firewall/status:
@@ -1306,3 +1575,47 @@ paths:
       tags: [events]
       summary: SSE：日志增量推送
       responses: { '200': { description: text/event-stream } }
+
+  # ───────── AI 运维助手（只读诊断） ─────────
+  /api/v1/assistant/diagnose:
+    post:
+      tags: [assistant]
+      summary: 诊断问答（内置规则引擎，只读）
+      description: |
+        采集指标/进程/服务/日志/安全基线/备份记录，按确定性规则产出
+        Finding{severity, evidence(真实数据引用), suggestion, action}。
+        问句经轻量关键词路由到诊断域（all/cpu/mem/disk/log/service/security/backup）；
+        未命中即全量体检。**只读**：action 仅 navigate，处置由用户在对应视图人工确认。
+      security: [cookieAuth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                question: { type: [string, "null"], description: 自然语言问句，可空 }
+      responses:
+        '200': { description: 诊断报告, content: { application/json: { schema: { $ref: '#/components/schemas/AssistantReport' } } } }
+
+  # ───────── 内置 Web 终端（WebSocket） ─────────
+  /api/v1/terminal:
+    get:
+      tags: [terminal]
+      summary: 内置 Web 终端（WebSocket 升级，101）
+      description: |
+        WebSocket 升级端点。**不支持** REST 语义，需在 101 之后按私有帧协议通信：
+
+        - 服务端 → 客户端：`Binary` = PTY 原始输出；`Text` = 控制 JSON
+          `{"t":"ready","shell":"bash"}` / `{"t":"exit","code":N}` / `{"t":"notice","msg":"..."}`。
+        - 客户端 → 服务端：`Binary` = 用户输入原始字节；`Text` = 控制 JSON
+          `{"t":"resize","cols":N,"rows":N}`。
+
+        卫士（升级前判定）：登录 Cookie `panel_sid` + `perm::SYSTEM_MANAGE` 权限 +
+        能力位 `terminal.manage` + 非只读模式 + Origin 同源（WS 升级无法带 X-CSRF-Token）。
+      responses:
+        '101': { description: WebSocket 协议切换（升级成功） }
+        '401': { description: 未登录 }
+        '403': { description: 权限/只读/同源校验失败 }
+        '10009': { description: 本机无可用交互 shell（terminal.manage=false） }
+        '503': { description: 终端并发上限 }
