@@ -317,10 +317,47 @@ pub fn backup_to(conn: &Connection, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 独立连接执行在线备份：**绕开写者事务**。
+///
+/// 为什么不能走 `WriterActor::exec`：写者把每个 op 包在 `conn.transaction()` 里，
+/// 而 `VACUUM INTO` 规定 **"cannot VACUUM from within a transaction"**，必然失败。
+/// 备份是只读快照，本就不需要参与写者事务，故此处自开一条连接。
+pub fn backup_file(db_path: &Path, dest: &Path) -> Result<()> {
+    let conn = Connection::open(db_path)
+        .map_err(|e| PanelError::Database(format!("open for backup: {e}")))?;
+    backup_to(&conn, dest)
+}
+
 /// 完整性自检（可选，低配机器上 40MB 库约数十毫秒，故仅在用户手动触发或升级前执行）
 pub fn integrity_check(conn: &Connection) -> Result<String> {
     conn.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
         .map_err(|e| PanelError::Database(e.to_string()))
+}
+
+#[cfg(test)]
+mod backup_tests {
+    use super::*;
+
+    /// 锁定根因回归：必须用独立连接备份，走写者事务会触发
+    /// "cannot VACUUM from within a transaction"。
+    #[test]
+    fn backup_file_produces_a_readable_snapshot() {
+        let dir = std::env::temp_dir().join(format!("panel-db-bk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("src.db");
+        let dest = dir.join("out.db");
+        {
+            let c = Connection::open(&db).unwrap();
+            c.execute_batch("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(42);").unwrap();
+        }
+        backup_file(&db, &dest).expect("独立连接备份应成功");
+        assert!(dest.is_file(), "备份产物应存在");
+        let c = Connection::open(&dest).unwrap();
+        let v: i64 = c.query_row("SELECT x FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 42, "备份内容应可读且一致");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
