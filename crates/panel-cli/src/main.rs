@@ -182,6 +182,19 @@ fn run(cli: Cli) -> Result<()> {
             let layout0 = build_layout(&os, None);
             let cfg = load_cfg(&cli, &layout0)?;
             let layout = build_layout(&os, Some(&cfg));
+            // 关键修复：把配置感知的路径布局注入适配器。否则运行期
+            // `site_root()` 等 [paths] 覆盖不生效（adapter 仍用默认 /var/www），
+            // 导致建站等依赖 site_root 的能力在非 root 环境下必然失败。
+            //
+            // 必须走 `panel_os::adapter_with_overrides`（跨平台入口）而非直接
+            // 构造 `linux::LinuxOsAdapter`：后者会让本 crate 绑死 Linux
+            // （CI 门禁 [4c]），并让 `force-mock` 构建在 `serve` 路径上失效。
+            let os = panel_os::adapter_with_overrides(
+                cfg.paths.config.clone(),
+                cfg.paths.site_root.clone(),
+                cfg.paths.data.clone(),
+                cfg.paths.log.clone(),
+            );
             let tier = detect_tier(&*os, &cfg);
 
             // 启动前硬校验：WAL 在网络文件系统上不可靠，直接拒绝启动
@@ -440,11 +453,13 @@ async fn register_internal_jobs(
                     mem_used_kib: snap.mem.used_kib,
                     mem_total_kib: snap.mem.total_kib,
                     swap_used_kib: snap.mem.swap_used_kib,
-                    disk_used_bytes: snap.disks.first().map(|d| d.used_bytes).unwrap_or(0),
-                    disk_total_bytes: snap.disks.first().map(|d| d.total_bytes).unwrap_or(0),
+                    // 与 /system/overview 保持同一口径：所有本地盘求和、排除网络文件系统；
+                    // 网络速率排除回环接口 lo。否则概览首屏（求和）与实时跳动（首个盘）会口径跳变。
+                    disk_used_bytes: snap.disks.iter().filter(|d| !d.is_network_fs).map(|d| d.used_bytes).sum(),
+                    disk_total_bytes: snap.disks.iter().filter(|d| !d.is_network_fs).map(|d| d.total_bytes).sum(),
                     // SystemSnapshot 字段是 nets（复数）；NetSample 速率字段是 rx/tx_rate_bps
-                    net_in_bps: snap.nets.iter().map(|n| n.rx_rate_bps).sum(),
-                    net_out_bps: snap.nets.iter().map(|n| n.tx_rate_bps).sum(),
+                    net_in_bps: snap.nets.iter().filter(|n| n.iface != "lo").map(|n| n.rx_rate_bps).sum(),
+                    net_out_bps: snap.nets.iter().filter(|n| n.iface != "lo").map(|n| n.tx_rate_bps).sum(),
                     load1: snap.cpu.load1,
                 });
                 Ok(())
@@ -539,19 +554,17 @@ async fn register_internal_jobs(
 
     // ── 每日备份（nano 档位未注册该任务）──
     if cfg.db.daily_backup && !matches!(tier, Tier::Nano) {
-        let writer = writer.clone();
         let backup_dir = layout.backup_dir();
+        let db_path = layout.sqlite_path();
         sched.register("db.backup", move || {
-            let writer = writer.clone();
             let backup_dir = backup_dir.clone();
+            let db_path = db_path.clone();
             async move {
                 std::fs::create_dir_all(&backup_dir).ok();
                 let ts = now_unix();
                 let dest = backup_dir.join(format!("panel-{ts}.db"));
-                writer.exec(move |conn| {
-                    panel_db::backup_to(conn, &dest)?;
-                    Ok(panel_db::WriteAck { rows_changed: 1 })
-                }).await?;
+                // 独立连接备份：写者把 op 包在事务里，事务内不能 VACUUM INTO
+                panel_db::backup_file(&db_path, &dest)?;
                 Ok(())
             }
         }).await;
