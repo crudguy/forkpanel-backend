@@ -24,7 +24,7 @@
 | POST `/auth/login` | 登录 + Set-Cookie | ✅ | 登录限速 + 一次性引导令牌首启向导 | LoginView |
 | POST `/auth/logout` | 清会话 | ✅ | | auth store |
 | GET `/auth/me` | 当前用户/权限/能力 | ✅ | | auth store |
-| POST `/auth/password` | 改密（需 CSRF） | ✅ | | SettingsView |
+| POST `/auth/password` | 改密（需 CSRF） | ✅ | **曾为假桩已修**：真校验 old + argon2 档位哈希 + 单写事务更新 + 吊销该用户其他会话；凭据错返回 400（非 401，避免前端误登出） | SettingsView |
 
 ## 2. 系统 / 监控 / 指标
 
@@ -94,8 +94,8 @@
 |---|---|---|---|---|
 | GET `/security/baseline` | 基线检查 | ✅ | 6 项只读检查；OpenSSH 默认值语义已修正并有单测 | SecurityView |
 | POST `/security/baseline/apply` | 应用基线 | 🟡 | 写回系统安全配置属高危：需 root + 先备份 + 二次确认（未实装不硬上） | — |
-| GET `/security/sessions` | 在线会话 | 🟡 | SessionCache 在内存，实现不难（下一步候选） | SecurityView（有引用） |
-| DELETE `/security/sessions/{id}` | 吊销会话 | 🟡 | 同上 | — |
+| GET `/security/sessions` | 在线会话 | ✅ | 内存 SessionCache 快照（重启即清零，如实标注）；`current` 标记自己；**ip 刻意不采集**（无对端地址管道，返回 null 不伪造） | SecurityView |
+| DELETE `/security/sessions/{id}` | 吊销会话 | ✅ | 允许吊销自己的当前会话（=自我登出）；404 对不存在会话；审计只落 sid 前 8 位（sid=凭据不落库） | SecurityView |
 
 ## 10. 计划任务（cron）
 
@@ -146,7 +146,7 @@
 ## 覆盖结论（2026-09-29）
 
 - **契约完整度：100%**，且新增模块全部先进 `openapi.yaml` 再实现（前端副本按事实源同步）。
-- **剩余 🟡 清单**（结构化 501，均如实返回原因）：files stat/upload/download/action、security sessions/revoke、baseline/apply、tasks/{id}、cron/preview、logs/download、db 与备份的 restore、ACME。
+- **剩余 🟡 清单**（结构化 501，均如实返回原因）：files stat/upload/download/action、baseline/apply、tasks/{id}、cron/preview、logs/download、db 与备份的 restore、ACME。
 - **🟠 真机验证项**：nginx 下发/reload、ufw、mysql/postgres 链路、ACME——能力位诚实置灰，沙箱内只验证降级路径。
 - **能力驱动 UI**：未支持能力一律 EmptyState/置灰 + 原因，绝不假装可用。
 

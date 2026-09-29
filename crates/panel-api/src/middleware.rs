@@ -23,9 +23,16 @@ pub async fn require_auth(
     next: Next,
 ) -> Response {
     let sid = extract_cookie(&req.headers(), "panel_sid");
-    let session = sid.and_then(|s| state.sessions.get(&s));
+    let session = sid.as_ref().and_then(|s| state.sessions.get(s));
     match session {
-        Some(s) => { req.extensions_mut().insert(s); next.run(req).await }
+        Some(s) => {
+            // sid 一并透出：会话管理需区分「自己」（CurrentSid 提取器）
+            if let Some(id) = &sid {
+                req.extensions_mut().insert(crate::routes::CurrentSid(id.clone()));
+            }
+            req.extensions_mut().insert(s);
+            next.run(req).await
+        }
         None => ApiError::unauthorized().into_response(),
     }
 }

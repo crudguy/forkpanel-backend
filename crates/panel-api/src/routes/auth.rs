@@ -3,7 +3,7 @@
 use crate::{
     auth::{self, Session},
     error::{ok, ApiError, ApiResult},
-    routes::{audit, Auth, Shared},
+    routes::{audit, Auth, CurrentSid, Shared},
     AppState,
 };
 use axum::{
@@ -149,12 +149,73 @@ pub struct PwdReq { pub old: String, pub new: String }
 pub async fn change_password(
     State(state): State<Shared>,
     Auth(s): Auth,
+    CurrentSid(cur): CurrentSid,
     Json(req): Json<PwdReq>,
 ) -> ApiResult<StatusCode> {
     auth::check_password_policy(&req.new)?;
-    let _ = (&state, &s, &req);
-    // 完整实现（M0 收尾）：校验 old → 用档位参数哈希 new → 单写事务更新 → 强制其他会话下线
-    audit(&state, &s, "auth.password", &s.username, "ok").await;
+    if req.old == req.new {
+        return Err(ApiError::bad_request("new", "new password must differ from the old one"));
+    }
+
+    // 1) 取旧哈希（只读池）。uid 先复制出来——闭包是 move，不能捕获整个 s
+    //    （后面 audit / 踢会话还要用 s）。
+    let uid = s.user_id;
+    let pwd_hash = state
+        .pool
+        .with(move |conn| {
+            use rusqlite::OptionalExtension;
+            conn.query_row(
+                "SELECT pwd_hash FROM users WHERE id = ?1",
+                [uid],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| panel_core::PanelError::Database(e.to_string()))
+        })
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found("user"))?;
+
+    // 2) 校验旧密码（argon2 较贵，blocking 池同 login）。
+    //    **刻意 400 而非 401**：前端把 401 视作会话失效全局登出，
+    //    凭据输错不该把人踢出登录态。
+    let old = req.old.clone();
+    let verified = tokio::task::spawn_blocking(move || auth::verify_password(&old, &pwd_hash))
+        .await
+        .map_err(|e| ApiError::new(10999, StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(ApiError::from)?;
+    if !verified {
+        return Err(ApiError::bad_request("old", "incorrect password"));
+    }
+
+    // 3) 新密码哈希（blocking 池，按档位成本）
+    let tier = state.tier;
+    let new = req.new.clone();
+    let hash = tokio::task::spawn_blocking(move || {
+        auth::hash_password(&new, &auth::HashParams::for_tier(tier))
+    })
+    .await
+    .map_err(|e| ApiError::new(10999, StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(ApiError::from)?;
+
+    // 4) 单写事务更新（rows_changed 复核用户仍在）
+    state
+        .db
+        .exec(move |conn| {
+            let n = conn
+                .execute("UPDATE users SET pwd_hash = ?1 WHERE id = ?2", rusqlite::params![hash, uid])
+                .map_err(|e| panel_core::PanelError::Database(e.to_string()))?;
+            if n == 0 {
+                return Err(panel_core::PanelError::NotFound("user".into()));
+            }
+            Ok(panel_db::WriteAck { rows_changed: n })
+        })
+        .await?;
+
+    // 5) 强制该用户**其他端**下线（当前会话保留，避免改密即被登出）
+    let kicked = state.sessions.remove_by_user_except(s.user_id, &cur);
+
+    audit(&state, &s, "auth.password", &format!("{} (kicked={kicked})", s.username), "ok").await;
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -218,13 +218,33 @@ impl SessionCache {
         Some((new, s))
     }
 
-    pub fn remove(&self, sid: &str) {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).remove(sid);
+    /// 吊销指定会话。返回是否存在（供「吊销不存在的会话」→ 404 判定）。
+    pub fn remove(&self, sid: &str) -> bool {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).remove(sid).is_some()
+    }
+
+    /// 在线会话快照（管理员视图）：sid → Session。锁内克隆，绝不外借引用。
+    pub fn list(&self) -> Vec<(String, Session)> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(k, s)| (k.clone(), s.clone()))
+            .collect()
     }
 
     /// 按用户 id 清除其所有会话（禁用/删除用户时立即踢下线）
     pub fn remove_by_user(&self, uid: i64) {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, s| s.user_id != uid);
+    }
+
+    /// 按用户清除其**除 keep_sid 外**的全部会话（改密强制其他端下线，当前端不踢）。
+    /// 返回清除的会话数。
+    pub fn remove_by_user_except(&self, uid: i64, keep_sid: &str) -> usize {
+        let mut m = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let before = m.len();
+        m.retain(|sid, s| s.user_id != uid || sid == keep_sid);
+        before - m.len()
     }
 
     /// 定时清理过期会话（合并进统一调度器，避免独立定时器）

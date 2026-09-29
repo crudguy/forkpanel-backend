@@ -527,13 +527,17 @@ components:
         applicable: { type: boolean, description: "该平台是否适用（如非 systemd 则 false）" }
     SessionInfo:
       type: object
+      description: 在线会话（内存 SessionCache 快照）。ip 刻意不采集——会话层无对端地址管道，不伪造数据
       properties:
-        id: { type: string }
-        user: { type: string }
-        ip: { type: [string, "null"] }
-        ua: { type: [string, "null"] }
+        id:         { type: string, description: 会话 sid（吊销用） }
+        user:       { type: string }
+        role:       { type: string }
+        ip:         { type: "null", nullable: true }
         created_at: { type: integer }
-        last_seen_at: { type: integer }
+        last_seen:  { type: integer }
+        expires_at: { type: integer }
+        idle_secs:  { type: integer }
+        current:    { type: boolean, description: 是否为发起本次请求的会话 }
 
     # ───────────── 计划任务 ─────────────
     CronJob:
@@ -1387,20 +1391,21 @@ paths:
   /api/v1/security/sessions:
     get:
       tags: [security]
-      summary: 当前活跃会话（可踢下线）
+      summary: 当前活跃会话（内存快照；重启即清零，如实行为）
+      security: [cookieAuth]
       responses:
         '200':
           description: ok
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/SessionInfo' } } } }
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { sessions: { type: array, items: { $ref: '#/components/schemas/SessionInfo' } }, total: { type: integer } } } } }
   /api/v1/security/sessions/{id}:
     delete:
       tags: [security]
-      summary: 踢下线
+      summary: 吊销会话（允许吊销自己的当前会话=自我登出）
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
-      responses: { '204': { description: ok } }
+      responses: { '204': { description: ok }, '404': { description: 会话不存在或已过期 } }
 
   # ───────── 计划任务 ─────────
   /api/v1/cron/jobs:

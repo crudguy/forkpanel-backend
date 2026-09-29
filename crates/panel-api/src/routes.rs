@@ -52,6 +52,18 @@ impl FromRequestParts<Shared> for Auth {
     }
 }
 
+/// 当前请求的会话 id（require_auth 中间件注入）。会话管理需区分「自己」。
+#[derive(Clone, Debug)]
+pub struct CurrentSid(pub String);
+
+impl FromRequestParts<Shared> for CurrentSid {
+    type Rejection = ApiError;
+    async fn from_request_parts(parts: &mut Parts, _: &Shared) -> Result<Self, Self::Rejection> {
+        parts.extensions.get::<CurrentSid>().cloned()
+            .ok_or_else(ApiError::unauthorized)
+    }
+}
+
 /// 可空会话（用于登录页等公开接口）
 pub struct MaybeAuth(pub Option<Session>);
 
