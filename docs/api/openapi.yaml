@@ -349,13 +349,43 @@ components:
         total: { type: integer }
     FileAction:
       type: object
-      required: [op]
+      required: [op, paths]
       properties:
-        op:   { type: string, enum: [move, copy, delete, chmod, rename, compress, extract] }
+        op:    { type: string, enum: [move, copy, delete, chmod] }
+        paths: { type: array, items: { type: string }, maxItems: 100, description: 批量目标（允许根内路径） }
+        dest:  { type: [string, "null"], description: move/copy 的目标目录 }
+        mode:  { type: [string, "null"], description: chmod 的八进制模式（如 644） }
+
+    FileStatOut:
+      type: object
+      properties:
+        path:        { type: string }
+        kind:        { type: string, enum: [dir, file, symlink, other] }
+        size:        { type: integer }
+        mode:        { type: [string, "null"], description: 八进制串（如 644） }
+        owner:       { type: [string, "null"] }
+        modified_at: { type: integer }
+
+    FileActionResult:
+      type: object
+      properties:
+        op:         { type: string }
+        results:
+          type: array
+          items:
+            type: object
+            properties:
+              path:  { type: string }
+              ok:    { type: boolean }
+              error: { type: [string, "null"] }
+        ok_count:   { type: integer }
+        fail_count: { type: integer }
+
+    FileUploadResult:
+      type: object
+      properties:
         path: { type: string }
-        target: { type: string }
-        name: { type: string }
-        mode: { type: string }
+        size: { type: integer }
 
     # ───────────── 数据库 ─────────────
     DbConnection:
@@ -1082,23 +1112,39 @@ paths:
     get:
       tags: [files]
       summary: 单文件/目录元信息
+      security: [cookieAuth]
       parameters: [{ name: path, in: query, required: true, schema: { type: string } }]
-      responses: { '200': { description: ok } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/FileStatOut' } } }
   /api/v1/files/upload:
     put:
       tags: [files]
-      summary: 流式上传（octet-stream，分片 5MB）
+      summary: 上传（body=原始字节 octet-stream；上限 min(100MB, 平台上限)；原子替换）
+      description: |
+        覆盖写：目标已存在则原子替换（provider 内部临时文件+rename）。
+        body 超限返回 400；目标为目录返回 400；沙箱越界 50001。
       security: [cookieAuth, csrfHeader]
-      parameters:
-        - { name: path, in: query, required: true, schema: { type: string } }
-        - { name: name, in: query, required: true, schema: { type: string } }
-      responses: { '204': { description: ok } }
+      parameters: [{ name: path, in: query, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/FileUploadResult' } } } } } } }
   /api/v1/files/download:
     get:
       tags: [files]
-      summary: 下载（一次性签名 token，60s 有效，绑定会话）
-      parameters: [{ name: token, in: query, required: true, schema: { type: string } }]
-      responses: { '200': { description: application/octet-stream }, '401': { description: token 失效 } }
+      summary: 下载（octet-stream + attachment 头；上限同上传；目录 400）
+      security: [cookieAuth]
+      parameters: [{ name: path, in: query, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: application/octet-stream }
+        '400': { description: 目录 / 超过大小上限 }
+        '50001': { description: 路径越界 }
   /api/v1/files/read:
     get:
       tags: [files]
@@ -1143,10 +1189,19 @@ paths:
   /api/v1/files/action:
     post:
       tags: [files]
-      summary: 批量操作（move/copy/compress/extract）
+      summary: 批量动作（move/copy/delete/chmod；逐项执行逐项报告）
+      description: |
+        move/copy：dest 为**目标目录**，各 path 移入同名；目标已存在 → 该项失败（不静默覆盖）。
+        delete：递归删除（目录也允许，前端须二次确认）。chmod：八进制 ≤777。
+        部分失败整体仍 200，结果数组逐项带 error；op/dest/mode 非法 → 400。
       security: [cookieAuth, csrfHeader]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/FileAction' } } } }
-      responses: { '202': { description: 大目录走后台任务 } }
+      responses:
+        '200':
+          description: 逐项结果
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/FileActionResult' } } }
 
   # ───────── 数据库 ─────────
   /api/v1/db/connections:

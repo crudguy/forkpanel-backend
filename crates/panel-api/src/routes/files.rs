@@ -17,9 +17,12 @@ use crate::{
 };
 use axum::{
     extract::{Query, State},
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
     Json,
 };
 use panel_core::{PanelError, Result, SafePath};
+use panel_os::EntryKind;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -33,11 +36,40 @@ const MAX_READ_BYTES: usize = 2 * 1024 * 1024;
 ///
 /// 返回 SafePath 意味着已通过：canonicalize + 允许根前缀断言。
 fn resolve(_state: &Shared, s: &crate::auth::Session, input: &str) -> Result<SafePath> {
+    resolve_impl(_state, s, input, false)
+}
+
+/// 「先登记、后落地」语义：目标允许尚不存在（上传/移动/复制的目标侧）。
+fn resolve_new(_state: &Shared, s: &crate::auth::Session, input: &str) -> Result<SafePath> {
+    resolve_impl(_state, s, input, true)
+}
+
+fn resolve_impl(
+    _state: &Shared, s: &crate::auth::Session, input: &str, create: bool,
+) -> Result<SafePath> {
     // 空路径视为根
     let input = if input.is_empty() { "/" } else { input };
+    // owner 特判：owner 等价宿主管理员（能开终端=任意命令），文件沙箱对其无意义；
+    // 且 bootstrap 建号时 allowed_roots='[]'，按"空=全拒"会让 owner 的文件管理器
+    // 完全不可用。owner 仍受敏感黑名单兜底（ensure_not_sensitive）。
+    // allowed_roots 的作用域限制是给 operator/viewer 的。
+    // 全盘沙箱：root=/。resolve_within 拒绝绝对输入，故把绝对路径转为
+    // 相对 root 的形式后走**同一管线**（.. 拦截 / 存在性 / 前缀断言全保留）。
+    let pick = |root: &PathBuf, rel: String| {
+        if create {
+            panel_os::paths::resolve_within_for_create(root, &rel)
+        } else {
+            panel_os::paths::resolve_within(root, &rel)
+        }
+    };
+    if s.role == "owner" && s.allowed_roots.is_empty() {
+        let rel = input.trim_start_matches('/');
+        let rel = if rel.is_empty() { "." } else { rel };
+        return pick(&PathBuf::from("/"), rel.to_string());
+    }
     let mut last_err = None;
     for root in &s.allowed_roots {
-        match panel_os::paths::resolve_within(&PathBuf::from(root), input) {
+        match pick(&PathBuf::from(root), input.to_string()) {
             Ok(p) => return Ok(p),
             Err(e) => last_err = Some(e),
         }
@@ -303,34 +335,216 @@ pub async fn chmod(
     Ok(ok(serde_json::json!({ "path": req.path, "mode": format!("{mode:o}") })))
 }
 
-// ─────────────── 文档式文件端点（M2 占位） ───────────────
+// ─────────────── stat / upload / download / action（M2 实装） ───────────────
+
+/// 上传/下载共用上限：取平台 `max_file_bytes`（100MB）与部署级 body 上限的较小者。
+/// 低配档位（1C1G）全量读入内存的峰值安全线，不做流式管道（避免引 tokio-util）。
+fn transfer_limit(state: &Shared) -> usize {
+    state.os.files().max_file_bytes().min(crate::middleware::BODY_LIMIT_UPLOAD)
+}
 
 pub async fn stat(
-    State(_): State<Shared>, Auth(s): Auth,
+    State(state): State<Shared>, Auth(s): Auth,
+    Query(q): Query<StatQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FILE_READ)?;
-    Err(ApiError::unsupported("file.stat (M2: 独立 stat 端点尚未接入；可用 /files/list 获取目录元数据)"))
+    let p = resolve(&state, &s, &q.path)?;
+    ensure_not_sensitive(&state, &p)?;
+    let st = state.os.files().stat(&p).await?;
+    Ok(ok(serde_json::json!({
+        "path": q.path,
+        "kind": match st.kind { EntryKind::Dir => "dir", EntryKind::File => "file", EntryKind::Symlink => "symlink", EntryKind::Other => "other" },
+        "size": st.size,
+        "mode": st.mode.map(|m| format!("{m:o}")),
+        "owner": st.owner,
+        "modified_at": st.modified_unix,
+    })))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct StatQuery { pub path: String }
+
+/// PUT /files/upload?path=… —— body 为**原始字节**（octet-stream）。
+/// 上限 = min(平台 max_file_bytes, BODY_LIMIT_UPLOAD)；超限 400。
+/// 写入经 provider（内部临时文件 + 原子替换），沙箱与敏感路径纪律同单项写入。
 pub async fn upload(
-    State(_): State<Shared>, Auth(s): Auth,
+    State(state): State<Shared>, Auth(s): Auth,
+    Query(q): Query<StatQuery>,
+    body: axum::body::Bytes,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FILE_WRITE)?;
-    Err(ApiError::unsupported("file.upload (M2: 流式上传尚未接入；可用 /files/write 写入文本)"))
+    let limit = transfer_limit(&state);
+    if body.len() > limit {
+        return Err(ApiError::bad_request(
+            "body",
+            format!("upload too large: {} bytes (limit {})", body.len(), limit),
+        ));
+    }
+    let p = resolve_new(&state, &s, &q.path)?;
+    ensure_not_sensitive(&state, &p)?;
+    if state.os.files().stat(&p).await.map(|st| matches!(st.kind, EntryKind::Dir)).unwrap_or(false) {
+        return Err(ApiError::bad_request("path", "target is a directory"));
+    }
+    state.os.files().write(&p, &body).await?;
+    audit(&state, &s, "file.upload", &q.path, "ok").await;
+    Ok(ok(serde_json::json!({ "path": q.path, "size": body.len() })))
 }
 
+/// GET /files/download?path=… —— 原始字节 + attachment 头。
+/// 全量读入（≤ transfer_limit）；更大文件属"归档"场景，留待分块下载专项。
 pub async fn download(
-    State(_): State<Shared>, Auth(s): Auth,
-) -> ApiResult<Json<serde_json::Value>> {
+    State(state): State<Shared>, Auth(s): Auth,
+    Query(q): Query<StatQuery>,
+) -> ApiResult<Response> {
     crate::auth::require(&s, perm::FILE_READ)?;
-    Err(ApiError::unsupported("file.download (M2: 分块下载尚未接入)"))
+    let p = resolve(&state, &s, &q.path)?;
+    ensure_not_sensitive(&state, &p)?;
+    let st = state.os.files().stat(&p).await?;
+    if matches!(st.kind, EntryKind::Dir) {
+        return Err(ApiError::bad_request("path", "cannot download a directory"));
+    }
+    let limit = transfer_limit(&state);
+    if st.size > limit as u64 {
+        return Err(ApiError::bad_request(
+            "path",
+            format!("file too large to download here: {} bytes (limit {})", st.size, limit),
+        ));
+    }
+    let data = state.os.files().read(&p, limit).await?;
+
+    // Content-Disposition：ASCII fallback + RFC 5987 filename*（UTF-8 手写百分号编码，零新依赖）
+    let name = q.path.rsplit('/').next().unwrap_or("download.bin");
+    let ascii: String = name.chars().map(|c| if c.is_ascii() && c != '%' { c } else { '_' }).collect();
+    let enc: String = name.bytes().map(|b| {
+        if b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_') {
+            (b as char).to_string()
+        } else {
+            format!("%{b:02X}")
+        }
+    }).collect();
+    let headers = [
+        (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+        (header::CONTENT_DISPOSITION,
+         format!("attachment; filename=\"{ascii}\"; filename*=UTF-8''{enc}")),
+    ];
+    Ok((StatusCode::OK, headers, data).into_response())
+}
+
+/// POST /files/action —— 批量动作。逐项执行、逐项报告（部分失败也 200，
+/// 结果数组里带 error）；op/dest/mode 非法则整体 400。
+#[derive(Debug, Deserialize)]
+pub struct ActionReq {
+    /// move | copy | delete | chmod
+    pub op: String,
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// move/copy 的目标**目录**（各 path 移入同名）
+    pub dest: Option<String>,
+    /// chmod 的八进制模式（如 "644"）
+    pub mode: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ActionItem {
+    pub path: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 pub async fn action(
-    State(_): State<Shared>, Auth(s): Auth,
+    State(state): State<Shared>, Auth(s): Auth,
+    Json(req): Json<ActionReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FILE_WRITE)?;
-    Err(ApiError::unsupported("file.action (M2: 批量/归档动作尚未接入)"))
+
+    if req.paths.is_empty() {
+        return Err(ApiError::bad_request("paths", "empty"));
+    }
+    if req.paths.len() > 100 {
+        return Err(ApiError::bad_request("paths", "too many (max 100 per batch)"));
+    }
+
+    // dest/mode 预解析（整体 400，不部分执行）
+    let dest_dir: Option<SafePath> = match req.op.as_str() {
+        "move" | "copy" => {
+            let d = req.dest.as_deref().ok_or_else(|| {
+                ApiError::bad_request("dest", "required for move/copy")
+            })?;
+            let dp = resolve(&state, &s, d)?;
+            ensure_not_sensitive(&state, &dp)?;
+            if state.os.files().stat(&dp).await.map(|st| st.kind != EntryKind::Dir).unwrap_or(true) {
+                return Err(ApiError::bad_request("dest", "must be an existing directory"));
+            }
+            Some(dp)
+        }
+        _ => None,
+    };
+    let mode: Option<u32> = match req.op.as_str() {
+        "chmod" => {
+            let m = u32::from_str_radix(
+                req.mode.as_deref().unwrap_or("").trim_start_matches("0o"), 8,
+            ).map_err(|_| ApiError::bad_request("mode", "must be octal, e.g. 644"))?;
+            if m > 0o777 {
+                return Err(ApiError::bad_request("mode", "out of range"));
+            }
+            Some(m)
+        }
+        _ => None,
+    };
+    if !matches!(req.op.as_str(), "move" | "copy" | "delete" | "chmod") {
+        return Err(ApiError::bad_request("op", "must be one of move/copy/delete/chmod"));
+    }
+
+    let mut results: Vec<ActionItem> = Vec::with_capacity(req.paths.len());
+    for raw in &req.paths {
+        let mut item = ActionItem { path: raw.clone(), ok: false, error: None };
+        let r = (|| async {
+            let p = resolve(&state, &s, raw)?;
+            ensure_not_sensitive(&state, &p)?;
+            match req.op.as_str() {
+                "delete" => state.os.files().remove(&p, true).await?,
+                "chmod" => {
+                    let m = mode.expect("预解析已保证");
+                    state.os.storage().set_permissions(
+                        &p, panel_os::PermissionOp::Posix { mode: m, owner: None, group: None },
+                    ).await?;
+                }
+                op => {
+                    let dest = dest_dir.as_ref().expect("预解析已保证");
+                    let name = raw.trim_end_matches('/').rsplit('/').next().unwrap_or(raw);
+                    // 目标路径字符串重走 resolve（统一沙箱入口），不手工拼 SafePath
+                    let base = dest.as_path().display().to_string();
+                    let target = resolve_new(&state, &s, &format!("{base}/{name}"))?;
+                    ensure_not_sensitive(&state, &target)?;
+                    // 目标已存在 → 跳过（不静默覆盖，逐项报 error 由前端提示）
+                    if state.os.files().stat(&target).await.is_ok() {
+                        return Err(PanelError::Io(format!("target exists: {name}")));
+                    }
+                    if op == "move" {
+                        state.os.files().rename(&p, &target).await?;
+                    } else {
+                        state.os.files().copy(&p, &target).await?;
+                    }
+                }
+            }
+            Ok::<(), PanelError>(())
+        })().await;
+        match r {
+            Ok(()) => item.ok = true,
+            Err(e) => item.error = Some(e.to_string()),
+        }
+        results.push(item);
+    }
+
+    let ok_count = results.iter().filter(|r| r.ok).count();
+    audit(&state, &s, "file.batch", &format!("{} x{}", req.op, req.paths.len()), "ok").await;
+    Ok(ok(serde_json::json!({
+        "op": req.op,
+        "results": results,
+        "ok_count": ok_count,
+        "fail_count": results.len() - ok_count,
+    })))
 }
 
 #[cfg(test)]

@@ -66,10 +66,10 @@
 | 方法 + 路径 | 文档要求 | 后端状态 | 备注 | 前端视图 |
 |---|---|---|---|---|
 | GET `/files/list` / `read` / `write` / mkdir/delete/rename/chmod | 浏览/读写/单项操作 | ✅ | 写自动 .bak | FilesView |
-| GET `/files/stat` | 独立 stat | 🟡 | M2 | — |
-| PUT `/files/upload` | 流式上传 | 🟡 | M2（前端亦未建 UI） | — |
-| GET `/files/download` | 一次性下载 | 🟡 | M2 | — |
-| POST `/files/action` | move/copy/delete/chmod 批量 | 🟡 | M2 | — |
+| GET `/files/stat` | 独立 stat | ✅ | kind/size/mode/owner/mtime | FilesView |
+| PUT `/files/upload` | 上传（octet-stream） | ✅ | 原子替换；上限 min(100MB, 平台上限)；目标为目录 400；**owner 空 allowed_roots 特判放行全盘（敏感黑名单兜底）** | FilesView（多选上传） |
+| GET `/files/download` | 下载 | ✅ | attachment 头 + RFC5987 文件名；目录 400；上限同上传 | FilesView（行内下载） |
+| POST `/files/action` | 批量 move/copy/delete/chmod | ✅ | 逐项执行逐项报告（部分失败 200）；**同名冲突不静默覆盖**；≤100 项/批 | FilesView（多选批量条） |
 
 ## 7. 数据库——#45/#62/#63 落地
 

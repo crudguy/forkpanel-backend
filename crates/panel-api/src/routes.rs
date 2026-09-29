@@ -126,10 +126,14 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/certs/{id}", delete(sites::cert_delete));
 
     // ── 文件 ──
+    // upload 单独放宽 body 上限（axum 默认 2MB 会拦住一切上传）；
+    // handler 内仍有 transfer_limit 二次校验（min(平台上限, BODY_LIMIT_UPLOAD)）。
+    let file_upload_r = Router::new()
+        .route("/api/v1/files/upload", put(files::upload))
+        .layer(axum::extract::DefaultBodyLimit::max(crate::middleware::BODY_LIMIT_UPLOAD));
     let file_r = Router::new()
         .route("/api/v1/files/list", get(files::list))
         .route("/api/v1/files/stat", get(files::stat))
-        .route("/api/v1/files/upload", put(files::upload))
         .route("/api/v1/files/download", get(files::download))
         .route("/api/v1/files/read", get(files::read))
         .route("/api/v1/files/write", put(files::write))
@@ -239,6 +243,7 @@ pub fn build_router(state: Shared) -> Router {
         .merge(svc_r)
         .merge(site_r)
         .merge(file_r)
+        .merge(file_upload_r)
         .merge(db_r)
         .merge(fw_r)
         .merge(sec_r)
