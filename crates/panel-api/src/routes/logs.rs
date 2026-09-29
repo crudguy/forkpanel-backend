@@ -130,14 +130,7 @@ pub async fn clear_panel(
 }
 
 // ─────────────── 文档式日志端点（M3 占位） ───────────────
-
-pub async fn stream(
-    State(state): State<Shared>, Auth(s): Auth,
-) -> ApiResult<Json<serde_json::Value>> {
-    crate::auth::require(&s, perm::LOG_VIEW)?;
-    let _ = state;
-    Err(ApiError::unsupported("logs.stream (M3: 日志跟随 SSE 尚未接入；可用 /events/logs)"))
-}
+// 注：`/api/v1/logs/stream` 的实时跟随已实装，见 `crate::sse::log_stream`。
 
 pub async fn download(
     State(state): State<Shared>, Auth(s): Auth,

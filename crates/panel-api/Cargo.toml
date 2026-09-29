@@ -14,7 +14,8 @@ panel-task = { path = "../panel-task" }
 
 # 注意：axum 0.8 把 Query 提取器放到了 `query` feature 之后；
 # 本仓刻意关掉默认特性控体积，故必须显式开启，否则 axum::extract::Query 不存在。
-axum       = { version = "0.8", default-features = false, features = ["http1", "json", "macros", "query", "tokio"] }
+# `ws` 供内置终端使用（WebSocket 升级 + 帧编解码，含 tokio-tungstenite 传递依赖）。
+axum       = { version = "0.8", default-features = false, features = ["http1", "json", "macros", "query", "tokio", "ws"] }
 tokio      = { workspace = true }
 async-trait = { workspace = true }
 tower      = { version = "0.5", features = ["limit"] }

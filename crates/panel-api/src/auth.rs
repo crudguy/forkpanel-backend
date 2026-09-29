@@ -222,6 +222,11 @@ impl SessionCache {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).remove(sid);
     }
 
+    /// 按用户 id 清除其所有会话（禁用/删除用户时立即踢下线）
+    pub fn remove_by_user(&self, uid: i64) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, s| s.user_id != uid);
+    }
+
     /// 定时清理过期会话（合并进统一调度器，避免独立定时器）
     pub fn sweep(&self) -> usize {
         let now = now_unix();
@@ -310,6 +315,10 @@ pub mod perm {
     pub const CRON_MANAGE: &str     = "cron.manage";
     pub const LOG_VIEW: &str        = "log.view";
     pub const TASK_VIEW: &str       = "task.view";
+    pub const BACKUP_VIEW: &str     = "backup.view";
+    pub const BACKUP_MANAGE: &str   = "backup.manage";
+    pub const CONTAINER_VIEW: &str  = "container.view";
+    pub const CONTAINER_MANAGE: &str= "container.manage";
     pub const USER_MANAGE: &str     = "user.manage";
     pub const SETTINGS_MANAGE: &str = "settings.manage";
     pub const AUDIT_VIEW: &str      = "audit.view";
@@ -319,18 +328,20 @@ pub mod perm {
 pub fn permissions_for_role(role: &str) -> Vec<String> {
     use perm::*;
     let view_only = vec![SYSTEM_VIEW, SERVICE_VIEW, SITE_VIEW, FILE_READ, DB_VIEW,
-                         FIREWALL_VIEW, CRON_VIEW, LOG_VIEW, TASK_VIEW, AUDIT_VIEW];
+                         FIREWALL_VIEW, CRON_VIEW, LOG_VIEW, TASK_VIEW, BACKUP_VIEW,
+                         CONTAINER_VIEW, AUDIT_VIEW];
     match role {
         "owner" | "admin" => {
             let mut v = view_only.clone();
             v.extend([SYSTEM_MANAGE, SERVICE_MANAGE, PACKAGE_MANAGE, SITE_MANAGE, SSL_MANAGE,
                       FILE_WRITE, DB_MANAGE, FIREWALL_MANAGE, SECURITY_MANAGE, CRON_MANAGE,
-                      SETTINGS_MANAGE, USER_MANAGE]);
+                      BACKUP_MANAGE, CONTAINER_MANAGE, SETTINGS_MANAGE, USER_MANAGE]);
             v
         }
         "operator" => {
             let mut v = view_only.clone();
-            v.extend([SERVICE_MANAGE, SITE_MANAGE, SSL_MANAGE, CRON_MANAGE, FILE_WRITE]);
+            v.extend([SERVICE_MANAGE, SITE_MANAGE, SSL_MANAGE, CRON_MANAGE, BACKUP_MANAGE,
+                      CONTAINER_MANAGE, FILE_WRITE]);
             v
         }
         "viewer" => view_only,
@@ -351,7 +362,7 @@ fn leak_static(p: &str) -> &'static str {
     for c in [SYSTEM_VIEW, SYSTEM_MANAGE, SERVICE_VIEW, SERVICE_MANAGE, PACKAGE_MANAGE,
               SITE_VIEW, SITE_MANAGE, SSL_MANAGE, FILE_READ, FILE_WRITE, DB_VIEW, DB_MANAGE,
               FIREWALL_VIEW, FIREWALL_MANAGE, SECURITY_MANAGE, CRON_VIEW, CRON_MANAGE,
-              LOG_VIEW, TASK_VIEW, USER_MANAGE, SETTINGS_MANAGE, AUDIT_VIEW] {
+              LOG_VIEW, TASK_VIEW, BACKUP_VIEW, BACKUP_MANAGE, USER_MANAGE, SETTINGS_MANAGE, AUDIT_VIEW] {
         if c == p { return c; }
     }
     "unknown"

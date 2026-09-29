@@ -1,40 +1,272 @@
-//! 用户管理（设计方案 §2.12）。M5 接入：管理员 CRUD、角色/权限分配、强制下线。
-//! 本期为占位端点，返回结构化 501。登录鉴权链路已在 `auth.rs` 实现。
+//! 用户管理（设计方案 §2.12）。管理员 CRUD、角色/权限分配、禁用/删除。
+//!
+//! 安全纪律：
+//! - owner 角色不可经 API 创建/修改/删除（仅首启引导建唯一 owner，见 auth.rs::bootstrap）。
+//! - 禁止自锁：不能禁用自己、不能把自己权限降到失去 `user.manage`（无法再恢复）。
+//! - 禁用/删除立即踢掉目标现有会话（state.sessions.remove_by_user）。
+//! - 每个写操作都审计操作人（actor = 当前会话用户名）。
 
-use crate::{auth::perm, error::{ApiError, ApiResult}, routes::{Auth, Shared}};
+use crate::{
+    auth::{self, perm},
+    error::{ApiError, ApiResult, ok},
+    routes::{audit, Auth, Shared},
+};
 use axum::extract::{Path as AxPath, State};
+use axum::http::StatusCode;
 use axum::Json;
+use panel_core::PanelError;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 
-pub async fn list(
-    State(_): State<Shared>,
-    Auth(s): Auth,
-) -> ApiResult<Json<serde_json::Value>> {
+/// API 可创建/分配的角色（owner 除外——它是引导态专属，不可经 API 操作）
+const ASSIGNABLE_ROLES: &[&str] = &["admin", "operator", "viewer"];
+
+#[derive(Debug, Deserialize)]
+pub struct CreateReq {
+    pub username: String,
+    pub password: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub allowed_roots: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PatchReq {
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub allowed_roots: Option<Vec<String>>,
+    #[serde(default)]
+    pub disabled: Option<bool>,
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UserOut {
+    pub id: i64,
+    pub username: String,
+    pub role: String,
+    pub allowed_roots: Vec<String>,
+    pub mfa_enabled: bool,
+    pub disabled: bool,
+    pub created_at: i64,
+    pub last_login_at: Option<i64>,
+}
+
+fn parse_roots(s: &str) -> Vec<String> {
+    serde_json::from_str(s).unwrap_or_default()
+}
+
+fn role_has_user_manage(role: &str) -> bool {
+    auth::permissions_for_role(role).iter().any(|p| p == perm::USER_MANAGE)
+}
+
+pub async fn list(State(state): State<Shared>, Auth(s): Auth) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::USER_MANAGE)?;
-    Err(ApiError::unsupported("user.list (M5: 用户管理尚未接入)"))
+    let rows = state.pool.with(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, username, role, allowed_roots, disabled, created_at, last_login_at \
+             FROM users ORDER BY id ASC")
+            .map_err(|e| PanelError::Database(e.to_string()))?;
+        let rows = stmt.query_map([], |r| Ok((
+            r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?, r.get::<_, i32>(4)?, r.get::<_, i64>(5)?,
+            r.get::<_, Option<i64>>(6)?,
+        ))).map_err(|e| PanelError::Database(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows { out.push(row.map_err(|e| PanelError::Database(e.to_string()))?); }
+        Ok(out)
+    }).await.map_err(ApiError::from)?;
+
+    let users: Vec<UserOut> = rows.into_iter().map(|(id, u, role, roots, dis, c, l)| UserOut {
+        id, username: u, role, allowed_roots: parse_roots(&roots),
+        mfa_enabled: false, disabled: dis != 0, created_at: c, last_login_at: l,
+    }).collect();
+    Ok(ok(users))
 }
 
 pub async fn create(
-    State(_): State<Shared>,
+    State(state): State<Shared>,
     Auth(s): Auth,
-) -> ApiResult<Json<serde_json::Value>> {
+    Json(req): Json<CreateReq>,
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     crate::auth::require(&s, perm::USER_MANAGE)?;
-    Err(ApiError::unsupported("user.create (M5)"))
+
+    // 1) 校验输入（只读）
+    let username = auth::validate_username(&req.username).map_err(ApiError::from)?;
+    auth::check_password_policy(&req.password).map_err(ApiError::from)?;
+    if !ASSIGNABLE_ROLES.contains(&req.role.as_str()) {
+        return Err(ApiError::bad_request(
+            "role", "role 必须是 admin / operator / viewer（owner 不可经 API 创建）"));
+    }
+    let role = req.role.clone();
+    let roots_json = serde_json::to_string(&req.allowed_roots).unwrap_or_else(|_| "[]".into());
+
+    // 2) argon2 哈希（贵，放 blocking 池）
+    let tier = state.tier;
+    let pwd = req.password.clone();
+    let hash = tokio::task::spawn_blocking(move || auth::hash_password(&pwd, &auth::HashParams::for_tier(tier)))
+        .await
+        .map_err(|e| ApiError::new(10999, StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(ApiError::from)?;
+
+    // 3) 单写事务：INSERT（用户名唯一约束冲突 → 409）
+    let now = crate::now_unix();
+    let uname = username.clone();
+    state.db.exec(move |conn| {
+        conn.execute(
+            "INSERT INTO users(username, pwd_hash, role, allowed_roots, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![uname, hash, role, roots_json, now],
+        ).map_err(|e| {
+            if e.to_string().contains("UNIQUE") {
+                PanelError::Conflict("username".into())
+            } else {
+                PanelError::Database(e.to_string())
+            }
+        })?;
+        Ok(panel_db::WriteAck { rows_changed: 1 })
+    }).await.map_err(ApiError::from)?;
+
+    audit(&state, &s, "user.create", &username, "ok").await;
+    Ok((StatusCode::CREATED, ok(json!({ "username": username }))))
 }
 
 pub async fn patch(
-    State(_): State<Shared>,
+    State(state): State<Shared>,
     Auth(s): Auth,
-    AxPath(_id): AxPath<i64>,
-) -> ApiResult<Json<serde_json::Value>> {
+    AxPath(id): AxPath<i64>,
+    Json(req): Json<PatchReq>,
+) -> ApiResult<StatusCode> {
     crate::auth::require(&s, perm::USER_MANAGE)?;
-    Err(ApiError::unsupported("user.patch (M5)"))
+
+    // 1) 取目标用户（含 role/disabled，用于自锁与 owner 守卫）
+    let target = state.pool.with(move |conn| {
+        let r = conn.query_row(
+            "SELECT id, role, disabled FROM users WHERE id = ?1",
+            rusqlite::params![id],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i32>(2)?)),
+        );
+        match r {
+            Ok(v) => Ok(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Err(PanelError::NotFound("user".into())),
+            Err(e) => Err(PanelError::Database(e.to_string())),
+        }
+    }).await.map_err(ApiError::from)?;
+    let (target_id, target_role, target_disabled) = target;
+
+    // 2) owner 不可经 API 改（role/disabled）；改密也走独立端点以保持单一入口
+    if target_role == "owner" {
+        return Err(ApiError::forbidden("owner 账号不可经 API 修改，请在服务器终端操作"));
+    }
+
+    // 3) 自锁防护：不能禁用自己、不能把自己降到失去 user.manage
+    if target_id == s.user_id {
+        if req.disabled == Some(true) {
+            return Err(ApiError::forbidden("不能禁用当前登录账号"));
+        }
+        if let Some(ref new_role) = req.role {
+            if !role_has_user_manage(new_role) {
+                return Err(ApiError::forbidden("不能将自身权限降至失去 user.manage（会锁死自己）"));
+            }
+        }
+    }
+
+    // 4) 角色合法性
+    if let Some(ref new_role) = req.role {
+        if !ASSIGNABLE_ROLES.contains(&new_role.as_str()) {
+            return Err(ApiError::bad_request("role", "role 必须是 admin / operator / viewer"));
+        }
+    }
+
+    // 5) 组装变更（只读计算）
+    let new_role = req.role.clone().unwrap_or(target_role.clone());
+    let new_roots = req.allowed_roots.as_ref().map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".into()));
+    let new_disabled = req.disabled.unwrap_or(target_disabled != 0);
+    let new_pwd_hash = match req.password {
+        Some(ref p) => {
+            auth::check_password_policy(p).map_err(ApiError::from)?;
+            let tier = state.tier;
+            let p2 = p.clone();
+            Some(tokio::task::spawn_blocking(move || auth::hash_password(&p2, &auth::HashParams::for_tier(tier)))
+                .await
+                .map_err(|e| ApiError::new(10999, StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                .map_err(ApiError::from)?)
+        }
+        None => None,
+    };
+
+    // 6) 单写事务应用
+    state.db.exec(move |conn| {
+        if let Some(h) = new_pwd_hash {
+            conn.execute("UPDATE users SET pwd_hash = ?1 WHERE id = ?2",
+                rusqlite::params![h, target_id]).map_err(|e| PanelError::Database(e.to_string()))?;
+        }
+        if let Some(roots) = new_roots {
+            conn.execute("UPDATE users SET allowed_roots = ?1 WHERE id = ?2",
+                rusqlite::params![roots, target_id]).map_err(|e| PanelError::Database(e.to_string()))?;
+        }
+        conn.execute("UPDATE users SET role = ?1, disabled = ?2 WHERE id = ?3",
+            rusqlite::params![new_role, new_disabled as i32, target_id])
+            .map_err(|e| PanelError::Database(e.to_string()))?;
+        Ok(panel_db::WriteAck { rows_changed: 1 })
+    }).await.map_err(ApiError::from)?;
+
+    // 7) 禁用/改密后立即踢下线
+    if new_disabled || req.password.is_some() {
+        state.sessions.remove_by_user(target_id);
+    }
+
+    audit(&state, &s, "user.patch", &target_id.to_string(), "ok").await;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn delete(
-    State(_): State<Shared>,
+    State(state): State<Shared>,
     Auth(s): Auth,
-    AxPath(_id): AxPath<i64>,
-) -> ApiResult<Json<serde_json::Value>> {
+    AxPath(id): AxPath<i64>,
+) -> ApiResult<StatusCode> {
     crate::auth::require(&s, perm::USER_MANAGE)?;
-    Err(ApiError::unsupported("user.delete (M5)"))
+
+    // 1) 取目标（含 role），用于守卫
+    let target = state.pool.with(move |conn| {
+        let r = conn.query_row(
+            "SELECT id, role FROM users WHERE id = ?1",
+            rusqlite::params![id],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+        );
+        match r {
+            Ok(v) => Ok(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Err(PanelError::NotFound("user".into())),
+            Err(e) => Err(PanelError::Database(e.to_string())),
+        }
+    }).await.map_err(ApiError::from)?;
+    let (target_id, target_role) = target;
+
+    // 2) 不能删自己
+    if target_id == s.user_id {
+        return Err(ApiError::forbidden("不能删除当前登录账号"));
+    }
+    // 3) owner 不可经 API 删除
+    if target_role == "owner" {
+        return Err(ApiError::forbidden("owner 账号不可经 API 删除"));
+    }
+
+    // 4) 删除（影响 0 行 → 已不存在）
+    let ack = state.db.exec(move |conn| {
+        let n = conn.execute("DELETE FROM users WHERE id = ?1", rusqlite::params![target_id])
+            .map_err(|e| PanelError::Database(e.to_string()))?;
+        Ok(panel_db::WriteAck { rows_changed: n })
+    }).await.map_err(ApiError::from)?;
+    if ack.rows_changed == 0 {
+        return Err(ApiError::not_found("user"));
+    }
+
+    // 5) 立即踢下线
+    state.sessions.remove_by_user(target_id);
+
+    audit(&state, &s, "user.delete", &target_id.to_string(), "ok").await;
+    Ok(StatusCode::NO_CONTENT)
 }

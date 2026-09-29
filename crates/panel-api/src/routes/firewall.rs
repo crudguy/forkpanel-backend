@@ -173,8 +173,11 @@ pub async fn apply(
             }
         }
 
+        // id 必须唯一**并写进 comment**：删除时靠 `panel-managed <id>` 定位规则。
+        // 若只写用户备注，两条同名规则会撞 id → 删除命中第一条，删错规则。
+        let rid = gen_rule_id();
         rules.push(panel_os::FirewallRule {
-            id: String::new(),
+            id: rid.clone(),
             ports,
             protocol: match r.protocol.as_deref().unwrap_or("tcp") {
                 "udp" => panel_os::Protocol::Udp,
@@ -185,9 +188,10 @@ pub async fn apply(
             action,
             direction: panel_os::Direction::Inbound,
             source_cidr: r.source.clone(),
-            // 打标记：这是"只删自己写的"能成立的前提
-            comment: Some(format!("{} {}", PANEL_MARK,
+            // 打标记 + 带 id：这是"只删自己写的、且删对那一条"能成立的前提
+            comment: Some(format!("{} {} {}", PANEL_MARK, rid,
                 r.comment.clone().unwrap_or_default()).trim().to_string()),
+            panel_managed: true,
         });
     }
 
@@ -215,6 +219,14 @@ pub async fn apply(
         // 返回快照 id，UI 提供"撤销本次变更"入口
         "snapshot_bytes": snapshot.len(),
     })))
+}
+
+/// 生成规则 id（写入 comment，用于精确定位待删规则）。
+fn gen_rule_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos()).unwrap_or(0);
+    format!("p{nanos:x}")
 }
 
 /// 判断是否会阻断 SSH
@@ -287,8 +299,21 @@ pub async fn delete_rule(
     State(state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FIREWALL_MANAGE)?;
-    let _ = (state, id);
-    Err(ApiError::unsupported("firewall.rule.delete (M2: 仅支持按面板标记删除自己创建的规则，尚未接入)"))
+    if !state.capabilities.get(cap_keys::FIREWALL_MANAGE).map(|c| c.supported).unwrap_or(false) {
+        return Err(ApiError::unsupported("firewall.manage"));
+    }
+    // 三条硬约束之一：改规则前先快照（防误操作把自己锁门外）
+    let snapshot = state.os.firewall().snapshot().await?;
+    match state.os.firewall().delete_rule(&id).await {
+        Ok(()) => {
+            audit(&state, &s, "firewall.rule.delete", &id, "ok").await;
+            Ok(ok(serde_json::json!({ "deleted": id })))
+        }
+        Err(e) => {
+            let _ = state.os.firewall().restore_snapshot(&snapshot).await;
+            Err(ApiError::from(e))
+        }
+    }
 }
 
 #[cfg(test)]

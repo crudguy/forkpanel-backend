@@ -9,6 +9,9 @@
 
 pub mod auth;
 pub mod cron;
+pub mod assistant;
+pub mod backups;
+pub mod containers;
 pub mod databases;
 pub mod files;
 pub mod firewall;
@@ -22,6 +25,7 @@ pub mod security;
 pub mod settings;
 pub mod users;
 pub mod audit;
+pub mod terminal;
 
 use crate::{auth::Session, error::ApiError, AppState, Envelope};
 use axum::{
@@ -75,7 +79,8 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/system/capabilities", get(system::capabilities))
         .route("/api/v1/system/overview", get(system::overview))
         .route("/api/v1/metrics/realtime", get(system::realtime))
-        .route("/api/v1/metrics/history", get(system::history));
+        .route("/api/v1/metrics/history", get(system::history))
+        .route("/api/v1/metrics/snapshot", get(system::snapshot));
 
     // ── 进程（M2） ──
     let proc_r = Router::new()
@@ -91,6 +96,7 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/services/{unit}/restart", post(services::restart))
         .route("/api/v1/services/{unit}/enabled", put(services::set_enabled))
         .route("/api/v1/services/{unit}/journal", get(services::journal))
+        .route("/api/v1/services/{unit}/config", get(services::config_get).put(services::config_put))
         .route("/api/v1/packages", get(services::packages_list))
         .route("/api/v1/packages/install", post(services::install))
         .route("/api/v1/packages/{name}", delete(services::package_remove));
@@ -139,7 +145,8 @@ pub fn build_router(state: Shared) -> Router {
 
     // ── 安全中心 ──
     let sec_r = Router::new()
-        .route("/api/v1/security/baseline", get(security::baseline).post(security::baseline_apply))
+        .route("/api/v1/security/baseline", get(security::baseline))
+        .route("/api/v1/security/baseline/apply", post(security::baseline_apply))
         .route("/api/v1/security/sessions", get(security::sessions))
         .route("/api/v1/security/sessions/{id}", delete(security::revoke_session));
 
@@ -154,9 +161,27 @@ pub fn build_router(state: Shared) -> Router {
     // ── 日志 ──
     let log_r = Router::new()
         .route("/api/v1/logs/sources", get(logs::sources))
-        .route("/api/v1/logs/stream", get(logs::stream))
+        .route("/api/v1/logs/stream", get(crate::sse::log_stream))
         .route("/api/v1/logs/download", get(logs::download))
         .route("/api/v1/logs/{id}", get(logs::read));
+
+    // ── 备份计划（本地） ──
+    let backup_r = Router::new()
+        .route("/api/v1/backups", get(backups::list).post(backups::create))
+        .route("/api/v1/backups/{id}", patch(backups::patch).delete(backups::delete))
+        .route("/api/v1/backups/{id}/run", post(backups::run))
+        .route("/api/v1/backups/{id}/artifacts", get(backups::artifacts))
+        .route("/api/v1/backups/{id}/restore", post(backups::restore));
+
+    // ── 容器（Docker）──
+    // 只读列举 + 生命周期；能力位不满足时端点内诚实 501（见 routes/containers.rs）
+    let container_r = Router::new()
+        .route("/api/v1/containers", get(containers::list))
+        .route("/api/v1/containers/images", get(containers::images))
+        .route("/api/v1/containers/{id}/start", post(containers::start))
+        .route("/api/v1/containers/{id}/stop", post(containers::stop))
+        .route("/api/v1/containers/{id}/restart", post(containers::restart))
+        .route("/api/v1/containers/{id}", delete(containers::remove));
 
     // ── 任务中心 ──
     let task_r = Router::new()
@@ -178,6 +203,20 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/events/tasks", get(crate::sse::task_stream))
         .route("/api/v1/events/logs", get(crate::sse::log_stream));
 
+    // ── Web 终端（WebSocket）──
+    // 独立守卫：仅 require_auth。WS 升级无法携带 X-CSRF-Token 头，故同源校验
+    // 改在 handler 内用 Origin == scheme://Host 完成（见 routes/terminal.rs）。
+    let terminal_r = Router::new()
+        .route("/api/v1/terminal", get(terminal::ws_handler))
+        .layer(middleware::from_fn_with_state(state.clone(), crate::middleware::require_auth));
+
+    // ── AI 助手（只读诊断）──
+    // 独立子路由 + 仅 require_auth：诊断是**只读**语义，只读模式下同样可用
+    // （不经 read_only_guard）；亦无写语义，不需要 guard_write 的 CSRF。
+    let asst_r = Router::new()
+        .route("/api/v1/assistant/diagnose", post(assistant::diagnose))
+        .layer(middleware::from_fn_with_state(state.clone(), crate::middleware::require_auth));
+
     // ── 需登录的根路由 ──
     let authed = Router::new()
         .route("/api/v1/auth/logout", post(auth::logout))
@@ -193,6 +232,8 @@ pub fn build_router(state: Shared) -> Router {
         .merge(sec_r)
         .merge(cron_r)
         .merge(log_r)
+        .merge(backup_r)
+        .merge(container_r)
         .merge(task_r)
         .merge(cfg_r)
         .merge(sse_r)
@@ -205,6 +246,8 @@ pub fn build_router(state: Shared) -> Router {
     Router::new()
         .merge(public)
         .merge(authed)
+        .merge(terminal_r)
+        .merge(asst_r)
         .layer(middleware::from_fn(crate::middleware::security_headers))
         // 兜底：未匹配路由返回结构化 404（不暴露路由表）
         .fallback(handler_404)

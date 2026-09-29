@@ -17,8 +17,8 @@ use crate::{
     routes::{audit, Auth, Shared},
 };
 // Path 与 std::path::PathBuf 同名，按全仓约定别名成 AxPath
-use axum::{extract::{Path as AxPath, State}, Json};
-use panel_core::{cap_keys, PanelError, Result, SafePath};
+use axum::{extract::{Path as AxPath, Query, State}, Json};
+use panel_core::{PanelError, Result, SafePath};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -29,8 +29,9 @@ pub struct ConnDto {
     pub engine: &'static str,
     pub host: Option<String>,
     pub port: Option<i64>,
-    pub database: Option<String>,
-    /// 是否可用（外部客户端缺失时为 false，UI 据此置灰）
+    /// 连接默认库（schema 列名 `default_db`，与 OpenAPI `DbConnection.default_db` 同名）
+    pub default_db: Option<String>,
+    /// 是否可用（该引擎未实装时为 false，UI 据此置灰）
     pub available: bool,
     /// 是否有口令（**绝不返回口令本身**）
     pub has_password: bool,
@@ -43,7 +44,7 @@ pub async fn list(
 
     let rows = state.pool.with(|conn| {
         let mut st = conn.prepare(
-            "SELECT id, name, engine, host, port, database, password_enc FROM db_connections")
+            "SELECT id, name, engine, host, port, default_db, password_enc FROM db_connections")
             .map_err(|e| PanelError::Database(e.to_string()))?;
         let it = st.query_map([], |r| Ok((
             r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
@@ -56,22 +57,21 @@ pub async fn list(
     }).await?;
 
     let mut dtos = Vec::new();
-    for (id, name, engine, host, port, database, pwd) in rows {
+    for (id, name, engine, host, port, default_db, pwd) in rows {
         let eng = match engine.as_str() {
             "mysql" => panel_os::DbEngine::MySql,
             "postgres" => panel_os::DbEngine::Postgres,
             _ => panel_os::DbEngine::Sqlite,
         };
-        // 可用性逐个探测（外部客户端可能缺失）
-        let available = state.os.databases().available().await.unwrap_or(false);
+        // 逐连接按引擎判定「是否已实装」：未实装的引擎（mysql/postgres）诚实置灰，不撒谎
+        let available = state.os.databases().supports(eng);
         dtos.push(ConnDto {
             id, name,
             engine: match eng { panel_os::DbEngine::MySql => "mysql",
                                 panel_os::DbEngine::Postgres => "postgres",
                                 panel_os::DbEngine::Sqlite => "sqlite" },
-            host, port, database,
-            available: available && state.capabilities
-                .get(cap_keys::DBMS_MANAGE).map(|c| c.supported).unwrap_or(false),
+            host, port, default_db,
+            available,
             has_password: pwd.is_some(),
         });
     }
@@ -86,7 +86,8 @@ pub struct CreateReq {
     pub port: Option<u16>,
     pub user: Option<String>,
     pub password: Option<String>,
-    pub database: Option<String>,
+    /// 连接默认库；sqlite 引擎下填 `.db` 文件路径
+    pub default_db: Option<String>,
 }
 
 pub async fn create(
@@ -98,9 +99,12 @@ pub async fn create(
     if !panel_core::rules::is_valid_db_name(&req.name) {
         return Err(ApiError::bad_request("name", "invalid database name"));
     }
-    if let Some(db) = &req.database {
-        if !panel_core::rules::is_valid_db_name(db) {
-            return Err(ApiError::bad_request("database", "invalid database name"));
+    if let Some(db) = &req.default_db {
+        if req.engine == "sqlite" {
+            // SQLite：「库名」实为 .db **文件路径**（浏览目标就是该文件）
+            validate_sqlite_path(db)?;
+        } else if !panel_core::rules::is_valid_db_name(db) {
+            return Err(ApiError::bad_request("default_db", "invalid database name"));
         }
     }
     let engine = match req.engine.as_str() {
@@ -120,15 +124,20 @@ pub async fn create(
     let user = req.user.clone();
 
     let name = req.name.clone();
-    let db = req.database.clone();
+    let db = req.default_db.clone();
     let host = req.host.clone();
     let port = req.port.map(|p| p as i64);
     state.db.exec(move |conn| {
+        // 注意：列名是 `default_db`（schema/契约口径）；`db_connections` 无 `created_at` 列
         conn.execute(
-            "INSERT INTO db_connections(name, engine, host, port, username, password_enc, database, created_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params![name, engine, host, port, user, password_enc, db, crate::now_unix()],
-        ).map_err(|e| PanelError::Database(e.to_string()))?;
+            "INSERT INTO db_connections(name, engine, host, port, username, password_enc, default_db)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![name, engine, host, port, user, password_enc, db],
+        ).map_err(|e| if e.to_string().contains("UNIQUE") {
+            PanelError::Conflict("connection name exists".into())
+        } else {
+            PanelError::Database(e.to_string())
+        })?;
         Ok(panel_db::WriteAck { rows_changed: 1 })
     }).await?;
 
@@ -221,14 +230,105 @@ pub async fn restore(
         "数据恢复为破坏性操作，M4 接入（需先完成凭据加密与二次确认流程）"));
 }
 
-// ─────────────── 文档式数据库端点（M4 占位） ───────────────
+// ─────────────── 浏览（连接 → 库 → 表 → 行预览，**只读**） ───────────────
+
+#[derive(Debug, Deserialize)]
+pub struct RowsQuery {
+    pub page: Option<u32>,
+    pub page_size: Option<u32>,
+}
+
+/// 标识符（库名/表名）业务层校验。provider 内部仍安全加引号，这里是纵深防御。
+fn validate_ident(v: &str, field: &'static str) -> ApiResult<()> {
+    if v.is_empty() || v.len() > 128 {
+        return Err(ApiError::bad_request(field, "empty or too long (>128)"));
+    }
+    if v.chars().any(|c| c.is_control() || c == '\0') {
+        return Err(ApiError::bad_request(field, "control characters not allowed"));
+    }
+    Ok(())
+}
+
+/// SQLite 的「库名」实为 `.db` 文件路径：必须存在且非敏感路径。
+fn validate_sqlite_path(db: &str) -> ApiResult<()> {
+    if db.is_empty() || db.chars().any(|c| c.is_control()) {
+        return Err(ApiError::bad_request("database", "invalid path"));
+    }
+    let p = std::path::Path::new(db);
+    if !p.is_file() {
+        return Err(ApiError::bad_request("database", format!("sqlite 文件不存在: {db}")));
+    }
+    if panel_os::linux::is_sensitive_path(p) {
+        return Err(ApiError::bad_request("database", "path not allowed"));
+    }
+    Ok(())
+}
+
+/// 读连接行 → 解密口令 → 构造 `DbTarget`（浏览各端点的统一入口）。
+async fn load_target(state: &Shared, conn: i64, db_override: Option<&str>) -> ApiResult<panel_os::DbTarget> {
+    let row = state.pool.with(move |c| {
+        let mut st = c.prepare(
+            "SELECT engine, host, port, username, password_enc, default_db \
+             FROM db_connections WHERE id = ?1")
+            .map_err(|e| PanelError::Database(e.to_string()))?;
+        let mut it = st.query_map([conn], |r| Ok((
+            r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<i64>>(2)?,
+            r.get::<_, Option<String>>(3)?, r.get::<_, Option<Vec<u8>>>(4)?, r.get::<_, Option<String>>(5)?,
+        ))).map_err(|e| PanelError::Database(e.to_string()))?;
+        Ok(it.next().transpose().map_err(|e| PanelError::Database(e.to_string()))?)
+    }).await?
+        .ok_or_else(|| ApiError::not_found("connection"))?;
+    let (engine_s, host, port, user, pwd_enc, database) = row;
+
+    let engine = match engine_s.as_str() {
+        "mysql" => panel_os::DbEngine::MySql,
+        "postgres" => panel_os::DbEngine::Postgres,
+        _ => panel_os::DbEngine::Sqlite,
+    };
+    // 口令解密：有密文则必须有主密钥（对齐 create 的纪律）
+    let password = match pwd_enc {
+        Some(blob) => {
+            let key = state.require_secret_key()?;
+            let plain = key.decrypt(&blob).map_err(ApiError::from)?;
+            Some(String::from_utf8(plain)
+                .map_err(|_| ApiError::from(PanelError::Internal("password not utf8".into())))?)
+        }
+        None => None,
+    };
+    // SQLite 的 `database` 是文件路径（不可被 URL 的 {db} 覆盖）；
+    // 其它引擎的 {db} 才是库名，需覆盖连接默认库。
+    let database = if matches!(engine, panel_os::DbEngine::Sqlite) {
+        database
+    } else {
+        db_override.map(|s| s.to_string()).or(database)
+    };
+    Ok(panel_os::DbTarget { engine, host, port: port.map(|p| p as u16), user, password, database })
+}
+
+/// 把 provider 的 DB 错误优雅归一到 ApiError：表不存在属客户端问题 → 404，
+/// 其余（连接失败、权限等）保持 500 语义。
+fn map_db_err(e: PanelError) -> ApiError {
+    if let PanelError::Database(ref m) = e {
+        if m.contains("no such table") {
+            return ApiError::not_found("table");
+        }
+    }
+    ApiError::from(e)
+}
+
+fn engine_str(e: panel_os::DbEngine) -> &'static str {
+    match e { panel_os::DbEngine::MySql => "mysql",
+              panel_os::DbEngine::Postgres => "postgres",
+              panel_os::DbEngine::Sqlite => "sqlite" }
+}
 
 pub async fn databases_of(
     State(state): State<Shared>, Auth(s): Auth, AxPath(conn): AxPath<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_VIEW)?;
-    let _ = (state, conn);
-    Err(ApiError::unsupported("db.databases (M4)"))
+    let t = load_target(&state, conn, None).await?;
+    let dbs = state.os.databases().databases(&t).await?;
+    Ok(ok(dbs))
 }
 
 pub async fn tables(
@@ -236,17 +336,35 @@ pub async fn tables(
     AxPath((conn, db)): AxPath<(i64, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_VIEW)?;
-    let _ = (state, conn, db);
-    Err(ApiError::unsupported("db.tables (M4)"))
+    validate_ident(&db, "db")?;
+    let t = load_target(&state, conn, Some(&db)).await?;
+    let engine = engine_str(t.engine);
+    let list = state.os.databases().tables(&t).await?;
+    let out: Vec<serde_json::Value> = list.into_iter()
+        .map(|x| serde_json::json!({ "name": x.name, "rows": x.rows, "engine": engine }))
+        .collect();
+    Ok(ok(out))
 }
 
 pub async fn rows(
     State(state): State<Shared>, Auth(s): Auth,
     AxPath((conn, db, table)): AxPath<(i64, String, String)>,
+    Query(q): Query<RowsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_VIEW)?;
-    let _ = (state, conn, db, table);
-    Err(ApiError::unsupported("db.rows (M4: 仅预览，禁止 Web SQL 终端)"))
+    validate_ident(&db, "db")?;
+    validate_ident(&table, "table")?;
+    let page = q.page.unwrap_or(1).max(1);
+    let page_size = q.page_size.unwrap_or(50).clamp(1, 200);
+    let offset = (page as usize - 1) * page_size as usize;
+    let t = load_target(&state, conn, Some(&db)).await?;
+    let data = state.os.databases().rows(&t, &table, page_size as usize, offset).await.map_err(map_db_err)?;
+    Ok(ok(serde_json::json!({
+        "columns": data.columns,
+        "rows": data.rows,   // Vec<Vec<Option<String>>>：NULL 序列化为 null
+        "page": page,
+        "total": data.total,
+    })))
 }
 
 #[cfg(test)]
@@ -276,7 +394,7 @@ mod tests {
     fn password_is_never_returned() {
         // 列表接口只返回 has_password 布尔，不返回口令
         let dto = ConnDto { id: 1, name: "x".into(), engine: "mysql", host: None,
-            port: None, database: None, available: true, has_password: true };
+            port: None, default_db: None, available: true, has_password: true };
         let v = serde_json::to_value(&dto).unwrap();
         assert!(!v.as_object().unwrap().contains_key("password"));
         assert_eq!(v["has_password"], true);

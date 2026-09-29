@@ -8,13 +8,14 @@
 
 use crate::{error::ApiError, routes::MaybeAuth, AppState};
 use axum::{
-    extract::State,
+    extract::{Query, State},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse,
     },
 };
 use futures_util::stream::StreamExt;
+use serde::Deserialize;
 use panel_core::Tier;
 use std::{
     convert::Infallible,
@@ -77,13 +78,19 @@ pub async fn metrics_stream(
                 let x = match g.ring().iter().next_back() {
                     Some(s) => serde_json::json!({
                         "ts": s.ts,
-                        "cpu": s.cpu_pct,
+                        "cpu_pct": s.cpu_pct,
                         "mem_used_kib": s.mem_used_kib,
                         "mem_total_kib": s.mem_total_kib,
+                        "disk_used_bytes": s.disk_used_bytes,
+                        "disk_total_bytes": s.disk_total_bytes,
+                        "net_in_bps": s.net_in_bps,
+                        "net_out_bps": s.net_out_bps,
                         "load1": s.load1,
                     }),
-                    None => serde_json::json!({ "ts": now_unix(), "cpu": 0.0,
-                                                "mem_used_kib": 0, "mem_total_kib": 0, "load1": 0.0 }),
+                    None => serde_json::json!({ "ts": now_unix(), "cpu_pct": 0.0,
+                                                "mem_used_kib": 0, "mem_total_kib": 0,
+                                                "disk_used_bytes": 0, "disk_total_bytes": 0,
+                                                "net_in_bps": 0, "net_out_bps": 0, "load1": 0.0 }),
                 };
                 x
             };
@@ -160,12 +167,75 @@ pub async fn task_stream(
         .into_response()
 }
 
-/// 日志跟随频道：订阅需 `log.view`（权限过滤示例）
+/// 日志跟随 SSE 的查询参数（契约 `/api/v1/logs/stream`）。
+#[derive(Debug, Deserialize)]
+pub struct LogStreamQ {
+    /// 日志源 id（见 `/api/v1/logs/sources`）；缺省 `system`
+    pub source: Option<String>,
+    /// 服务端**字面量**子串过滤（刻意不支持正则，防 ReDoS）
+    pub filter: Option<String>,
+    pub level: Option<String>,
+    /// 预读历史行数（服务端硬上限 2000）
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub follow: Option<bool>,
+}
+
+fn line_json(l: &panel_os::LogLine) -> String {
+    serde_json::json!({ "ts": l.ts_unix, "level": l.level, "text": l.text }).to_string()
+}
+
+/// 通用的「日志源 → SSE」：先补历史（预读），再持续推送增量。
+/// 站点日志（`sites::logs`）与统一日志浏览器（`log_stream`）共用此实现。
+pub async fn follow_source(
+    state: Arc<AppState>,
+    src: panel_os::LogSource,
+    filter: Option<String>,
+    limit: usize,
+) -> axum::response::Response {
+    let n = limit.clamp(1, 2000);
+    let cap = max_clients(state.tier);
+    if SSE_CONNS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |k| {
+        if k >= cap { None } else { Some(k + 1) }
+    }).is_err() {
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                format!("sse client limit reached ({cap})")).into_response();
+    }
+
+    let history = state.os.logs().read(&src, panel_os::LogQuery {
+        lines: n, grep: filter.clone(), level: None, follow: false, since_unix: None,
+    }).await.unwrap_or_default();
+
+    let rx = match state.os.logs().follow(&src, panel_os::LogQuery {
+        lines: n, grep: filter, level: None, follow: true, since_unix: None,
+    }).await {
+        Ok(rx) => rx,
+        Err(e) => {
+            SSE_CONNS.fetch_sub(1, Ordering::SeqCst);
+            return ApiError::from(e).into_response();
+        }
+    };
+
+    let stream = async_stream::stream! {
+        for l in history { yield Ok::<_, Infallible>(Event::default().event("log").data(line_json(&l))); }
+        let mut rx = rx;
+        while let Some(l) = rx.recv().await {
+            yield Ok(Event::default().event("log").data(line_json(&l)));
+        }
+        SSE_CONNS.fetch_sub(1, Ordering::SeqCst);
+    };
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("ping"))
+        .into_response()
+}
+
+/// 日志跟随频道（契约：`/api/v1/logs/stream` 与 `/api/v1/events/logs`）。
 pub async fn log_stream(
     State(state): State<Arc<AppState>>,
     // Session 未实现 FromRequestParts，不能直接用 Option<Session> 作提取器；
     // MaybeAuth 即为此设计（Rejection 为 Infallible）。
     MaybeAuth(session): MaybeAuth,
+    Query(q): Query<LogStreamQ>,
 ) -> axum::response::Response {
     match &session {
         Some(s) => {
@@ -179,13 +249,15 @@ pub async fn log_stream(
     if !state.capabilities.get("logs.read").map(|c| c.supported).unwrap_or(false) {
         return ApiError::unsupported("logs.read").into_response();
     }
-    let (tx, mut rx) = mpsc::channel::<Event>(BACKLOG);
-    drop(tx);
-    // 注意：不能写成 `let s: Sse<impl Stream<...>> = ...`
-    // —— `impl Trait` 不允许出现在 let 绑定的类型标注上（E0562）。直接构造并转换即可。
-    Sse::new(async_stream::stream! {
-        while let Some(ev) = rx.recv().await { yield Ok::<_, Infallible>(ev); }
-    }).into_response()
+    let want = q.source.clone().unwrap_or_else(|| "system".into());
+    let srcs = match state.os.logs().sources().await {
+        Ok(v) => v,
+        Err(e) => return ApiError::from(e).into_response(),
+    };
+    let Some(src) = srcs.into_iter().find(|s| s.id == want) else {
+        return ApiError::not_found("log source").into_response();
+    };
+    follow_source(state.clone(), src, q.filter, q.limit.unwrap_or(200)).await
 }
 
 fn now_unix() -> i64 {

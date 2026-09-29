@@ -44,6 +44,14 @@ pub struct OverviewResp {
     pub mem_total_kib: u64,
     pub load1: f32,
     pub disks: usize,
+    /// 本地磁盘（排除网络文件系统）已用字节
+    pub disk_used_bytes: u64,
+    /// 本地磁盘（排除网络文件系统）总字节
+    pub disk_total_bytes: u64,
+    /// 入站速率（排除回环接口），字节/秒
+    pub net_in_bps: u64,
+    /// 出站速率（排除回环接口），字节/秒
+    pub net_out_bps: u64,
     pub tier: &'static str,
     /// 采样是否已被降频（低配保护，UI 需提示）
     pub degraded: bool,
@@ -61,6 +69,10 @@ pub async fn overview(State(state): State<Shared>, Auth(s): Auth) -> ApiResult<J
         mem_total_kib: snap.mem.total_kib,
         load1: snap.cpu.load1,
         disks: snap.disks.len(),
+        disk_used_bytes: snap.disks.iter().filter(|d| !d.is_network_fs).map(|d| d.used_bytes).sum(),
+        disk_total_bytes: snap.disks.iter().filter(|d| !d.is_network_fs).map(|d| d.total_bytes).sum(),
+        net_in_bps: snap.nets.iter().filter(|n| n.iface != "lo").map(|n| n.rx_rate_bps).sum(),
+        net_out_bps: snap.nets.iter().filter(|n| n.iface != "lo").map(|n| n.tx_rate_bps).sum(),
         tier: match state.tier {
             panel_core::Tier::Nano => "nano",
             panel_core::Tier::Small => "small",
@@ -86,6 +98,11 @@ pub async fn realtime(
         g.ring().last_n(n).iter().map(|s| serde_json::json!({
             "ts": s.ts, "cpu": s.cpu_pct, "mem_used_kib": s.mem_used_kib,
             "mem_total_kib": s.mem_total_kib, "load1": s.load1,
+            // 与 SSE 推送口径一致：补充磁盘/网络实时字段，供前端画实时趋势
+            "disk_used_bytes": s.disk_used_bytes,
+            "disk_total_bytes": s.disk_total_bytes,
+            "net_in_bps": s.net_in_bps,
+            "net_out_bps": s.net_out_bps,
         })).collect()
     };
     Ok(ok(serde_json::json!({
@@ -139,6 +156,14 @@ pub async fn history(
         Ok(v)
     }).await?;
     Ok(ok(serde_json::json!({ "granularity": gran, "samples": rows })))
+}
+
+/// 完整系统快照（专业监控页）：暴露 SystemSnapshot 的全部细节字段
+/// （CPU 总体 + per-core、load1/5/15、内存 + swap 明细、每挂载点磁盘、每网卡吞吐、进程数）。
+pub async fn snapshot(State(state): State<Shared>, Auth(s): Auth) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::SYSTEM_VIEW)?;
+    let snap = state.os.metrics().snapshot().await?;
+    Ok(ok(snap))
 }
 
 #[allow(dead_code)]

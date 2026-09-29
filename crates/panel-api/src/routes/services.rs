@@ -216,7 +216,7 @@ pub async fn install(
     // 安装必须走任务队列：耗时不可预测 + 输出需流式返回
     let pkg = req.name.clone();
     let os = state.os.clone();
-    let body = PackageTask { pkg, os };
+    let body = PackageTask { pkg, os, op: PkgOp::Install };
     let (id, created) = state.tasks.submit(
         panel_task::TaskRequest {
             // 幂等键：同一包在窗口期内重复提交只会执行一次（防双击 / 防重试风暴）
@@ -232,57 +232,97 @@ pub async fn install(
     Ok(ok(serde_json::json!({ "task_id": id, "created": created })))
 }
 
-struct PackageTask { pkg: String, os: std::sync::Arc<dyn panel_os::OsAdapter> }
+/// 安装/卸载共用同一任务体：结构一致（白名单→队列→底层），仅动词不同。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PkgOp { Install, Remove }
+
+struct PackageTask { pkg: String, os: std::sync::Arc<dyn panel_os::OsAdapter>, op: PkgOp }
 
 #[async_trait::async_trait]
 impl panel_task::TaskBody for PackageTask {
     async fn run(&self, progress: panel_task::Progress) -> Result<panel_task::TaskOutcome> {
-        progress.set(5, &format!("开始安装 {}", self.pkg)).await;
+        let installing = self.op == PkgOp::Install;
+        let verb = if installing { "安装" } else { "卸载" };
+        progress.set(5, &format!("开始{verb} {}", self.pkg)).await;
 
-        // 同步回调 → 异步广播的桥接。
-        // 用 unbounded 但在消费端限速：包管理器输出可能几万行，
-        // 全部堆进 channel 会撑爆内存。消费端每 N 行合并成一条进度。
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let consumer = {
-            let progress = progress.clone();
-            tokio::spawn(async move {
-                let mut n = 0usize;
-                while let Some(line) = rx.recv().await {
-                    n += 1;
-                    // 每 20 行上报一次进度，其余只转发日志行
-                    if n % 20 == 0 {
-                        progress.set(percent_from_lines(n), &line).await;
-                    } else {
-                        progress.log(&line).await;
+        // 输出缓冲：任务结束后落临时文件并经 output_path 登记，
+        // 任务中心的 /tasks/{id}/output 才有内容可读（失败原因不丢）。
+        // 只留尾部 MAX_BUF 行：包管理器输出可达几万行，全量落盘没必要。
+        const MAX_BUF: usize = 400;
+        let buf: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+
+        let result: Option<String> = if installing {
+            // 同步回调 → 异步广播的桥接。
+            // 用 unbounded 但在消费端限速：包管理器输出可能几万行，
+            // 全部堆进 channel 会撑爆内存。消费端每 N 行合并成一条进度。
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let consumer = {
+                let progress = progress.clone();
+                let buf = buf.clone();
+                tokio::spawn(async move {
+                    let mut n = 0usize;
+                    while let Some(line) = rx.recv().await {
+                        n += 1;
+                        {
+                            let mut b = buf.lock().unwrap();
+                            if b.len() >= MAX_BUF { b.remove(0); }
+                            b.push(line.clone());
+                        }
+                        // 每 20 行上报一次进度，其余只转发日志行
+                        if n % 20 == 0 {
+                            progress.set(percent_from_lines(n), &line).await;
+                        } else {
+                            progress.log(&line).await;
+                        }
+                        if progress.is_canceled() { break; }
                     }
-                    if progress.is_canceled() { break; }
-                }
-            })
+                })
+            };
+
+            let tx_for_cb = tx;
+            let r = self.os.packages()
+                .install(&self.pkg, Box::new(move |line| {
+                    // try_send 永不阻塞：消费者跟不上就丢弃，绝不拖慢安装本身
+                    let _ = tx_for_cb.send(line);
+                }))
+                .await;
+            // tx 已随上方回调闭包一起释放（闭包所有权在 install 内），通道关闭后
+            // 消费者 recv() 返回 None 自然退出；这里只需等消费者收尾。
+            let _ = consumer.await;
+            r.err().map(|e| e.to_string())
+        } else {
+            // 卸载没有流式输出可桥接（remove 不带回调），失败原因原样落日志
+            self.os.packages().remove(&self.pkg).await.err().map(|e| e.to_string())
         };
 
-        let tx_for_cb = tx;
-        let result = self.os.packages()
-            .install(&self.pkg, Box::new(move |line| {
-                // try_send 永不阻塞：消费者跟不上就丢弃，绝不拖慢安装本身
-                let _ = tx_for_cb.send(line);
-            }))
-            .await;
-        // tx 已随上方回调闭包一起释放（闭包所有权在 install 内），通道关闭后
-        // 消费者 recv() 返回 None 自然退出；这里只需等消费者收尾。
-        let _ = consumer.await;
+        if let Some(e) = &result {
+            progress.log(&format!("失败：{e}")).await;
+            let mut b = buf.lock().unwrap();
+            if b.len() >= MAX_BUF { b.remove(0); }
+            b.push(format!("失败：{e}"));
+        }
+
+        // 缓冲落盘 → 任务中心可读
+        let mut output_path = None;
+        let lines_snapshot: Vec<String> = buf.lock().unwrap().clone();
+        if !lines_snapshot.is_empty() {
+            let p = std::env::temp_dir().join(format!("panel-task-{}.log", progress.id()));
+            if tokio::fs::write(&p, lines_snapshot.join("\n")).await.is_ok() {
+                output_path = Some(p);
+            }
+        }
 
         match result {
-            Ok(()) => {
-                progress.set(100, "安装完成").await;
+            None => {
+                progress.set(100, &format!("{verb}完成")).await;
                 Ok(panel_task::TaskOutcome {
-                    state: panel_task::TaskState::Ok, exit_code: Some(0), output_path: None,
+                    state: panel_task::TaskState::Ok, exit_code: Some(0), output_path,
                 })
             }
-            Err(e) => {
-                progress.log(&format!("失败：{e}")).await;
-                // Package 类型 max_attempts=1：**不自动重试**（半装比重跑更危险）
+            Some(_) => {
+                // Package 类型 max_attempts=1：**不自动重试**（半装/半卸比重跑更危险）
                 Ok(panel_task::TaskOutcome {
-                    state: panel_task::TaskState::Failed, exit_code: Some(1), output_path: None,
+                    state: panel_task::TaskState::Failed, exit_code: Some(1), output_path,
                 })
             }
         }
@@ -346,15 +386,84 @@ pub async fn set_enabled(
     Ok(ok(serde_json::json!({ "name": name, "enabled": req.enabled })))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct JournalQ { pub lines: Option<usize> }
+
 pub async fn journal(
-    State(state): State<Shared>, Auth(s): Auth, AxPath(name): AxPath<String>,
+    State(state): State<Shared>, Auth(s): Auth,
+    AxPath(name): AxPath<String>, Query(q): Query<JournalQ>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SERVICE_VIEW)?;
     if !state.capabilities.get(cap_keys::SERVICE_MANAGE).map(|c| c.supported).unwrap_or(false) {
         return Err(ApiError::unsupported("service.manage"));
     }
-    let _ = name;
-    Err(ApiError::unsupported("service.journal (M3: 服务日志流尚未接入)"))
+    let unit = panel_core::unit_name(&name)
+        .map_err(|_| ApiError::bad_request("name", "invalid unit name"))?;
+    let jq = panel_os::JournalQuery {
+        lines: q.lines.unwrap_or(200).min(2000),
+        ..Default::default()
+    };
+    let mut rx = state.os.services().journal(&unit, jq).await?;
+
+    // 一次性收取：底层非 follow 模式输出完即关闭通道。兜底超时 10s，
+    // 超时也已收到的行照常返回（部分日志好过请求悬挂）。
+    let mut lines: Vec<String> = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(l) = rx.recv().await {
+            lines.push(l);
+            if lines.len() >= 2000 { break; }
+        }
+    }).await;
+
+    Ok(ok(serde_json::json!({ "name": name, "lines": lines })))
+}
+
+// ─────────────── 服务配置（在线编辑单元文件） ───────────────
+
+#[derive(Debug, Deserialize)]
+pub struct ConfigPutReq {
+    /// 单元文件完整内容（由前端编辑器提交）
+    pub content: String,
+    /// 保存后是否重启服务（默认 false：仅 daemon-reload 重新加载单元）
+    pub restart: Option<bool>,
+}
+
+pub async fn config_get(
+    State(state): State<Shared>, Auth(s): Auth, AxPath(name): AxPath<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::SERVICE_MANAGE)?;
+    if !state.capabilities.get(cap_keys::SERVICE_MANAGE).map(|c| c.supported).unwrap_or(false) {
+        return Err(ApiError::unsupported("service.manage"));
+    }
+    let unit = panel_core::unit_name(&name)
+        .map_err(|_| ApiError::bad_request("name", "invalid unit name"))?;
+    let cfg = state.os.services().config_read(&unit).await?;
+    Ok(ok(serde_json::json!({
+        "name": name,
+        "path": cfg.path,
+        "content": cfg.content,
+        "writable": cfg.writable,
+    })))
+}
+
+pub async fn config_put(
+    State(state): State<Shared>, Auth(s): Auth,
+    AxPath(name): AxPath<String>, Json(req): Json<ConfigPutReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::SERVICE_MANAGE)?;
+    if !state.capabilities.get(cap_keys::SERVICE_MANAGE).map(|c| c.supported).unwrap_or(false) {
+        return Err(ApiError::unsupported("service.manage"));
+    }
+    // 防御：单元文件不应无限大（256KiB 上限足够容纳任何真实 unit 文件）
+    if req.content.len() > 256 * 1024 {
+        return Err(ApiError::bad_request("content", "unit file too large (>256KiB)"));
+    }
+    let unit = panel_core::unit_name(&name)
+        .map_err(|_| ApiError::bad_request("name", "invalid unit name"))?;
+    state.os.services()
+        .config_write(&unit, &req.content, req.restart.unwrap_or(false)).await?;
+    audit(&state, &s, "service.config_write", &name, "ok").await;
+    Ok(ok(serde_json::json!({ "name": name })))
 }
 
 pub async fn packages_list(
@@ -364,15 +473,45 @@ pub async fn packages_list(
     if !state.capabilities.get(cap_keys::PACKAGE_INSTALL).map(|c| c.supported).unwrap_or(false) {
         return Err(ApiError::unsupported("package.install"));
     }
-    Err(ApiError::unsupported("package.list (M2: 已安装包枚举尚未接入)"))
+    // 语义是"管理白名单内软件的安装状态"，不是通用包管理器枚举：
+    // 只在白名单范围内探测，避免全量 rpm/dpkg 扫描（慢且暴露无关信息）。
+    let pkgs = state.os.packages().detect_installed(ALLOWED_PACKAGES).await?;
+    let items: Vec<serde_json::Value> = pkgs.into_iter().map(|p| serde_json::json!({
+        "name": p.name,
+        "version": p.version,
+        "manager": p.manager,
+    })).collect();
+    Ok(ok(serde_json::json!({ "packages": items })))
 }
 
 pub async fn package_remove(
-    State(_state): State<Shared>, Auth(s): Auth, AxPath(name): AxPath<String>,
+    State(state): State<Shared>, Auth(s): Auth, AxPath(name): AxPath<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::PACKAGE_MANAGE)?;
-    let _ = name;
-    Err(ApiError::unsupported("package.remove (M2: 卸载走任务队列，尚未接入)"))
+    if !state.capabilities.get(cap_keys::PACKAGE_INSTALL).map(|c| c.supported).unwrap_or(false) {
+        return Err(ApiError::unsupported("package.install"));
+    }
+    if !ALLOWED_PACKAGES.contains(&name.as_str()) {
+        return Err(ApiError::bad_request("name",
+            "package not in the allowed list (panel runs as root; arbitrary removes are refused)"));
+    }
+
+    // 卸载与安装同权重：走任务队列 + 幂等键（与 install 不同键，避免互相吞并）
+    let pkg = name.clone();
+    let os = state.os.clone();
+    let body = PackageTask { pkg, os, op: PkgOp::Remove };
+    let (id, created) = state.tasks.submit(
+        panel_task::TaskRequest {
+            idempotency_key: format!("pkg.remove:{}", name),
+            kind: panel_task::TaskKind::Package,
+            label: format!("卸载 {}", name),
+            timeout: Duration::from_secs(1800),
+        },
+        body,
+    ).await.map_err(ApiError::from)?;
+
+    audit(&state, &s, "package.remove", &name, "queued").await;
+    Ok(ok(serde_json::json!({ "task_id": id, "created": created })))
 }
 
 #[cfg(test)]
