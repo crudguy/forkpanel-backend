@@ -9,6 +9,7 @@
 pub mod auth;
 pub mod error;
 pub mod middleware;
+pub mod remote_store;
 pub mod routes;
 pub mod sse;
 pub mod totp;
