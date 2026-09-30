@@ -96,13 +96,36 @@ pub struct SiteOut {
     pub waf_burst: Option<i64>,
 }
 
+/// API 口径（`proxy`）→ 库内口径（`reverse_proxy`）。
+///
+/// 两套名字的换算**只在这两个函数里**，不散落到别处——散开的下场就是之前那样：
+/// `apply` 一律写死 `'static'`、`to_out` 又把一切非 `reverse_proxy` 都当静态，
+/// 于是反代站在列表里显示成"静态"，前端编辑后一点"应用"就把线上站点改成静态站。
+fn kind_to_db(k: &panel_os::SiteKind) -> &'static str {
+    match k {
+        panel_os::SiteKind::Static => "static",
+        panel_os::SiteKind::ReverseProxy { .. } => "reverse_proxy",
+        panel_os::SiteKind::Php { .. } => "php",
+    }
+}
+
+/// 库内口径 → API 口径。未知值一律落到 `static`（**不是** `proxy`）：
+/// 认不出来时降级成"静态"只是显示不准，认成反代则会让人按错误前提去改配置。
+fn kind_to_api(k: &str) -> &'static str {
+    match k {
+        "reverse_proxy" => "proxy",
+        "php" => "php",
+        _ => "static",
+    }
+}
+
 fn to_out(r: &RawSite) -> SiteOut {
     SiteOut {
         id: r.id,
         name: r.name.clone(),
         domains: serde_json::from_str(&r.domains).unwrap_or_default(),
         root: r.root.clone(),
-        kind: if r.kind == "reverse_proxy" { "proxy" } else { "static" }.to_string(),
+        kind: kind_to_api(&r.kind).to_string(),
         enabled: r.enabled != 0,
         tls: r.tls,
         created_at: r.created_at,
@@ -694,6 +717,7 @@ pub async fn apply(
             ))
         }
     };
+    let kind_db = kind_to_db(&kind);
     let spec = panel_os::SiteSpec {
         server_names: domains.iter().map(|d| d.clone()).collect(),
         root: root.as_path().to_path_buf(),
@@ -740,13 +764,13 @@ pub async fn apply(
             conn.execute(
                 "INSERT INTO sites(name, domains, root, kind, webserver, enabled, conf_path, created_at,
                                    waf_enabled, waf_profile, waf_rate, waf_burst)
-                 VALUES(?1, ?2, ?3, 'static', 'nginx', 1, ?4, ?5, ?6, ?7, ?8, ?9)
+                 VALUES(?1, ?2, ?3, ?4, 'nginx', 1, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(name) DO UPDATE SET
-                    domains=excluded.domains, root=excluded.root, enabled=1,
+                    domains=excluded.domains, root=excluded.root, kind=excluded.kind, enabled=1,
                     conf_path=excluded.conf_path, webserver='nginx',
                     waf_enabled=excluded.waf_enabled, waf_profile=excluded.waf_profile,
                     waf_rate=excluded.waf_rate, waf_burst=excluded.waf_burst",
-                rusqlite::params![name, domains_json, root_str, conf_db, now,
+                rusqlite::params![name, domains_json, root_str, kind_db, conf_db, now,
                                   waf_on, waf_profile, waf_rate, waf_burst],
             )
             .map(|_| panel_db::WriteAck { rows_changed: 1 })
@@ -1369,6 +1393,30 @@ mod waf_tests {
         let ok = build_waf(Some(&req(true, None, Some(WAF_RATE_MAX), None)), None).unwrap().unwrap();
         assert_eq!(ok.rate_per_sec, Some(WAF_RATE_MAX));
         assert_eq!(ok.burst, WAF_RATE_MAX * 2);
+    }
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use super::*;
+
+    /// 两个换算必须互为逆（在各自定义域上）。之前这里断链：`apply` 写死
+    /// `'static'`，`to_out` 又只认 `reverse_proxy`，于是**任何**站点读出来都是
+    /// 静态站——反代站被编辑后一点"应用"就被改坏。
+    #[test]
+    fn kind_maps_round_trip_and_unknown_falls_back_to_static() {
+        for (db, api) in [("static", "static"), ("reverse_proxy", "proxy"), ("php", "php")] {
+            assert_eq!(kind_to_api(db), api, "库口径 {db} 应呈现为 {api}");
+        }
+        assert_eq!(kind_to_db(&panel_os::SiteKind::Static), "static");
+        assert_eq!(
+            kind_to_db(&panel_os::SiteKind::ReverseProxy { upstreams: vec!["http://127.0.0.1:3000".into()] }),
+            "reverse_proxy"
+        );
+        assert_eq!(kind_to_db(&panel_os::SiteKind::Php { fpm: "unix:/run/php.sock".into() }), "php");
+        // 未知值必须降级成 static：认成 proxy 会让人按错误前提去改配置
+        assert_eq!(kind_to_api("something_else"), "static");
+        assert_eq!(kind_to_api(""), "static");
     }
 }
 

@@ -433,7 +433,7 @@ components:
         name:     { type: string }
         domains:  { type: array, items: { type: string } }
         root:     { type: string }
-        kind:     { type: string, enum: [static, proxy] }
+        kind:     { type: string, enum: [static, proxy, php], description: "站点类型（库内口径为 static | reverse_proxy | php；API 把 reverse_proxy 呈现为 proxy）" }
         enabled:  { type: boolean }
         tls:      { type: boolean }
         waf_enabled:      { type: boolean, description: "WAF 是否启用" }
