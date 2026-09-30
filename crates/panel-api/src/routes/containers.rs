@@ -29,7 +29,8 @@ use axum::{
     Json,
 };
 use panel_core::cap_keys;
-use panel_os::{ContainerAction, ContainerProvider};
+use panel_os::{ContainerAction, ContainerCreateReq, ContainerProvider};
+use serde::Deserialize;
 
 /// 能力前置检查：不可用即诚实 501，并把原因透出（前端无需再请求 capabilities 才能解释原因）。
 fn ensure_supported(state: &Shared) -> Result<(), ApiError> {
@@ -85,6 +86,63 @@ pub async fn images(State(state): State<Shared>, Auth(s): Auth) -> ApiResult<Jso
     ensure_supported(&state)?;
     let items = state.os.containers().images().await?;
     Ok(ok(items))
+}
+
+// ─────────────── 创建 ───────────────
+
+/// 创建容器请求。**二次确认词** `confirm_token` 必须为「创建容器」——
+/// 创建容器等价宿主机任意代码执行，必须让用户手输确认词，不接受随手点的 OK。
+#[derive(Debug, Deserialize)]
+pub struct CreateReq {
+    pub name: String,
+    pub image: String,
+    pub cmd: Option<Vec<String>>,
+    pub ports: Option<Vec<String>>,
+    pub env: Option<Vec<String>>,
+    pub volumes: Option<Vec<String>>,
+    pub restart: Option<String>,
+    pub cpu_quota: Option<f64>,
+    pub mem_limit: Option<String>,
+    /// 必须为 false（true 时 provider 直接拒绝）；前端不得提供"特权"开关。
+    pub privileged: Option<bool>,
+    /// 二次确认词（同「覆盖恢复」纪律）。
+    pub confirm_token: Option<String>,
+}
+
+/// 二次确认词：手输才有效，防止误触一键创建特权/宿主挂载容器。
+const CREATE_CONFIRM: &str = "创建容器";
+
+pub async fn create(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    Json(req): Json<CreateReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::CONTAINER_MANAGE)?;
+    ensure_supported(&state)?;
+    if req.confirm_token.as_deref() != Some(CREATE_CONFIRM) {
+        return Err(ApiError::bad_request("confirm_token", "需手输确认词「创建容器」"));
+    }
+    let inner = ContainerCreateReq {
+        name: req.name,
+        image: req.image,
+        cmd: req.cmd.unwrap_or_default(),
+        ports: req.ports.unwrap_or_default(),
+        env: req.env.unwrap_or_default(),
+        volumes: req.volumes.unwrap_or_default(),
+        restart: req.restart,
+        cpu_quota: req.cpu_quota,
+        mem_limit: req.mem_limit,
+        privileged: req.privileged.unwrap_or(false),
+    };
+    let c = state.os.containers().create(inner).await?;
+    audit(&state, &s, "container.create", &c.id, "ok").await;
+    Ok(ok(serde_json::json!({
+        "id": c.id,
+        "name": c.name,
+        "image": c.image,
+        "state": c.state,
+        "note": "已创建但未启动；请在列表中对它执行「启动」",
+    })))
 }
 
 // ─────────────── 生命周期 ───────────────

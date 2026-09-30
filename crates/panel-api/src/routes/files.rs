@@ -285,6 +285,238 @@ pub async fn remove(
     Ok(ok(serde_json::json!({ "path": req.path })))
 }
 
+// ─────────────── 回收站（软删除） ───────────────
+//
+// 设计：产物是**逐条自描述目录**（`<data_dir>/trash/<id>/{archive.tar.gz,meta.json}`），
+// 不维护全局索引。好处是崩溃安全——没有"索引与实体不一致"的窗口；purge 就是删目录。
+//
+// 为什么用 tar.gz 而不是原地 `rename` 进回收站：
+//   1. 跨分区 `rename` 直接 EXDEV 失败，而被管理的站点目录常在另一块盘；
+//   2. 归档天然统一处理文件与目录两种情形；
+//   3. 复用备份模块**已验证**的实现（含 `..` 逃逸校验、超时、进程收敛），
+//      不必新写一套递归拷贝/删除。
+
+const TRASH_META: &str = "meta.json";
+const TRASH_ARCHIVE: &str = "archive.tar.gz";
+/// 回收站列表上限：回收站不该成为无限增长的垃圾场
+const TRASH_LIST_MAX: usize = 1000;
+
+fn trash_root(state: &Shared) -> PathBuf {
+    state.os.paths().data_dir().join("trash")
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn io_err(ctx: &str, e: std::io::Error) -> ApiError {
+    ApiError::from(PanelError::Io(format!("{ctx}: {e}")))
+}
+
+/// 回收站 id：纳秒时间戳 + 进程号。字符集锁死在 `[0-9a-f-]`——
+/// 该串会参与路径拼接，必须在**生成侧**就限定，不能指望使用侧过滤。
+fn new_trash_id() -> String {
+    let ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{ns:x}-{:x}", std::process::id())
+}
+
+/// 校验**外部传入**的 id（列表/恢复/purge 都会带）。与生成侧同字符集，杜绝 `../` 注入。
+fn is_valid_trash_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
+async fn count_dir_entries(p: &std::path::Path) -> usize {
+    let mut n = 0usize;
+    if let Ok(mut rd) = tokio::fs::read_dir(p).await {
+        while let Ok(Some(_)) = rd.next_entry().await {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// 读一条元数据；损坏条目返回 None（由调用方跳过）——
+/// 一条坏数据不该让整个回收站不可用。
+async fn read_trash_meta(entry_dir: &std::path::Path) -> Option<serde_json::Value> {
+    let raw = tokio::fs::read(entry_dir.join(TRASH_META)).await.ok()?;
+    serde_json::from_slice::<serde_json::Value>(&raw).ok()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TrashReq { pub path: String }
+
+/// 把**已校验**的单个路径移入回收站（`trash` handler 与批量 `action` 共用）。
+///
+/// 顺序刻意为「先归档、后删除」：归档失败时原文件必须还在；
+/// 删除失败则连归档一起回滚，避免"原件还在、回收站也有一份"的双份歧义。
+async fn trash_one(state: &Shared, p: &SafePath) -> Result<serde_json::Value> {
+    let st = state.os.files().stat(p).await?;
+    let kind = if st.kind == EntryKind::Dir { "dir" } else { "file" };
+
+    let entry_dir = trash_root(state).join(new_trash_id());
+    tokio::fs::create_dir_all(&entry_dir).await
+        .map_err(|e| PanelError::Io(format!("创建回收站条目失败: {e}")))?;
+    let archive = entry_dir.join(TRASH_ARCHIVE);
+
+    if let Err(e) = panel_os::backup::tar_gz(p.as_path(), &archive).await {
+        let _ = tokio::fs::remove_dir_all(&entry_dir).await;
+        return Err(e);
+    }
+    if let Err(e) = state.os.files().remove(p, true).await {
+        let _ = tokio::fs::remove_dir_all(&entry_dir).await;
+        return Err(e);
+    }
+
+    let entry = serde_json::json!({
+        "id": entry_dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+        "original_path": p.as_path().to_string_lossy(),
+        "name": p.as_path().file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+        "deleted_at": now_unix(),
+        "kind": kind,
+        "size_bytes": st.size,
+    });
+    let bytes = serde_json::to_vec_pretty(&entry)
+        .map_err(|e| PanelError::Internal(format!("序列化回收站元数据失败: {e}")))?;
+    tokio::fs::write(entry_dir.join(TRASH_META), bytes).await
+        .map_err(|e| PanelError::Io(format!("写入回收站元数据失败: {e}")))?;
+    Ok(entry)
+}
+
+/// 移入回收站（软删除）。与 `remove`（永久删除）刻意分成两个端点：
+/// 用户误删是高频事件，恢复路径必须存在。
+pub async fn trash(
+    State(state): State<Shared>, Auth(s): Auth, Json(req): Json<TrashReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::FILE_WRITE)?;
+    let p = resolve(&state, &s, &req.path)?;
+    ensure_not_sensitive(&state, &p)?;
+    let entry = trash_one(&state, &p).await?;
+    audit(&state, &s, "file.trash", &req.path, "ok").await;
+    Ok(ok(entry))
+}
+
+/// 回收站列表（新 → 旧）。
+pub async fn trash_list(
+    State(state): State<Shared>, Auth(s): Auth,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::FILE_READ)?;
+    let root = trash_root(&state);
+    let mut rd = match tokio::fs::read_dir(&root).await {
+        Ok(r) => r,
+        // 回收站尚未建立不是错误：如实返回空列表
+        Err(_) => return Ok(ok(serde_json::json!({ "items": [] }))),
+    };
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    while let Ok(Some(ent)) = rd.next_entry().await {
+        if items.len() >= TRASH_LIST_MAX { break; }
+        let dir = ent.path();
+        if !dir.is_dir() { continue; }
+        // 元数据缺失/损坏的条目直接跳过——**不顺手删除**：那是用户可能的恢复数据，
+        // 删不删得由人明确决定。
+        if let Some(md) = read_trash_meta(&dir).await {
+            items.push(md);
+        }
+    }
+    items.sort_by(|a, b| {
+        let ta = a.get("deleted_at").and_then(|x| x.as_i64()).unwrap_or(0);
+        let tb = b.get("deleted_at").and_then(|x| x.as_i64()).unwrap_or(0);
+        tb.cmp(&ta)
+    });
+    Ok(ok(serde_json::json!({ "items": items })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TrashIdReq { pub id: String }
+
+/// 从回收站恢复。
+///
+/// **恢复目标重新走完整沙箱**（`resolve_new`）：回收站元数据是磁盘上的普通文件，
+/// 不能因为"是我们自己写的"就信任——被篡改的 meta 可以指向任意路径。
+pub async fn trash_restore(
+    State(state): State<Shared>, Auth(s): Auth, Json(req): Json<TrashIdReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::FILE_WRITE)?;
+    if !is_valid_trash_id(&req.id) {
+        return Err(ApiError::bad_request("id", "非法回收站 id"));
+    }
+    let entry_dir = trash_root(&state).join(&req.id);
+    let md = read_trash_meta(&entry_dir).await
+        .ok_or_else(|| ApiError::from(PanelError::NotFound("回收站条目不存在或元数据损坏".into())))?;
+
+    let original = md.get("original_path").and_then(|v| v.as_str()).unwrap_or_default();
+    let target = resolve_new(&state, &s, original)?;
+    ensure_not_sensitive(&state, &target)?;
+
+    // 父目录必须已存在：原父目录若已被删，恢复无处安放（面板不越权替用户建目录）
+    let parent = target.as_path().parent()
+        .ok_or_else(|| ApiError::bad_request("path", "原路径无父目录"))?
+        .to_path_buf();
+    if tokio::fs::symlink_metadata(&parent).await.is_err() {
+        return Err(ApiError::bad_request("path", "原目录已不存在，无法恢复"));
+    }
+    // 原位置已有同名文件则拒绝：**绝不覆盖**——那会吃掉用户后来新建的文件
+    if tokio::fs::symlink_metadata(target.as_path()).await.is_ok() {
+        return Err(ApiError::bad_request("path", "原位置已有同名文件，请先移走它再恢复"));
+    }
+
+    let archive = entry_dir.join(TRASH_ARCHIVE);
+    // 归档条目逃逸校验：归档虽由本面板产出，仍按不可信输入对待（纵深防御）
+    for name in panel_os::backup::list_tar_entries(&archive).await? {
+        if !panel_os::backup::is_safe_entry(&name) {
+            return Err(ApiError::bad_request("archive", format!("归档含非法条目: {name}")));
+        }
+    }
+    panel_os::backup::untar_gz(&archive, &parent).await?;
+    tokio::fs::remove_dir_all(&entry_dir).await
+        .map_err(|e| io_err("清理回收站条目失败", e))?;
+
+    audit(&state, &s, "file.trash.restore", original, "ok").await;
+    Ok(ok(serde_json::json!({ "restored": original })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TrashPurgeReq { pub id: Option<String> }
+
+/// 彻底删除：给 `id` 删一条，不给则**清空**回收站。返回删除条数。
+pub async fn trash_purge(
+    State(state): State<Shared>, Auth(s): Auth, Json(req): Json<TrashPurgeReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::FILE_WRITE)?;
+    let root = trash_root(&state);
+
+    let (target, single) = match req.id.as_deref() {
+        Some(id) => {
+            if !is_valid_trash_id(id) {
+                return Err(ApiError::bad_request("id", "非法回收站 id"));
+            }
+            (root.join(id), true)
+        }
+        None => (root.clone(), false),
+    };
+
+    let n = if single {
+        usize::from(tokio::fs::symlink_metadata(&target).await.is_ok())
+    } else {
+        count_dir_entries(&target).await
+    };
+    match tokio::fs::remove_dir_all(&target).await {
+        Ok(()) => {}
+        // 目录本就不存在 → 视为已清空（幂等，不报错）
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io_err("清空回收站失败", e)),
+    }
+    audit(&state, &s, "file.trash.purge", req.id.as_deref().unwrap_or("all"), "ok").await;
+    Ok(ok(serde_json::json!({ "purged": n })))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RenameReq { pub from: String, pub to: String, pub copy: Option<bool> }
 
@@ -492,8 +724,8 @@ pub async fn action(
         }
         _ => None,
     };
-    if !matches!(req.op.as_str(), "move" | "copy" | "delete" | "chmod") {
-        return Err(ApiError::bad_request("op", "must be one of move/copy/delete/chmod"));
+    if !matches!(req.op.as_str(), "move" | "copy" | "delete" | "trash" | "chmod") {
+        return Err(ApiError::bad_request("op", "must be one of move/copy/delete/trash/chmod"));
     }
 
     let mut results: Vec<ActionItem> = Vec::with_capacity(req.paths.len());
@@ -504,6 +736,8 @@ pub async fn action(
             ensure_not_sensitive(&state, &p)?;
             match req.op.as_str() {
                 "delete" => state.os.files().remove(&p, true).await?,
+                // 软删除：批量操作里最容易被误触的一个，故默认走回收站
+                "trash" => { trash_one(&state, &p).await?; }
                 "chmod" => {
                     let m = mode.expect("预解析已保证");
                     state.os.storage().set_permissions(
@@ -555,6 +789,23 @@ mod tests {
     fn read_cap_is_bounded() {
         assert!(MAX_READ_BYTES <= 8 * 1024 * 1024, "单次读取上限不应过大");
         assert!(MAX_READ_BYTES >= 512 * 1024, "太小会让编辑器频繁分块");
+    }
+
+    #[test]
+    fn trash_id_charset_is_locked_down() {
+        // 生成侧只产 [0-9a-f-]，且必须自洽通过自己的校验
+        let id = new_trash_id();
+        assert!(is_valid_trash_id(&id), "生成的 id 必须通过自身校验: {id}");
+        // 拒绝一切可参与路径逃逸的输入
+        for bad in ["../etc", "a/b", "", ".", "..", "x y", "a\\b", "a..b"] {
+            assert!(!is_valid_trash_id(bad), "必须拒绝非法 id: {bad:?}");
+        }
+        assert!(!is_valid_trash_id(&"a".repeat(65)), "超长 id 必须拒绝");
+    }
+
+    #[test]
+    fn trash_id_is_unique_across_calls() {
+        assert_ne!(new_trash_id(), new_trash_id(), "纳秒时间戳 + pid 应保证不撞");
     }
 
     #[test]

@@ -74,6 +74,8 @@ impl MetricsProvider for MockMetrics {
                                     rx_rate_bps: 1024, tx_rate_bps: 2048 }],
             proc_count: 120,
             tcp_conns: 8,
+            // 温度是尽力而为的维度：mock 不编造真实传感器读数，如实给空
+            temps: Vec::new(),
         })
     }
 
@@ -211,6 +213,21 @@ impl FirewallProvider for MockFirewall {
         if st.rules.remove(id).is_some() { Ok(()) }
         else { Err(PanelError::NotFound(format!("firewall rule `{id}`"))) }
     }
+
+    fn fail2ban_capability(&self) -> Capability { Capability::yes("mock") }
+    async fn fail2ban_status(&self) -> Result<Fail2banStatus> {
+        Ok(Fail2banStatus {
+            available: true,
+            active: true,
+            jails: vec![Fail2banJail {
+                name: "sshd".into(), enabled: true,
+                currently_failed: 0, total_failed: 3, banned: 1,
+                banned_ips: vec!["192.168.1.5".into()],
+            }],
+        })
+    }
+    async fn fail2ban_set_jail(&self, _name: &str, _enabled: bool) -> Result<()> { Ok(()) }
+    async fn fail2ban_unban(&self, _jail: &str, _ip: &str) -> Result<()> { Ok(()) }
 }
 
 // ───────────────────────── 其余：显式不支持 ─────────────────────────
@@ -377,6 +394,19 @@ impl ContainerProvider for MockContainers {
     }
 
     async fn act(&self, _action: ContainerAction, _id: &str) -> Result<()> { Ok(()) }
+
+    async fn create(&self, req: ContainerCreateReq) -> Result<ContainerSummary> {
+        // mock 不真正调用 docker：仅返回结构化摘要（id 用 name 派生，便于回放测试）
+        Ok(ContainerSummary {
+            id: format!("mock-{:x}", req.name.len()),
+            name: req.name,
+            image: req.image,
+            state: "created".into(),
+            status: "Created".into(),
+            ports: req.ports.join(","),
+            created: String::new(),
+        })
+    }
 }
 
 #[async_trait]

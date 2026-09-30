@@ -12,6 +12,7 @@ pub mod middleware;
 pub mod routes;
 pub mod sse;
 pub mod totp;
+pub mod webhook;
 
 use error::{ApiError, ApiResult};
 use panel_core::{crypto::MasterKey, CapabilityMap, Tier};

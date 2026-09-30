@@ -105,6 +105,52 @@ components:
         lines:  { type: array, items: { $ref: '#/components/schemas/LogLine' } }
         capped: { type: boolean, description: 是否因行数上限被截断 }
 
+    LogStats:
+      type: object
+      description: 日志聚合统计（启发式，用于概览而非精确分析）
+      properties:
+        source:  { type: string }
+        scanned: { type: integer, description: 实际扫描行数 }
+        capped:  { type: boolean, description: 是否触及 2000 行扫描上限 }
+        buckets: { type: integer, description: 请求的时间分桶数 }
+        levels:
+          type: object
+          description: level 分布（固定五档，缺档恒为 0）；优先采信 provider 的结构化 level，缺失时按文本关键词启发
+          properties:
+            error: { type: integer }
+            warn:  { type: integer }
+            info:  { type: integer }
+            debug: { type: integer }
+            other: { type: integer }
+        histogram:
+          type: array
+          description: 时间直方图；无时间戳的源为空数组（不按行序伪造分布）
+          items:
+            type: object
+            properties:
+              start: { type: integer }
+              end:   { type: integer }
+              count: { type: integer }
+        top_patterns:
+          type: array
+          description: 高频消息模式（数字/引号内容归一化后计数；仅保留出现 ≥2 次者，最多 8 条，按次数降序）
+          items:
+            type: object
+            properties:
+              pattern: { type: string }
+              count:   { type: integer }
+
+    TrashEntry:
+      type: object
+      description: 回收站条目（即条目目录里 meta.json 的内容）
+      properties:
+        id:            { type: string, description: "条目 id（纳秒时间戳-进程号），字符集限定 [0-9a-f-]" }
+        original_path: { type: string, description: "删除前的绝对路径（恢复目标；恢复时会重新走沙箱校验）" }
+        name:          { type: string, description: "原文件名（展示用）" }
+        deleted_at:    { type: integer, description: "删除时间（unix 秒）" }
+        kind:          { type: string, enum: [file, dir] }
+        size_bytes:    { type: integer, description: "文件字节数；目录为 0（不递归统计，避免 IO 放大）" }
+
     LogLine:
       type: object
       properties:
@@ -233,6 +279,14 @@ components:
         nets:       { type: array, items: { $ref: '#/components/schemas/NetSample' } }
         proc_count: { type: integer }
         tcp_conns:  { type: integer }
+        temps:      { type: array, items: { $ref: '#/components/schemas/TempSample' }, description: "无 hwmon 的机器（多为虚拟机）为空数组" }
+    TempSample:
+      type: object
+      properties:
+        chip:     { type: string, description: "hwmon 芯片名（coretemp / k10temp / nvme / acpitz …）" }
+        label:    { type: string, description: "通道标签；内核未提供 label 时回退为 tempN，绝不凭空命名" }
+        celsius:  { type: number, description: "摄氏度（内核毫摄氏度 / 1000）" }
+        critical: { type: boolean, description: "是否达到 tempN_crit 阈值；读不到 crit 时恒 false（不臆测告警）" }
     CpuSample:
       type: object
       properties:
@@ -428,7 +482,7 @@ components:
       type: object
       required: [op, paths]
       properties:
-        op:    { type: string, enum: [move, copy, delete, chmod] }
+        op:    { type: string, enum: [move, copy, delete, trash, chmod] }
         paths: { type: array, items: { type: string }, maxItems: 100, description: 批量目标（允许根内路径） }
         dest:  { type: [string, "null"], description: move/copy 的目标目录 }
         mode:  { type: [string, "null"], description: chmod 的八进制模式（如 644） }
@@ -592,6 +646,24 @@ components:
         tag:        { type: string, example: "1.27-alpine" }
         size:       { type: string, description: CLI 已格式化的体积，如 `55.3MB` }
         created:    { type: string }
+
+    Fail2banJail:
+      type: object
+      description: fail2ban 单个监狱（jail）状态
+      properties:
+        name:            { type: string, example: sshd }
+        enabled:         { type: boolean }
+        currently_failed: { type: integer }
+        total_failed:    { type: integer }
+        banned:          { type: integer, description: 当前封禁数 }
+        banned_ips:      { type: array, items: { type: string } }
+    Fail2banStatus:
+      type: object
+      description: fail2ban 总览
+      properties:
+        available: { type: boolean, description: fail2ban-client 是否存在 }
+        active:    { type: boolean, description: fail2ban 服务是否运行中 }
+        jails:     { type: array, items: { $ref: '#/components/schemas/Fail2banJail' } }
 
     # ───────────── 防火墙 ─────────────
     FirewallStatus:
@@ -1313,6 +1385,52 @@ paths:
       security: [cookieAuth, csrfHeader]
       requestBody: { required: true, content: { application/json: { schema: { type: object, required: [path], properties: { path: { type: string } } } } } }
       responses: { '204': { description: ok } }
+  /api/v1/files/trash:
+    get:
+      tags: [files]
+      summary: 回收站列表（新 → 旧；最多 1000 条；元数据损坏的条目跳过且不删除）
+      security: [cookieAuth, csrfHeader]
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/TrashEntry' } } } } } }
+    post:
+      tags: [files]
+      summary: 移入回收站（软删除；先归档后删除，任一步失败即回滚）
+      security: [cookieAuth, csrfHeader]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [path], properties: { path: { type: string } } } } } }
+      responses:
+        '200':
+          description: ok（返回该条目元数据）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/TrashEntry' } } }
+  /api/v1/files/trash/restore:
+    post:
+      tags: [files]
+      summary: 从回收站恢复（目标重新走沙箱校验；原位置已有同名文件则拒绝，绝不覆盖）
+      security: [cookieAuth, csrfHeader]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [id], properties: { id: { type: string } } } } } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { restored: { type: string } } } } }
+  /api/v1/files/trash/purge:
+    post:
+      tags: [files]
+      summary: 彻底删除（给 id 删一条；不给则清空回收站。幂等）
+      security: [cookieAuth, csrfHeader]
+      requestBody: { required: false, content: { application/json: { schema: { type: object, properties: { id: { type: [string, 'null'] } } } } } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { purged: { type: integer } } } } }
   /api/v1/files/rename:
     post:
       tags: [files]
@@ -1328,10 +1446,12 @@ paths:
   /api/v1/files/action:
     post:
       tags: [files]
-      summary: 批量动作（move/copy/delete/chmod；逐项执行逐项报告）
+      summary: 批量动作（move/copy/delete/trash/chmod；逐项执行逐项报告）
       description: |
         move/copy：dest 为**目标目录**，各 path 移入同名；目标已存在 → 该项失败（不静默覆盖）。
-        delete：递归删除（目录也允许，前端须二次确认）。chmod：八进制 ≤777。
+        delete：**永久**递归删除（目录也允许，前端须二次确认）。
+        trash：移入回收站（可从 `/files/trash/restore` 恢复；归档或删除任一步失败即回滚）。
+        chmod：八进制 ≤777。
         部分失败整体仍 200，结果数组逐项带 error；op/dest/mode 非法 → 400。
       security: [cookieAuth, csrfHeader]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/FileAction' } } } }
@@ -1491,6 +1611,37 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/ContainerSummary' } } } }
         '501': { description: "容器能力不可用（detail.reason：binary_missing / daemon_unreachable）" }
+    post:
+      tags: [containers]
+      summary: 创建容器（`docker create`，**默认不启动**）
+      security: [cookieAuth, csrfHeader]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, image, confirm_token]
+              properties:
+                name: { type: string }
+                image: { type: string }
+                cmd: { type: array, items: { type: string } }
+                ports: { type: array, items: { type: string }, description: 'host:container[/proto]' }
+                env: { type: array, items: { type: string }, description: 'KEY=VALUE' }
+                volumes: { type: array, items: { type: string }, description: 'src:dst[:ro]' }
+                restart: { type: string, enum: [no, on-failure, always, unless-stopped] }
+                cpu_quota: { type: number, description: CPU 核数配额 }
+                mem_limit: { type: string, description: '如 512m / 2g' }
+                privileged: { type: boolean, description: '必须为 false（provider 拒绝 true）' }
+                confirm_token: { type: string, description: '二次确认词，必须为「创建容器」' }
+      responses:
+        '200':
+          description: 已创建（state=created，需再 start 才运行）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/ContainerSummary' } } }
+        '400': { description: 校验失败（确认词错 / 特权 / 宿主敏感挂载 / 端口格式等） }
+        '501': { description: 容器能力不可用 }
   /api/v1/containers/images:
     get:
       tags: [containers]
@@ -1584,6 +1735,41 @@ paths:
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
       responses: { '204': { description: ok } }
+
+  /api/v1/firewall/fail2ban:
+    get:
+      tags: [firewall]
+      summary: fail2ban 总览（可用性与各 jail 封禁统计）
+      security: [cookieAuth, csrfHeader]
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/Fail2banStatus' } } }
+        '501': { description: fail2ban 不可用（未装 fail2ban-client） }
+  /api/v1/firewall/fail2ban/jail:
+    post:
+      tags: [firewall]
+      summary: 启停某 jail
+      security: [cookieAuth, csrfHeader]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [name, enabled], properties: { name: { type: string }, enabled: { type: boolean } } }
+      responses: { '200': { description: ok }, '501': { description: fail2ban 不可用 } }
+  /api/v1/firewall/fail2ban/unban:
+    post:
+      tags: [firewall]
+      summary: 解封某 jail 下指定 IP
+      security: [cookieAuth, csrfHeader]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [jail, ip], properties: { jail: { type: string }, ip: { type: string } } }
+      responses: { '200': { description: ok }, '501': { description: fail2ban 不可用 } }
 
   # ───────── 安全 ─────────
   /api/v1/security/baseline:
@@ -1683,6 +1869,13 @@ paths:
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
       responses: { '202': { description: 已入队 } }
+  /api/v1/cron/jobs/{id}/webhook:
+    post:
+      tags: [cron]
+      summary: 测试该任务已配置的 Webhook（POST 一条 test 事件）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: ok } }
   /api/v1/cron/jobs/{id}/runs:
     get:
       tags: [cron]
@@ -1700,6 +1893,13 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { expr: { type: string }, next: { type: array, items: { type: integer } } } } } }
+  /api/v1/cron/webhook/test:
+    post:
+      tags: [cron]
+      summary: 测试任意 Webhook URL 可达性（POST 一条 test 事件）
+      security: [cookieAuth, csrfHeader]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [url], properties: { url: { type: string } } } } } }
+      responses: { '200': { description: ok } }
 
   # ───────── 日志 ─────────
   /api/v1/logs/sources:
@@ -1743,6 +1943,24 @@ paths:
           content:
             text/plain:
               schema: { type: string }
+
+  /api/v1/logs/{id}/stats:
+    get:
+      tags: [logs]
+      summary: 日志聚合统计（level 分布 + 时间直方图 + 高频消息模式）
+      parameters:
+        - $ref: '#/components/parameters/LogId'
+        - { name: lines, in: query, schema: { type: integer, maximum: 2000, default: 2000 }, description: 扫描行数（统计默认扫满上限） }
+        - { name: grep, in: query, schema: { type: string }, description: 字面量子串过滤（非正则） }
+        - { name: level, in: query, schema: { type: string } }
+        - { name: since, in: query, schema: { type: integer } }
+        - { name: buckets, in: query, schema: { type: integer, minimum: 1, maximum: 60, default: 12 }, description: 时间分桶数 }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/LogStats' } } }
 
   /api/v1/logs/{id}:
     get:

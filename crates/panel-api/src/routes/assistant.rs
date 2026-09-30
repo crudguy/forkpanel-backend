@@ -147,6 +147,7 @@ async fn collect(state: &Shared) -> Ctx {
         nets: Vec::new(),
         proc_count: 0,
         tcp_conns: 0,
+        temps: Vec::new(),
     });
     let failed_units = units
         .unwrap_or_default()
@@ -495,6 +496,7 @@ mod tests {
                 buffers_kib: 0, cached_kib: 0, swap_total_kib: 0, swap_used_kib: 0,
             },
             disks: Vec::new(), nets: Vec::new(), proc_count: 128, tcp_conns: 0,
+            temps: Vec::new(),
         }
     }
 

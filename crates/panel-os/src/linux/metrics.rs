@@ -54,6 +54,7 @@ impl MetricsProvider for LinuxMetrics {
             nets,
             proc_count: count_pids(),
             tcp_conns: 0, // 由 NetworkProvider 提供（/proc/net/tcp 解析成本较高，按需采集）
+            temps: read_temps().await,
         })
     }
 
@@ -73,6 +74,75 @@ impl MetricsProvider for LinuxMetrics {
 
 async fn read_str(p: &str) -> Result<String> {
     tokio::fs::read_to_string(p).await.map_err(|e| panel_core::PanelError::Internal(format!("read {p}: {e}")))
+}
+
+/// 采集 hwmon 温度通道（`/sys/class/hwmon/hwmon*/tempN_input`）。
+///
+/// **尽力而为**：目录不存在、单通道读失败都只跳过，绝不因此让整次快照失败——
+/// 温度是锦上添花的维度，不该拖垮核心指标（无 hwmon 的虚拟机返回空数组，属正常）。
+/// 返回值按 (chip, label) 稳定排序，避免 `read_dir` 顺序抖动导致前端数值闪跳。
+async fn read_temps() -> Vec<crate::traits::TempSample> {
+    let mut out: Vec<crate::traits::TempSample> = Vec::new();
+    let mut top = match tokio::fs::read_dir("/sys/class/hwmon").await {
+        Ok(r) => r,
+        Err(_) => return out,
+    };
+    while let Ok(Some(ent)) = top.next_entry().await {
+        let dir = ent.path();
+        let chip = tokio::fs::read_to_string(dir.join("name"))
+            .await
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let chip = if chip.is_empty() { "hwmon".to_string() } else { chip };
+
+        // 先收集该芯片下的 tempN_input 通道名（顺序由内核给出，统一排序后再读）
+        let mut channels: Vec<String> = Vec::new();
+        let mut sub = match tokio::fs::read_dir(&dir).await {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        while let Ok(Some(e)) = sub.next_entry().await {
+            let n = e.file_name().to_string_lossy().to_string();
+            if n.starts_with("temp") && n.ends_with("_input") {
+                channels.push(n);
+            }
+        }
+        channels.sort();
+
+        for ch in channels {
+            let Ok(raw) = tokio::fs::read_to_string(dir.join(&ch)).await else { continue };
+            let Ok(milli) = raw.trim().parse::<i64>() else { continue };
+            let channel = ch.trim_end_matches("_input").to_string(); // 形如 temp1
+            let label = tokio::fs::read_to_string(dir.join(format!("{channel}_label"))).await.ok();
+            let crit = tokio::fs::read_to_string(dir.join(format!("{channel}_crit")))
+                .await
+                .ok()
+                .and_then(|s| s.trim().parse::<i64>().ok());
+            out.push(temp_from_parts(&chip, label.as_deref(), &channel, milli, crit));
+        }
+    }
+    out.sort_by(|a, b| a.chip.cmp(&b.chip).then_with(|| a.label.cmp(&b.label)));
+    out
+}
+
+/// 由 hwmon 原始值构造 `TempSample`（纯函数，便于单测）。
+/// `input_milli` / `crit_milli` 均为内核毫摄氏度；`crit` 缺失时**不臆测告警**。
+fn temp_from_parts(
+    chip: &str,
+    label: Option<&str>,
+    channel: &str,
+    input_milli: i64,
+    crit_milli: Option<i64>,
+) -> crate::traits::TempSample {
+    crate::traits::TempSample {
+        chip: chip.to_string(),
+        label: label
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| channel.to_string()),
+        celsius: input_milli as f64 / 1000.0,
+        critical: crit_milli.map(|c| input_milli >= c).unwrap_or(false),
+    }
 }
 
 fn now_unix() -> i64 {
@@ -287,6 +357,28 @@ mod tests {
     fn cpu_delta_math() {
         assert_eq!(delta_pct(None, 100, 200), 0.0);
         assert_eq!(delta_pct(Some((50, 100)), 100, 200), 50.0);
+    }
+
+    #[test]
+    fn temp_sample_prefers_label() {
+        // 内核 sysfs 文件常带尾换行，必须 trim
+        let t = temp_from_parts("coretemp", Some(" Package id 0\n"), "temp1", 45_000, Some(100_000));
+        assert_eq!(t.chip, "coretemp");
+        assert_eq!(t.label, "Package id 0");
+        assert_eq!(t.celsius, 45.0);
+        assert!(!t.critical);
+    }
+
+    #[test]
+    fn temp_sample_falls_back_and_detects_crit() {
+        // 无 label → 用通道名；input ≥ crit → critical
+        let t = temp_from_parts("nvme", None, "temp2", 100_000, Some(100_000));
+        assert_eq!(t.label, "temp2");
+        assert!(t.critical);
+        // 空/空白 label 同样回退，不产生空标签
+        let e = temp_from_parts("acpitz", Some("   "), "temp1", 30_000, None);
+        assert_eq!(e.label, "temp1");
+        assert!(!e.critical, "crit 缺失时绝不臆测告警");
     }
 
     #[tokio::test]

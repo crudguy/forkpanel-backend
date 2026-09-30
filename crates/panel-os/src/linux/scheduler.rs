@@ -28,7 +28,7 @@ pub struct LinuxScheduler;
 #[derive(Debug)]
 enum Entry {
     Raw(String),
-    Job { id: String, user: String, expr: String, command: String, enabled: bool },
+    Job { id: String, user: String, expr: String, command: String, enabled: bool, max_overlap: u32 },
 }
 
 fn parse_crontab(lines: &[String]) -> Vec<Entry> {
@@ -66,18 +66,24 @@ fn parse_crontab(lines: &[String]) -> Vec<Entry> {
     out
 }
 
-/// `<expr> <command>` → Job（前 5 段为表达式，其余为命令）
+/// `<expr> <command>` → Job（前 5 段为表达式，其余为命令）。
+/// `command` 可能是被 flock 互斥包裹过的形式（P2-3 防重入），这里负责还原。
 fn parse_job_line(id: &str, user: &str, payload: &str, enabled: bool) -> Option<Entry> {
     let parts: Vec<&str> = payload.split_whitespace().collect();
     if parts.len() < 6 { return None; }   // 5 段 + 至少 1 个命令词
     let expr = parts[..5].join(" ");
-    let command = parts[5..].join(" ");
+    let body = parts[5..].join(" ");
+    let (command, max_overlap) = match unwrap_overlap_guard(&body) {
+        Some((c, m)) => (c, m),
+        None => (body, 1),
+    };
     Some(Entry::Job {
         id: id.to_string(),
         user: user.to_string(),
         expr,
         command,
         enabled,
+        max_overlap,
     })
 }
 
@@ -86,17 +92,76 @@ fn serialize(entries: &[Entry]) -> String {
     for e in entries {
         match e {
             Entry::Raw(line) => { s.push_str(line); s.push('\n'); }
-            Entry::Job { id, user, expr, command, enabled } => {
+            Entry::Job { id, user, expr, command, enabled, max_overlap } => {
+                // P2-3 防重入：max_overlap<=1 且宿主有 flock 时，用互斥锁包裹命令。
+                // max_overlap==0（不限制）或 >1（OS 级并发计数未实装）→ 裸命令。
+                let body = if *max_overlap <= 1 && Bin::Flock.available() {
+                    wrap_overlap_guard(id, command)
+                } else {
+                    command.clone()
+                };
                 s.push_str(&format!("{MARK}{id} user={user}\n"));
                 if *enabled {
-                    s.push_str(expr); s.push(' '); s.push_str(command); s.push('\n');
+                    s.push_str(expr); s.push(' '); s.push_str(&body); s.push('\n');
                 } else {
-                    s.push_str(OFF); s.push_str(expr); s.push(' '); s.push_str(command); s.push('\n');
+                    s.push_str(OFF); s.push_str(expr); s.push(' '); s.push_str(&body); s.push('\n');
                 }
             }
         }
     }
     s
+}
+
+/// 把任意字符串安全地包进单引号（内部 `'` → `'\''`），供 `sh -c '<…>'` 嵌入。
+/// 这是 POSIX 下嵌入任意文本的标准做法，且与 [`unwrap_overlap_guard`] 互逆。
+fn shell_quote_single(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' { out.push_str("'\\''"); } else { out.push(c); }
+    }
+    out.push('\'');
+    out
+}
+
+/// 用 flock 互斥锁包裹命令：锁占用时本行直接结束（命令被跳过），`|| true` 压零退出码。
+fn wrap_overlap_guard(id: &str, command: &str) -> String {
+    format!(
+        "flock -n /run/lock/panel-cron-{id} -- sh -c {q} || true",
+        q = shell_quote_single(command),
+    )
+}
+
+/// 逆操作：识别本模块生成的 `flock -n /run/lock/panel-cron-<id> -- sh -c '<cmd>' || true`
+/// 形式，还原出原始 `command` 与 `max_overlap`(=1)。非该形式返回 None（调用方按裸命令处理）。
+fn unwrap_overlap_guard(body: &str) -> Option<(String, u32)> {
+    const P: &str = "flock -n /run/lock/panel-cron-";
+    let b = body.trim_start();
+    if !b.starts_with(P) { return None; }
+    let rest = &b[P.len()..];
+    let marker = "sh -c ";
+    let idx = rest.find(marker)?;
+    let after = &rest[idx + marker.len()..];
+    if !after.starts_with('\'') { return None; }
+    // 解析 POSIX 单引号串：内嵌引号由 `'\''`（关-转义-开，4 字符）编码，
+    // 与 `shell_quote_single` 严格互逆。遇真正的结束 `'`（其后非 `\'` 再 `'`）停止。
+    let mut s = String::new();
+    let bytes = after.as_bytes();
+    let mut i = 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if i + 3 < bytes.len()
+                && bytes[i + 1] == b'\\' && bytes[i + 2] == b'\'' && bytes[i + 3] == b'\'' =>
+            {
+                // 内嵌引号：整段 `'\''` 还原为一个 `'`，跳到重开的 `'` 之后
+                s.push('\'');
+                i += 4;
+            }
+            b'\'' => break,
+            c => { s.push(c as char); i += 1; }
+        }
+    }
+    Some((s, 1))
 }
 
 async fn read_crontab() -> Result<Vec<String>> {
@@ -171,9 +236,12 @@ impl SchedulerProvider for LinuxScheduler {
     async fn list(&self) -> Result<Vec<ScheduledJob>> {
         let entries = parse_crontab(&read_crontab().await?);
         Ok(entries.into_iter().filter_map(|e| match e {
-            Entry::Job { id, user, expr, command, enabled } => Some(ScheduledJob {
+            Entry::Job { id, user, expr, command, enabled, max_overlap } => Some(ScheduledJob {
                 id, expression: expr, command, user, enabled,
                 timeout: Duration::from_secs(1800),
+                max_overlap,
+                webhook_url: None,
+                webhook_events: Vec::new(),
             }),
             Entry::Raw(_) => None,
         }).collect())
@@ -194,12 +262,13 @@ impl SchedulerProvider for LinuxScheduler {
         };
         if replaced {
             for e in entries.iter_mut() {
-                if let Entry::Job { id, user, expr, command, enabled } = e {
+                if let Entry::Job { id, user, expr, command, enabled, max_overlap } = e {
                     if *id == job.id {
                         *user = job.user.clone();
                         *expr = job.expression.clone();
                         *command = job.command.clone();
                         *enabled = job.enabled;
+                        *max_overlap = job.max_overlap;
                     }
                 }
             }
@@ -207,6 +276,7 @@ impl SchedulerProvider for LinuxScheduler {
             entries.push(Entry::Job {
                 id: job.id, user: job.user, expr: job.expression,
                 command: job.command, enabled: job.enabled,
+                max_overlap: job.max_overlap,
             });
         }
         write_crontab(&serialize(&entries)).await
@@ -402,7 +472,7 @@ impl Capable for LinuxScheduler {
 
 #[cfg(test)]
 mod tz_tests {
-    use super::next_fire_times_from;
+    use super::{next_fire_times_from, unwrap_overlap_guard, wrap_overlap_guard};
 
     const OFF8: i64 = 8 * 3600; // 东八区
 
@@ -464,5 +534,33 @@ mod tz_tests {
         // 2 月 31 日不存在 → 1 年窗口内零命中
         let out = next_fire_times_from("0 5 31 2 *", 5, now, 0);
         assert!(out.is_empty());
+    }
+
+    // ── P2-3 重叠保护包裹/还原（与 crontab 真实写入互逆，否则会双包裹）──
+
+    #[test]
+    fn overlap_guard_roundtrip_plain() {
+        let cmd = "echo hello world";
+        let wrapped = wrap_overlap_guard("job1", cmd);
+        assert!(wrapped.starts_with("flock -n /run/lock/panel-cron-job1 -- sh -c '"));
+        let (back, m) = unwrap_overlap_guard(&wrapped).unwrap();
+        assert_eq!(back, cmd);
+        assert_eq!(m, 1);
+    }
+
+    #[test]
+    fn overlap_guard_roundtrip_with_special_chars() {
+        // 含单引号、分号、空格——这些若被错误拼接进 shell 会注入；单引号转义必须可逆
+        for cmd in ["sh -c 'echo a'", "a;b && c | d", "echo 'it''s ok'", "rm -rf / ; id"] {
+            let wrapped = wrap_overlap_guard("x", cmd);
+            let (back, _) = unwrap_overlap_guard(&wrapped).expect("应能还原");
+            assert_eq!(back, cmd, "还原后必须与原文一致（防双包裹/注入）");
+        }
+    }
+
+    #[test]
+    fn overlap_guard_not_applied_to_plain_command() {
+        // 非本模块生成的包裹形式不识别 → 整行作为命令，max_overlap 默认 1
+        assert_eq!(unwrap_overlap_guard("0 9 * * * /usr/bin/backup.sh"), None);
     }
 }

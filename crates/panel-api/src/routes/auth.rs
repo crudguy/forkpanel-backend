@@ -432,7 +432,7 @@ pub async fn mfa_verify(
     Auth(s): Auth,
     Json(req): Json<MfaCodeReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let (secret_enc, codes, enabled) = mfa_material(&state, s.user_id).await?;
+    let (secret_enc, _codes, enabled) = mfa_material(&state, s.user_id).await?;
     if enabled.is_some() {
         return Err(ApiError::bad_request("mfa", "MFA 已启用"));
     }

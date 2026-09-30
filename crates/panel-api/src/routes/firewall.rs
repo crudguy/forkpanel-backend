@@ -316,6 +316,57 @@ pub async fn delete_rule(
     }
 }
 
+// ─────────────── fail2ban（入侵防御 jail 管理） ───────────────
+
+pub async fn fail2ban_status(
+    State(state): State<Shared>, Auth(s): Auth,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::FIREWALL_MANAGE)?;
+    if !state.capabilities.get(cap_keys::FAIL2BAN).map(|c| c.supported).unwrap_or(false) {
+        return Err(ApiError::unsupported("fail2ban.manage"));
+    }
+    let st = state.os.firewall().fail2ban_status().await?;
+    Ok(ok(serde_json::json!({
+        "available": st.available,
+        "active": st.active,
+        "jails": st.jails.into_iter().map(|j| serde_json::json!({
+            "name": j.name, "enabled": j.enabled,
+            "currently_failed": j.currently_failed, "total_failed": j.total_failed,
+            "banned": j.banned, "banned_ips": j.banned_ips,
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct JailReq { pub name: String, pub enabled: bool }
+
+pub async fn fail2ban_set_jail(
+    State(state): State<Shared>, Auth(s): Auth, Json(req): Json<JailReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::FIREWALL_MANAGE)?;
+    if !state.capabilities.get(cap_keys::FAIL2BAN).map(|c| c.supported).unwrap_or(false) {
+        return Err(ApiError::unsupported("fail2ban.manage"));
+    }
+    state.os.firewall().fail2ban_set_jail(&req.name, req.enabled).await?;
+    audit(&state, &s, "firewall.fail2ban.set_jail", &req.name, "ok").await;
+    Ok(ok(serde_json::json!({ "name": req.name, "enabled": req.enabled })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UnbanReq { pub jail: String, pub ip: String }
+
+pub async fn fail2ban_unban(
+    State(state): State<Shared>, Auth(s): Auth, Json(req): Json<UnbanReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::FIREWALL_MANAGE)?;
+    if !state.capabilities.get(cap_keys::FAIL2BAN).map(|c| c.supported).unwrap_or(false) {
+        return Err(ApiError::unsupported("fail2ban.manage"));
+    }
+    state.os.firewall().fail2ban_unban(&req.jail, &req.ip).await?;
+    audit(&state, &s, "firewall.fail2ban.unban", &format!("{} {}", req.jail, req.ip), "ok").await;
+    Ok(ok(serde_json::json!({ "jail": req.jail, "ip": req.ip })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

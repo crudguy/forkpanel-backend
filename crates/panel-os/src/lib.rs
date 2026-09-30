@@ -116,6 +116,7 @@ impl OsAdapter for linux::LinuxOsAdapter {
         m.insert(k::FILE_READ.into(), Capability::yes("posix"));
         m.insert(k::FILE_WRITE.into(), Capability::yes("posix"));
         m.insert(k::FIREWALL_MANAGE.into(), self.firewall.capability());
+        m.insert(k::FAIL2BAN.into(), self.firewall.fail2ban_capability());
         // 仅 nginx 已实装渲染/下发；caddy 已探测但 render 未实现，
         // 不能"探测到就报 yes"——那正是"假装可移植"。诚实置 no 并给出原因。
         m.insert(k::WEBSERVER_MANAGE.into(), match self.webserver.name() {

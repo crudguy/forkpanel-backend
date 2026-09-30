@@ -70,6 +70,62 @@ impl LinuxContainers {
             detail: format!("{what}: {detail}"),
         })
     }
+
+    /// 创建前的安全校验（固有方法，供 `create` 调用；非 trait 方法）。
+    /// provider 层强制：业务层不得假设上游已校验。
+    fn validate_create(&self, req: &ContainerCreateReq) -> Result<()> {
+        if !panel_core::rules::is_valid_container_ref(&req.name) {
+            return Err(PanelError::Validation {
+                field: "name",
+                reason: "容器名非法（仅允许字母数字与 . _ -，且不得以 - 开头）".into(),
+            });
+        }
+        if req.privileged {
+            // 等价宿主机 root：面板绝不提供创建特权容器的入口
+            return Err(PanelError::Validation {
+                field: "privileged",
+                reason: "面板禁止创建特权容器（privileged 必须为 false）".into(),
+            });
+        }
+        if req.image.trim().is_empty() {
+            return Err(PanelError::Validation { field: "image", reason: "镜像名不能为空".into() });
+        }
+        if !image_is_safe(&req.image) {
+            return Err(PanelError::Validation { field: "image", reason: "镜像名含非法字符（空白或 shell 元字符）".into() });
+        }
+        for v in &req.volumes {
+            if let Some(s) = sensitive_host_mount(v) {
+                return Err(PanelError::Validation {
+                    field: "volumes",
+                    reason: format!("禁止挂载宿主敏感路径：{s}"),
+                });
+            }
+        }
+        for p in &req.ports {
+            if !port_mapping_is_safe(p) {
+                return Err(PanelError::Validation {
+                    field: "ports",
+                    reason: format!("端口映射格式非法（应为 host:container[/proto]）：{p}"),
+                });
+            }
+        }
+        if let Some(r) = &req.restart {
+            if !matches!(r.as_str(), "no" | "on-failure" | "always" | "unless-stopped") {
+                return Err(PanelError::Validation { field: "restart", reason: "未知重启策略".into() });
+            }
+        }
+        if let Some(m) = &req.mem_limit {
+            if !mem_limit_is_safe(m) {
+                return Err(PanelError::Validation { field: "mem_limit", reason: "内存上限格式非法（如 512m / 2g）".into() });
+            }
+        }
+        if let Some(c) = req.cpu_quota {
+            if c <= 0.0 || c.is_nan() || c.is_infinite() {
+                return Err(PanelError::Validation { field: "cpu_quota", reason: "CPU 配额必须为正数".into() });
+            }
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -136,6 +192,126 @@ impl ContainerProvider for LinuxContainers {
         ).await?;
         LinuxContainers::check(&out, &format!("docker {}", action.as_str()))
     }
+
+    async fn create(&self, req: ContainerCreateReq) -> Result<ContainerSummary> {
+        self.ensure_ready()?;
+        self.validate_create(&req)?;
+
+        // 所有动态值先落进 owned buffer，再统一借出 &str —— 既避免 f64 格式化产生的
+        // 临时值生命周期问题，也确保**没有任何用户输入以整体字符串形式拼进 argv**
+        // （每个字段都是独立的 argv 元素，docker 不会把它当 shell 解析）。
+        let mut owned: Vec<String> = vec!["create".into(), "--name".into(), req.name.clone()];
+        if let Some(r) = &req.restart {
+            owned.push("--restart".into());
+            owned.push(r.clone());
+        }
+        if let Some(c) = req.cpu_quota {
+            owned.push("--cpus".into());
+            owned.push(c.to_string());
+        }
+        if let Some(m) = &req.mem_limit {
+            owned.push("--memory".into());
+            owned.push(m.clone());
+        }
+        for p in &req.ports {
+            owned.push("-p".into());
+            owned.push(p.clone());
+        }
+        for e in &req.env {
+            owned.push("-e".into());
+            owned.push(e.clone());
+        }
+        for v in &req.volumes {
+            owned.push("-v".into());
+            owned.push(v.clone());
+        }
+        owned.push(req.image.clone());
+        for c in &req.cmd {
+            owned.push(c.clone());
+        }
+        let args: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+
+        let out = crate::cmd::run(
+            Bin::Docker,
+            &args,
+            CmdOpt { timeout: ACT_TIMEOUT, ..Default::default() },
+        ).await?;
+        LinuxContainers::check(&out, "docker create")?;
+
+        // `docker create` 成功时 stdout 即完整容器 id；默认**不启动**——
+        // 运行生产容器是用户显式的第二步（列表里 start），不提供"创建即运行"的一键风险。
+        let id = out.stdout.trim().to_string();
+        Ok(ContainerSummary {
+            id,
+            name: req.name,
+            image: req.image,
+            state: "created".into(),
+            status: "Created".into(),
+            ports: req.ports.join(","),
+            created: String::new(),
+        })
+    }
+}
+
+// ─────────────── 创建安全校验（纯函数，可离线单测） ───────────────
+
+/// 镜像名不得含空白或 shell 元字符：docker 把 image 当单参数，
+/// 含空白会分裂 argv、含元字符可能被 shell 误解析（虽本项目走 argv 直传，仍守底线）。
+fn image_is_safe(img: &str) -> bool {
+    if img.is_empty() {
+        return false; // 空镜像名本身即非法
+    }
+    !img.chars().any(|c| c.is_whitespace() || ";&|$`\\'\"<>(){}".contains(c))
+}
+
+/// 若卷挂载的宿主源路径命中敏感目录，返回该路径（供错误信息）；否则 None。
+/// 具名卷（不含 `/`）放行；宿主路径（`/...`）才进入敏感判定。
+fn sensitive_host_mount(spec: &str) -> Option<&'static str> {
+    let src = spec.split(':').next().unwrap_or("").trim();
+    if src.is_empty() || !src.starts_with('/') {
+        return None; // 空或具名卷
+    }
+    const SENSITIVE: &[&str] = &["/", "/etc", "/var/run/docker.sock", "/proc", "/sys", "/var/run"];
+    for s in SENSITIVE {
+        if src == *s || src.starts_with(&format!("{s}/")) {
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// 端口映射 `host:container[/proto]`：端口须为数字，proto 仅 tcp/udp。
+fn port_mapping_is_safe(p: &str) -> bool {
+    let (hp, proto) = match p.split_once('/') {
+        Some((a, b)) => (a, Some(b)),
+        None => (p, None),
+    };
+    if let Some(proto) = proto {
+        if proto != "tcp" && proto != "udp" {
+            return false;
+        }
+    }
+    match hp.split_once(':') {
+        Some((h, c)) => !h.is_empty() && !c.is_empty()
+            && h.chars().all(|x| x.is_ascii_digit() || x == '-')
+            && c.chars().all(|x| x.is_ascii_digit() || x == '-'),
+        None => false, // 必须有 host:container
+    }
+}
+
+/// 内存上限 `^\d+[kmg]?$`（大小写不敏感，单位可选）。
+fn mem_limit_is_safe(m: &str) -> bool {
+    let b = m.trim();
+    if b.is_empty() {
+        return false;
+    }
+    let digits: String = b.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return false;
+    }
+    let unit = &b[digits.len()..];
+    unit.is_empty() || unit.eq_ignore_ascii_case("k") || unit.eq_ignore_ascii_case("m")
+        || unit.eq_ignore_ascii_case("g")
 }
 
 /// 守护进程可达性探测：对 unix socket 做一次 connect。
@@ -304,5 +480,62 @@ mod tests {
         // 探测必须走 PathLayout（业务层不硬编码路径），此处验证布局确实提供该值
         let layout = LinuxPathLayout::default();
         assert_eq!(layout.container_socket(), std::path::PathBuf::from("/var/run/docker.sock"));
+    }
+
+    // ───────── 创建安全校验（纯函数） ─────────
+
+    #[test]
+    fn image_is_safe_rejects_shell_meta_and_whitespace() {
+        assert!(!image_is_safe("nginx; rm -rf /"));
+        assert!(!image_is_safe("foo $(id)"));
+        assert!(!image_is_safe("img`whoami`"));
+        assert!(!image_is_safe("a b"));        // 空白会分裂 argv
+        assert!(!image_is_safe("a|b"));
+        assert!(!image_is_safe(""));          // 空
+    }
+
+    #[test]
+    fn image_is_safe_allows_normal_refs() {
+        assert!(image_is_safe("nginx:1.27-alpine"));
+        assert!(image_is_safe("registry.example.com/lib/app:latest"));
+        assert!(image_is_safe("sha256:abcdef"));
+    }
+
+    #[test]
+    fn sensitive_host_mount_blocks_root_and_docker_sock() {
+        assert_eq!(sensitive_host_mount("/:/host"), Some("/"));
+        assert_eq!(sensitive_host_mount("/etc:/etc"), Some("/etc"));
+        assert_eq!(sensitive_host_mount("/var/run/docker.sock:/var/run/docker.sock"), Some("/var/run/docker.sock"));
+        assert_eq!(sensitive_host_mount("/proc:/proc"), Some("/proc"));
+        assert_eq!(sensitive_host_mount("/var/run:/x"), Some("/var/run"));
+    }
+
+    #[test]
+    fn sensitive_host_mount_allows_named_volume_and_data() {
+        assert!(sensitive_host_mount("myvol:/data").is_none());          // 具名卷
+        assert!(sensitive_host_mount("/srv/data:/data").is_none());      // 非敏感宿主路径
+        assert!(sensitive_host_mount("").is_none());
+    }
+
+    #[test]
+    fn port_mapping_is_safe_valid() {
+        assert!(port_mapping_is_safe("8080:80"));
+        assert!(port_mapping_is_safe("8080:80/tcp"));
+        assert!(port_mapping_is_safe("53:53/udp"));
+        assert!(port_mapping_is_safe("8080-8090:80"));                   // 范围端口
+        assert!(!port_mapping_is_safe("80"));                            // 缺 host:container
+        assert!(!port_mapping_is_safe("host:80"));                       // host 非数字
+        assert!(!port_mapping_is_safe("80:container"));                  // container 非数字
+        assert!(!port_mapping_is_safe("80:80/icmp"));                    // 非法 proto
+    }
+
+    #[test]
+    fn mem_limit_is_safe_valid() {
+        assert!(mem_limit_is_safe("512m"));
+        assert!(mem_limit_is_safe("2g"));
+        assert!(mem_limit_is_safe("1024"));        // 纯字节数也接受
+        assert!(!mem_limit_is_safe(""));
+        assert!(!mem_limit_is_safe("big"));
+        assert!(!mem_limit_is_safe("512x"));
     }
 }

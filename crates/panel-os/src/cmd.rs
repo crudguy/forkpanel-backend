@@ -27,6 +27,16 @@ pub enum Bin {
     Apt, Dnf, Yum, Apk, Zypper, Dpkg,   // 包管理
     Journalctl,                         // 日志
     Crontab,                            // 计划任务（用户 crontab）
+    /// 计划任务重叠保护（P2-3）：包裹 cron 命令实现互斥锁。
+    /// 只用 `-n <lockfile>`（非阻塞）+ `--` 分隔命令，命令本身由调用方经 argv 传入，
+    /// 绝不把用户命令拼进 shell 字符串——flock 直接 exec 目标命令，无 shell 解释。
+    Flock,
+    /// Webhook 投递（P2-3 cron 回调 / P2-10 通知通道）的唯一 HTTP 出口。
+    /// 安全评估：① 只接受 http/https 且经 `PanelError::Validation` 校验的 URL，
+    /// 不接 `file://` 等危险协议；② 整个 URL 与 JSON body 各自作为**单个 argv 参数**
+    /// 传给 curl，不经过 shell；③ 固定 `--max-time` 上限 + `--fail`，避免无限挂起
+    /// 与把 HTTP 错误当成功。零新增依赖，复用 cmd 唯一出口纪律。
+    Curl,
     Nginx, Caddy,                       // Web 服务器
     /// 容器管理（**只读列举 + 生命周期**）。安全评估：
     /// - argv 直传不经 shell；子命令由 provider 侧**编译期写死**（ps/images/start/stop/restart/rm），
@@ -41,6 +51,7 @@ pub enum Bin {
     Tar, Gzip,                          // 备份打包
     Sshd,                               // sshd -t 配置校验：改 SSH 配置前的强制安全网
     Certbot,                            // ACME 证书签发/续期（http-01 webroot）
+    Fail2banClient,                     // fail2ban-client 入侵防御 jail 管理
     UserAdd, GroupAdd, Chown, Chmod,    // 用户与权限
     Df, Stat,                           // 探测类（回退路径）
     /// 交互式登录 shell（Web 终端用）。**不经任何 shell 解释**——由 `spawn_pty`
@@ -63,12 +74,13 @@ impl Bin {
             Systemctl => "systemctl", Service => "service", RcService => "rc-service",
             Nft => "nft", Iptables => "iptables", Ufw => "ufw", FirewallCmd => "firewall-cmd",
             Apt => "apt-get", Dnf => "dnf", Yum => "yum", Apk => "apk", Zypper => "zypper", Dpkg => "dpkg-query",
-            Journalctl => "journalctl", Crontab => "crontab", Nginx => "nginx", Caddy => "caddy",
+            Journalctl => "journalctl", Crontab => "crontab", Flock => "flock", Curl => "curl",
+            Nginx => "nginx", Caddy => "caddy",
             Docker => "docker",
             OpenSsl => "openssl",
             MySql => "mysql", MySqlDump => "mysqldump", Psql => "psql", PgDump => "pg_dump",
             Tar => "tar", Gzip => "gzip", Sshd => "sshd", Certbot => "certbot",
-            MySql => "mysql", Psql => "psql",
+            Fail2banClient => "fail2ban-client",
             UserAdd => "useradd", GroupAdd => "groupadd", Chown => "chown", Chmod => "chmod",
             Df => "df", Stat => "stat",
             Sh => "sh",

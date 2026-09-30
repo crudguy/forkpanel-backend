@@ -62,6 +62,22 @@ pub struct NetSample {
     pub tx_rate_bps: u64,
 }
 
+/// 温度传感器读数（取自 `/sys/class/hwmon`，内核以**毫摄氏度**暴露）。
+///
+/// 采集是**尽力而为**的：没有 hwmon 的机器（多数虚拟机、部分云主机）返回空列表，
+/// 这属于正常情况而非故障——因此不报错，也不伪造 `0°C`。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TempSample {
+    /// 传感器芯片名（hwmon 的 `name`，如 `coretemp` / `k10temp` / `nvme` / `acpitz`）
+    pub chip: String,
+    /// 通道标签（`tempN_label`；缺失时回退为 `tempN`，绝不凭空命名）
+    pub label: String,
+    /// 摄氏度（内核值 / 1000）
+    pub celsius: f64,
+    /// 是否达到 `tempN_crit` 阈值；读不到 crit 时恒 `false`（不臆测告警）
+    pub critical: bool,
+}
+
 /// 一次完整采样快照（单点写入 ArcSwap，多 SSE 客户端共享，设计方案 §3.6-7）
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct SystemSnapshot {
@@ -73,6 +89,8 @@ pub struct SystemSnapshot {
     pub nets: Vec<NetSample>,
     pub proc_count: u32,
     pub tcp_conns: u32,
+    /// 温度传感器（无 hwmon 时为空数组）
+    pub temps: Vec<TempSample>,
 }
 
 #[async_trait]
@@ -252,6 +270,27 @@ pub struct ApplyReport {
     pub warnings: Vec<String>,
 }
 
+/// fail2ban 监狱（jail）状态——防 SSH 等服务被暴力破解的封禁统计。
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Fail2banJail {
+    pub name: String,
+    pub enabled: bool,
+    pub currently_failed: u32,
+    pub total_failed: u32,
+    pub banned: u32,
+    pub banned_ips: Vec<String>,
+}
+
+/// fail2ban 总览。
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Fail2banStatus {
+    /// fail2ban-client 是否存在（二进制缺失则整功能不可用）
+    pub available: bool,
+    /// fail2ban 服务是否运行中
+    pub active: bool,
+    pub jails: Vec<Fail2banJail>,
+}
+
 #[async_trait]
 pub trait FirewallProvider: Send + Sync {
     fn backend(&self) -> FirewallBackend;
@@ -265,6 +304,14 @@ pub trait FirewallProvider: Send + Sync {
     /// 规则快照用于"误操作应急恢复"（防 SSH 失联，设计方案 §4-M5）
     async fn snapshot(&self) -> Result<Vec<u8>>;
     async fn restore_snapshot(&self, data: &[u8]) -> Result<()>;
+    /// fail2ban 能力位（独立于防火墙后端，按 fail2ban-client 存在性判定）。
+    fn fail2ban_capability(&self) -> Capability;
+    /// 总览：可用性与各 jail 状态。
+    async fn fail2ban_status(&self) -> Result<Fail2banStatus>;
+    /// 启停某 jail（等价 `fail2ban-client set <jail> on/off`）。
+    async fn fail2ban_set_jail(&self, name: &str, enabled: bool) -> Result<()>;
+    /// 解封某 jail 下的某个 IP（等价 `fail2ban-client set <jail> unbanip <ip>`）。
+    async fn fail2ban_unban(&self, jail: &str, ip: &str) -> Result<()>;
 }
 
 // ═══════════════════════════ 网络 ═══════════════════════════
@@ -362,6 +409,13 @@ pub struct ScheduledJob {
     pub user: String,
     pub enabled: bool,
     pub timeout: Duration,
+    /// 并发上限（防重入）。==1 时由 Linux 实现用 flock 互斥包裹命令；
+    /// >1 或 0 表示不强制（OS 级 N>1 计数并发未实装，诚实标注）。
+    pub max_overlap: u32,
+    /// 完成/开始时回调的 Webhook URL（POST JSON）。None = 不发。
+    pub webhook_url: Option<String>,
+    /// 触发事件子集：`start` / `success` / `failure`，逗号分隔持久化，此处展开。
+    pub webhook_events: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -578,6 +632,36 @@ impl ContainerAction {
     }
 }
 
+/// 创建容器的请求。**结构化字段**：所有值经 provider 严格校验后翻译成固定 argv，
+/// 任何用户原始串都不会直接拼进命令（防参数注入，与 `act` 同纪律）。
+///
+/// 安全约束（provider 层强制，业务层不得假设上游已校验）：
+/// - `privileged` 必须为 false：等价宿主机 root，绝不允许经面板创建特权容器。
+/// - `volumes` 不得挂载宿主敏感路径（`/`、`/etc`、`/var/run/docker.sock`、`/proc`、`/sys`）。
+/// - `image` 必须命中字符集（不含 shell 元字符），且（若服务端配置了镜像白名单）必须命中。
+/// - `cpu_quota` / `mem_limit` 提供资源配额，避免单容器吃满宿主。
+#[derive(Debug, Clone, Default)]
+pub struct ContainerCreateReq {
+    pub name: String,
+    pub image: String,
+    /// 容器启动命令（覆盖镜像 ENTRYPOINT）；逐元素进 argv，不整体拼串。
+    pub cmd: Vec<String>,
+    /// 端口映射 `host:container[/proto]`，如 `8080:80/tcp`。
+    pub ports: Vec<String>,
+    /// 环境变量 `KEY=VALUE`，逐条进 `-e`。
+    pub env: Vec<String>,
+    /// 卷挂载 `src:dst[:ro]`，src 可为具名卷或宿主路径（宿主敏感路径被拒）。
+    pub volumes: Vec<String>,
+    /// 重启策略：`no` / `on-failure` / `always` / `unless-stopped`。
+    pub restart: Option<String>,
+    /// CPU 配额（核数，如 1.5 = 1.5 核）。
+    pub cpu_quota: Option<f64>,
+    /// 内存上限，CLI 单位串（如 `512m`、`2g`）。
+    pub mem_limit: Option<String>,
+    /// 必须为 false；为 true 时 provider 直接拒绝（等价宿主 root）。
+    pub privileged: bool,
+}
+
 #[async_trait]
 pub trait ContainerProvider: Send + Sync {
     fn engine(&self) -> ContainerEngine;
@@ -593,6 +677,9 @@ pub trait ContainerProvider: Send + Sync {
     async fn images(&self) -> Result<Vec<ImageSummary>>;
     /// 执行生命周期动作。`id` 必须是容器 ID/名称，实现**必须**先校验字符集。
     async fn act(&self, action: ContainerAction, id: &str) -> Result<()>;
+    /// 创建容器（等价 `docker create`，**不自动运行**）。`privileged`/宿主挂载/镜像
+    /// 白名单等安全约束由实现强制；返回新建容器的摘要（含完整 id）。
+    async fn create(&self, req: ContainerCreateReq) -> Result<ContainerSummary>;
 }
 
 // ═══════════════════════════ 终端 ═══════════════════════════

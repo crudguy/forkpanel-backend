@@ -28,6 +28,8 @@ pub mod users;
 pub mod audit;
 pub mod terminal;
 
+use crate::webhook;
+
 use crate::{auth::Session, error::ApiError, AppState, Envelope};
 use axum::{
     extract::{FromRequestParts, Request},
@@ -140,6 +142,9 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/files/write", put(files::write))
         .route("/api/v1/files/mkdir", post(files::mkdir))
         .route("/api/v1/files/delete", post(files::remove))
+        .route("/api/v1/files/trash", get(files::trash_list).post(files::trash))
+        .route("/api/v1/files/trash/restore", post(files::trash_restore))
+        .route("/api/v1/files/trash/purge", post(files::trash_purge))
         .route("/api/v1/files/rename", post(files::rename))
         .route("/api/v1/files/chmod", post(files::chmod))
         .route("/api/v1/files/action", post(files::action));
@@ -158,7 +163,10 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/firewall/status", get(firewall::status))
         .route("/api/v1/firewall/enabled", put(firewall::set_enabled))
         .route("/api/v1/firewall/rules", get(firewall::list).post(firewall::apply))
-        .route("/api/v1/firewall/rules/{id}", delete(firewall::delete_rule));
+        .route("/api/v1/firewall/rules/{id}", delete(firewall::delete_rule))
+        .route("/api/v1/firewall/fail2ban", get(firewall::fail2ban_status))
+        .route("/api/v1/firewall/fail2ban/jail", post(firewall::fail2ban_set_jail))
+        .route("/api/v1/firewall/fail2ban/unban", post(firewall::fail2ban_unban));
 
     // ── 安全中心 ──
     let sec_r = Router::new()
@@ -172,14 +180,17 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/cron/jobs", get(cron::list).post(cron::create))
         .route("/api/v1/cron/jobs/{id}", get(cron::get_job).patch(cron::patch_job).delete(cron::remove))
         .route("/api/v1/cron/jobs/{id}/run", post(cron::run))
+        .route("/api/v1/cron/jobs/{id}/webhook", post(cron::webhook_test_job))
         .route("/api/v1/cron/jobs/{id}/runs", get(cron::runs))
-        .route("/api/v1/cron/preview", post(cron::preview));
+        .route("/api/v1/cron/preview", post(cron::preview))
+        .route("/api/v1/cron/webhook/test", post(webhook::test));
 
     // ── 日志 ──
     let log_r = Router::new()
         .route("/api/v1/logs/sources", get(logs::sources))
         .route("/api/v1/logs/stream", get(crate::sse::log_stream))
         .route("/api/v1/logs/{id}/download", get(logs::download))
+        .route("/api/v1/logs/{id}/stats", get(logs::stats))
         .route("/api/v1/logs/{id}", get(logs::read));
 
     // ── 站内通知 ──
@@ -203,6 +214,7 @@ pub fn build_router(state: Shared) -> Router {
     // 只读列举 + 生命周期；能力位不满足时端点内诚实 501（见 routes/containers.rs）
     let container_r = Router::new()
         .route("/api/v1/containers", get(containers::list))
+        .route("/api/v1/containers", post(containers::create))
         .route("/api/v1/containers/images", get(containers::images))
         .route("/api/v1/containers/{id}/start", post(containers::start))
         .route("/api/v1/containers/{id}/stop", post(containers::stop))

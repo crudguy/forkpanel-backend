@@ -146,6 +146,7 @@ pub mod cap_keys {
     pub const FILE_READ: &str      = "file.read";
     pub const FILE_WRITE: &str     = "file.write";
     pub const FIREWALL_MANAGE: &str= "firewall.manage";
+    pub const FAIL2BAN: &str = "fail2ban.manage";
     pub const WEBSERVER_MANAGE:&str= "webserver.manage";
     pub const SCHEDULER_MANAGE:&str= "scheduler.manage";
     pub const LOGS_READ: &str      = "logs.read";
