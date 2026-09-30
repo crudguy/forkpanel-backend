@@ -62,7 +62,7 @@ pub async fn cancel(
     Auth(s): Auth,
     AxPath(id): AxPath<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    crate::auth::require(&s, perm::TASK_VIEW)?;
+    crate::auth::require(&s, perm::TASK_MANAGE)?;
     // 只置状态位；任务体在检查点优雅退出（强杀会留下半个副作用）
     state.tasks.cancel(id).await.map_err(ApiError::from)?;
     audit(&state, &s, "task.cancel", &id.to_string(), "ok").await;

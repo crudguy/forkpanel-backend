@@ -506,6 +506,7 @@ pub mod perm {
     pub const CRON_MANAGE: &str     = "cron.manage";
     pub const LOG_VIEW: &str        = "log.view";
     pub const TASK_VIEW: &str       = "task.view";
+    pub const TASK_MANAGE: &str      = "task.manage";
     pub const BACKUP_VIEW: &str     = "backup.view";
     pub const BACKUP_MANAGE: &str   = "backup.manage";
     pub const CONTAINER_VIEW: &str  = "container.view";
@@ -528,7 +529,7 @@ pub fn all_permissions() -> Vec<&'static str> {
         SYSTEM_VIEW, SYSTEM_MANAGE, SERVICE_VIEW, SERVICE_MANAGE, PACKAGE_MANAGE,
         SITE_VIEW, SITE_MANAGE, SSL_MANAGE, FILE_READ, FILE_WRITE,
         DB_VIEW, DB_MANAGE, FIREWALL_VIEW, FIREWALL_MANAGE, SECURITY_MANAGE,
-        CRON_VIEW, CRON_MANAGE, LOG_VIEW, TASK_VIEW, BACKUP_VIEW, BACKUP_MANAGE,
+        CRON_VIEW, CRON_MANAGE, LOG_VIEW, TASK_VIEW, TASK_MANAGE, BACKUP_VIEW, BACKUP_MANAGE,
         CONTAINER_VIEW, CONTAINER_MANAGE, USER_MANAGE, SETTINGS_MANAGE, AUDIT_VIEW,
     ]
 }
@@ -584,12 +585,12 @@ pub fn permissions_for_role(role: &str) -> Vec<String> {
             let mut v = view_only.clone();
             v.extend([SYSTEM_MANAGE, SERVICE_MANAGE, PACKAGE_MANAGE, SITE_MANAGE, SSL_MANAGE,
                       FILE_WRITE, DB_MANAGE, FIREWALL_MANAGE, SECURITY_MANAGE, CRON_MANAGE,
-                      BACKUP_MANAGE, CONTAINER_MANAGE, SETTINGS_MANAGE, USER_MANAGE]);
+                      TASK_MANAGE, BACKUP_MANAGE, CONTAINER_MANAGE, SETTINGS_MANAGE, USER_MANAGE]);
             v
         }
         "operator" => {
             let mut v = view_only.clone();
-            v.extend([SERVICE_MANAGE, SITE_MANAGE, SSL_MANAGE, CRON_MANAGE, BACKUP_MANAGE,
+            v.extend([SERVICE_MANAGE, SITE_MANAGE, SSL_MANAGE, CRON_MANAGE, TASK_MANAGE, BACKUP_MANAGE,
                       CONTAINER_MANAGE, FILE_WRITE]);
             v
         }
@@ -611,7 +612,7 @@ fn leak_static(p: &str) -> &'static str {
     for c in [SYSTEM_VIEW, SYSTEM_MANAGE, SERVICE_VIEW, SERVICE_MANAGE, PACKAGE_MANAGE,
               SITE_VIEW, SITE_MANAGE, SSL_MANAGE, FILE_READ, FILE_WRITE, DB_VIEW, DB_MANAGE,
               FIREWALL_VIEW, FIREWALL_MANAGE, SECURITY_MANAGE, CRON_VIEW, CRON_MANAGE,
-              LOG_VIEW, TASK_VIEW, BACKUP_VIEW, BACKUP_MANAGE, USER_MANAGE, SETTINGS_MANAGE, AUDIT_VIEW] {
+              LOG_VIEW, TASK_VIEW, TASK_MANAGE, BACKUP_VIEW, BACKUP_MANAGE, USER_MANAGE, SETTINGS_MANAGE, AUDIT_VIEW] {
         if c == p { return c; }
     }
     "unknown"
@@ -661,7 +662,7 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), all.len(), "all_permissions 存在重复项");
-        assert_eq!(all.len(), 26, "权限常量增减时请同步 all_permissions 与其数量断言");
+        assert_eq!(all.len(), 27, "权限常量增减时请同步 all_permissions 与其数量断言");
 
         // 内置角色用到的权限必须都在白名单内，否则自定义角色会出现
         // "内置能用、自定义选不到"的不一致

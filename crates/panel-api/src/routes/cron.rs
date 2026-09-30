@@ -176,9 +176,12 @@ pub async fn create(
         conn.execute(
             "INSERT OR REPLACE INTO cron_jobs(name, expr, kind, payload_json, enabled, timeout_sec, \
              max_overlap, webhook_url, webhook_events)
-             VALUES(?1, ?2, 'script', '{}', 1, ?3, ?4, ?5, ?6)",
-            rusqlite::params![name, req.expr, req.timeout_sec.unwrap_or(1800),
-                              max_overlap as i64, webhook_url, events_joined],
+             VALUES(?1, ?2, 'script', '{}', ?3, ?4, ?5, ?6, ?7)",
+            // enabled 必须与调度器侧 ScheduledJob.enabled 保持一致（之前硬编码为 1，
+            // 导致创建 enabled:false 的任务时 crontab 真禁用、列表却显示"启用"）
+            rusqlite::params![name, req.expr, req.enabled.unwrap_or(true) as i64,
+                              req.timeout_sec.unwrap_or(1800), max_overlap as i64,
+                              webhook_url, events_joined],
         ).map_err(|e| PanelError::Database(e.to_string()))?;
         Ok(panel_db::WriteAck { rows_changed: 1 })
     }).await?;
