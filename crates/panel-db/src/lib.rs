@@ -189,20 +189,37 @@ impl WriterActor {
                             // 因此这里按值遍历，并把 reply 收集起来供提交结果回传。
                             let mut results = Vec::with_capacity(drained.len());
                             let mut replies = Vec::with_capacity(drained.len());
+                            let mut first_err: Option<PanelError> = None;
                             for (op, reply) in drained {
-                                results.push(op(&txn));
-                                replies.push(reply);
-                            }
-                            match txn.commit() {
-                                Ok(()) => {
-                                    for (reply, r) in replies.into_iter().zip(results) {
-                                        let _ = reply.send(r);
+                                match op(&txn) {
+                                    Ok(ack) => results.push(Ok(ack)),
+                                    Err(e) => {
+                                        // 记录首个失败原因（用于整批回滚后统一回复）
+                                        if first_err.is_none() { first_err = Some(clone_err(&e)); }
+                                        results.push(Err(e));
                                     }
                                 }
-                                Err(e) => {
-                                    let err = PanelError::Database(format!("commit: {e}"));
-                                    for reply in replies {
-                                        let _ = reply.send(Err(clone_err(&err)));
+                                replies.push(reply);
+                            }
+                            if let Some(err) = first_err {
+                                // 任一 op 失败 → 整批回滚（Transaction 析构自动 ROLLBACK），
+                                // 绝不提交已执行的部分语句，避免数据半改。
+                                drop(txn);
+                                for reply in replies {
+                                    let _ = reply.send(Err(clone_err(&err)));
+                                }
+                            } else {
+                                match txn.commit() {
+                                    Ok(()) => {
+                                        for (reply, r) in replies.into_iter().zip(results) {
+                                            let _ = reply.send(r);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let err = PanelError::Database(format!("commit: {e}"));
+                                        for reply in replies {
+                                            let _ = reply.send(Err(clone_err(&err)));
+                                        }
                                     }
                                 }
                             }
