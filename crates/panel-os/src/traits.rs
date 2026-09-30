@@ -453,8 +453,21 @@ pub struct SiteSpec {
     pub force_https: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SiteKind { Static, ReverseProxy { upstream: &'static str } }
+/// 站点类型。
+///
+/// **刻意不再派生 `Copy`**：负载均衡与 PHP 需要携带动态字符串（后端列表 /
+/// socket 路径），而 `&'static str` 只能表达硬编码常量——等于把配置能力
+/// 锁死在编译期，用户在界面上永远改不了。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SiteKind {
+    /// 纯静态文件
+    Static,
+    /// 反向代理 / 负载均衡：一个或多个后端。
+    /// 多个后端时由 nginx `upstream` 块轮询（块必须置于 http 级，见 render 实现）。
+    ReverseProxy { upstreams: Vec<String> },
+    /// PHP：`fastcgi_pass` 到 php-fpm（`unix:/path.sock` 或 `host:port`）
+    Php { fpm: String },
+}
 
 #[async_trait]
 pub trait WebServerProvider: Send + Sync {

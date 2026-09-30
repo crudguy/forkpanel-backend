@@ -395,6 +395,79 @@ pub struct ApplyReq {
     pub domains: Vec<String>,
     pub root: String,
     pub force_https: Option<bool>,
+    /// 站点类型：`static`（默认）/ `proxy` / `php`
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// `kind=proxy` 的后端列表（1~16 个）
+    #[serde(default)]
+    pub upstreams: Option<Vec<String>>,
+    /// `kind=php` 的 php-fpm 目标（`unix:/path.sock` 或 `host:port`）
+    #[serde(default)]
+    pub fpm: Option<String>,
+}
+
+/// 校验反代后端。
+///
+/// **这是注入防护，不是语法校验**：该值会被直接拼进 nginx 配置文本，所以必须
+/// 保证它不越出单个 token（无空白、无换行、无 `;`、无 `{}`）。语法正确性交给
+/// 后续的 `nginx -t`（render → validate → deploy 链路里本就有这一步）。
+fn validate_upstream(u: &str) -> ApiResult<String> {
+    let u = u.trim();
+    let rest = u
+        .strip_prefix("http://")
+        .or_else(|| u.strip_prefix("https://"))
+        .ok_or_else(|| {
+            ApiError::bad_request("upstreams", format!("必须以 http:// 或 https:// 开头：{u}"))
+        })?;
+    if rest.is_empty() {
+        return Err(ApiError::bad_request("upstreams", format!("缺少主机名：{u}")));
+    }
+    if rest.contains('/') || rest.contains('?') || rest.contains('#') {
+        return Err(ApiError::bad_request(
+            "upstreams",
+            format!("只接受 host[:port]，不得含路径 / 查询 / 片段：{u}"),
+        ));
+    }
+    if !rest
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '[' | ']' | '%'))
+    {
+        return Err(ApiError::bad_request(
+            "upstreams",
+            format!("含非法字符（仅允许字母数字与 . - _ : [ ] %）：{u}"),
+        ));
+    }
+    Ok(u.to_string())
+}
+
+/// 校验 php-fpm 目标：`unix:/abs/path.sock` 或 `host:port`。同样是注入防护。
+fn validate_fpm(v: &str) -> ApiResult<String> {
+    let v = v.trim();
+    if v.is_empty() {
+        return Err(ApiError::bad_request("fpm", "不能为空"));
+    }
+    if let Some(path) = v.strip_prefix("unix:") {
+        if !path.starts_with('/') {
+            return Err(ApiError::bad_request("fpm", "unix socket 必须是绝对路径"));
+        }
+        if path.contains("..") {
+            return Err(ApiError::bad_request("fpm", "socket 路径不得含 .."));
+        }
+        if path.len() > 128 {
+            return Err(ApiError::bad_request("fpm", "socket 路径过长（上限 128）"));
+        }
+    }
+    // 必须是一个 token：不得含空白、换行、分号、花括号、引号或反斜杠
+    if !v
+        .chars()
+        .all(|c| c.is_ascii_graphic() && !matches!(c, ';' | '{' | '}' | '"' | '\'' | '`' | '\\'))
+    {
+        return Err(ApiError::bad_request(
+            "fpm",
+            "含非法字符（不得含空白、引号、分号或花括号）",
+        ));
+    }
+    Ok(v.to_string())
 }
 
 /// 应用站点配置。**整个流程在写事务之外完成**。
@@ -442,11 +515,39 @@ pub async fn apply(
     // 4) 渲染配置（纯字符串生成，不落盘）
     //   未配置证书时 force_https 无意义（无 https 可跳转），诚实降级为 false
     let has_tls = tls_cert.is_some() && tls_key.is_some();
+    // 站点类型：默认静态。反代与 PHP 的目标值都会**直接进 nginx 配置文本**，
+    // 因此逐个过注入防护（见 validate_upstream / validate_fpm）。
+    let kind = match req.kind.as_deref().unwrap_or("static") {
+        "static" => panel_os::SiteKind::Static,
+        "proxy" => {
+            let raw = req.upstreams.clone().unwrap_or_default();
+            if raw.is_empty() || raw.len() > 16 {
+                return Err(ApiError::bad_request("upstreams", "反代需要 1~16 个后端"));
+            }
+            let mut outs = Vec::with_capacity(raw.len());
+            for u in &raw {
+                outs.push(validate_upstream(u)?);
+            }
+            panel_os::SiteKind::ReverseProxy { upstreams: outs }
+        }
+        "php" => {
+            let fpm = req.fpm.as_deref().ok_or_else(|| {
+                ApiError::bad_request("fpm", "PHP 站点必须指定 php-fpm 目标")
+            })?;
+            panel_os::SiteKind::Php { fpm: validate_fpm(fpm)? }
+        }
+        other => {
+            return Err(ApiError::bad_request(
+                "kind",
+                format!("未知站点类型：{other}（可选 static / proxy / php）"),
+            ))
+        }
+    };
     let spec = panel_os::SiteSpec {
         server_names: domains.iter().map(|d| d.clone()).collect(),
         root: root.as_path().to_path_buf(),
         listen: vec![80, 443],
-        kind: panel_os::SiteKind::Static,
+        kind,
         access_log: None,
         error_log: None,
         tls_cert,
@@ -1058,6 +1159,41 @@ pub async fn cert_delete(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_validation_blocks_config_injection() {
+        for ok in ["http://127.0.0.1:3000", "https://backend.internal", "http://[::1]:8080"] {
+            assert!(validate_upstream(ok).is_ok(), "应放行: {ok}");
+        }
+        for bad in [
+            // 关键用例：值会直接进 nginx 配置，一个换行就能插入任意指令
+            "http://127.0.0.1:3000; }\nserver { listen 9999",
+            "http://127.0.0.1:3000 /",
+            "http://127.0.0.1:3000/x",
+            "http://127.0.0.1:3000#frag",
+            "127.0.0.1:3000",            // 缺 scheme
+            "http://bad host:3000",      // 含空格
+            "http://127.0.0.1\t:3000",   // 含制表符
+        ] {
+            assert!(validate_upstream(bad).is_err(), "必须拒绝: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn fpm_validation_blocks_injection() {
+        assert!(validate_fpm("unix:/run/php/php8.2-fpm.sock").is_ok());
+        assert!(validate_fpm("127.0.0.1:9000").is_ok());
+        for bad in [
+            "unix:relative.sock",        // 非绝对路径
+            "unix:/run/../etc/passwd",   // 含 ..
+            "127.0.0.1:9000; }",         // 分号 + 花括号
+            "127.0.0.1:9000\nserver{",   // 换行
+            "",
+            "a b",
+        ] {
+            assert!(validate_fpm(bad).is_err(), "必须拒绝: {bad:?}");
+        }
+    }
 
     #[test]
     fn days_left_calculation() {

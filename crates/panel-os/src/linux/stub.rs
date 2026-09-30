@@ -587,6 +587,23 @@ fn render_nginx(spec: &SiteSpec) -> String {
         out.push_str("    return 301 https://$host$request_uri;\n}\n\n");
     }
 
+    // ── 负载均衡 upstream 块 ──
+    // `upstream` 是 **http 级**指令，必须排在 server 之前；塞进 server{} 会直接
+    // 语法错误（而且 nginx -t 会拒绝整份配置，不只是这个站点）。
+    if let SiteKind::ReverseProxy { upstreams } = &spec.kind {
+        if upstreams.len() > 1 {
+            out.push_str(&format!("upstream {} {{\n", upstream_name(&spec.server_names)));
+            // least_conn：相比轮询，对长连接/慢请求更均衡；单机小集群够用
+            out.push_str("    least_conn;\n");
+            for u in upstreams {
+                // upstream 的 server 指令只接受 host:port，不接受 scheme
+                let hp = u.split_once("://").map(|(_, r)| r).unwrap_or(u.as_str());
+                out.push_str(&format!("    server {hp};\n"));
+            }
+            out.push_str("}\n\n");
+        }
+    }
+
     // ── 主 server 块 ──
     out.push_str("server {\n");
     // force_https+tls 时主块只留 443（80 已交给重定向块）
@@ -614,21 +631,48 @@ fn render_nginx(spec: &SiteSpec) -> String {
     if let Some(el) = &spec.error_log  { out.push_str(&format!("    error_log {};\n", el.display())); }
     if spec.access_log.is_some() || spec.error_log.is_some() { out.push('\n'); }
 
-    match spec.kind {
+    match &spec.kind {
         SiteKind::Static => {
             out.push_str("    location / {\n        try_files $uri $uri/ =404;\n    }\n");
         }
-        SiteKind::ReverseProxy { upstream } => {
+        SiteKind::ReverseProxy { upstreams } => {
+            let target = match upstreams.len() {
+                // 单后端：直接 proxy_pass，不建 upstream 块（少一层间接，语义更直白）
+                1 => upstreams[0].clone(),
+                // 多后端：指向 upstream 名（块已在上方 http 级输出）
+                _ => format!("http://{}", upstream_name(&spec.server_names)),
+            };
             out.push_str("    location / {\n");
-            out.push_str(&format!("        proxy_pass {upstream};\n"));
+            out.push_str(&format!("        proxy_pass {target};\n"));
             out.push_str("        proxy_set_header Host $host;\n");
             out.push_str("        proxy_set_header X-Real-IP $remote_addr;\n");
             out.push_str("        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n");
             out.push_str("        proxy_set_header X-Forwarded-Proto $scheme;\n");
             out.push_str("    }\n");
         }
+        SiteKind::Php { fpm } => {
+            // `fastcgi_params` 由发行版提供（Debian: /etc/nginx/fastcgi_params）
+            out.push_str("    location ~ \\.php$ {\n");
+            out.push_str("        include fastcgi_params;\n");
+            out.push_str(&format!("        fastcgi_pass {fpm};\n"));
+            out.push_str("        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;\n");
+            out.push_str("    }\n");
+            out.push_str("    location / {\n        try_files $uri $uri/ =404;\n    }\n");
+        }
     }
     out.push_str("}\n");
+    out
+}
+
+/// upstream 块名：由首个 server_name 派生并净化（非字母数字 → `_`）。
+/// 必须稳定且唯一——同一台机器上多站点的 upstream 名一旦撞车，
+/// nginx 会拒绝加载整份配置（`duplicate upstream`）。
+fn upstream_name(server_names: &[String]) -> String {
+    let base = server_names.first().map(|s| s.as_str()).unwrap_or("site");
+    let mut out = String::from("panel_");
+    for c in base.chars() {
+        if c.is_ascii_alphanumeric() { out.push(c); } else { out.push('_'); }
+    }
     out
 }
 
@@ -1201,12 +1245,41 @@ mod tests {
     #[test]
     fn render_reverse_proxy_sets_headers() {
         let mut s = spec_static();
-        s.kind = SiteKind::ReverseProxy { upstream: "http://127.0.0.1:3000" };
+        s.kind = SiteKind::ReverseProxy { upstreams: vec!["http://127.0.0.1:3000".into()] };
         let out = render_nginx(&s);
         assert!(out.contains("proxy_pass http://127.0.0.1:3000;"), "{out}");
         assert!(out.contains("proxy_set_header Host $host;"), "{out}");
         assert!(out.contains("proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;"), "{out}");
         assert!(!out.contains("try_files"), "反代不应有 try_files: {out}");
+        // 单后端不该建 upstream 块：多一层间接没有收益
+        assert!(!out.contains("upstream "), "单后端不应生成 upstream 块: {out}");
+    }
+
+    #[test]
+    fn render_multi_upstream_puts_block_at_http_level() {
+        let mut s = spec_static();
+        s.kind = SiteKind::ReverseProxy {
+            upstreams: vec!["http://127.0.0.1:3000".into(), "http://127.0.0.1:3001".into()],
+        };
+        let out = render_nginx(&s);
+        // upstream 是 http 级指令：必须排在 server 之前，否则 nginx -t 会整份拒绝
+        let up = out.find("upstream ").expect("应生成 upstream 块");
+        let srv = out.find("server {").expect("应有 server 块");
+        assert!(up < srv, "upstream 块必须在 server 之前: {out}");
+        // server 指令只接受 host:port
+        assert!(out.contains("server 127.0.0.1:3000;"), "{out}");
+        assert!(!out.contains("server http://"), "upstream 内不得出现 scheme: {out}");
+        assert!(out.contains("proxy_pass http://panel_"), "proxy_pass 应指向 upstream 名: {out}");
+    }
+
+    #[test]
+    fn render_php_passes_to_fpm() {
+        let mut s = spec_static();
+        s.kind = SiteKind::Php { fpm: "unix:/run/php/php8.2-fpm.sock".into() };
+        let out = render_nginx(&s);
+        assert!(out.contains("fastcgi_pass unix:/run/php/php8.2-fpm.sock;"), "{out}");
+        assert!(out.contains("SCRIPT_FILENAME $document_root$fastcgi_script_name;"), "{out}");
+        assert!(out.contains("location ~ \\.php$"), "{out}");
     }
 
     #[test]

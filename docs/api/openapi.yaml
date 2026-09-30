@@ -434,6 +434,12 @@ components:
         domains:     { type: array, items: { type: string } }
         root:        { type: string }
         force_https: { type: boolean }
+        kind:        { type: string, enum: [static, proxy, php], default: static, description: "站点类型；默认静态" }
+        upstreams:
+          type: array
+          description: "kind=proxy 的后端（1~16 个）。必须是 http(s)://host[:port]，不得含路径/查询/片段——该值直接进 nginx 配置文本，注入校验在后端（前端校验不可作数）"
+          items: { type: string }
+        fpm:         { type: string, description: "kind=php 的 php-fpm 目标：unix:/绝对路径.sock 或 host:port" }
     Cert:
       type: object
       properties:
