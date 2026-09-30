@@ -244,6 +244,7 @@ components:
         capabilities: { $ref: '#/components/schemas/CapabilitiesResponse' }
         tier:         { type: string, enum: [nano, small, standard] }
         polling:      { type: boolean }
+        mfa_enabled:  { type: boolean, description: "MFA 是否已启用（审计 F8：由 /auth/me 权威下发，前端不再靠 enroll 报错文案反推）" }
     ChangePasswordRequest:
       type: object
       required: [old, new]

@@ -29,6 +29,9 @@ pub struct MeResp {
     pub allowed_roots: Vec<String>,
     pub capabilities: panel_core::CapabilityMap,
     pub tier: &'static str,
+    /// MFA 是否已启用（审计 F8）：此前前端靠「重复 enroll 得到的 400 中文文案」
+    /// 反推状态——刷新即丢、后端改文案即失效。由 /auth/me 权威下发。
+    pub mfa_enabled: bool,
 }
 
 /// 登录。故意**不做** GET：口令绝不能进 URL/日志。
@@ -203,6 +206,26 @@ pub async fn logout(State(state): State<Shared>, headers: HeaderMap, Auth(s): Au
 }
 
 pub async fn me(State(state): State<Shared>, Auth(s): Auth) -> Json<serde_json::Value> {
+    // MFA 状态随 me 一起下发（审计 F8），省一次专门的状态接口。
+    // mfa_enabled_at 非空 = 已启用。me 的本职是身份下发，MFA 状态查询
+    // 失败时降级为 false（不挡整个会话接口），SecurityView 的 enroll
+    // 请求仍会对已启用情况给出明确 400。
+    let uid = s.user_id;
+    let mfa_enabled = state
+        .pool
+        .with(move |conn| {
+            use rusqlite::OptionalExtension;
+            conn.query_row(
+                "SELECT mfa_enabled_at FROM users WHERE id = ?1",
+                [uid],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .map(|x| x.flatten().is_some())
+            .map_err(|e| panel_core::PanelError::Database(e.to_string()))
+        })
+        .await
+        .unwrap_or(false);
     ok(MeResp {
         user: s.username.clone(),
         role: s.role.clone(),
@@ -210,6 +233,7 @@ pub async fn me(State(state): State<Shared>, Auth(s): Auth) -> Json<serde_json::
         allowed_roots: s.allowed_roots.clone(),
         capabilities: state.capabilities.clone(),
         tier: tier_name(state.tier),
+        mfa_enabled,
     })
 }
 
