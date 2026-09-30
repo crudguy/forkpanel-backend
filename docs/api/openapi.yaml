@@ -151,6 +151,23 @@ components:
         kind:          { type: string, enum: [file, dir] }
         size_bytes:    { type: integer, description: "文件字节数；目录为 0（不递归统计，避免 IO 放大）" }
 
+    MultipartInit:
+      type: object
+      properties:
+        upload_id:    { type: string, description: "会话 id（字符集限定 [0-9a-f-]，服务端生成）" }
+        chunk_size:   { type: integer, description: "服务端定档的分片大小（字节），客户端必须照此切分" }
+        total_chunks: { type: integer }
+        received:     { type: array, items: { type: integer }, description: "新会话恒为空" }
+    MultipartStatus:
+      type: object
+      properties:
+        upload_id:    { type: string }
+        path:         { type: string, description: "目标路径（仅作记录；完成时会重新校验）" }
+        size:         { type: integer }
+        chunk_size:   { type: integer }
+        total_chunks: { type: integer }
+        received:     { type: array, items: { type: integer }, description: "已上传分片下标——客户端据此跳过已传部分（断点续传）" }
+
     Role:
       type: object
       properties:
@@ -1361,6 +1378,85 @@ paths:
           application/octet-stream:
             schema: { type: string, format: binary }
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/FileUploadResult' } } } } } } }
+  /api/v1/files/multipart/init:
+    post:
+      tags: [files]
+      summary: 开始分片上传（分片大小由服务端定档，客户端不得自选）
+      description: |
+        分片大小由服务端决定（见响应的 chunk_size）——让客户端自选等于让它决定面板的
+        内存占用。目标路径在这一步就**先校验一次**：早失败，别等传完 10GB 才发现路径非法。
+      security: [cookieAuth, csrfHeader]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path, size]
+              properties:
+                path: { type: string, description: 最终落盘路径（完成时会重新走完整沙箱校验） }
+                size: { type: integer, description: "总字节数；上限 10 GiB" }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/MultipartInit' } } }
+        '400': { description: 大小为 0 / 超限 / 路径非法或命中敏感路径 }
+  /api/v1/files/multipart/chunk:
+    put:
+      tags: [files]
+      summary: 上传单个分片（非末片必须恰好 chunk_size）
+      description: |
+        严格校验分片大小：不符即 400。放过去只会在"合并后字节数不符"时才暴露，
+        而那时已经白传了一整轮。
+        **该路由挂在放宽了 body 上限的 router 上**——否则 4MB 分片会被 axum 默认的
+        2MB 上限整片拒掉，表现为静默失败（实测踩过）。
+      security: [cookieAuth, csrfHeader]
+      parameters:
+        - { name: upload_id, in: query, required: true, schema: { type: string } }
+        - { name: index, in: query, required: true, schema: { type: integer, minimum: 0 } }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        '204': { description: ok }
+        '400': { description: 下标越界 / 分片大小不符 / 会话不存在或不属于当前用户 }
+  /api/v1/files/multipart/{id}:
+    get:
+      tags: [files]
+      summary: 查询已上传分片（**断点续传就靠它**）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: upload_id }]
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/MultipartStatus' } } }
+    delete:
+      tags: [files]
+      summary: 中止上传并清理分片（幂等：会话已不存在也返回 204）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '204': { description: ok } }
+  /api/v1/files/multipart/{id}/complete:
+    post:
+      tags: [files]
+      summary: 合并分片并落盘（缺片则拒绝并**保留会话**，供续传）
+      description: |
+        缺片 → 400 且保留会话（清掉等于逼客户端重传全部）。
+        合并前目标路径**重新走一遍沙箱**：meta.json 是磁盘上的普通文件，
+        不因"是我们自己写的"就信任。合并后核对字节数，不符即删除目标并报错——
+        宁可报错，也不留一个"大小不对但看起来正常"的文件。
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/FileUploadResult' } } } } } }
+        '400': { description: 缺片 / 路径非法 }
+        '500': { description: 合并后字节数与声明不符（已放弃该次上传） }
   /api/v1/files/download:
     get:
       tags: [files]

@@ -213,6 +213,13 @@ impl FileProvider for MockFiles {
         is_sensitive_str(&path.to_string_lossy())
     }
 
+    async fn merge_chunks(&self, _parts: &[std::path::PathBuf], dst: &SafePath) -> Result<u64> {
+        // mock 不落真实磁盘：登记一个空的目标文件即可。
+        // 真实合并语义（顺序、流式、原子替换）由 Linux 实现覆盖。
+        self.write(dst, b"").await?;
+        Ok(0)
+    }
+
     fn max_file_bytes(&self) -> usize { 100 * 1024 * 1024 }
 }
 

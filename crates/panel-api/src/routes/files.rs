@@ -35,12 +35,12 @@ const MAX_READ_BYTES: usize = 2 * 1024 * 1024;
 /// 解析用户传入的路径。**所有文件 handler 都必须经此函数**。
 ///
 /// 返回 SafePath 意味着已通过：canonicalize + 允许根前缀断言。
-fn resolve(_state: &Shared, s: &crate::auth::Session, input: &str) -> Result<SafePath> {
+pub(crate) fn resolve(_state: &Shared, s: &crate::auth::Session, input: &str) -> Result<SafePath> {
     resolve_impl(_state, s, input, false)
 }
 
 /// 「先登记、后落地」语义：目标允许尚不存在（上传/移动/复制的目标侧）。
-fn resolve_new(_state: &Shared, s: &crate::auth::Session, input: &str) -> Result<SafePath> {
+pub(crate) fn resolve_new(_state: &Shared, s: &crate::auth::Session, input: &str) -> Result<SafePath> {
     resolve_impl(_state, s, input, true)
 }
 
@@ -79,7 +79,7 @@ fn resolve_impl(
 }
 
 /// 敏感文件兜底检查
-fn ensure_not_sensitive(state: &Shared, p: &SafePath) -> Result<()> {
+pub(crate) fn ensure_not_sensitive(state: &Shared, p: &SafePath) -> Result<()> {
     if state.os.files().is_sensitive(p) {
         return Err(PanelError::PermissionDenied("file.sensitive"));
     }

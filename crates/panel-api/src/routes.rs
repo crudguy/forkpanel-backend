@@ -26,6 +26,7 @@ pub mod security;
 pub mod settings;
 pub mod users;
 pub mod audit;
+pub mod multipart;
 pub mod roles;
 pub mod terminal;
 
@@ -134,6 +135,10 @@ pub fn build_router(state: Shared) -> Router {
     // handler 内仍有 transfer_limit 二次校验（min(平台上限, BODY_LIMIT_UPLOAD)）。
     let file_upload_r = Router::new()
         .route("/api/v1/files/upload", put(files::upload))
+        // **分片上传必须收在这个 router 里**：axum 默认 body 上限是 2MB，
+        // 4MB 的分片会被整片拒掉。实测踩到过——分片静默失败，只有 2MB 的末片能过，
+        // 表现为"完整上传时永远缺前几片"。
+        .route("/api/v1/files/multipart/chunk", put(multipart::chunk))
         .layer(axum::extract::DefaultBodyLimit::max(crate::middleware::BODY_LIMIT_UPLOAD));
     let file_r = Router::new()
         .route("/api/v1/files/list", get(files::list))
@@ -148,7 +153,13 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/files/trash/purge", post(files::trash_purge))
         .route("/api/v1/files/rename", post(files::rename))
         .route("/api/v1/files/chmod", post(files::chmod))
-        .route("/api/v1/files/action", post(files::action));
+        .route("/api/v1/files/action", post(files::action))
+        // 分片上传（断点续传）。静态段 `multipart/init` 优先于 `multipart/{id}`，
+        // axum 的路由优先级保证两者不冲突。
+        .route("/api/v1/files/multipart/init", post(multipart::init))
+        // chunk 不在这里：它带大 body，收在 file_upload_r（见上方注释）
+        .route("/api/v1/files/multipart/{id}", get(multipart::status).delete(multipart::abort))
+        .route("/api/v1/files/multipart/{id}/complete", post(multipart::complete));
 
     // ── 数据库 ──
     let db_r = Router::new()

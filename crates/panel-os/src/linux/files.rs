@@ -240,6 +240,59 @@ impl FileProvider for LinuxFileProvider {
     // 裸路径版本：与上一行共用同一个自由函数，两处判定不会分叉
     fn is_sensitive_path(&self, path: &Path) -> bool { is_sensitive_path(path) }
 
+    async fn merge_chunks(&self, parts: &[std::path::PathBuf], dst: &SafePath) -> Result<u64> {
+        let parts = parts.to_vec();
+        let dst = dst.as_path().to_path_buf();
+        tokio::task::spawn_blocking(move || -> Result<u64> {
+            use std::io::{Read, Write};
+            // 与 write 同纪律：先写临时文件、再原子替换。
+            // 否则中途失败会留下一个"看起来完整"的截断文件——那比没有更危险。
+            let tmp = dst.with_extension(format!(
+                "merging-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            let merged = (|| -> Result<u64> {
+                let mut w = std::fs::File::create(&tmp)
+                    .map_err(|e| PanelError::Io(format!("create {}: {e}", tmp.display())))?;
+                let mut total = 0u64;
+                let mut buf = vec![0u8; 1024 * 1024];
+                for p in &parts {
+                    let mut r = std::fs::File::open(p)
+                        .map_err(|e| PanelError::Io(format!("open {}: {e}", p.display())))?;
+                    loop {
+                        // 短读是正常的：读多少写多少，不做"必须读满"的假设
+                        let n = r.read(&mut buf).map_err(|e| PanelError::Io(e.to_string()))?;
+                        if n == 0 { break; }
+                        w.write_all(&buf[..n]).map_err(|e| PanelError::Io(e.to_string()))?;
+                        total += n as u64;
+                    }
+                }
+                w.sync_all().map_err(|e| PanelError::Io(e.to_string()))?;
+                drop(w);
+                Ok(total)
+            })();
+            match merged {
+                Ok(total) => {
+                    std::fs::rename(&tmp, &dst).map_err(|e| {
+                        PanelError::Io(format!("rename to {}: {e}", dst.display()))
+                    })?;
+                    Ok(total)
+                }
+                Err(e) => {
+                    // 失败即清掉半成品，不给下一次留垃圾
+                    let _ = std::fs::remove_file(&tmp);
+                    Err(e)
+                }
+            }
+        })
+        .await
+        .map_err(|e| PanelError::Internal(format!("merge join: {e}")))?
+    }
+
     fn max_file_bytes(&self) -> usize { 100 * 1024 * 1024 }
 }
 

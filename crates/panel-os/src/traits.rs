@@ -811,6 +811,13 @@ pub trait FileProvider: Send + Sync {
     /// 写入。**必须**先写临时文件再原子替换，避免半写状态
     async fn write(&self, path: &SafePath, content: &[u8]) -> Result<()>;
     async fn append(&self, path: &SafePath, content: &[u8]) -> Result<()>;
+    /// 把若干**分片文件**按顺序流式合并写入 `dst`（先写临时文件、再原子替换）。
+    ///
+    /// 分片由面板自己产出（位于数据目录的 `uploads/` 下），故以裸 `PathBuf` 传入；
+    /// 最终目标对用户可见，走 `SafePath` 以复用沙箱校验。
+    /// **必须流式**：分片各自可能几十 MB，整体读进内存再拼会在低配机上直接 OOM。
+    /// 返回实际写入字节数，供调用方与声明的总大小核对。
+    async fn merge_chunks(&self, parts: &[std::path::PathBuf], dst: &SafePath) -> Result<u64>;
     async fn create_dir(&self, path: &SafePath, recursive: bool) -> Result<()>;
     /// 删除。目录需递归；`allow_dir` 为 false 时拒绝删目录（防误删）
     async fn remove(&self, path: &SafePath, allow_dir: bool) -> Result<()>;
