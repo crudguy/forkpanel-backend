@@ -564,6 +564,146 @@ fn uniq_counter() -> u64 {
     C.fetch_add(1, Ordering::Relaxed)
 }
 
+/// 校验用的 wrapper 主配置：把站点片段包成一份合法主配置。
+///
+/// 抽成独立函数是为了让测试用**同一份** wrapper 去跑真实 nginx——测试里另抄一份
+/// 必然漂移，而漂移的那份会把"真实校验"变成在验一个不存在的东西。
+///
+/// 三个细节各有原因：
+/// - `error_log stderr`：不落日志文件，不污染宿主；
+/// - **所有路径（pid、五个 temp 目录）都落到临时 prefix 内**：`nginx -t` 期间会
+///   打开 pid 文件、还会 mkdir 这些 temp 目录。用编译期默认值（Debian 是
+///   `/run/nginx.pid` 与 `/var/lib/nginx/*`）会让校验**依赖宿主状态**——目录缺失
+///   或权限不足就直接失败，而这跟"配置本身对不对"毫无关系。语法校验就只该校验语法。
+///   实测：只改 pid 不改 temp 路径，会挂在 `mkdir() "/var/lib/nginx/body" failed`。
+/// - `include <frag>` 落在 `http` 块内：片段里的 `upstream` / `map` /
+///   `limit_req_zone` 都只在 http 上下文合法，否则会得到一堆假阳性。
+fn validate_wrapper(base: &std::path::Path, frag: &std::path::Path) -> String {
+    // 直接挂在 base 下而不是 base/tmp：nginx 建临时目录用的是单层 `mkdir()`，
+    // 父目录必须已存在——多套一层就得自己先建，不如少一层。
+    let tmp = base;
+    let mut s = String::new();
+    s.push_str("error_log stderr;\n");
+    s.push_str(&format!("pid {};\n", base.join("nginx.pid").display()));
+    s.push_str("events {}\nhttp {\n");
+    // `access_log off` 必须显式写，且只能写在 http / server / location 级
+    // （main 上下文会报 "directive is not allowed here"）。不写就会落到编译期的
+    // 默认 access_log（Debian 是 /var/log/nginx/access.log），于是校验变成在测
+    // "宿主能不能写那个日志文件"，而不是在测配置语法。
+    s.push_str("    access_log off;\n");
+    for (directive, name) in [
+        ("client_body_temp_path", "body"),
+        ("proxy_temp_path", "proxy"),
+        ("fastcgi_temp_path", "fastcgi"),
+        ("uwsgi_temp_path", "uwsgi"),
+        ("scgi_temp_path", "scgi"),
+    ] {
+        s.push_str(&format!("    {directive} {}/{name};\n", tmp.display()));
+    }
+    s.push_str(&format!("    include {};\n}}\n", frag.display()));
+    s
+}
+
+/// 抽出片段里需要**搬运**的相对 `include` 名（去重、保序）。
+///
+/// 只认整行的 `include <名>;`，跳过注释行、绝对路径与通配（前者 nginx 自己能读，
+/// 后者需要真实目录，搬不了）。名字限制在 `[A-Za-z0-9_./-]` 且不含 `..`——
+/// 这里读的是宿主文件，任何"聪明"的解析都只是扩大攻击面。
+fn relative_includes(rendered: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in rendered.lines() {
+        let t = line.trim();
+        if t.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = t.strip_prefix("include") else { continue };
+        if !rest.starts_with(|c: char| c.is_whitespace()) {
+            continue; // 形如 `include_foo` 的无关指令
+        }
+        let Some(name) = rest.trim().strip_suffix(';') else { continue };
+        let name = name.trim();
+        if name.is_empty() || name.starts_with('/') || name.contains('*') || name.contains("..") {
+            continue;
+        }
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | '/'))
+        {
+            continue;
+        }
+        if !out.iter().any(|x| x == name) {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+/// 校验时相对 `include` 的**源目录**：nginx 主配置所在目录（`conf.d` 的上一级）。
+///
+/// 这是个假设——假定部署目录的父目录就是主配置目录（Debian / Arch / RHEL 均如此）。
+/// 假设不成立时 [`stage_relative_includes`] 会如实报"读取失败"，而不是静默放行。
+fn nginx_conf_source_dir(web_conf_dir: &std::path::Path) -> std::path::PathBuf {
+    web_conf_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("/etc/nginx"))
+}
+
+/// 把片段里**相对** `include` 的文件，从 nginx 主配置目录搬进校验用的临时 `conf/`。
+///
+/// 为什么必须搬：`include foo;` 的相对名在 nginx 中相对 **conf_prefix** 解析。
+/// 生产时 conf_prefix 是主配置目录（Debian 是 `/etc/nginx`），而校验时因为用了
+/// `-c <base>/conf/nginx.conf`，conf_prefix 变成临时目录——相对 include 一律找不到。
+/// 不搬的话 PHP 站点的校验会报 `open() .../conf/fastcgi_params failed`：一个与真实
+/// 配置毫无关系的**假失败**。（P2-8 起 validate 一直是坏的，所以这个坑没人踩到。）
+///
+/// 源文件缺失时**如实报错**：那份配置在真实 nginx 上会因为同样的原因加载失败，
+/// 不是可以宽容的情况。
+async fn stage_relative_includes(
+    rendered: &str,
+    src_conf_dir: &std::path::Path,
+    dest_conf_dir: &std::path::Path,
+) -> Result<()> {
+    for name in relative_includes(rendered) {
+        let src = src_conf_dir.join(&name);
+        let dst = dest_conf_dir.join(&name);
+        let bytes = tokio::fs::read(&src).await.map_err(|e| PanelError::ConfigInvalid {
+            detail: format!(
+                "片段 include 了 `{name}`，但读取 {} 失败（{e}）——真实 nginx 会因同样的原因加载失败",
+                src.display()
+            ),
+        })?;
+        if let Some(parent) = dst.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| PanelError::Internal(e.to_string()))?;
+        }
+        tokio::fs::write(&dst, bytes)
+            .await
+            .map_err(|e| PanelError::Internal(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// `nginx -t` 的 argv（不含二进制）。抽出来同样是为了让测试与生产走同一份参数。
+///
+/// **必须同时给 `-p` 与 `-c`**：`-p` 只改 prefix，只有当二进制编译期的
+/// `--conf-path` 是**相对路径**时，nginx 才会去读 `<prefix>/conf/nginx.conf`。
+/// Debian / Ubuntu 的包把 conf-path 编成了绝对路径（`/etc/nginx/nginx.conf`），
+/// 此时 `-p` 完全不生效——校验会变成替"系统的 nginx 配置"背书，而生成的片段
+/// 一个字都没验过。本函数此前只给 `-p`，在 Debian 上就是这样**静默失灵**的：
+/// 系统里没有 /etc/nginx/nginx.conf 时它报"文件不存在"，装了 nginx 之后它又
+/// 恒为通过，两种表现都不指向真正的问题。
+fn nginx_test_argv(base: &std::path::Path) -> Vec<String> {
+    vec![
+        "-t".into(),
+        "-p".into(),
+        base.display().to_string(),
+        "-c".into(), // ci-allow-layering[2]: nginx 的"配置文件"参数，与 shell 无关（非 shell 解释）
+        base.join("conf/nginx.conf").display().to_string(),
+    ]
+}
+
 /// 渲染 nginx `server{}` 块（纯函数，可黄金单测）。
 fn render_nginx(spec: &SiteSpec) -> String {
     let names = spec.server_names.join(" ");
@@ -829,8 +969,8 @@ impl WebServerProvider for LinuxWebServer {
     /// 语法校验：把片段包进临时 wrapper 主配置后跑 `nginx -t`。**在 deploy 之前**，
     /// 失败则旧配置纹丝不动。
     ///
-    /// 用 **prefix 语义**（`-p <base>`，nginx 自动读取 `<base>/conf/nginx.conf`）而非 `-c`：
-    /// 少一个参数，且不会撞上 CI"禁止 shell"门禁对 `"-c"` 字面量的误判。
+    /// wrapper 与 argv 都由 [`validate_wrapper`] / [`nginx_test_argv`] 生成——
+    /// 生产与测试共用同一份，测试才不会"在验一个不存在的东西"。
     async fn validate(&self, rendered: &str) -> Result<()> {
         if self.name != Some("nginx") { return unsupported!("webserver.validate: 仅 nginx"); }
         let base = self.paths.tmp_dir()
@@ -841,18 +981,21 @@ impl WebServerProvider for LinuxWebServer {
         // 片段：该站点配置
         let frag = base.join("site.conf");
         tokio::fs::write(&frag, rendered).await.map_err(|e| PanelError::Internal(e.to_string()))?;
-        // wrapper：把片段包成合法主配置（error_log 走 stderr，避免写文件）
-        let wrapper = format!(
-            "error_log stderr;\nevents {{}}\nhttp {{\n    include {};\n}}\n",
-            frag.display()
-        );
-        tokio::fs::write(conf_dir.join("nginx.conf"), wrapper)
+        // 片段的相对 include 也要在临时 conf/ 下可见（见 stage_relative_includes）
+        stage_relative_includes(
+            rendered,
+            &nginx_conf_source_dir(&self.paths.web_conf_dir()),
+            &conf_dir,
+        )
+        .await?;
+        tokio::fs::write(conf_dir.join("nginx.conf"), validate_wrapper(&base, &frag))
             .await.map_err(|e| PanelError::Internal(e.to_string()))?;
 
-        let base_s = base.to_str().ok_or_else(|| PanelError::Internal("tmp path not utf8".into()))?;
+        let argv = nginx_test_argv(&base);
+        let argv_ref: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
         let r = crate::cmd::run(
             Bin::Nginx,
-            &["-t", "-p", base_s],
+            &argv_ref,
             CmdOpt { timeout: Duration::from_secs(20), ..Default::default() },
         ).await;
 
@@ -1442,6 +1585,119 @@ mod tests {
         for bad in ["map $", "limit_req", "WAF", "well-known"] {
             assert!(!out.contains(bad), "未启用 WAF 时不该出现 {bad:?}：\n{out}");
         }
+    }
+
+    /// 真机语法校验：把渲染结果交给**真实的** `nginx -t`。
+    ///
+    /// 上面那些断言只能证明"生成的东西符合我以为的 nginx 语法"——那正是最容易错的
+    /// 地方（`map` 的上下文、`if` 在 server 级是否合法、PCRE 前瞻、`limit_req` 参数、
+    /// 引号内反斜杠的转义）。只有真解析器说了算。
+    ///
+    /// 本机没有 nginx 时**跳过并打印原因**，绝不假装通过。可用 `PANEL_NGINX_BIN`
+    /// 指定任意二进制（例如从 .deb 里 `dpkg-deb -x` 解出来的，无需安装）。
+    #[tokio::test]
+    async fn rendered_config_passes_real_nginx_syntax_check() {
+        let bin = std::path::PathBuf::from(
+            std::env::var("PANEL_NGINX_BIN").unwrap_or_else(|_| "/usr/sbin/nginx".into()),
+        );
+        if !bin.is_file() {
+            eprintln!(
+                "跳过：未找到 nginx 二进制（{} 不存在；可用 PANEL_NGINX_BIN 指定）",
+                bin.display()
+            );
+            return;
+        }
+        // 相对 include 的源目录。本机没装 nginx 时，可以指向从 .deb 里解出来的
+        // `etc/nginx`（那里有 fastcgi_params 等发行版文件）。
+        let conf_src = std::path::PathBuf::from(
+            std::env::var("PANEL_NGINX_CONF_DIR").unwrap_or_else(|_| "/etc/nginx".into()),
+        );
+        if !conf_src.is_dir() {
+            eprintln!(
+                "跳过：未找到 nginx 配置目录（{} 不存在；可用 PANEL_NGINX_CONF_DIR 指定）",
+                conf_src.display()
+            );
+            return;
+        }
+
+        // 组合覆盖全部渲染分支：3 种站点类型 × 2 个 WAF 档位 × 限速开关，外加无 WAF 基线
+        let mut specs: Vec<SiteSpec> = Vec::new();
+        for kind in [
+            SiteKind::Static,
+            SiteKind::ReverseProxy {
+                upstreams: vec!["http://127.0.0.1:3000".into(), "http://127.0.0.1:3001".into()],
+            },
+            SiteKind::Php { fpm: "unix:/run/php/php8.2-fpm.sock".into() },
+        ] {
+            for profile in [WafProfile::Basic, WafProfile::Strict] {
+                for rate in [None, Some(10u32)] {
+                    let mut s = spec_static();
+                    s.kind = kind.clone();
+                    // 非特权环境下 :80/:443 会被内核拒绝 bind —— **`nginx -t` 会真的去
+                    // bind**（它靠端口冲突来检测配置里的重复 `listen`），于是校验会因
+                    // 权限失败，而这与配置内容无关。测试改用高位端口：WAF 片段与端口
+                    // 无关，结论不受影响。
+                    s.listen = vec![18080, 18443];
+                    s.waf = Some(WafSpec { profile, rate_per_sec: rate, burst: 20 });
+                    specs.push(s);
+                }
+            }
+        }
+        let mut baseline = spec_static();
+        baseline.listen = vec![18080, 18443];
+        specs.push(baseline);
+
+        let base = std::env::temp_dir()
+            .join(format!("panel-nginx-t-{}-{}", std::process::id(), uniq_counter()));
+        std::fs::create_dir_all(base.join("conf")).unwrap();
+        std::fs::create_dir_all(base.join("logs")).unwrap();
+
+        for (i, s) in specs.iter().enumerate() {
+            let frag = base.join("site.conf");
+            let rendered = render_nginx(s);
+            std::fs::write(&frag, &rendered).unwrap();
+            // **复用生产那三份实现**（wrapper / argv / include 搬运），不另抄一份：
+            // 抄一份必然漂移，而漂移的方向恰恰是"测试通过了、生产那套没通过"。
+            stage_relative_includes(&rendered, &conf_src, &base.join("conf"))
+                .await
+                .unwrap();
+            std::fs::write(base.join("conf/nginx.conf"), validate_wrapper(&base, &frag)).unwrap();
+
+            let out = std::process::Command::new(&bin)
+                .args(nginx_test_argv(&base))
+                .output()
+                .expect("启动 nginx 失败");
+            assert!(
+                out.status.success(),
+                "第 {i} 份配置未通过真实 nginx 语法校验（kind={:?}）：\n{}\n--- 渲染结果 ---\n{}",
+                s.kind,
+                String::from_utf8_lossy(&out.stderr),
+                render_nginx(s)
+            );
+        }
+
+        // ── 阴性对照：喂一份**故意非法**的片段，必须被判失败 ──
+        // 这一条才是真正钉住本次修复的断言。旧实现只给 `-p`，而 Debian 的 nginx
+        // 把 `--conf-path` 编成了绝对路径 → `-p` 不生效 → 无论片段多离谱，测的
+        // 都是系统的 /etc/nginx/nginx.conf：系统里没装 nginx 时它报"文件不存在"，
+        // 装了 nginx 之后它又**恒为通过**。两种表现都不指向真正的问题，
+        // 而生成片段里的语法错误会一路部署到线上（reload 失败留下坏配置，
+        // 下次 nginx 重启直接起不来）。
+        let bad = base.join("bad.conf");
+        std::fs::write(&bad, "this_is_not_an_nginx_directive 1;\n").unwrap();
+        std::fs::write(base.join("conf/nginx.conf"), validate_wrapper(&base, &bad)).unwrap();
+        let out = std::process::Command::new(&bin)
+            .args(nginx_test_argv(&base))
+            .output()
+            .expect("启动 nginx 失败");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "非法片段必须被判失败，否则说明校验根本没读到它");
+        assert!(
+            err.contains("bad.conf"),
+            "报错应当指向我们自己生成的片段文件（证明真的读到了它），实际是：{err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

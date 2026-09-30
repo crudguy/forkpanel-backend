@@ -31,9 +31,12 @@ allow_filter() {
 }
 
 echo "== [1] 子进程出口唯一性 =="
-# 除 panel-os/src/cmd.rs 外，任何 crate 都不得直接 spawn 进程
-SPAWN_HITS=$(grep -rn --include="*.rs" -E "Command::new|tokio::process|std::process::Command" \
-  crates/ 2>/dev/null | grep -v "crates/panel-os/src/cmd.rs" | grep -v "^crates/panel-os/src/cmd.rs")
+# 除 panel-os/src/cmd.rs 外，任何 crate 都不得直接 spawn 进程。
+# 走 strip_tests.py：本规则管的是**生产代码**，测试里直接跑外部二进制
+# （例如用真实 nginx 校验渲染结果）不属于违规。与 [2] 共用同一套剥离逻辑——
+# 各条规则各自 grep、各自加 -v 绕过，正是把豁免面散开的开始。
+SPAWN_HITS=$(python3 ci/strip_tests.py 'Command::new|tokio\.process|std::process::Command' 2>/dev/null \
+  | grep -v "crates/panel-os/src/cmd.rs" | allow_filter 1 || true)
 if [ -n "$SPAWN_HITS" ]; then
   note_fail "发现 cmd.rs 之外的进程调用："
   echo "$SPAWN_HITS" | sed 's/^/      /'
