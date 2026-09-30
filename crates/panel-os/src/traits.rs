@@ -500,6 +500,18 @@ pub struct DbRows {
     pub total: i64,
 }
 
+/// 只读查询结果。**刻意与 [`DbRows`] 分开**：任意 SQL 的"总行数"无从得知，
+/// 硬塞一个 `total` 只会逼实现去伪造数字。这里用 `truncated` 如实表达
+/// "是否被行数上限截断"——这是唯一能诚实回答的问题。
+#[derive(Debug, Clone)]
+pub struct DbQueryResult {
+    pub columns: Vec<String>,
+    /// 最多 `limit` 行（超出部分已被丢弃）
+    pub rows: Vec<Vec<Option<String>>>,
+    /// 是否因行数上限被截断
+    pub truncated: bool,
+}
+
 #[async_trait]
 pub trait DatabaseProvider: Send + Sync {
     fn engine(&self) -> DbEngine;
@@ -512,6 +524,12 @@ pub trait DatabaseProvider: Send + Sync {
     async fn tables(&self, t: &DbTarget) -> Result<Vec<DbTable>>;
     /// **只读**数据预览（分页）。`table` 由业务层校验后传入，实现内部仍须安全加引号。
     async fn rows(&self, t: &DbTarget, table: &str, limit: usize, offset: usize) -> Result<DbRows>;
+    /// **只读**任意查询（SQL 控制台）。SQL 由业务层白名单校验后传入。
+    ///
+    /// 实现必须自己兜底只读：SQLite 用**只读连接**打开，即使上层校验被绕过
+    /// 也物理写不进去（纵深防御）；没有只读保证的引擎应当直接返回 `Unsupported`，
+    /// 而不是"先跑起来再说"——那等于给面板开了一个任意写库的口子。
+    async fn query(&self, t: &DbTarget, sql: &str, limit: usize) -> Result<DbQueryResult>;
     async fn backup(&self, t: &DbTarget, out: &SafePath,
                     on_line: Box<dyn Fn(String) + Send + Sync>) -> Result<()>;
     async fn restore(&self, t: &DbTarget, from: &SafePath) -> Result<()>;

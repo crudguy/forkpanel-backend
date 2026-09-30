@@ -1502,6 +1502,38 @@ paths:
         - { $ref: '#/components/parameters/Page' }
         - { $ref: '#/components/parameters/PageSize' }
       responses: { '200': { description: ok } }
+  /api/v1/db/{conn}/query:
+    post:
+      tags: [db]
+      summary: 只读 SQL 查询（仅 SQLite；单语句 + 写关键词黑名单拦截）
+      description: |
+        校验分两层：首关键词白名单（SELECT/WITH/EXPLAIN/PRAGMA/VALUES）
+        + 写关键词黑名单（拦 `WITH … DELETE` 这类「首词合法、后面在写」的语句）。
+        注释与引号串内的内容不参与判定（先 scrub 再判）。
+        **SQLite 另有物理兜底**：连接以只读模式打开，写语句必然失败。
+        mysql/pg 返回 501 —— 它们的客户端连接不是只读的，开任意 SQL 入口
+        等于给面板开一个写库的口子。
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: conn, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sql]
+              properties:
+                sql:   { type: string, description: 单条只读语句 }
+                limit: { type: integer, minimum: 1, maximum: 2000, default: 200, description: 返回行数上限 }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { columns: { type: array, items: { type: string } }, rows: { type: array, items: { type: array, items: { type: [string, 'null'] } } }, truncated: { type: boolean }, limit: { type: integer } } } } }
+        '400': { description: 写操作 / 多语句 / 超长语句 }
+        '501': { description: 非 SQLite 引擎 }
+
   /api/v1/db/{conn}/backup:
     post:
       tags: [db]

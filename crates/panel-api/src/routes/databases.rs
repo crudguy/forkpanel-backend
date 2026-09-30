@@ -454,9 +454,236 @@ pub async fn rows(
     })))
 }
 
+// ─────────────── 只读 SQL 控制台 ───────────────
+
+/// 默认返回行数 / 硬上限。**上限不是"建议"**：任意 SQL 可能扫全表，
+/// 不限行数等于让一个请求决定面板吃掉多少内存。
+const QUERY_DEFAULT_LIMIT: usize = 200;
+const QUERY_MAX_LIMIT: usize = 2000;
+/// SQL 文本长度上限：正常查询不该有几十 KB
+const SQL_MAX_BYTES: usize = 8192;
+
+#[derive(Debug, Deserialize)]
+pub struct QueryReq {
+    pub sql: String,
+    pub limit: Option<usize>,
+}
+
+/// 只读 SQL 控制台。**只对 SQLite 开放**——只有它的读连接是物理只读的，
+/// 其它引擎没有这个保证，provider 层会诚实 501。
+pub async fn query(
+    State(state): State<Shared>, Auth(s): Auth,
+    AxPath(conn): AxPath<i64>, Json(req): Json<QueryReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::DB_VIEW)?;
+    validate_read_only_sql(&req.sql)?;
+    // 不额外要求 db 参数：SQL 自带库/表限定，再传一个库名只会让语义含糊
+    let t = load_target(&state, conn, None).await?;
+    let limit = req.limit.unwrap_or(QUERY_DEFAULT_LIMIT).clamp(1, QUERY_MAX_LIMIT);
+    let r = state.os.databases().query(&t, &req.sql, limit).await.map_err(map_db_err)?;
+    audit(&state, &s, "db.query", &format!("conn={conn}"), "ok").await;
+    Ok(ok(serde_json::json!({
+        "columns": r.columns,
+        "rows": r.rows,
+        "truncated": r.truncated,
+        "limit": limit,
+    })))
+}
+
+/// 写操作关键词。**必须是完整词匹配**（`delete_log` 不算 `delete`）。
+///
+/// 注意这里**刻意不含 `replace`**：`SELECT replace(name,'a','b')` 是常用字符串函数，
+/// 放进来会大面积误伤；而 `REPLACE INTO` 由 SQLite 的只读连接兜底拒绝。
+const WRITE_KEYWORDS: &[&str] = &[
+    "insert", "update", "delete", "drop", "alter", "create", "truncate",
+    "attach", "detach", "grant", "revoke", "vacuum", "reindex",
+    "commit", "rollback", "savepoint", "load_extension", "into", "outfile",
+];
+
+/// 只读 SQL 校验。
+///
+/// **这不是唯一防线**：SQLite 走只读连接打开，写语句物理上会失败。
+/// 这里做两件事：
+///   1. 尽早给出可读的错误（比引擎的 "attempt to write a readonly database" 好懂）；
+///   2. 对将来可能接入的其它引擎，这是**必须**拦住的地方。
+///
+/// 判定不能只看首关键词——`WITH x AS (…) DELETE …` 的首词完全合法，
+/// 因此必须叠加写关键词黑名单。
+fn validate_read_only_sql(sql: &str) -> ApiResult<()> {
+    if sql.len() > SQL_MAX_BYTES {
+        return Err(ApiError::bad_request("sql", format!("语句过长（上限 {SQL_MAX_BYTES} 字节）")));
+    }
+    let (scrubbed, semis) = scrub_sql(sql);
+    let body = scrubbed.trim();
+    let trailing_semi = body.ends_with(';');
+    let body = body.strip_suffix(';').unwrap_or(body).trim();
+    if body.is_empty() {
+        return Err(ApiError::bad_request("sql", "空语句"));
+    }
+    // 去掉结尾分号后仍出现分号 → 多语句（注释与字符串里的分号已被 scrub 排除）
+    let inner = if trailing_semi { semis.saturating_sub(1) } else { semis };
+    if inner > 0 {
+        return Err(ApiError::bad_request("sql", "一次只允许一条语句"));
+    }
+    let kw = body.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+    const ALLOWED: &[&str] = &["select", "with", "explain", "pragma", "values"];
+    if !ALLOWED.contains(&kw.as_str()) {
+        return Err(ApiError::bad_request(
+            "sql",
+            format!("只允许只读查询（SELECT / WITH / EXPLAIN / PRAGMA / VALUES），当前以 `{kw}` 开头"),
+        ));
+    }
+    for w in WRITE_KEYWORDS {
+        if has_keyword(body, w) {
+            return Err(ApiError::bad_request(
+                "sql",
+                format!("语句包含写操作关键字 `{w}`，只读控制台拒绝执行"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 完整词匹配：左右边界都必须是非词字符。
+/// 这样 `deleted_at` / `create_time` 这类**列名**不会被误判成写操作。
+fn has_keyword(haystack: &str, kw: &str) -> bool {
+    let hay = haystack.to_ascii_lowercase();
+    let mut from = 0usize;
+    while from < hay.len() {
+        let Some(pos) = hay[from..].find(kw) else { return false };
+        let start = from + pos;
+        let end = start + kw.len();
+        // 索引始终落在字符边界上：kw 是 ASCII，start 来自 find
+        let ok_left = start == 0 || !is_word_byte(hay.as_bytes()[start - 1]);
+        let ok_right = end >= hay.len() || !is_word_byte(hay.as_bytes()[end]);
+        if ok_left && ok_right {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+/// 扫描 SQL：**去掉注释**、把引号串内容抹成占位（不参与关键词判定），
+/// 并统计顶层分号数。返回 `(可判定的正文, 顶层分号数)`。
+///
+/// 自己扫而不用正则的原因：注释/引号状态只有真正走一遍才判得准，
+/// 正则很容易在 `'a--b'`、`SELECT 'a;b'` 这类输入上给出错误结论。
+fn scrub_sql(sql: &str) -> (String, usize) {
+    let cs: Vec<char> = sql.chars().collect();
+    let mut out = String::with_capacity(sql.len());
+    let mut semis = 0usize;
+    let mut i = 0usize;
+    while i < cs.len() {
+        let c = cs[i];
+        // 引号串：整段跳过，只留一个空引号对
+        if c == '\'' || c == '"' || c == '`' {
+            let q = c;
+            i += 1;
+            while i < cs.len() {
+                if cs[i] == q {
+                    // SQL 用重复引号转义（'' / ""）
+                    if i + 1 < cs.len() && cs[i + 1] == q {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str("''");
+            continue;
+        }
+        // 行注释 --
+        if c == '-' && i + 1 < cs.len() && cs[i + 1] == '-' {
+            while i < cs.len() && cs[i] != '\n' {
+                i += 1;
+            }
+            out.push(' '); // 用空格替位，避免前后 token 粘连成新词
+            continue;
+        }
+        // 块注释 /* */（未闭合则吞到结尾——未闭合的注释本就不合法）
+        if c == '/' && i + 1 < cs.len() && cs[i + 1] == '*' {
+            i += 2;
+            while i + 1 < cs.len() && !(cs[i] == '*' && cs[i + 1] == '/') {
+                i += 1;
+            }
+            i = (i + 2).min(cs.len());
+            out.push(' ');
+            continue;
+        }
+        if c == ';' {
+            semis += 1;
+        }
+        out.push(c);
+        i += 1;
+    }
+    (out, semis)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_only_sql_accepts_plain_selects() {
+        for ok_sql in [
+            "SELECT 1",
+            "select * from sites limit 5",
+            "  \n SELECT name FROM users ;  ",
+            "WITH t AS (SELECT 1 AS a) SELECT a FROM t",
+            "EXPLAIN SELECT 1",
+            "PRAGMA table_info(sites)",
+            // 引号里的关键字不算写操作——这是最常见的误伤来源
+            "SELECT * FROM audit WHERE action = 'delete'",
+        ] {
+            assert!(validate_read_only_sql(ok_sql).is_ok(), "应放行: {ok_sql}");
+        }
+    }
+
+    #[test]
+    fn read_only_sql_rejects_writes_and_multi_statements() {
+        for bad in [
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET a = 1",
+            "DELETE FROM t",
+            "DROP TABLE t",
+            // 首词合法、后面在写：只看首关键词会漏掉
+            "WITH x AS (SELECT 1) DELETE FROM t",
+            "SELECT 1; SELECT 2",
+            "SELECT 1; DROP TABLE t",
+            "ATTACH DATABASE '/tmp/x' AS y",
+            "SELECT * FROM t INTO OUTFILE '/tmp/x'",
+        ] {
+            assert!(validate_read_only_sql(bad).is_err(), "应拒绝: {bad}");
+        }
+    }
+
+    #[test]
+    fn comments_cannot_hide_writes() {
+        assert!(validate_read_only_sql("/* hi */ DELETE FROM t").is_err());
+        assert!(validate_read_only_sql("-- x\nDELETE FROM t").is_err());
+        // 反向：注释里的分号/写词不该误伤合法查询
+        assert!(validate_read_only_sql("SELECT 1 /* ; DROP TABLE t */").is_ok());
+    }
+
+    #[test]
+    fn column_names_containing_keywords_are_not_writes() {
+        // 完整词匹配的意义：`deleted_at` 不是 `delete`
+        assert!(validate_read_only_sql("SELECT deleted_at, create_time, updated_at FROM sites").is_ok());
+    }
+
+    #[test]
+    fn empty_and_oversized_sql_rejected() {
+        assert!(validate_read_only_sql("").is_err());
+        assert!(validate_read_only_sql("   ;; ").is_err());
+        assert!(validate_read_only_sql(&"SELECT ".repeat(2000)).is_err());
+    }
 
     #[test]
     fn db_name_validation() {

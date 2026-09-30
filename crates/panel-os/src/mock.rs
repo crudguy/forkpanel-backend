@@ -352,6 +352,13 @@ impl DatabaseProvider for MockDatabases {
             total: 2,
         })
     }
+    async fn query(&self, _t: &DbTarget, _sql: &str, _limit: usize) -> Result<DbQueryResult> {
+        Ok(DbQueryResult {
+            columns: vec!["answer".into()],
+            rows: vec![vec![Some("42".into())]],
+            truncated: false,
+        })
+    }
     async fn backup(&self, _t: &DbTarget, _o: &SafePath, cb: Box<dyn Fn(String) + Send + Sync>) -> Result<()> {
         cb("mock: dump complete".into()); Ok(())
     }

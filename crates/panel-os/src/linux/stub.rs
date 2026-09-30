@@ -1085,6 +1085,44 @@ impl DatabaseProvider for LinuxDatabases {
         .map_err(join_err)?
     }
 
+    async fn query(&self, t: &DbTarget, sql: &str, limit: usize) -> Result<DbQueryResult> {
+        if !matches!(t.engine, DbEngine::Sqlite) {
+            // 刻意不实装 mysql/pg：它们的客户端连接**不是只读的**，白名单一旦被绕过
+            // （例如 `WITH x AS (...) DELETE ...` 这类以 WITH 开头的写语句），
+            // 语句会真的落到库里。SQLite 有只读连接兜底，这两个没有——
+            // 与其开一个"看起来能用"的口子，不如诚实拒绝。
+            return unsupported!("dbms.query: 仅 SQLite 已实装（mysql/pg 需只读账号支持）");
+        }
+        let t = t.clone();
+        let sql = sql.to_string();
+        tokio::task::spawn_blocking(move || {
+            // open_sqlite 固定 SQLITE_OPEN_READ_ONLY：即便上层白名单被绕过，
+            // 写语句在这里也会**物理失败**（纵深防御，不依赖单点校验）。
+            let conn = LinuxDatabases::open_sqlite(&t)?;
+            let mut st = conn.prepare(&sql).map_err(db_err)?;
+            let columns: Vec<String> = st.column_names().iter().map(|s| s.to_string()).collect();
+            let ncol = columns.len();
+            let mut out: Vec<Vec<Option<String>>> = Vec::new();
+            let mut truncated = false;
+            let mut qr = st.query([]).map_err(db_err)?;
+            while let Some(row) = qr.next().map_err(db_err)? {
+                // 先判上限再取值：多出来的行不取，避免无谓的值转换开销
+                if out.len() >= limit {
+                    truncated = true;
+                    break;
+                }
+                let mut vals = Vec::with_capacity(ncol);
+                for i in 0..ncol {
+                    vals.push(value_to_string(row.get_ref(i).map_err(db_err)?));
+                }
+                out.push(vals);
+            }
+            Ok(DbQueryResult { columns, rows: out, truncated })
+        })
+        .await
+        .map_err(join_err)?
+    }
+
     async fn backup(&self, _t: &DbTarget, _o: &SafePath, _cb: Box<dyn Fn(String) + Send + Sync>) -> Result<()> {
         unsupported!("dbms.backup (M4)")
     }

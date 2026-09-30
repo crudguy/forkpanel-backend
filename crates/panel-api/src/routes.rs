@@ -156,6 +156,7 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/db/{conn}/{db}/tables", get(databases::tables))
         .route("/api/v1/db/{conn}/{db}/{table}/rows", get(databases::rows))
         .route("/api/v1/db/{conn}/backup", post(databases::backup))
+        .route("/api/v1/db/{conn}/query", post(databases::query))
         .route("/api/v1/db/{conn}/restore", post(databases::restore));
 
     // ── 防火墙 ──
