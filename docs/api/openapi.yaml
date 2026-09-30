@@ -436,6 +436,31 @@ components:
         kind:     { type: string, enum: [static, proxy] }
         enabled:  { type: boolean }
         tls:      { type: boolean }
+        waf_enabled:      { type: boolean, description: "WAF 是否启用" }
+        waf_profile:      { type: [string, "null"], enum: [basic, strict, null], description: "WAF 档位；未启用为 null" }
+        waf_rate_per_sec: { type: [integer, "null"], description: "CC 限速（每 IP 每秒请求数）；null = 不限速" }
+        waf_burst:        { type: [integer, "null"], description: "突发桶容量" }
+    SiteWaf:
+      type: object
+      required: [enabled]
+      description: |
+        站点 WAF。规则集是**编译期常量**，用户只能选档位与数值——刻意不开放
+        "自定义正则"：那等于把配置注入面直接交出去，而且一条写坏的正则会让
+        nginx 拒绝加载**整份**配置（一个站点出错，全机站点一起挂）。
+
+        三条容易踩的语义：
+        - `waf` **整个字段缺省 = 保留库中现有配置**（不是"关闭"）。apply 按
+          "期望状态"覆盖，但静默关掉一层防护比多一次点击危险得多，而且调用方
+          未必都知道有 `waf` 这个字段。要关请显式 `{"enabled": false}`。
+        - `rate_per_sec: 0` 与缺省等价（不限速）。**若此时给了 `burst` 会被 400 拒绝**：
+          "配了但没生效"的静默失败比直接报错糟糕得多。
+        - 开启严格档会额外拦空 UA 与非白名单方法（405）。基础档不拦，因为
+          空 UA 也可能是正常脚本——默认值应当"够用且不误伤"。
+      properties:
+        enabled:      { type: boolean, description: "显式 false 才关闭；缺省按上面的规则保留" }
+        profile:      { type: string, enum: [basic, strict], default: basic, description: "basic = SQLi / XSS / 路径穿越 / 敏感文件探测 / 恶意 UA；strict 在其之上增加空 UA、非白名单方法（405）与更宽的注入 / 扫描器关键词。**严格档误杀概率更高**，故不设为默认" }
+        rate_per_sec: { type: integer, minimum: 0, maximum: 1000, description: "CC 限速（每 IP 每秒请求数）；0 / 缺省 = 不限速。超限返回 429（而非 503——503 会让监控误判成服务挂了，实际只是这个客户端被限流）" }
+        burst:        { type: integer, minimum: 0, maximum: 10000, description: "突发桶容量；缺省 = rate * 2" }
     SiteCreate:
       type: object
       required: [name, domains]
@@ -465,6 +490,7 @@ components:
           description: "kind=proxy 的后端（1~16 个）。必须是 http(s)://host[:port]，不得含路径/查询/片段——该值直接进 nginx 配置文本，注入校验在后端（前端校验不可作数）"
           items: { type: string }
         fpm:         { type: string, description: "kind=php 的 php-fpm 目标：unix:/绝对路径.sock 或 host:port" }
+        waf:         { $ref: '#/components/schemas/SiteWaf' }
     Cert:
       type: object
       properties:
