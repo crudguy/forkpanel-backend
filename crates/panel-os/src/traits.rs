@@ -451,6 +451,49 @@ pub struct SiteSpec {
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
     pub force_https: bool,
+    /// WAF 配置；`None` = 不生成任何拦截规则
+    pub waf: Option<WafSpec>,
+}
+
+/// WAF 规则档位。
+///
+/// **规则集是编译期常量，用户只能选档位与数值**——刻意不开放"自定义正则"：
+/// ① 让用户写原始 nginx 正则等于把配置注入面交出去；② 一条写坏的正则会让
+/// `nginx -t` 拒绝**整份**配置，一个站点出错会连带全机站点加载失败。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WafProfile {
+    /// 基础：SQLi / XSS / 路径穿越 / 敏感文件探测 / 恶意 UA
+    Basic,
+    /// 严格：基础 + 空 UA / 非白名单方法 / 更宽的注入与扫描器关键词。
+    /// **误杀概率随之上抬**，故不设为默认——安全的默认值应该是"够用且不误伤"。
+    Strict,
+}
+
+impl WafProfile {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "basic" => Some(Self::Basic),
+            "strict" => Some(Self::Strict),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Basic => "basic",
+            Self::Strict => "strict",
+        }
+    }
+}
+
+/// 站点 WAF 配置。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WafSpec {
+    pub profile: WafProfile,
+    /// CC 限速：每秒请求数上限；`None` = 不限速
+    pub rate_per_sec: Option<u32>,
+    /// 突发桶容量（仅在 `rate_per_sec` 有值时生效）
+    pub burst: u32,
 }
 
 /// 站点类型。

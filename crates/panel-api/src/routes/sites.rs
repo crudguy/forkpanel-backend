@@ -49,6 +49,30 @@ struct RawSite {
     enabled: i32,
     created_at: i64,
     tls: bool,
+    waf_enabled: i32,
+    waf_profile: Option<String>,
+    waf_rate: Option<i64>,
+    waf_burst: Option<i64>,
+}
+
+impl RawSite {
+    /// 库中现存的 WAF 配置（`waf_enabled=0` → `None`）。
+    fn waf(&self) -> Option<panel_os::WafSpec> {
+        if self.waf_enabled == 0 {
+            return None;
+        }
+        Some(panel_os::WafSpec {
+            profile: self
+                .waf_profile
+                .as_deref()
+                .and_then(panel_os::WafProfile::parse)
+                // 档位认不出来时退回**基础档**，而不是退回"无防护"：
+                // 配置解析失败不该静默变成"一条规则都不拦"。
+                .unwrap_or(panel_os::WafProfile::Basic),
+            rate_per_sec: self.waf_rate.and_then(|n| u32::try_from(n).ok()).filter(|n| *n > 0),
+            burst: self.waf_burst.and_then(|n| u32::try_from(n).ok()).unwrap_or(0),
+        })
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -63,6 +87,13 @@ pub struct SiteOut {
     /// 是否已有绑定的 SSL 证书
     pub tls: bool,
     pub created_at: i64,
+    /// WAF 是否启用
+    pub waf_enabled: bool,
+    /// WAF 档位（basic / strict）；未启用为 null
+    pub waf_profile: Option<String>,
+    /// CC 限速（次/秒）；null = 不限速
+    pub waf_rate_per_sec: Option<i64>,
+    pub waf_burst: Option<i64>,
 }
 
 fn to_out(r: &RawSite) -> SiteOut {
@@ -75,6 +106,10 @@ fn to_out(r: &RawSite) -> SiteOut {
         enabled: r.enabled != 0,
         tls: r.tls,
         created_at: r.created_at,
+        waf_enabled: r.waf_enabled != 0,
+        waf_profile: r.waf_profile.clone(),
+        waf_rate_per_sec: r.waf_rate,
+        waf_burst: r.waf_burst,
     }
 }
 
@@ -84,7 +119,8 @@ fn db_err(e: rusqlite::Error) -> PanelError {
 
 /// SELECT 公共投影（含派生的 tls 计数）
 const SITE_SELECT: &str = "s.id, s.name, s.domains, s.root, s.kind, s.enabled, s.created_at,
-       (SELECT COUNT(*) FROM ssl_certs c WHERE c.site_id = s.id) AS tls_count";
+       (SELECT COUNT(*) FROM ssl_certs c WHERE c.site_id = s.id) AS tls_count,
+       s.waf_enabled, s.waf_profile, s.waf_rate, s.waf_burst";
 
 /// 站点查询 SQL。
 ///
@@ -113,6 +149,10 @@ async fn fetch_all(state: &Shared) -> Result<Vec<RawSite>> {
                         enabled: r.get(5)?,
                         created_at: r.get(6)?,
                         tls: r.get::<_, i64>(7)? > 0,
+                        waf_enabled: r.get(8)?,
+                        waf_profile: r.get(9)?,
+                        waf_rate: r.get(10)?,
+                        waf_burst: r.get(11)?,
                     })
                 })
                 .map_err(db_err)?;
@@ -142,6 +182,10 @@ async fn fetch_one(state: &Shared, id: i64) -> Result<Option<RawSite>> {
                     enabled: r.get(5)?,
                     created_at: r.get(6)?,
                     tls: r.get::<_, i64>(7)? > 0,
+                    waf_enabled: r.get(8)?,
+                    waf_profile: r.get(9)?,
+                    waf_rate: r.get(10)?,
+                    waf_burst: r.get(11)?,
                 })
             })
             .map_err(db_err)?;
@@ -168,6 +212,10 @@ async fn fetch_one_by_name(state: &Shared, name: &str) -> Result<Option<RawSite>
                     enabled: r.get(5)?,
                     created_at: r.get(6)?,
                     tls: r.get::<_, i64>(7)? > 0,
+                    waf_enabled: r.get(8)?,
+                    waf_profile: r.get(9)?,
+                    waf_rate: r.get(10)?,
+                    waf_burst: r.get(11)?,
                 })
             })
             .map_err(db_err)?;
@@ -282,6 +330,12 @@ pub async fn create(
                     enabled: true,
                     tls: false,
                     created_at: now,
+                    // 兜底分支：站点刚建、WAF **默认关闭**——防护能力的默认值
+                    // 应当是"不替用户做决定"，开启是显式动作。
+                    waf_enabled: false,
+                    waf_profile: None,
+                    waf_rate_per_sec: None,
+                    waf_burst: None,
                 });
             Ok(ok(out))
         }
@@ -413,6 +467,78 @@ pub struct ApplyReq {
     /// `kind=php` 的 php-fpm 目标（`unix:/path.sock` 或 `host:port`）
     #[serde(default)]
     pub fpm: Option<String>,
+    /// 站点 WAF。**缺省 = 保留库中现有配置**（不是"关闭"）——apply 是按
+    /// "期望状态"覆盖的，但静默关掉一层防护比多一次点击危险得多，
+    /// 而且调用方未必都知道有 `waf` 这个字段。显式 `{"enabled": false}` 才关闭。
+    #[serde(default)]
+    pub waf: Option<WafReq>,
+}
+
+/// WAF 请求体。
+#[derive(Debug, Deserialize)]
+pub struct WafReq {
+    pub enabled: bool,
+    /// `basic`（默认）/ `strict`
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// CC 限速：每秒请求数；`None` / 0 = 不限速
+    #[serde(default)]
+    pub rate_per_sec: Option<u32>,
+    /// 突发桶容量；缺省 = `rate * 2`
+    #[serde(default)]
+    pub burst: Option<u32>,
+}
+
+/// 限速上限。上限存在的理由：`rate` 决定每 IP 的放行速率，`burst` 决定
+/// 单 IP 能用掉多少缓冲——两者都直接换内存（每个 zone 10m 是硬上限）。
+const WAF_RATE_MAX: u32 = 1000;
+const WAF_BURST_MAX: u32 = 10_000;
+
+/// 归一化 + 校验 WAF 配置。
+///
+/// 规则集本身是**编译期常量**，用户只能选档位与数值——所以这里没有"正则注入"面。
+/// 但数值边界仍必须挡：`rate=0` 会让 nginx 直接拒绝加载配置。
+fn build_waf(
+    req: Option<&WafReq>,
+    cur: Option<&panel_os::WafSpec>,
+) -> ApiResult<Option<panel_os::WafSpec>> {
+    let Some(r) = req else { return Ok(cur.cloned()) };   // 缺省 = 保留
+    if !r.enabled {
+        return Ok(None);                                   // 显式关闭
+    }
+    let profile = match r.profile.as_deref().unwrap_or("basic") {
+        "basic" => panel_os::WafProfile::Basic,
+        "strict" => panel_os::WafProfile::Strict,
+        other => {
+            return Err(ApiError::bad_request(
+                "waf.profile",
+                format!("未知档位：{other}（可选 basic / strict）"),
+            ))
+        }
+    };
+    let rate = match r.rate_per_sec {
+        None | Some(0) => None,
+        Some(n) if n > WAF_RATE_MAX => {
+            return Err(ApiError::bad_request(
+                "waf.rate_per_sec",
+                format!("限速上限 {WAF_RATE_MAX} 次/秒"),
+            ))
+        }
+        Some(n) => Some(n),
+    };
+    let burst = r.burst.unwrap_or_else(|| rate.map(|n| n.saturating_mul(2)).unwrap_or(0));
+    if burst > WAF_BURST_MAX {
+        return Err(ApiError::bad_request("waf.burst", format!("上限 {WAF_BURST_MAX}")));
+    }
+    // burst 只在限速时有意义。给了 burst 却不限速，用户会以为限速生效了——
+    // 这种"配了但没生效"的静默失败比直接报错糟糕得多。
+    if rate.is_none() && burst > 0 {
+        return Err(ApiError::bad_request(
+            "waf.burst",
+            "burst 仅在启用限速（rate_per_sec）时有意义",
+        ));
+    }
+    Ok(Some(panel_os::WafSpec { profile, rate_per_sec: rate, burst }))
 }
 
 /// 校验反代后端。
@@ -510,7 +636,23 @@ pub async fn apply(
     let root = resolve_site_root(&state, &req.root, &req.name)?;
 
     // 3) 已有证书则注入（自签/ACME 均按域名落盘）；证书文件不存在则不启用 TLS
-    let (tls_cert, tls_key) = match fetch_one_by_name(&state, &req.name).await? {
+    // 取一次现运行配置：TLS 与 WAF 都要基于"当前状态"做缺省合并
+    let cur_row = fetch_one_by_name(&state, &req.name).await?;
+    let waf = build_waf(req.waf.as_ref(), cur_row.as_ref().and_then(|r| r.waf()).as_ref())?;
+    // 落库四元组在这里就算好：`waf` 随即被 move 进 SiteSpec。
+    // 关掉 WAF 时一并清空——留着旧数值会让"下次重新打开"意外带上几年前的参数，
+    // 而用户早就不记得了。
+    let (waf_on, waf_profile, waf_rate, waf_burst) = match &waf {
+        Some(w) => (
+            1i32,
+            Some(w.profile.as_str().to_string()),
+            w.rate_per_sec.map(i64::from),
+            Some(i64::from(w.burst)),
+        ),
+        None => (0i32, None, None, None),
+    };
+
+    let (tls_cert, tls_key) = match &cur_row {
         Some(row) => match cert_domains_for_site(&state, row.id).await? {
             Some(ds) if !ds.is_empty() => {
                 let (c, k) = cert_paths_for(&state, &ds);
@@ -562,6 +704,7 @@ pub async fn apply(
         tls_cert,
         tls_key,
         force_https: req.force_https.unwrap_or(true) && has_tls,
+        waf,
     };
     let (target, rendered) = state.os.webserver().render(&spec)?;
 
@@ -595,12 +738,16 @@ pub async fn apply(
         .db
         .exec(move |conn| {
             conn.execute(
-                "INSERT INTO sites(name, domains, root, kind, webserver, enabled, conf_path, created_at)
-                 VALUES(?1, ?2, ?3, 'static', 'nginx', 1, ?4, ?5)
+                "INSERT INTO sites(name, domains, root, kind, webserver, enabled, conf_path, created_at,
+                                   waf_enabled, waf_profile, waf_rate, waf_burst)
+                 VALUES(?1, ?2, ?3, 'static', 'nginx', 1, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(name) DO UPDATE SET
                     domains=excluded.domains, root=excluded.root, enabled=1,
-                    conf_path=excluded.conf_path, webserver='nginx'",
-                rusqlite::params![name, domains_json, root_str, conf_db, now],
+                    conf_path=excluded.conf_path, webserver='nginx',
+                    waf_enabled=excluded.waf_enabled, waf_profile=excluded.waf_profile,
+                    waf_rate=excluded.waf_rate, waf_burst=excluded.waf_burst",
+                rusqlite::params![name, domains_json, root_str, conf_db, now,
+                                  waf_on, waf_profile, waf_rate, waf_burst],
             )
             .map(|_| panel_db::WriteAck { rows_changed: 1 })
             .map_err(|e| PanelError::Database(e.to_string()))
@@ -1163,6 +1310,66 @@ pub async fn cert_delete(
 
     audit(&state, &s, "cert.delete", &id.to_string(), "ok").await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod waf_tests {
+    use super::*;
+
+    fn req(enabled: bool, profile: Option<&str>, rate: Option<u32>, burst: Option<u32>) -> WafReq {
+        WafReq { enabled, profile: profile.map(str::to_string), rate_per_sec: rate, burst }
+    }
+
+    fn spec(profile: panel_os::WafProfile, rate: Option<u32>, burst: u32) -> panel_os::WafSpec {
+        panel_os::WafSpec { profile, rate_per_sec: rate, burst }
+    }
+
+    /// 缺省必须**保留**而不是关闭：否则任何不知道 `waf` 字段的调用方
+    /// 一次 apply 就会把防护静默关掉，而且没有任何提示。
+    #[test]
+    fn omitted_waf_keeps_the_stored_config() {
+        let cur = spec(panel_os::WafProfile::Strict, Some(5), 10);
+        assert_eq!(build_waf(None, Some(&cur)).unwrap(), Some(cur));
+        assert_eq!(build_waf(None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn explicit_disable_turns_it_off_even_if_currently_on() {
+        let cur = spec(panel_os::WafProfile::Basic, Some(5), 10);
+        assert_eq!(build_waf(Some(&req(false, None, None, None)), Some(&cur)).unwrap(), None);
+    }
+
+    #[test]
+    fn burst_defaults_to_twice_the_rate_and_profile_defaults_to_basic() {
+        let g = build_waf(Some(&req(true, Some("basic"), Some(10), None)), None).unwrap().unwrap();
+        assert_eq!(g.burst, 20);
+        assert_eq!(g.profile, panel_os::WafProfile::Basic);
+        // 不给档位 → 基础档（默认值应当"够用且不误伤"）
+        let g2 = build_waf(Some(&req(true, None, None, None)), None).unwrap().unwrap();
+        assert_eq!(g2.profile, panel_os::WafProfile::Basic);
+        assert_eq!(g2.rate_per_sec, None);
+    }
+
+    /// `rate=0` 若原样下发，nginx 会拒绝加载整份配置——必须解释成"不限速"。
+    #[test]
+    fn rate_zero_means_unlimited_rather_than_going_into_the_config() {
+        let g = build_waf(Some(&req(true, None, Some(0), None)), None).unwrap().unwrap();
+        assert_eq!(g.rate_per_sec, None);
+        assert_eq!(g.burst, 0);
+        // 不限速却给了 burst = 用户以为限速生效了，直接拒绝
+        assert!(build_waf(Some(&req(true, None, None, Some(50))), None).is_err());
+    }
+
+    #[test]
+    fn unknown_profile_and_out_of_range_numbers_are_rejected() {
+        assert!(build_waf(Some(&req(true, Some("yolo"), None, None)), None).is_err());
+        assert!(build_waf(Some(&req(true, None, Some(WAF_RATE_MAX + 1), None)), None).is_err());
+        assert!(build_waf(Some(&req(true, None, Some(1), Some(WAF_BURST_MAX + 1))), None).is_err());
+        // 边界值本身必须放过：不然"上限"就成了一句空话
+        let ok = build_waf(Some(&req(true, None, Some(WAF_RATE_MAX), None)), None).unwrap().unwrap();
+        assert_eq!(ok.rate_per_sec, Some(WAF_RATE_MAX));
+        assert_eq!(ok.burst, WAF_RATE_MAX * 2);
+    }
 }
 
 #[cfg(test)]

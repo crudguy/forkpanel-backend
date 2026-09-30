@@ -604,6 +604,11 @@ fn render_nginx(spec: &SiteSpec) -> String {
         }
     }
 
+    // ── WAF 的 http 级片段（map / limit_req_zone），同样必须排在 server 之前 ──
+    if let Some(w) = &spec.waf {
+        out.push_str(&render_waf_http(&spec.server_names, w));
+    }
+
     // ── 主 server 块 ──
     out.push_str("server {\n");
     // force_https+tls 时主块只留 443（80 已交给重定向块）
@@ -630,6 +635,10 @@ fn render_nginx(spec: &SiteSpec) -> String {
     if let Some(al) = &spec.access_log { out.push_str(&format!("    access_log {};\n", al.display())); }
     if let Some(el) = &spec.error_log  { out.push_str(&format!("    error_log {};\n", el.display())); }
     if spec.access_log.is_some() || spec.error_log.is_some() { out.push('\n'); }
+
+    if let Some(w) = &spec.waf {
+        out.push_str(&render_waf_server(&spec.server_names, w));
+    }
 
     match &spec.kind {
         SiteKind::Static => {
@@ -674,6 +683,130 @@ fn upstream_name(server_names: &[String]) -> String {
         if c.is_ascii_alphanumeric() { out.push(c); } else { out.push('_'); }
     }
     out
+}
+
+// ───────────────── WAF 规则集（编译期常量） ─────────────────
+//
+// 写进 nginx 配置的字符串有两条硬约束，规则集必须自我遵守（有专门的回归测试钉住）：
+// ① **不含空白 / `;` / `{` / `}`**：nginx 词法器用它们切分 token 与块，出现在正则
+//    里会直接破坏配置结构——所以 `{8,}` 这类量词不能用；
+// ② **不含反斜杠**：nginx 把 `\x` 当转义处理，`\s` / `\.` 是否被原样传给 PCRE
+//    取决于引号内外的上下文，属于**不该去赌**的实现细节。一律改用字符类表达：
+//    `\.` → `[.]`、`\s` → `[[:space:]]`（POSIX 类，无转义）。
+// 于是规则集加不加引号行为完全一致。
+
+/// 恶意 / 扫描器 UA（基础档）。只挑**特征明确的工具名**——刻意不含 curl / wget /
+/// python：它们是大量正常脚本与健康检查的 UA，一刀切会误杀真实流量。
+const WAF_UA_BASIC: &str = "sqlmap|nikto|acunetix|nessus|dirbuster|gobuster|wfuzz|hydra|zgrab|nuclei|masscan|w3af|whatweb";
+/// 严格档追加的 UA 备选
+const WAF_UA_STRICT_EXTRA: &str = "nmap|zaproxy|owasp-zap|burpsuite|skipfish|arachni|commix|wpscan|joomscan";
+
+/// SQL 注入关键词（基础档）：只放**低误报**模式
+const WAF_SQLI_BASIC: &str = "union[[:space:](/*]+select|information_schema|sleep[(]|benchmark[(]|load_file[(]|into[[:space:]/]+outfile|waitfor[[:space:]]+delay|updatexml[(]|extractvalue[(]";
+/// 严格档追加：误报更高，故不进默认档
+const WAF_SQLI_STRICT_EXTRA: &str = "or[[:space:]]+1[[:space:]]*=1|and[[:space:]]+1[[:space:]]*=1|[[:space:]]having[[:space:]]|concat_ws[(]|[[:space:]]xp_cmdshell";
+
+/// XSS 关键词（基础档）
+const WAF_XSS_BASIC: &str = "[<]script|javascript:|onerror[[:space:]]*=|onload[[:space:]]*=|onmouseover[[:space:]]*=|document[.]cookie|srcdoc=|%3cscript";
+/// 严格档追加
+const WAF_XSS_STRICT_EXTRA: &str = "[<]iframe|[<]object|[<]embed|[<]svg|onfocus[[:space:]]*=|onclick[[:space:]]*=|alert[(]|eval[(]";
+
+/// 路径穿越 / 本地文件读取（基础档）
+const WAF_TRAV_BASIC: &str = "[.][.]/|%2e%2e|%252e|/etc/passwd|/proc/self/|/windows/win[.]ini";
+/// 严格档追加
+const WAF_TRAV_STRICT_EXTRA: &str = "[.][.]%2f|%2f%2e%2e|/etc/shadow|/root/[.]ssh";
+
+/// 档位合成：严格档 = 基础档 + 附加备选（**只增不减**）。
+///
+/// 结构化拼接而不是各写一份清单：两份清单必然漂移，而漂移的方向可能是"严格档
+/// 反而少了某条基础规则"——用户以为开了更严的档，实际放松了防护。
+fn waf_rules(basic: &str, extra: &str, p: WafProfile) -> String {
+    match p {
+        WafProfile::Basic => basic.to_string(),
+        WafProfile::Strict => format!("{basic}|{extra}"),
+    }
+}
+
+fn waf_ua(p: WafProfile) -> String { waf_rules(WAF_UA_BASIC, WAF_UA_STRICT_EXTRA, p) }
+fn waf_sqli(p: WafProfile) -> String { waf_rules(WAF_SQLI_BASIC, WAF_SQLI_STRICT_EXTRA, p) }
+fn waf_xss(p: WafProfile) -> String { waf_rules(WAF_XSS_BASIC, WAF_XSS_STRICT_EXTRA, p) }
+fn waf_trav(p: WafProfile) -> String { waf_rules(WAF_TRAV_BASIC, WAF_TRAV_STRICT_EXTRA, p) }
+
+/// WAF 变量 / zone 名：复用 upstream 的净化规则（同一站点稳定且唯一）。
+/// 多站点 zone 名撞车会让 nginx 拒绝加载**整份**配置，不只是这个站点。
+fn waf_token(server_names: &[String]) -> String { upstream_name(server_names) }
+
+/// WAF 的 **http 级**片段（`map` / `limit_req_zone` / `limit_req_status`）。
+///
+/// 为什么必须排在 server 之前：nginx 只在 http 上下文接受这些指令。放错位置
+/// 不是"这个站点不生效"，而是 `nginx -t` 拒绝整份配置——**一个站点写错会让
+/// 全机所有站点一起加载失败**。
+fn render_waf_http(server_names: &[String], w: &WafSpec) -> String {
+    let t = waf_token(server_names);
+    let strict = w.profile == WafProfile::Strict;
+    let mut o = String::new();
+
+    o.push_str(&format!("# ── WAF（{}）──\n", w.profile.as_str()));
+    // 每条规则一个 map：只算一次、可读，再在 server 内用
+    // `if ($var) { return 403; }` 拒绝。`if` 配 `return` 是官方认可的安全用法
+    // （危险的是 `if` 里配 proxy_pass / 重写）。
+    o.push_str(&format!("map $http_user_agent ${t}_ua {{\n    default 0;\n    \"~*{}\" 1;\n}}\n", waf_ua(w.profile)));
+    o.push_str(&format!("map $request_uri ${t}_sqli {{\n    default 0;\n    \"~*{}\" 1;\n}}\n", waf_sqli(w.profile)));
+    o.push_str(&format!("map $request_uri ${t}_xss {{\n    default 0;\n    \"~*{}\" 1;\n}}\n", waf_xss(w.profile)));
+    o.push_str(&format!("map $request_uri ${t}_trav {{\n    default 0;\n    \"~*{}\" 1;\n}}\n", waf_trav(w.profile)));
+
+    if strict {
+        // 非白名单方法一律 405。`default 1` + 逐个放行，比列黑名单安全：
+        // 将来 nginx 支持新方法时默认仍是拒绝。
+        o.push_str(&format!(
+            "map $request_method ${t}_method {{\n    default 1;\n    GET 0;\n    HEAD 0;\n    POST 0;\n    PUT 0;\n    DELETE 0;\n    PATCH 0;\n    OPTIONS 0;\n}}\n"
+        ));
+        // 空 UA：不少扫描器连 UA 都不发。同时列 "" 与 "-"——nginx 在请求头缺失时
+        // 把变量取值为 "-"（不是空串），两个都写上就不必依赖具体版本的细节。
+        o.push_str(&format!(
+            "map $http_user_agent ${t}_noua {{\n    default 0;\n    \"\" 1;\n    \"-\" 1;\n}}\n"
+        ));
+    }
+
+    if let Some(r) = w.rate_per_sec {
+        // 10m 共享内存约记住 16 万个 IP。rate 必须 ≥1——nginx 会拒绝 rate=0r/s。
+        o.push_str(&format!("limit_req_zone $binary_remote_addr zone={t}_rl:10m rate={r}r/s;\n"));
+        // 默认超限返回 503，语义上应是 429（Too Many Requests）：503 会让监控
+        // 误判成"服务挂了"，而实际只是这个客户端被限流。
+        o.push_str("limit_req_status 429;\n");
+    }
+    o.push('\n');
+    o
+}
+
+/// WAF 的 **server 级**片段（拦截判定 + 限速 + 隐藏文件拒绝）。
+fn render_waf_server(server_names: &[String], w: &WafSpec) -> String {
+    let t = waf_token(server_names);
+    let strict = w.profile == WafProfile::Strict;
+    let mut o = String::new();
+
+    o.push_str("\n    # ── WAF 拦截（命中即拒）──\n");
+    o.push_str(&format!("    if (${t}_ua)   {{ return 403; }}\n"));
+    o.push_str(&format!("    if (${t}_sqli) {{ return 403; }}\n"));
+    o.push_str(&format!("    if (${t}_xss)  {{ return 403; }}\n"));
+    o.push_str(&format!("    if (${t}_trav) {{ return 403; }}\n"));
+    if strict {
+        o.push_str(&format!("    if (${t}_noua)   {{ return 403; }}\n"));
+        o.push_str(&format!("    if (${t}_method) {{ return 405; }}\n"));
+    }
+    if let Some(_r) = w.rate_per_sec {
+        o.push_str(&format!("    limit_req zone={t}_rl burst={} nodelay;\n", w.burst));
+    }
+
+    // 隐藏文件 / 目录探测。
+    // **必须放行 `/.well-known`**：ACME http-01 的挑战文件就落在这里，一刀切会把
+    // 证书续期打死——"顺手加的一条规则让线上证书过期"是最难排查的那类事故。
+    o.push_str("    location ~ /[.](?!well-known/) { deny all; }\n");
+    if strict {
+        // 备份与编辑器残留：正常站点不该被下载到这些
+        o.push_str("    location ~* [.](sql|bak|old|orig|swp|save|tar|gz|zip|env)$ { deny all; }\n");
+    }
+    o
 }
 
 #[async_trait]
@@ -1213,6 +1346,101 @@ mod tests {
             tls_cert: None,
             tls_key: None,
             force_https: false,
+            waf: None,
+        }
+    }
+
+    fn spec_waf(profile: WafProfile, rate: Option<u32>, burst: u32) -> SiteSpec {
+        let mut s = spec_static();
+        s.waf = Some(WafSpec { profile, rate_per_sec: rate, burst });
+        s
+    }
+
+    /// 规则集必须遵守的硬约束：不含空白 / `;` / `{` / `}` / 反斜杠 / 引号。
+    /// 前四者会破坏 nginx 的词法结构（正则里的 `{8,}` 量词因此不可用）；
+    /// 反斜杠的转义语义在引号内外不一致——**不依赖它**才不用赌具体实现。
+    #[test]
+    fn waf_rule_sets_stay_token_safe() {
+        for pat in [
+            WAF_UA_BASIC, WAF_UA_STRICT_EXTRA,
+            WAF_SQLI_BASIC, WAF_SQLI_STRICT_EXTRA,
+            WAF_XSS_BASIC, WAF_XSS_STRICT_EXTRA,
+            WAF_TRAV_BASIC, WAF_TRAV_STRICT_EXTRA,
+        ] {
+            assert!(!pat.is_empty(), "规则集不该为空");
+            for bad in [' ', '\t', '\n', ';', '{', '}', '\\', '"', '\''] {
+                assert!(
+                    !pat.contains(bad),
+                    "规则集含非法字符 {bad:?}，会破坏 nginx 词法：{pat}"
+                );
+            }
+        }
+    }
+
+    /// 分层只能是"加规则"，不能是"换一套规则"——否则打开严格档反而可能放松某项防护。
+    #[test]
+    fn strict_profile_only_adds_rules() {
+        for (b, s) in [
+            (waf_ua(WafProfile::Basic), waf_ua(WafProfile::Strict)),
+            (waf_sqli(WafProfile::Basic), waf_sqli(WafProfile::Strict)),
+            (waf_xss(WafProfile::Basic), waf_xss(WafProfile::Strict)),
+            (waf_trav(WafProfile::Basic), waf_trav(WafProfile::Strict)),
+        ] {
+            assert!(s.starts_with(&b), "严格档必须包含基础档的全部备选：\n基础: {b}\n严格: {s}");
+        }
+        // 高误报备选不得出现在默认档
+        assert!(!waf_sqli(WafProfile::Basic).contains("1[[:space:]]*=1"));
+        assert!(!waf_xss(WafProfile::Basic).contains("eval[(]"));
+    }
+
+    #[test]
+    fn waf_http_directives_precede_the_server_block() {
+        let out = render_nginx(&spec_waf(WafProfile::Basic, Some(10), 20));
+        let zone = out.find("limit_req_zone").expect("限速开启时应有 limit_req_zone");
+        let map = out.find("map $http_user_agent").expect("应有 UA map");
+        let srv = out.find("server {").expect("应有 server 块");
+        assert!(zone < srv, "limit_req_zone 是 http 级指令，必须排在 server 之前：\n{out}");
+        assert!(map < srv, "map 是 http 级指令，必须排在 server 之前：\n{out}");
+        assert!(out.contains("rate=10r/s"), "{out}");
+        assert!(out.contains("burst=20 nodelay"), "{out}");
+        assert!(out.contains("limit_req_status 429"), "超限应 429（503 会被监控误判成服务挂了）：\n{out}");
+    }
+
+    #[test]
+    fn waf_basic_vs_strict_differences() {
+        let basic = render_nginx(&spec_waf(WafProfile::Basic, None, 0));
+        assert!(basic.contains("if ($panel_example_com_ua)   { return 403; }"), "{basic}");
+        assert!(basic.contains("if ($panel_example_com_sqli) { return 403; }"), "{basic}");
+        assert!(basic.contains("if ($panel_example_com_xss)  { return 403; }"), "{basic}");
+        assert!(basic.contains("if ($panel_example_com_trav) { return 403; }"), "{basic}");
+        assert!(!basic.contains("_method"), "基础档不该限制请求方法：\n{basic}");
+        assert!(!basic.contains("_noua"), "基础档不该拦空 UA：\n{basic}");
+        assert!(!basic.contains("limit_req zone="), "未配置限速就不该出现 limit_req：\n{basic}");
+
+        let strict = render_nginx(&spec_waf(WafProfile::Strict, None, 0));
+        assert!(strict.contains("_noua)   { return 403; }"), "{strict}");
+        assert!(strict.contains("_method) { return 405; }"), "非白名单方法应 405 而非 403：\n{strict}");
+        // 严格档专有：备份 / 残留文件拒绝。基础档不该有（误杀风险更高）
+        assert!(strict.contains("env)$ { deny all; }"), "严格档应拦备份 / 残留文件：\n{strict}");
+        assert_eq!(basic.matches("deny all;").count(), 1, "基础档应只有一条 deny 规则（隐藏文件）：\n{basic}");
+        assert_eq!(strict.matches("deny all;").count(), 2, "严格档应多一条备份 / 残留文件拒绝：\n{strict}");
+    }
+
+    #[test]
+    fn well_known_is_exempt_from_the_dotfile_deny() {
+        let out = render_nginx(&spec_waf(WafProfile::Basic, None, 0));
+        assert!(
+            out.contains("(?!well-known/)"),
+            "隐藏文件规则必须放行 /.well-known —— ACME http-01 挑战文件就落在那里，\
+             一刀切会把证书续期打死：\n{out}"
+        );
+    }
+
+    #[test]
+    fn no_waf_means_no_waf_directives() {
+        let out = render_nginx(&spec_static());
+        for bad in ["map $", "limit_req", "WAF", "well-known"] {
+            assert!(!out.contains(bad), "未启用 WAF 时不该出现 {bad:?}：\n{out}");
         }
     }
 
