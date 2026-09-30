@@ -162,7 +162,9 @@ pub async fn login(
 
     state.logins.reset(&key);
 
-    let permissions = auth::permissions_for_role(&role);
+    // 自定义角色的权限存在库里，故走异步解析；内置角色走"未命中则回退内置"的路径。
+    // 权限在这里**快照**进会话：角色权限后续变更需重新登录才生效（已知边界）。
+    let permissions = auth::permissions_for_role_resolved(&state, &role).await;
     let allowed_roots: Vec<String> = serde_json::from_str(&roots).unwrap_or_default();
     let sid = auth::generate_sid();
     state.sessions.insert(sid.clone(), Session {

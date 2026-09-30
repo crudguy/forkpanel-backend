@@ -151,6 +151,14 @@ components:
         kind:          { type: string, enum: [file, dir] }
         size_bytes:    { type: integer, description: "文件字节数；目录为 0（不递归统计，避免 IO 放大）" }
 
+    Role:
+      type: object
+      properties:
+        name:        { type: string }
+        permissions: { type: array, items: { type: string } }
+        builtin:     { type: boolean, description: "内置角色：权限由代码定义，不可改、不可删" }
+        created_at:  { type: [integer, 'null'], description: "自定义角色的创建时间；内置为 null" }
+
     LogLine:
       type: object
       properties:
@@ -2118,6 +2126,61 @@ paths:
       security: [cookieAuth, csrfHeader]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SettingsPatch' } } } }
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/SettingsReport' } } } } } } }
+  /api/v1/roles:
+    get:
+      tags: [users]
+      summary: 角色列表（内置 builtin=true + 自定义）+ 已知权限白名单
+      security: [cookieAuth, csrfHeader]
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { roles: { type: array, items: { $ref: '#/components/schemas/Role' } }, known_permissions: { type: array, items: { type: string } } } } } }
+    post:
+      tags: [users]
+      summary: 新建自定义角色（防提权：权限必须是调用者自身权限的子集）
+      security: [cookieAuth, csrfHeader]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, permissions]
+              properties:
+                name:        { type: string, description: "2~32 位、小写字母开头，只含小写字母/数字/_/-；内置角色名为保留字" }
+                permissions: { type: array, items: { type: string }, description: "必须在 known_permissions 内，且必须是调用者自身权限的子集" }
+      responses:
+        '200': { description: 已创建 }
+        '400': { description: 名称非法 / 权限未知 / 超出自身权限 / 与内置同名 }
+  /api/v1/roles/{name}:
+    patch:
+      tags: [users]
+      summary: 修改自定义角色权限（**不开放改名**——users.role 存的是名字，改名会让引用悬空）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: name, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [permissions]
+              properties:
+                permissions: { type: array, items: { type: string } }
+      responses:
+        '200': { description: ok }
+        '400': { description: 内置角色不可改 / 权限超出自身 }
+    delete:
+      tags: [users]
+      summary: 删除自定义角色（内置拒绝；**仍被用户引用时拒绝**，避免那些账号静默变成零权限）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: name, in: path, required: true, schema: { type: string } }]
+      responses:
+        '204': { description: ok }
+        '400': { description: 内置角色 / 仍被用户引用 }
+
   /api/v1/users:
     get:
       tags: [users]

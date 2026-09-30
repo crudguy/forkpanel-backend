@@ -59,8 +59,63 @@ fn parse_roots(s: &str) -> Vec<String> {
     serde_json::from_str(s).unwrap_or_default()
 }
 
-fn role_has_user_manage(role: &str) -> bool {
-    auth::permissions_for_role(role).iter().any(|p| p == perm::USER_MANAGE)
+/// 该角色是否具备 `user.manage`。**异步**：自定义角色的权限在库里，
+/// 只查内置定义会把"自定义角色含 user.manage"误判成不含，从而阻止一次
+/// 合法的自我调整（是保守方向的误伤，但仍然是误伤）。
+async fn role_has_user_manage(state: &Shared, role: &str) -> bool {
+    auth::permissions_for_role_resolved(state, role)
+        .await
+        .iter()
+        .any(|p| p == perm::USER_MANAGE)
+}
+
+/// 角色是否可经 API 分配：内置可分配名单 ∪ 数据库中的自定义角色。
+///
+/// `owner` 刻意排除在外——owner 只能由 CLI/引导流程产生，不能经 API 再造一个：
+/// 多个 owner 会让"唯一不可剥夺的管理员"这个前提悄然消失。
+async fn ensure_role_assignable(state: &Shared, role: &str) -> ApiResult<()> {
+    if ASSIGNABLE_ROLES.contains(&role) {
+        return Ok(());
+    }
+    if auth::BUILTIN_ROLES.contains(&role) {
+        return Err(ApiError::bad_request(
+            "role",
+            format!("角色 `{role}` 不可经 API 分配（owner 只能由引导流程创建）"),
+        ));
+    }
+    let r = role.to_string();
+    let exists = state
+        .pool
+        .with(move |conn| {
+            conn.query_row("SELECT 1 FROM roles WHERE name = ?1", [r], |x| x.get::<_, i64>(0))
+                .map(Some)
+                .or_else(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    other => Err(other),
+                })
+                .map_err(|e: rusqlite::Error| PanelError::Database(e.to_string()))
+        })
+        .await?;
+    if exists.is_none() {
+        return Err(ApiError::bad_request("role", format!("角色 `{role}` 不存在")));
+    }
+    Ok(())
+}
+
+/// **防提权**：不能创建/调整为权限超出自己的账号。
+///
+/// 没有这一条，任何一个拥有 `user.manage` 的人都可以凭空造一个权限更大的角色
+/// 再据为己有——整条 RBAC 就成了摆设。
+async fn ensure_no_escalation(state: &Shared, role: &str, granted: &[String]) -> ApiResult<()> {
+    for p in auth::permissions_for_role_resolved(state, role).await {
+        if !granted.iter().any(|g| g == &p) {
+            return Err(ApiError::bad_request(
+                "role",
+                format!("不能分配权限超出自己的账号（该角色需要 `{p}`）"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub async fn list(State(state): State<Shared>, Auth(s): Auth) -> ApiResult<Json<serde_json::Value>> {
@@ -97,10 +152,9 @@ pub async fn create(
     // 1) 校验输入（只读）
     let username = auth::validate_username(&req.username).map_err(ApiError::from)?;
     auth::check_password_policy(&req.password).map_err(ApiError::from)?;
-    if !ASSIGNABLE_ROLES.contains(&req.role.as_str()) {
-        return Err(ApiError::bad_request(
-            "role", "role 必须是 admin / operator / viewer（owner 不可经 API 创建）"));
-    }
+    // 角色必须真实存在（内置可分配名单 ∪ 自定义角色），且不得超出自己的权限
+    ensure_role_assignable(&state, &req.role).await?;
+    ensure_no_escalation(&state, &req.role, &s.permissions).await?;
     let role = req.role.clone();
     let roots_json = serde_json::to_string(&req.allowed_roots).unwrap_or_else(|_| "[]".into());
 
@@ -168,17 +222,18 @@ pub async fn patch(
             return Err(ApiError::forbidden("不能禁用当前登录账号"));
         }
         if let Some(ref new_role) = req.role {
-            if !role_has_user_manage(new_role) {
-                return Err(ApiError::forbidden("不能将自身权限降至失去 user.manage（会锁死自己）"));
+            if !role_has_user_manage(&state, new_role).await {
+                return Err(ApiError::forbidden(
+                    "不能将自身权限降至失去 user.manage（会锁死自己）",
+                ));
             }
         }
     }
 
-    // 4) 角色合法性
+    // 4) 角色合法性：必须存在，且不得超出自己的权限
     if let Some(ref new_role) = req.role {
-        if !ASSIGNABLE_ROLES.contains(&new_role.as_str()) {
-            return Err(ApiError::bad_request("role", "role 必须是 admin / operator / viewer"));
-        }
+        ensure_role_assignable(&state, new_role).await?;
+        ensure_no_escalation(&state, new_role, &s.permissions).await?;
     }
 
     // 5) 组装变更（只读计算）

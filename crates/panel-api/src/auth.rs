@@ -515,6 +515,64 @@ pub mod perm {
     pub const AUDIT_VIEW: &str      = "audit.view";
 }
 
+/// 内置角色名。**保留字**：自定义角色不得占用——同名两套权限定义是最难排查的 bug。
+pub const BUILTIN_ROLES: &[&str] = &["owner", "admin", "operator", "viewer"];
+
+/// 全部已知权限名。用于校验自定义角色的权限集合"确实有意义"。
+///
+/// **必须与 [`perm`] 模块保持同步**：新增权限常量时这里也要加，否则新权限
+/// 无法授予任何自定义角色。有一条单测钉住两者数量一致。
+pub fn all_permissions() -> Vec<&'static str> {
+    use perm::*;
+    vec![
+        SYSTEM_VIEW, SYSTEM_MANAGE, SERVICE_VIEW, SERVICE_MANAGE, PACKAGE_MANAGE,
+        SITE_VIEW, SITE_MANAGE, SSL_MANAGE, FILE_READ, FILE_WRITE,
+        DB_VIEW, DB_MANAGE, FIREWALL_VIEW, FIREWALL_MANAGE, SECURITY_MANAGE,
+        CRON_VIEW, CRON_MANAGE, LOG_VIEW, TASK_VIEW, BACKUP_VIEW, BACKUP_MANAGE,
+        CONTAINER_VIEW, CONTAINER_MANAGE, USER_MANAGE, SETTINGS_MANAGE, AUDIT_VIEW,
+    ]
+}
+
+/// 解析角色的权限集合：**先查自定义角色表，未命中回退内置**。
+///
+/// 失败路径刻意选择"回退内置"而不是"返回空权限"：后者会让所有内置角色的用户
+/// 在一次 DB 抖动中**集体被锁在门外**。内置定义是代码里的常量，永远可得。
+pub async fn permissions_for_role_resolved(state: &crate::AppState, role: &str) -> Vec<String> {
+    let role_owned = role.to_string();
+    let from_db = state
+        .pool
+        .with(move |conn| {
+            let mut st = conn
+                .prepare("SELECT permissions FROM roles WHERE name = ?1")
+                .map_err(|e| PanelError::Database(e.to_string()))?;
+            let mut it = st
+                .query_map([role_owned], |r| r.get::<_, String>(0))
+                .map_err(|e| PanelError::Database(e.to_string()))?;
+            let row: Option<String> = it
+                .next()
+                .transpose()
+                .map_err(|e| PanelError::Database(e.to_string()))?;
+            Ok(row)
+        })
+        .await;
+    match from_db {
+        // 命中自定义角色：用它的权限集合
+        Ok(Some(json_str)) => match serde_json::from_str::<Vec<String>>(&json_str) {
+            Ok(v) => v,
+            // JSON 损坏：不静默给空（等于锁死），也不放行——回退内置并把问题暴露出来
+            Err(e) => {
+                eprintln!("[panel] 角色 {role} 的权限 JSON 损坏，已回退内置定义: {e}");
+                permissions_for_role(role)
+            }
+        },
+        Ok(None) => permissions_for_role(role),
+        Err(e) => {
+            eprintln!("[panel] 解析角色 {role} 权限失败，已回退内置定义: {e}");
+            permissions_for_role(role)
+        }
+    }
+}
+
 /// 角色 → 权限集合。**默认拒绝**：未列出的权限一律不允许。
 pub fn permissions_for_role(role: &str) -> Vec<String> {
     use perm::*;
@@ -592,6 +650,35 @@ fn now_unix() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_permissions_stays_in_sync_with_perm_module() {
+        // all_permissions 是自定义角色的权限白名单。漏掉一个权限常量，
+        // 就意味着该权限**永远无法授予任何自定义角色**——而且不会报错，
+        // 只会在用户创建角色时"这个权限怎么选不到"。故钉住数量与无重复。
+        let all = all_permissions();
+        let mut sorted = all.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), all.len(), "all_permissions 存在重复项");
+        assert_eq!(all.len(), 26, "权限常量增减时请同步 all_permissions 与其数量断言");
+
+        // 内置角色用到的权限必须都在白名单内，否则自定义角色会出现
+        // "内置能用、自定义选不到"的不一致
+        for r in BUILTIN_ROLES {
+            for p in permissions_for_role(r) {
+                assert!(all.contains(&p.as_str()), "内置角色 {r} 使用了白名单外的权限: {p}");
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_role_is_deny_by_default() {
+        // 默认拒绝：不认识的角色（含被删除的自定义角色）拿到零权限，
+        // 而不是意外继承某个内置角色的权限
+        assert!(permissions_for_role("no-such-role").is_empty());
+        assert!(permissions_for_role("").is_empty());
+    }
 
     #[test]
     fn weak_passwords_rejected() {
