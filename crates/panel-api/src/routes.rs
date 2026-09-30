@@ -218,6 +218,9 @@ pub fn build_router(state: Shared) -> Router {
     // ── 备份计划（本地） ──
     let backup_r = Router::new()
         .route("/api/v1/backups", get(backups::list).post(backups::create))
+        // 连接自检。axum(matchit) 里静态段优先级高于参数段，故与 `/backups/{id}` 不冲突；
+        // 放在这里只是让"这是一个固定路径"读起来更直白。
+        .route("/api/v1/backups/test-remote", post(backups::test_remote))
         .route("/api/v1/backups/{id}", patch(backups::patch).delete(backups::delete))
         .route("/api/v1/backups/{id}/run", post(backups::run))
         .route("/api/v1/backups/{id}/artifacts", get(backups::artifacts))

@@ -23,6 +23,8 @@ use std::time::Duration;
 const UPLOAD_TIMEOUT_SECS: u64 = 3600;
 /// 单次删除的超时（删除是幂等轻量操作，不该占着连接）
 const DELETE_TIMEOUT_SECS: u64 = 120;
+/// 连接自检用的探针对象名。固定名且用完即删，不会在远端累积垃圾。
+pub const PROBE_OBJECT: &str = ".panel-conn-test";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteKind {
@@ -97,6 +99,16 @@ impl RemoteTarget {
                 Ok(format!("{base}/{bucket}/{key}"))
             }
         }
+    }
+
+    /// 配置自检：构造一次**真实**对象 URL 并走 URL 纪律校验。
+    ///
+    /// 为什么不是"只校验基地址"：拼接本身会引入问题（S3 的 bucket/prefix 组合、
+    /// 双斜杠），只校验基地址会漏掉它们——而执行路径校验的是**拼好的** URL，
+    /// 两处不一致就等于"保存得进去、跑起来才失败"。
+    pub fn validate(&self) -> Result<(), PanelError> {
+        let u = self.object_url(PROBE_OBJECT)?;
+        validate_remote_url(&u)
     }
 
     /// 凭据相关的 argv（两种协议都用 `--user`，S3 另需 `--aws-sigv4`）。
@@ -191,6 +203,27 @@ impl RemoteTarget {
         self.run_curl(args, DELETE_TIMEOUT_SECS).await
     }
 
+    /// 连接自检：上传一个探针对象，再删除它。返回探针对象 URL。
+    ///
+    /// 为什么用 PUT 而不是 HEAD/LIST：WebDAV 与 S3 的"只读探测"是两套协议
+    /// （PROPFIND / HeadBucket），得写两遍；而**备份真正需要的能力就是 PUT**——
+    /// 用实际要用的操作探测，才不算撒谎（存在 HEAD 通过、PUT 被拒的存储）。
+    pub async fn probe(&self) -> Result<String, PanelError> {
+        let url = self.object_url(PROBE_OBJECT)?;
+        validate_remote_url(&url)?;
+        let tmp = std::env::temp_dir().join(format!("panel-probe-{}", std::process::id()));
+        std::fs::write(&tmp, b"panel-connection-probe")
+            .map_err(|e| PanelError::Io(e.to_string()))?;
+        let up = self.upload(&tmp, PROBE_OBJECT).await;
+        let _ = std::fs::remove_file(&tmp);
+        up?;
+        // 探针清理失败**不改变连接结论**（能力本身已验证），记一笔即可
+        if let Err(e) = self.delete(PROBE_OBJECT).await {
+            eprintln!("[panel] 远端探针对象清理失败（连接结论仍然有效）: {e}");
+        }
+        Ok(url)
+    }
+
     /// 远端能力是否可用（curl 是否在位）。前端据此置灰远端配置项。
     pub fn available() -> bool {
         Bin::Curl.available()
@@ -271,6 +304,21 @@ mod tests {
         let mut t = s3();
         t.region = None;
         assert_eq!(t.auth_args()[1], "aws:amz:us-east-1:s3");
+    }
+
+    #[test]
+    fn validate_walks_the_real_object_url() {
+        // 基地址合法但拼完越界的情况必须被抓到——校验的必须是拼好的 URL
+        let mut t = s3();
+        t.bucket = None;
+        assert!(t.validate().is_err(), "s3 缺 bucket 时拼接就会失败，validate 必须报出来");
+
+        let mut t2 = webdav();
+        t2.url = "ftp://dav.example.com/b/".into();
+        assert!(t2.validate().is_err(), "非 http/https 必须被拒");
+
+        assert!(webdav().validate().is_ok());
+        assert!(s3().validate().is_ok());
     }
 
     #[test]

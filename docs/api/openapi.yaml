@@ -603,6 +603,31 @@ components:
         last_run_at: { type: [integer, "null"] }
         last_result: { type: [string, "null"] }
         encrypt:     { type: boolean, default: false, description: "产物静态加密（AES-256-GCM 分块容器，见 panel-os/backup.rs）；主密钥来自 /etc/panel/master.key 且不落库。加密会抬高恢复门槛——主密钥丢失等于备份全废，故默认关闭，由用户显式选择" }
+        remote_kind:  { type: [string, "null"], enum: [webdav, s3, null], description: "远端副本类型；null=仅本地。本地备份挡不住整机故障（磁盘坏、误删、机房事故），异地那份才是真兜底" }
+        remote_url:   { type: [string, "null"], description: "webdav: 目标目录 URL；s3: endpoint（如 https://s3.example.com）。仅 http/https" }
+        remote_bucket:{ type: [string, "null"], description: "s3: bucket 名（s3 必填）" }
+        remote_prefix:{ type: [string, "null"], description: "s3: key 前缀；两端斜杠会被吃掉" }
+        remote_region:{ type: [string, "null"], description: "s3: region，缺省 us-east-1" }
+        remote_user:  { type: [string, "null"], description: "webdav 用户名 / s3 access key id；留空 = 匿名访问" }
+        remote_has_secret: { type: boolean, description: "是否已存凭据。**凭据本身永不返回**——它是打开备份仓库的钥匙，回显没有任何正当理由够得上" }
+    RemoteConfig:
+      type: object
+      description: |
+        远端副本配置。**字段级三态语义**（前端不回显密文，必须区分"不改"与"清空"）：
+        - `remote_kind`：缺省 = 保持现状；`none` = 关闭远端（连同凭据一并清空）；`webdav` / `s3` = 启用；
+        - url / bucket / prefix / region / user：缺省 = 保持现状；**空串 = 清空该项**；
+        - `remote_secret`：缺省或空串 = **保留已存凭据**（不能解释成清空，否则每次改 cron
+          都会顺手把凭据抹掉，而用户根本无从发现）；非空 = 加密后替换。
+        启用时 `remote_url` 必填、s3 另需 `remote_bucket`；填了 `remote_user` 就必须同时给凭据
+        （`--user "ak:"` 这类半截配置在远端必然认证失败，不如保存时就说清楚）。
+      properties:
+        remote_kind:   { type: string, enum: [none, webdav, s3] }
+        remote_url:    { type: string }
+        remote_bucket: { type: string }
+        remote_prefix: { type: string }
+        remote_region: { type: string }
+        remote_user:   { type: string }
+        remote_secret: { type: string, description: "明文凭据，落库前用主密钥 AES-256-GCM 加密；永远不会被回读" }
     BackupArtifact:
       type: object
       properties:
@@ -1674,16 +1699,73 @@ paths:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/BackupPlan' } } } }
     post:
       tags: [backups]
-      summary: 新建备份计划（本地）
+      summary: 新建备份计划
+      description: |
+        `remote`（可选）配置远端副本。启用远端时**在创建时就把全部字段校验完**——
+        地址 / 协议 / bucket / 凭据配对任何一处不对即 400，不会留到第一次执行时才在后台报错。
+        凭据落库前用主密钥（/etc/panel/master.key）AES-256-GCM 加密，**永不回读**。
       security: [cookieAuth, csrfHeader]
-      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/BackupPlan' } } } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind, target, dest_dir]
+              properties:
+                kind:       { type: string, enum: [panel, site] }
+                target:     { type: string, description: "panel 固定 'panel'；site 为站点名" }
+                dest_dir:   { type: string, description: "相对面板 backup_dir 的子目录" }
+                cron_expr:  { type: [string, "null"] }
+                keep_count: { type: integer, default: 7 }
+                enabled:    { type: boolean, default: true }
+                encrypt:    { type: boolean, default: false }
+                remote:     { $ref: '#/components/schemas/RemoteConfig' }
       responses: { '201': { description: 已创建 } }
+  /api/v1/backups/test-remote:
+    post:
+      tags: [backups]
+      summary: 远端连接自检（PUT 探针对象 → DELETE）
+      description: |
+        用**备份真正要用的操作**验证配置与凭据，而不是 HEAD / 列目录——
+        存在 HEAD 通过但 PUT 被拒的存储。远端配置写错是最典型的静默失败
+        （本地照常成功、远端一直 401），用户要等到出事才发现异地没有副本，
+        所以这项配置必须能**当场验证**。探针落在一个固定对象名上，用完即删。
+        校验逻辑与保存时**完全同一份**：测试通过而保存失败是最恼人的不一致。
+      security: [cookieAuth, csrfHeader]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                plan_id: { type: integer, description: "复用该计划已存的凭据（前端不回显密文，否则只能逼用户重输一遍）" }
+                remote:  { $ref: '#/components/schemas/RemoteConfig' }
+      responses:
+        '200': { description: 连接可用 }
+        '400': { description: 配置非法（协议 / 地址 / bucket / 凭据配对） }
+        '502': { description: "远端拒绝或不可达；curl 的 stderr 在 detail.stderr" }
   /api/v1/backups/{id}:
     patch:
       tags: [backups]
       summary: 更新备份计划
+      description: 各字段缺省 = 不改动；`remote` 的字段级语义见 `RemoteConfig`。
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                cron_expr:  { type: [string, "null"] }
+                keep_count: { type: integer }
+                dest_dir:   { type: string }
+                enabled:    { type: boolean }
+                encrypt:    { type: boolean }
+                remote:     { $ref: '#/components/schemas/RemoteConfig' }
       responses: { '200': { description: ok } }
     delete:
       tags: [backups]

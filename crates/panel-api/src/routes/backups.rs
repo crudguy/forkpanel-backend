@@ -1,4 +1,4 @@
-//! 备份计划与产物（**本地**）。
+//! 备份计划与产物（本地 + 可选远端副本）。
 //!
 //! 数据模型：`backup_jobs`（schema 早已定义，此前无人使用）。
 //! - `kind=panel`：用 SQLite 在线备份（`panel_db::backup_to`）导出面板自身数据；
@@ -9,6 +9,14 @@
 //! **恢复**（`kind=site`）已实装：确认词 + 产物名白名单 + **自动先备份当前态** + 归档逃逸校验，
 //! 全程走任务中心（`TaskKind::Restore`，破坏性操作不自动重试）。
 //! `kind=panel` 保持诚实 501：面板库是自身运行中的库，在线覆盖会损坏 SQLite WAL。
+//!
+//! **远端副本**（`remote_*` 列，schema v7，见 `crate::remote_store`）：本地备份挡不住
+//! "整机没了"——磁盘故障、误删、机房事故会把备份一起带走。三条纪律：
+//! 1. 凭据加密存储（主密钥 AES-256-GCM），且**绝不下发**——列表只回 `remote_has_secret`；
+//! 2. 远端失败**不把本地备份翻转为失败**（本地那份是真的），但也**不谎报 ok**：
+//!    `last_result=partial` + 一条 warn 通知，让"异地那份没成"一眼可见；
+//! 3. 远端不做独立裁剪：本地按 `keep_count` 裁掉哪份，就同步 DELETE 远端同名对象
+//!    （远端清单 == 本地清单，因此不需要 LIST 能力，也不会悄悄堆垃圾）。
 
 use crate::{
     auth::perm,
@@ -19,6 +27,7 @@ use axum::{
     extract::{Path as AxPath, State},
     Json,
 };
+use crate::remote_store::{RemoteKind, RemoteTarget};
 use panel_core::{cap_keys, PanelError, Result, SafePath};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -27,7 +36,7 @@ use std::time::Duration;
 /// 当前只实装这两类；`db` 见 `/api/v1/db/{conn}/backup`（另一条线）。
 const KINDS: &[&str] = &["panel", "site"];
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PlanDto {
     pub id: i64,
     pub kind: String,
@@ -40,9 +49,21 @@ pub struct PlanDto {
     pub last_result: Option<String>,
     /// 产物是否静态加密（AES-256-GCM，主密钥来自 /etc/panel/master.key）
     pub encrypt: bool,
+    /// 远端类型：`None` = 仅本地；`webdav` / `s3`
+    pub remote_kind: Option<String>,
+    pub remote_url: Option<String>,
+    pub remote_bucket: Option<String>,
+    pub remote_prefix: Option<String>,
+    pub remote_region: Option<String>,
+    pub remote_user: Option<String>,
+    /// 是否已存凭据。**只回这一个布尔**——凭据是打开备份仓库的钥匙，
+    /// 没有任何正当理由把它下发到浏览器（哪怕只是"回显"）。
+    pub remote_has_secret: bool,
 }
 
-const COLS: &str = "id, kind, target, cron_expr, keep_count, dest_dir, enabled, last_run_at, last_result, encrypt";
+const COLS: &str = "id, kind, target, cron_expr, keep_count, dest_dir, enabled, last_run_at, \
+                    last_result, encrypt, remote_kind, remote_url, remote_bucket, remote_prefix, \
+                    remote_region, remote_user, remote_secret_enc";
 
 fn db_err(e: rusqlite::Error) -> PanelError { PanelError::Database(e.to_string()) }
 
@@ -58,7 +79,21 @@ fn row_dto(r: &rusqlite::Row<'_>) -> rusqlite::Result<PlanDto> {
         last_run_at: r.get(7)?,
         last_result: r.get(8)?,
         encrypt: r.get::<_, i64>(9)? != 0,
+        remote_kind: r.get(10)?,
+        remote_url: r.get(11)?,
+        remote_bucket: r.get(12)?,
+        remote_prefix: r.get(13)?,
+        remote_region: r.get(14)?,
+        remote_user: r.get(15)?,
+        remote_has_secret: r.get::<_, Option<Vec<u8>>>(16)?.is_some(),
     })
+}
+
+/// 含**加密凭据**的完整行。只有执行路径与连接自检需要它——
+/// `PlanDto` 是下发给浏览器的形状，绝不携带密文。
+struct PlanFull {
+    dto: PlanDto,
+    secret_enc: Option<Vec<u8>>,
 }
 
 /// 产物目录必须在 `backup_dir()` 之内（`input` 为相对该目录的子路径）。
@@ -71,12 +106,18 @@ fn resolve_dest(state: &Shared, input: &str) -> Result<SafePath> {
 }
 
 async fn fetch_plan(state: &Shared, id: i64) -> Result<Option<PlanDto>> {
+    Ok(fetch_plan_full(state, id).await?.map(|p| p.dto))
+}
+
+async fn fetch_plan_full(state: &Shared, id: i64) -> Result<Option<PlanFull>> {
     state
         .pool
         .with(move |conn| {
             let sql = format!("SELECT {COLS} FROM backup_jobs WHERE id = ?1");
             let mut st = conn.prepare(&sql).map_err(db_err)?;
-            let mut it = st.query_map([id], row_dto).map_err(db_err)?;
+            let mut it = st
+                .query_map([id], |r| Ok(PlanFull { dto: row_dto(r)?, secret_enc: r.get(16)? }))
+                .map_err(db_err)?;
             Ok(it.next().transpose().map_err(db_err)?)
         })
         .await
@@ -94,6 +135,162 @@ async fn site_root_by_name(state: &Shared, name: &str) -> Result<Option<String>>
             Ok(it.next().transpose().map_err(db_err)?)
         })
         .await
+}
+
+// ─────────────── 远端配置：请求片段 → 落库形态 ───────────────
+
+/// 远端配置的请求片段（create / patch / 连接自检共用）。
+///
+/// **字段级三态语义**——这是本模块最容易搞错的地方（前端不回显密文）：
+/// - `remote_kind`：`None` = 保持现状；`""`/`"none"`/`"off"` = 关闭远端；`webdav`/`s3` = 启用；
+/// - 非密字段（url/bucket/prefix/region/user）：`None` = 保持现状；空串 = 清空该项；
+/// - `remote_secret`：`None` 或空串 = **保留已存凭据**（不能解释成"清空"，否则每次
+///   改 cron 都会顺手把凭据抹掉，而用户根本无从发现）；非空 = 加密后替换。
+#[derive(Debug, Default, Deserialize)]
+pub struct RemoteReq {
+    #[serde(default)] pub remote_kind: Option<String>,
+    #[serde(default)] pub remote_url: Option<String>,
+    #[serde(default)] pub remote_bucket: Option<String>,
+    #[serde(default)] pub remote_prefix: Option<String>,
+    #[serde(default)] pub remote_region: Option<String>,
+    #[serde(default)] pub remote_user: Option<String>,
+    #[serde(default)] pub remote_secret: Option<String>,
+}
+
+/// 远端配置的落库形态：6 个非密列 + 1 个密文列。
+#[derive(Debug, Clone)]
+struct RemoteColumns {
+    kind: Option<String>,
+    url: Option<String>,
+    bucket: Option<String>,
+    prefix: Option<String>,
+    region: Option<String>,
+    user: Option<String>,
+    secret_enc: Option<Vec<u8>>,
+}
+
+impl RemoteColumns {
+    /// 关闭远端：连同凭据一起清空。留着密文没有任何用处，只扩大密钥的暴露面。
+    fn cleared() -> Self {
+        Self { kind: None, url: None, bucket: None, prefix: None, region: None,
+               user: None, secret_enc: None }
+    }
+}
+
+/// 合并请求片段与现值，并在**落库前**做完整校验。
+fn merge_remote(
+    state: &Shared,
+    req: &RemoteReq,
+    cur: Option<&PlanDto>,
+    cur_secret: Option<&Vec<u8>>,
+) -> ApiResult<RemoteColumns> {
+    // ① kind
+    let kind: Option<String> = match req.remote_kind.as_deref().map(str::trim) {
+        None => cur.and_then(|p| p.remote_kind.clone()),
+        Some("") | Some("none") | Some("off") => None,
+        Some(k) => {
+            if RemoteKind::parse(k).is_none() {
+                return Err(ApiError::bad_request(
+                    "remote_kind", "remote_kind 必须是 webdav / s3 / none"));
+            }
+            Some(k.to_string())
+        }
+    };
+    let Some(kind) = kind else { return Ok(RemoteColumns::cleared()) };
+
+    // ② 非密字段：给了就替换（空串 = 清空该项），没给就沿用现值
+    fn pick(new: &Option<String>, old: Option<&String>) -> Option<String> {
+        match new {
+            Some(s) => {
+                let t = s.trim();
+                if t.is_empty() { None } else { Some(t.to_string()) }
+            }
+            None => old.cloned(),
+        }
+    }
+    let url = pick(&req.remote_url, cur.and_then(|p| p.remote_url.as_ref()));
+    let bucket = pick(&req.remote_bucket, cur.and_then(|p| p.remote_bucket.as_ref()));
+    let prefix = pick(&req.remote_prefix, cur.and_then(|p| p.remote_prefix.as_ref()));
+    let region = pick(&req.remote_region, cur.and_then(|p| p.remote_region.as_ref()));
+    let user = pick(&req.remote_user, cur.and_then(|p| p.remote_user.as_ref()));
+
+    // ③ 凭据
+    let typed = req.remote_secret.as_deref().map(str::trim).unwrap_or("");
+    let secret_enc = if typed.is_empty() {
+        cur_secret.cloned()
+    } else {
+        let key = state.require_secret_key()?;
+        Some(key.encrypt(typed.as_bytes()).map_err(ApiError::from)?)
+    };
+
+    // ④ 配对与完整性。用户名与凭据必须同进同退：`--user "ak:"` 这类半截配置在远端
+    //    一定认证失败，与其等第一次执行才炸，不如保存时就说清楚。
+    if user.is_some() && secret_enc.is_none() {
+        return Err(ApiError::bad_request(
+            "remote_secret",
+            "填了远端用户名就必须提供凭据（改为匿名访问请清空用户名）",
+        ));
+    }
+    if user.is_none() && secret_enc.is_some() {
+        return Err(ApiError::bad_request("remote_user", "提供了凭据但缺少用户名"));
+    }
+    let Some(url_v) = url.clone().filter(|u| !u.is_empty()) else {
+        return Err(ApiError::bad_request("remote_url", "启用远端存储必须填写地址"));
+    };
+
+    // ⑤ 自检**拼好的对象 URL**（与执行路径同一份逻辑）：
+    //    避免"保存得进去、跑起来才失败"这种最难排查的不一致。
+    RemoteTarget {
+        kind: RemoteKind::parse(&kind).expect("上面已校验"),
+        url: url_v,
+        bucket: bucket.clone(),
+        prefix: prefix.clone(),
+        region: region.clone(),
+        user: user.clone(),
+        // 这里只为过 URL / bucket 校验，凭据内容不参与
+        secret: user.as_ref().map(|_| String::new()),
+    }
+    .validate()
+    .map_err(ApiError::from)?;
+
+    Ok(RemoteColumns { kind: Some(kind), url, bucket, prefix, region, user, secret_enc })
+}
+
+/// 解密已存凭据。仅执行路径与连接自检使用。
+fn decrypt_secret(state: &Shared, blob: Option<&Vec<u8>>) -> ApiResult<Option<String>> {
+    let Some(blob) = blob else { return Ok(None) };
+    let key = state.require_secret_key()?;
+    let bytes = key.decrypt(blob).map_err(ApiError::from)?;
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| ApiError::from(PanelError::Internal("远端凭据不是合法 UTF-8".into())))
+}
+
+/// 由计划行组装可直接使用的 [`RemoteTarget`]（含解密后的凭据）。
+///
+/// 未配置远端 → `None`；配置了但主密钥不可用 → **当场报错**：
+/// 让"配置看着好好的、每次执行都静默不上传"成为不可能。
+fn remote_target_from(
+    state: &Shared,
+    plan: &PlanDto,
+    secret_enc: Option<&Vec<u8>>,
+) -> ApiResult<Option<RemoteTarget>> {
+    let Some(kind_s) = plan.remote_kind.as_deref().map(str::trim).filter(|k| !k.is_empty()) else {
+        return Ok(None);
+    };
+    let kind = RemoteKind::parse(kind_s)
+        .ok_or_else(|| ApiError::bad_request("remote_kind", format!("未知的远端类型：{kind_s}")))?;
+    let target = RemoteTarget {
+        kind,
+        url: plan.remote_url.clone().unwrap_or_default(),
+        bucket: plan.remote_bucket.clone(),
+        prefix: plan.remote_prefix.clone(),
+        region: plan.remote_region.clone(),
+        user: plan.remote_user.clone(),
+        secret: decrypt_secret(state, secret_enc)?,
+    };
+    target.validate().map_err(ApiError::from)?;
+    Ok(Some(target))
 }
 
 // ─────────────── CRUD ───────────────
@@ -131,6 +328,9 @@ pub struct CreateReq {
     /// 产物是否静态加密；默认 false——加密会抬高恢复门槛，取舍必须由用户显式决定
     #[serde(default)]
     pub encrypt: Option<bool>,
+    /// 远端副本（可选）。缺省 = 仅本地。语义见 [`RemoteReq`]。
+    #[serde(default)]
+    pub remote: RemoteReq,
 }
 
 pub async fn create(
@@ -149,13 +349,20 @@ pub async fn create(
     if encrypt != 0 {
         let _ = state.require_secret_key()?;
     }
+    // 远端配置同样在**创建时**就完整校验：地址、协议、bucket、凭据配对，
+    // 任何一处不对都当场 400，而不是等第一次执行时才在后台报错。
+    let remote = merge_remote(&state, &req.remote, None, None)?;
     state
         .db
         .exec(move |conn| {
             conn.execute(
-                "INSERT INTO backup_jobs(kind, target, cron_expr, keep_count, dest_dir, enabled, encrypt)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![kind, target, cron, keep, dest, enabled, encrypt],
+                "INSERT INTO backup_jobs(kind, target, cron_expr, keep_count, dest_dir, enabled, encrypt,
+                                         remote_kind, remote_url, remote_bucket, remote_prefix,
+                                         remote_region, remote_user, remote_secret_enc)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                rusqlite::params![kind, target, cron, keep, dest, enabled, encrypt,
+                                  remote.kind, remote.url, remote.bucket, remote.prefix,
+                                  remote.region, remote.user, remote.secret_enc],
             )
             .map(|_| panel_db::WriteAck { rows_changed: 1 })
             .map_err(|e| PanelError::Database(e.to_string()))
@@ -177,6 +384,10 @@ pub struct PatchReq {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub encrypt: Option<bool>,
+    /// 远端副本。字段级语义见 [`RemoteReq`]：`remote_kind` 缺省 = 不改动，
+    /// `"none"` = 关闭；`remote_secret` 留空 = 保留已存凭据。
+    #[serde(default)]
+    pub remote: RemoteReq,
 }
 
 pub async fn patch(
@@ -186,7 +397,9 @@ pub async fn patch(
     Json(req): Json<PatchReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::BACKUP_MANAGE)?;
-    let cur = fetch_plan(&state, id).await?.ok_or_else(|| ApiError::not_found("backup plan"))?;
+    let full = fetch_plan_full(&state, id).await?
+        .ok_or_else(|| ApiError::not_found("backup plan"))?;
+    let cur = full.dto.clone();
 
     // 校验 dest_dir（若变更）：仍必须落在 backup_dir 之内
     let dest = match &req.dest_dir {
@@ -202,12 +415,20 @@ pub async fn patch(
         let _ = state.require_secret_key()?;
     }
 
+    // 远端：与现值合并后再落库（凭据三态语义见 `merge_remote`），同样**保存前**校验
+    let remote = merge_remote(&state, &req.remote, Some(&cur), full.secret_enc.as_ref())?;
+
     state
         .db
         .exec(move |conn| {
             conn.execute(
-                "UPDATE backup_jobs SET cron_expr = ?1, keep_count = ?2, dest_dir = ?3, enabled = ?4, encrypt = ?5 WHERE id = ?6",
-                rusqlite::params![cron, keep, dest, enabled, encrypt, id],
+                "UPDATE backup_jobs SET cron_expr = ?1, keep_count = ?2, dest_dir = ?3, enabled = ?4, encrypt = ?5,
+                     remote_kind = ?7, remote_url = ?8, remote_bucket = ?9, remote_prefix = ?10,
+                     remote_region = ?11, remote_user = ?12, remote_secret_enc = ?13
+                 WHERE id = ?6",
+                rusqlite::params![cron, keep, dest, enabled, encrypt, id,
+                                  remote.kind, remote.url, remote.bucket, remote.prefix,
+                                  remote.region, remote.user, remote.secret_enc],
             )
             .map(|n| panel_db::WriteAck { rows_changed: n })
             .map_err(|e| PanelError::Database(e.to_string()))
@@ -280,6 +501,8 @@ struct BackupJob {
     writer: std::sync::Arc<panel_db::WriterActor>,
     /// 是否对产物做静态加密
     encrypt: bool,
+    /// 远端副本目标（`None` = 仅本地）。凭据已解密——本结构是执行期形态。
+    remote: Option<RemoteTarget>,
     /// 主密钥。`encrypt=false` 时为 `None` —— **不为不加密的计划持有密钥**，
     /// 减少密钥在内存里的驻留面。
     master: Option<panel_core::crypto::MasterKey>,
@@ -292,6 +515,20 @@ impl panel_task::TaskBody for BackupJob {
             Ok(o) => Ok(o),
             Err(e) => {
                 eprintln!("[panel] 备份计划 #{} 失败: {e}", self.id);
+                // 失败必须落库。否则 `last_result` 会**停在上一轮成功的 'ok'**——
+                // 界面显示"最近一次成功"、实际已连续失败多天，又是一个静默失败。
+                let id = self.id;
+                let _ = self
+                    .writer
+                    .exec(move |conn| {
+                        conn.execute(
+                            "UPDATE backup_jobs SET last_run_at = ?1, last_result = 'fail' WHERE id = ?2",
+                            rusqlite::params![crate::now_unix(), id],
+                        )
+                        .map(|_| panel_db::WriteAck { rows_changed: 1 })
+                        .map_err(|e| PanelError::Database(e.to_string()))
+                    })
+                    .await;
                 // 备份**静默失败等于没有备份** —— 必须让人知道，否则出事才发现无退路。
                 // 按天去重：同一计划当天只报一条，避免每次调度都刷屏。
                 let msg = e.to_string();
@@ -368,25 +605,91 @@ impl BackupJob {
             out_path
         };
 
+        // 远端副本。**本地已成功，远端失败不把任务翻转为失败**——本地那份是真的；
+        // 但也**不谎报 ok**：`partial` + warn 通知，否则"异地没有备份"会一直没人发现。
+        let mut remote_err: Option<String> = None;
+        if let Some(rt) = &self.remote {
+            progress.set(92, "上传远端").await;
+            let name = out_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if let Err(e) = rt.upload(&out_path, &name).await {
+                remote_err = Some(e.to_string());
+            }
+        }
+
         progress.set(95, "记录结果").await;
+        let result: &'static str = if remote_err.is_some() { "partial" } else { "ok" };
         let id = self.id;
         self.writer
             .exec(move |conn| {
                 conn.execute(
-                    "UPDATE backup_jobs SET last_run_at = ?1, last_result = 'ok' WHERE id = ?2",
-                    rusqlite::params![crate::now_unix(), id],
+                    "UPDATE backup_jobs SET last_run_at = ?1, last_result = ?2 WHERE id = ?3",
+                    rusqlite::params![crate::now_unix(), result, id],
                 )
                 .map(|_| panel_db::WriteAck { rows_changed: 1 })
                 .map_err(|e| PanelError::Database(e.to_string()))
             })
             .await?;
 
+        if let Some(detail) = &remote_err {
+            crate::routes::notifications::push(
+                &self.writer,
+                crate::routes::notifications::NewNotification {
+                    level: "warn",
+                    source: "backup",
+                    title: format!("备份计划 #{} 本地成功，但远端上传失败", self.id),
+                    body: Some(format!(
+                        "本地产物已生成，**异地副本缺失**，请检查远端配置。\n\n{detail}"
+                    )),
+                    // 按天去重：同一个坏配置不该每次调度都刷一条
+                    dedup_key: Some(format!(
+                        "backup:{}:remote:{}",
+                        self.id,
+                        crate::now_unix() / 86_400
+                    )),
+                },
+            )
+            .await;
+        }
+
         // 成功后按 keep_count 裁剪最旧产物（保留含本次在内的最新 keep 份）。
         // 不清理会让备份产物无限累加，最终撑爆低配盘——备份反而成了故障源。
         let pruned = prune_old_artifacts(&self.dest, self.id, self.keep_count);
-        if pruned > 0 {
-            eprintln!("[panel] 备份计划 #{} 按 keep_count={} 清理了 {pruned} 份旧产物",
-                self.id, self.keep_count);
+        if !pruned.is_empty() {
+            eprintln!("[panel] 备份计划 #{} 按 keep_count={} 清理了 {} 份旧产物",
+                self.id, self.keep_count, pruned.len());
+        }
+        // 本地裁掉哪份，远端就同步删同名对象 —— 于是"远端清单 == 本地清单"，
+        // 既不需要 LIST 能力，也不会出现"远端悄悄堆了几百个旧备份"。
+        if let Some(rt) = &self.remote {
+            let mut fails = 0usize;
+            for n in &pruned {
+                if let Err(e) = rt.delete(n).await {
+                    eprintln!("[panel] 远端旧产物清理失败 {n}: {e}");
+                    fails += 1;
+                }
+            }
+            if fails > 0 {
+                crate::routes::notifications::push(
+                    &self.writer,
+                    crate::routes::notifications::NewNotification {
+                        level: "warn",
+                        source: "backup",
+                        title: format!("备份计划 #{} 远端旧产物清理失败", self.id),
+                        body: Some(format!(
+                            "{fails} 个已被本地裁剪的旧备份没能从远端删除，远端会比本地多留这些对象。"
+                        )),
+                        dedup_key: Some(format!(
+                            "backup:{}:remote-prune:{}",
+                            self.id,
+                            crate::now_unix() / 86_400
+                        )),
+                    },
+                )
+                .await;
+            }
         }
 
         progress.set(100, "完成").await;
@@ -407,7 +710,9 @@ pub async fn run(
     if !state.capabilities.get(cap_keys::BACKUP_MANAGE).map(|c| c.supported).unwrap_or(false) {
         return Err(ApiError::unsupported("backup.manage"));
     }
-    let plan = fetch_plan(&state, id).await?.ok_or_else(|| ApiError::not_found("backup plan"))?;
+    let full = fetch_plan_full(&state, id).await?
+        .ok_or_else(|| ApiError::not_found("backup plan"))?;
+    let plan = full.dto.clone();
     let dest = resolve_dest(&state, &plan.dest_dir)?.as_path().to_path_buf();
     let root = match plan.kind.as_str() {
         "site" => Some(PathBuf::from(
@@ -420,6 +725,9 @@ pub async fn run(
     // 加密计划的密钥在**提交任务前**取：取不到就当场 501，
     // 不让任务进队列后在后台反复失败（用户会以为备份在跑）
     let master = if plan.encrypt { Some(state.require_secret_key()?) } else { None };
+    // 远端目标也在**提交任务前**组装：凭据解不开就当场报错，
+    // 而不是让任务进队列后在后台反复失败（用户会以为备份在跑）。
+    let remote = remote_target_from(&state, &plan, full.secret_enc.as_ref())?;
     let job = BackupJob {
         id,
         kind: plan.kind.clone(),
@@ -430,6 +738,7 @@ pub async fn run(
         writer: state.db.clone(),
         encrypt: plan.encrypt,
         master,
+        remote,
     };
     let (tid, _) = state
         .tasks
@@ -695,9 +1004,9 @@ impl RestoreJob {
 /// 只认 `plan<id>-` 前缀（不误伤其他计划与其他文件）；按文件名排序——
 /// 文件名形如 `plan1-1700000000.db`，时间戳为定长 unix 秒，字典序即时间序。
 ///
-/// **返回被删除的数量**。单点删除失败只记日志、不向上抛错：
-/// 产物清理失败不该把一次「备份已成功」翻转为失败。
-fn prune_old_artifacts(dest: &std::path::Path, plan_id: i64, keep: i64) -> usize {
+/// **返回被删除的产物名**（不只是数量）——远端要按名字同步 DELETE 同名对象。
+/// 单点删除失败只记日志、不向上抛错：产物清理失败不该把一次「备份已成功」翻转为失败。
+fn prune_old_artifacts(dest: &std::path::Path, plan_id: i64, keep: i64) -> Vec<String> {
     let keep = keep.max(1) as usize;
     let prefix = format!("plan{plan_id}-");
     let mut names: Vec<String> = match std::fs::read_dir(dest) {
@@ -706,21 +1015,79 @@ fn prune_old_artifacts(dest: &std::path::Path, plan_id: i64, keep: i64) -> usize
             .map(|e| e.file_name().to_string_lossy().to_string())
             .filter(|n| n.starts_with(&prefix))
             .collect(),
-        Err(_) => return 0,
+        Err(_) => return Vec::new(),
     };
     if names.len() <= keep {
-        return 0;
+        return Vec::new();
     }
     names.sort(); // 升序 → 前面是最旧的
     let drop_n = names.len() - keep;
-    let mut removed = 0usize;
+    let mut removed = Vec::new();
     for n in names.into_iter().take(drop_n) {
         match std::fs::remove_file(dest.join(&n)) {
-            Ok(()) => removed += 1,
+            Ok(()) => removed.push(n),
             Err(e) => eprintln!("[panel] 清理旧备份产物失败 {}: {e}", dest.join(&n).display()),
         }
     }
     removed
+}
+
+/// 远端连接自检请求。
+#[derive(Debug, Deserialize)]
+pub struct TestRemoteReq {
+    /// 复用某个已存计划的凭据（前端不回显密文，否则只能逼用户重输一遍）。
+    #[serde(default)]
+    pub plan_id: Option<i64>,
+    #[serde(default)]
+    pub remote: RemoteReq,
+}
+
+/// 远端连接自检：**用备份真正要用的操作**（PUT 探针对象 → DELETE）验证配置与凭据。
+///
+/// 为什么值得单独一个端点：远端配置写错是最典型的静默失败——本地备份照常成功、
+/// 远端一直 401，用户要等到真出事才发现异地根本没有副本。让配置**当场可验证**。
+pub async fn test_remote(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    Json(req): Json<TestRemoteReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::BACKUP_MANAGE)?;
+    let (cur, cur_secret) = match req.plan_id {
+        Some(id) => {
+            let full = fetch_plan_full(&state, id)
+                .await?
+                .ok_or_else(|| ApiError::not_found("backup plan"))?;
+            (Some(full.dto), full.secret_enc)
+        }
+        None => (None, None),
+    };
+    // 复用与落库**同一份**装配/校验：测试通过但保存失败（或反之）是最恼人的不一致
+    let cols = merge_remote(&state, &req.remote, cur.as_ref(), cur_secret.as_ref())?;
+    let Some(kind_s) = cols.kind.clone() else {
+        return Err(ApiError::bad_request("remote_kind", "请先选择远端类型（webdav / s3）"));
+    };
+    let provided = req
+        .remote
+        .remote_secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|x| !x.is_empty());
+    let secret = match provided {
+        Some(p) => Some(p.to_string()),
+        None => decrypt_secret(&state, cols.secret_enc.as_ref())?,
+    };
+    let target = RemoteTarget {
+        kind: RemoteKind::parse(&kind_s).expect("merge_remote 已校验 kind"),
+        url: cols.url.clone().unwrap_or_default(),
+        bucket: cols.bucket.clone(),
+        prefix: cols.prefix.clone(),
+        region: cols.region.clone(),
+        user: cols.user.clone(),
+        secret,
+    };
+    let probe_url = target.probe().await.map_err(ApiError::from)?;
+    audit(&state, &s, "backup.test_remote", &probe_url, "ok").await;
+    Ok(ok(serde_json::json!({ "ok": true, "probe_url": probe_url })))
 }
 
 #[cfg(test)]
@@ -751,7 +1118,15 @@ mod prune_tests {
             mk(&d, &format!("plan7-100000000{i}.db"));
         }
         let removed = prune_old_artifacts(&d, 7, 2);
-        assert_eq!(removed, 3, "5 份保留 2 → 应删 3");
+        assert_eq!(removed.len(), 3, "5 份保留 2 → 应删 3");
+        assert_eq!(
+            removed,
+            vec!["plan7-1000000001.db".to_string(),
+                 "plan7-1000000002.db".to_string(),
+                 "plan7-1000000003.db".to_string()],
+            "返回的必须是**被删掉的那些名字**——远端要按名字同步删同名对象，\
+             只回数量没法删"
+        );
         assert_eq!(
             ls(&d),
             vec!["plan7-1000000004.db".to_string(), "plan7-1000000005.db".to_string()],
@@ -770,7 +1145,8 @@ mod prune_tests {
         mk(&d, "plan8-1.db"); // 别的计划
         mk(&d, "unrelated.txt");
         let removed = prune_old_artifacts(&d, 7, 1);
-        assert_eq!(removed, 2, "只应删 plan7- 的旧产物");
+        assert_eq!(removed, vec!["plan7-1.db".to_string(), "plan7-2.db".to_string()],
+                   "只应删 plan7- 的旧产物，且不得波及 plans/其它计划/无关文件");
         assert_eq!(ls(&d), vec!["plan7-3.db".to_string(), "plan8-1.db".to_string(), "unrelated.txt".to_string()]);
         fs::remove_dir_all(&d).unwrap();
     }
@@ -780,7 +1156,7 @@ mod prune_tests {
         let d = std::env::temp_dir().join(format!("panel-prune3-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         mk(&d, "plan9-1.db");
-        assert_eq!(prune_old_artifacts(&d, 9, 7), 0, "份数未超不应删");
+        assert!(prune_old_artifacts(&d, 9, 7).is_empty(), "份数未超不应删");
         assert_eq!(ls(&d).len(), 1);
         fs::remove_dir_all(&d).unwrap();
     }
@@ -788,6 +1164,6 @@ mod prune_tests {
     #[test]
     fn missing_dir_is_not_an_error() {
         let d = std::env::temp_dir().join(format!("panel-prune4-nope-{}", std::process::id()));
-        assert_eq!(prune_old_artifacts(&d, 1, 3), 0, "目录不存在应静默返回 0");
+        assert!(prune_old_artifacts(&d, 1, 3).is_empty(), "目录不存在应静默返回空");
     }
 }
