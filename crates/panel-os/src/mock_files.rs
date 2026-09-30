@@ -206,17 +206,24 @@ impl FileProvider for MockFiles {
     }
 
     fn is_sensitive(&self, path: &SafePath) -> bool {
-        // mock 复用与 Linux 相同的判定，保证一致性测试有意义
-        let s = path.as_path().to_string_lossy().to_string();
-        const DENY_EXACT: &[&str] = &["/etc/shadow", "/etc/gshadow", "/etc/sudoers"];
-        const DENY_PREFIX: &[&str] = &["/etc/ssh/", "/etc/ssl/private/", "/etc/panel/", "/root/.ssh/",
-                                       "/proc/", "/sys/", "/dev/"];
-        DENY_EXACT.contains(&s.as_str())
-            || DENY_PREFIX.iter().any(|x| s.starts_with(x))
-            || s.ends_with("/authorized_keys")
+        is_sensitive_str(&path.as_path().to_string_lossy())
+    }
+
+    fn is_sensitive_path(&self, path: &std::path::Path) -> bool {
+        is_sensitive_str(&path.to_string_lossy())
     }
 
     fn max_file_bytes(&self) -> usize { 100 * 1024 * 1024 }
+}
+
+/// mock 的敏感路径判定，供 `is_sensitive` 与 `is_sensitive_path` **共用**——
+/// 两套判定迟早会漂移，而漂移的那一套就是漏网的那一套。
+fn is_sensitive_str(s: &str) -> bool {
+    // mock 复用与 Linux 相同的判定，保证一致性测试有意义
+    const DENY_EXACT: &[&str] = &["/etc/shadow", "/etc/gshadow", "/etc/sudoers"];
+    const DENY_PREFIX: &[&str] = &["/etc/ssh/", "/etc/ssl/private/", "/etc/panel/", "/root/.ssh/",
+                                   "/proc/", "/sys/", "/dev/"];
+    DENY_EXACT.contains(&s) || DENY_PREFIX.iter().any(|x| s.starts_with(x)) || s.ends_with("/authorized_keys")
 }
 
 #[cfg(test)]

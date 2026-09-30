@@ -237,6 +237,9 @@ impl FileProvider for LinuxFileProvider {
 
     fn is_sensitive(&self, path: &SafePath) -> bool { is_sensitive_path(path.as_path()) }
 
+    // 裸路径版本：与上一行共用同一个自由函数，两处判定不会分叉
+    fn is_sensitive_path(&self, path: &Path) -> bool { is_sensitive_path(path) }
+
     fn max_file_bytes(&self) -> usize { 100 * 1024 * 1024 }
 }
 

@@ -293,6 +293,20 @@ pub fn spawn_stream(bin: Bin, args: &[&str], cap: usize) -> Result<Receiver<Stri
 }
 
 /// 便捷包装：期望成功，否则带上 stderr 抛出
+/// 执行一条**用户定义的 shell 命令**（cron 任务等）。
+///
+/// 这是全项目**唯一**会解释 shell 的地方，刻意收在 `cmd.rs` 内：
+/// 1. `cmd.rs` 是子进程唯一出口——把 shell 执行放这里，才不破坏"出口唯一"；
+/// 2. 将来审计"哪里能执行任意命令"时，只需看这一个函数；
+/// 3. 业务层调用它时不必知道 `sh -c` 的细节，也就不会到处散落 shell 调用
+///    （此前 `crate/panel-api` 就自己拼了 `&["-c", cmd]`，那属于分层泄漏）。
+///
+/// 安全性由**调用方**保证：命令本身就是用户配置、且明确要执行的内容。
+/// 这里只做工程兜底：命令作为单个 argv 传入（不参与拼接）、超时、可选降权、输出截断。
+pub async fn run_shell(command: &str, opt: CmdOpt) -> Result<CmdOutput> {
+    run(Bin::Sh, &["-c", command], opt).await
+}
+
 pub async fn run_checked(bin: Bin, args: &[&str], opt: CmdOpt) -> Result<CmdOutput> {
     let out = run(bin, args, opt).await?;
     match out.code {

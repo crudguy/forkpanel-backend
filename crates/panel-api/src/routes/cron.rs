@@ -443,9 +443,10 @@ impl panel_task::TaskBody for CronRunTask {
         } else {
             None
         };
-        let r = panel_os::run(
-            panel_os::Bin::Sh,
-            &["-c", &job.command],
+        // 经 panel-os 的 shell 入口执行：业务层不再自己拼 `sh -c`——
+        // shell 执行细节（含"命令作为单个 argv、不参与拼接"）锁在 OS 抽象层。
+        let r = panel_os::run_shell(
+            &job.command,
             panel_os::CmdOpt {
                 timeout: job.timeout,
                 run_as,

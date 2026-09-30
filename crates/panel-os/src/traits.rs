@@ -819,6 +819,12 @@ pub trait FileProvider: Send + Sync {
     async fn copy(&self, from: &SafePath, to: &SafePath) -> Result<()>;
     /// 平台敏感路径黑名单判定（如 /etc/shadow）。**由平台实现决定**，业务层不硬编码
     fn is_sensitive(&self, path: &SafePath) -> bool;
+    /// 按**裸路径**判定敏感。
+    ///
+    /// 给"路径不是用户交互输入、因此拿不到 `SafePath`"的场景用——典型是数据库连接
+    /// 配置里填的 sqlite 文件路径。**必须与 `is_sensitive` 共用同一份黑名单**：
+    /// 两套判定必然会漂移，而漂移的那一套就是漏网的那一套。
+    fn is_sensitive_path(&self, path: &std::path::Path) -> bool;
     /// 单文件大小上限（上传与写入共用）
     fn max_file_bytes(&self) -> usize { 100 * 1024 * 1024 }
 }

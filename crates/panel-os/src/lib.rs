@@ -16,7 +16,7 @@ pub mod paths;
 pub mod tls;
 pub mod traits;
 
-pub use cmd::{run, run_checked, spawn_stream, Bin, CmdOpt, CmdOutput};
+pub use cmd::{run, run_checked, run_shell, spawn_stream, Bin, CmdOpt, CmdOutput};
 pub use fs::{ensure_dir, is_root, mode_of, read_password, set_mode, write_private};
 pub use paths::{resolve_within, PathLayout};
 pub use traits::*;

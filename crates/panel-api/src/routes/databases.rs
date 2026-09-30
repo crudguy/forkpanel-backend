@@ -102,7 +102,7 @@ pub async fn create(
     if let Some(db) = &req.default_db {
         if req.engine == "sqlite" {
             // SQLite：「库名」实为 .db **文件路径**（浏览目标就是该文件）
-            validate_sqlite_path(db)?;
+            validate_sqlite_path(&state, db)?;
         } else if !panel_core::rules::is_valid_db_name(db) {
             return Err(ApiError::bad_request("default_db", "invalid database name"));
         }
@@ -337,7 +337,7 @@ fn validate_ident(v: &str, field: &'static str) -> ApiResult<()> {
 }
 
 /// SQLite 的「库名」实为 `.db` 文件路径：必须存在且非敏感路径。
-fn validate_sqlite_path(db: &str) -> ApiResult<()> {
+fn validate_sqlite_path(state: &Shared, db: &str) -> ApiResult<()> {
     if db.is_empty() || db.chars().any(|c| c.is_control()) {
         return Err(ApiError::bad_request("database", "invalid path"));
     }
@@ -345,7 +345,8 @@ fn validate_sqlite_path(db: &str) -> ApiResult<()> {
     if !p.is_file() {
         return Err(ApiError::bad_request("database", format!("sqlite 文件不存在: {db}")));
     }
-    if panel_os::linux::is_sensitive_path(p) {
+    // 经跨平台入口判定：业务层不得直接引用 panel_os::linux::*（那会让非 Linux 目标编译不过）
+    if state.os.files().is_sensitive_path(p) {
         return Err(ApiError::bad_request("database", "path not allowed"));
     }
     Ok(())

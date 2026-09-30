@@ -127,7 +127,7 @@ fn shell_quote_single(s: &str) -> String {
 /// 用 flock 互斥锁包裹命令：锁占用时本行直接结束（命令被跳过），`|| true` 压零退出码。
 fn wrap_overlap_guard(id: &str, command: &str) -> String {
     format!(
-        "flock -n /run/lock/panel-cron-{id} -- sh -c {q} || true",
+        "flock -n /run/lock/panel-cron-{id} -- sh -c {q} || true", // ci-allow-layering[2]: 生成的是写进 crontab 的命令文本（交给 cron 执行），面板自身不解释 shell
         q = shell_quote_single(command),
     )
 }
@@ -139,7 +139,7 @@ fn unwrap_overlap_guard(body: &str) -> Option<(String, u32)> {
     let b = body.trim_start();
     if !b.starts_with(P) { return None; }
     let rest = &b[P.len()..];
-    let marker = "sh -c ";
+    let marker = "sh -c "; // ci-allow-layering[2]: 逆解析上一行生成文本用的分隔串，此处无 shell 执行
     let idx = rest.find(marker)?;
     let after = &rest[idx + marker.len()..];
     if !after.starts_with('\'') { return None; }

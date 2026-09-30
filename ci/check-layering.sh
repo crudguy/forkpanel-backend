@@ -16,6 +16,20 @@ note_ok()   { echo "  ✓ $1"; }
 # 过滤掉注释行（形如 path:N:// 注释 或 path:N: * 注释），避免把规则说明当成违规
 strip_comments() { grep -vE ':[0-9]+:[[:space:]]*(//|\*|/\*)' || true; }
 
+# 行内豁免：在违规行**行尾**写 `ci-allow-layering[规则号]: 理由`，该行即被跳过。
+#
+# 为什么需要这个机制：有些规则会撞上真实需求（例如"禁止 shell 解释"遇上 cron——
+# cron 的本职就是执行用户定义的命令），或者出现静态检测分辨不了的误报
+# （例如拼接的是编译期常量、而非用户输入）。没有豁免出口时门禁会永远红着，
+# 而"永远红"= 没人再看它 = 门禁失效。豁免把这类冲突**显式化**：
+# 理由就写在违规点旁边，将来审计时一眼能看到"这里为什么可以例外"。
+#
+# **必须带理由**：冒号后没有实际内容（`ci-allow-layering[5]:` 后面空空如也）
+# 不算豁免，该行照旧报错——空理由的豁免等于沉默，比不豁免更糟。
+allow_filter() {
+  grep -vE "ci-allow-layering\[$1\]: .+" || true
+}
+
 echo "== [1] 子进程出口唯一性 =="
 # 除 panel-os/src/cmd.rs 外，任何 crate 都不得直接 spawn 进程
 SPAWN_HITS=$(grep -rn --include="*.rs" -E "Command::new|tokio::process|std::process::Command" \
@@ -29,7 +43,7 @@ fi
 
 echo "== [2] 禁止 shell 解释 =="
 SHELL_HITS=$(python3 ci/strip_tests.py 'sh -c|bash -c|/bin/sh|"-c"' 2>/dev/null \
-  | grep -v "crates/panel-os/src/cmd.rs" | strip_comments)
+  | grep -v "crates/panel-os/src/cmd.rs" | strip_comments | allow_filter 2)
 if [ -n "$SHELL_HITS" ]; then
   note_fail "存在 shell 调用（命令注入高危）："
   echo "$SHELL_HITS" | sed 's/^/      /'
@@ -65,7 +79,7 @@ echo "== [4c] 平台模块直接引用 =="
 # 业务层直接写 panel_os::linux::xxx 会让代码绑死在 Linux 上，
 # 且非 Linux 目标编译不过。平台能力必须经 OsAdapter / fs 等跨平台入口。
 PLAT_HITS=$(grep -rn --include="*.rs" -E 'panel_os::(linux|win|macos)::' crates/ 2>/dev/null \
-  | grep -v "crates/panel-os/src/")
+  | grep -v "crates/panel-os/src/" | strip_comments | allow_filter 4c)
 if [ -n "$PLAT_HITS" ]; then
   note_fail "业务层直接引用平台模块（应通过跨平台入口）："
   echo "$PLAT_HITS" | sed 's/^/      /'
@@ -91,7 +105,7 @@ echo "== [5] SQL 拼接 =="
 # 规则：值必须走绑定参数。**例外**：表名/库名等 SQL 标识符无法参数化，
 # 只能经专门的转义函数（`quote_ident`，双引号翻倍）拼接 —— 这类安全用法豁免。
 SQL_HITS=$(grep -rn --include="*.rs" -E 'execute\(&format!|prepare\(&format!|query_row\(&format!' crates/ 2>/dev/null \
-  | grep -v 'quote_ident' || true)
+  | grep -v 'quote_ident' | strip_comments | allow_filter 5 || true)
 if [ -n "$SQL_HITS" ]; then
   note_fail "存在 SQL 字符串拼接（必须使用绑定参数）："
   echo "$SQL_HITS" | sed 's/^/      /'

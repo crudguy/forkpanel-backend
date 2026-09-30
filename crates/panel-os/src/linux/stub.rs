@@ -822,7 +822,7 @@ impl LinuxDatabases {
                 if let Some(p) = t.port { a.push("-p".into()); a.push(p.to_string()); }
                 if let Some(u) = &t.user { a.push("-U".into()); a.push(u.clone()); }
                 if let Some(d) = &t.database { a.push("-d".into()); a.push(d.clone()); }
-                a.push("-c".into());
+                a.push("-c".into()); // ci-allow-layering[2]: 这是 `psql -c <sql>` 的客户端参数，与 shell 无关
                 a.push(sql.to_string());
                 if let Some(p) = &t.password {
                     env.insert("PGPASSWORD".into(), std::ffi::OsString::from(p));
