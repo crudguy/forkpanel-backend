@@ -2,7 +2,7 @@
 
 **技术栈**：Rust（edition 2021，MSRV 1.75）+ axum + rusqlite(SQLite) + tokio
 **形态**：单文件静态二进制，内嵌前端产物，无运行时依赖，面向低配 Linux VPS 单机部署
-**配套前端**：[forkpanel-frontend](https://github.com/your-org/forkpanel-frontend)（独立仓库）
+**配套前端**：[forkpanel-frontend](https://github.com/crudguy/forkpanel-frontend)（独立仓库）
 
 ---
 
