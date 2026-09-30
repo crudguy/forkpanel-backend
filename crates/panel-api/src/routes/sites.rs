@@ -53,6 +53,10 @@ struct RawSite {
     waf_profile: Option<String>,
     waf_rate: Option<i64>,
     waf_burst: Option<i64>,
+    /// JSON 数组：反代后端列表（static 站点为 NULL）
+    upstreams_json: Option<String>,
+    /// php-fpm 目标（unix:/path.sock | host:port）；非 php 站点为 NULL
+    fpm: Option<String>,
 }
 
 impl RawSite {
@@ -94,6 +98,10 @@ pub struct SiteOut {
     /// CC 限速（次/秒）；null = 不限速
     pub waf_rate_per_sec: Option<i64>,
     pub waf_burst: Option<i64>,
+    /// 反代后端列表（kind=proxy 时存在）
+    pub upstreams: Option<Vec<String>>,
+    /// php-fpm 目标（kind=php 时存在）
+    pub fpm: Option<String>,
 }
 
 /// API 口径（`proxy`）→ 库内口径（`reverse_proxy`）。
@@ -133,6 +141,8 @@ fn to_out(r: &RawSite) -> SiteOut {
         waf_profile: r.waf_profile.clone(),
         waf_rate_per_sec: r.waf_rate,
         waf_burst: r.waf_burst,
+        upstreams: r.upstreams_json.as_deref().and_then(|s| serde_json::from_str(s).ok()),
+        fpm: r.fpm.clone(),
     }
 }
 
@@ -143,7 +153,8 @@ fn db_err(e: rusqlite::Error) -> PanelError {
 /// SELECT 公共投影（含派生的 tls 计数）
 const SITE_SELECT: &str = "s.id, s.name, s.domains, s.root, s.kind, s.enabled, s.created_at,
        (SELECT COUNT(*) FROM ssl_certs c WHERE c.site_id = s.id) AS tls_count,
-       s.waf_enabled, s.waf_profile, s.waf_rate, s.waf_burst";
+       s.waf_enabled, s.waf_profile, s.waf_rate, s.waf_burst,
+       s.upstreams_json, s.fpm";
 
 /// 站点查询 SQL。
 ///
@@ -176,6 +187,8 @@ async fn fetch_all(state: &Shared) -> Result<Vec<RawSite>> {
                         waf_profile: r.get(9)?,
                         waf_rate: r.get(10)?,
                         waf_burst: r.get(11)?,
+                    upstreams_json: r.get(12)?,
+                    fpm: r.get(13)?,
                     })
                 })
                 .map_err(db_err)?;
@@ -209,6 +222,8 @@ async fn fetch_one(state: &Shared, id: i64) -> Result<Option<RawSite>> {
                     waf_profile: r.get(9)?,
                     waf_rate: r.get(10)?,
                     waf_burst: r.get(11)?,
+                    upstreams_json: r.get(12)?,
+                    fpm: r.get(13)?,
                 })
             })
             .map_err(db_err)?;
@@ -239,6 +254,8 @@ async fn fetch_one_by_name(state: &Shared, name: &str) -> Result<Option<RawSite>
                     waf_profile: r.get(9)?,
                     waf_rate: r.get(10)?,
                     waf_burst: r.get(11)?,
+                    upstreams_json: r.get(12)?,
+                    fpm: r.get(13)?,
                 })
             })
             .map_err(db_err)?;
@@ -359,6 +376,8 @@ pub async fn create(
                     waf_profile: None,
                     waf_rate_per_sec: None,
                     waf_burst: None,
+                    upstreams: None,
+                    fpm: None,
                 });
             Ok(ok(out))
         }
@@ -458,6 +477,34 @@ pub async fn delete(
     let _cur = fetch_one(&state, id)
         .await?
         .ok_or_else(|| ApiError::not_found("site"))?;
+
+    // F7：删站必须同步移除 nginx 配置并 reload，否则站点"已删除"却仍在对外服务。
+    // 先取该站点的 conf_path，在删库行**之前**移除配置——配置删除失败则中止，
+    // 避免产生"库里没了、配置还在"的孤儿站点。此查询走只读连接池。
+    let conf_path = state
+        .pool
+        .with(move |conn| {
+            conn.query_row(
+                "SELECT conf_path FROM sites WHERE id = ?1",
+                [id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .map_err(|e| PanelError::Database(e.to_string()))
+        })
+        .await?;
+
+    if let Some(ref c) = conf_path {
+        if !c.is_empty()
+            && state
+                .capabilities
+                .get(cap_keys::WEBSERVER_MANAGE)
+                .map(|x| x.supported)
+                .unwrap_or(false)
+        {
+            let p = std::path::PathBuf::from(c);
+            state.os.webserver().remove(&p).await.map_err(ApiError::from)?;
+        }
+    }
 
     state
         .db
@@ -717,6 +764,12 @@ pub async fn apply(
             ))
         }
     };
+    // 反代 / PHP 后端配置一并落库（F6）：从已校验的 kind 提前取出，避免被 move 进 SiteSpec 后无法再借
+    let (upstreams_json, fpm_str) = match &kind {
+        panel_os::SiteKind::ReverseProxy { upstreams } => (serde_json::to_string(upstreams).ok(), None),
+        panel_os::SiteKind::Php { fpm } => (None, Some(fpm.clone())),
+        _ => (None, None),
+    };
     let kind_db = kind_to_db(&kind);
     let spec = panel_os::SiteSpec {
         server_names: domains.iter().map(|d| d.clone()).collect(),
@@ -761,17 +814,20 @@ pub async fn apply(
     state
         .db
         .exec(move |conn| {
+            // upstreams_json / fpm_str 已在 apply 开头算出（kind 之后被 move 进 SiteSpec）
             conn.execute(
                 "INSERT INTO sites(name, domains, root, kind, webserver, enabled, conf_path, created_at,
-                                   waf_enabled, waf_profile, waf_rate, waf_burst)
-                 VALUES(?1, ?2, ?3, ?4, 'nginx', 1, ?5, ?6, ?7, ?8, ?9, ?10)
+                                   waf_enabled, waf_profile, waf_rate, waf_burst, upstreams_json, fpm)
+                 VALUES(?1, ?2, ?3, ?4, 'nginx', 1, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                  ON CONFLICT(name) DO UPDATE SET
                     domains=excluded.domains, root=excluded.root, kind=excluded.kind, enabled=1,
                     conf_path=excluded.conf_path, webserver='nginx',
                     waf_enabled=excluded.waf_enabled, waf_profile=excluded.waf_profile,
-                    waf_rate=excluded.waf_rate, waf_burst=excluded.waf_burst",
+                    waf_rate=excluded.waf_rate, waf_burst=excluded.waf_burst,
+                    upstreams_json=excluded.upstreams_json, fpm=excluded.fpm",
                 rusqlite::params![name, domains_json, root_str, kind_db, conf_db, now,
-                                  waf_on, waf_profile, waf_rate, waf_burst],
+                                  waf_on, waf_profile, waf_rate, waf_burst,
+                                  upstreams_json, fpm_str],
             )
             .map(|_| panel_db::WriteAck { rows_changed: 1 })
             .map_err(|e| PanelError::Database(e.to_string()))

@@ -440,6 +440,8 @@ components:
         waf_profile:      { type: [string, "null"], enum: [basic, strict, null], description: "WAF 档位；未启用为 null" }
         waf_rate_per_sec: { type: [integer, "null"], description: "CC 限速（每 IP 每秒请求数）；null = 不限速" }
         waf_burst:        { type: [integer, "null"], description: "突发桶容量" }
+        upstreams:        { type: [array, "null"], items: { type: string }, description: "反代后端列表（kind=proxy 时存在，如 [\"http://127.0.0.1:3000\"]）；其余为 null" }
+        fpm:              { type: [string, "null"], description: "php-fpm 目标（kind=php 时存在，unix:/path.sock | host:port）；其余为 null" }
     SiteWaf:
       type: object
       required: [enabled]
