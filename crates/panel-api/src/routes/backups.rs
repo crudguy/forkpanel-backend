@@ -38,9 +38,11 @@ pub struct PlanDto {
     pub enabled: bool,
     pub last_run_at: Option<i64>,
     pub last_result: Option<String>,
+    /// 产物是否静态加密（AES-256-GCM，主密钥来自 /etc/panel/master.key）
+    pub encrypt: bool,
 }
 
-const COLS: &str = "id, kind, target, cron_expr, keep_count, dest_dir, enabled, last_run_at, last_result";
+const COLS: &str = "id, kind, target, cron_expr, keep_count, dest_dir, enabled, last_run_at, last_result, encrypt";
 
 fn db_err(e: rusqlite::Error) -> PanelError { PanelError::Database(e.to_string()) }
 
@@ -55,6 +57,7 @@ fn row_dto(r: &rusqlite::Row<'_>) -> rusqlite::Result<PlanDto> {
         enabled: r.get::<_, i64>(6)? != 0,
         last_run_at: r.get(7)?,
         last_result: r.get(8)?,
+        encrypt: r.get::<_, i64>(9)? != 0,
     })
 }
 
@@ -125,6 +128,9 @@ pub struct CreateReq {
     pub dest_dir: String,
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// 产物是否静态加密；默认 false——加密会抬高恢复门槛，取舍必须由用户显式决定
+    #[serde(default)]
+    pub encrypt: Option<bool>,
 }
 
 pub async fn create(
@@ -137,13 +143,19 @@ pub async fn create(
     let keep = req.keep_count.unwrap_or(7).clamp(1, 365);
     let enabled = req.enabled.unwrap_or(true) as i32;
     let cron = req.cron_expr.clone();
+    let encrypt = req.encrypt.unwrap_or(false) as i32;
+    // 开启加密前先确认主密钥可用：否则计划创建成功、**执行时**才失败，
+    // 用户会以为"已经在备份了"，实际每天在报错——这是最坏的失败方式。
+    if encrypt != 0 {
+        let _ = state.require_secret_key()?;
+    }
     state
         .db
         .exec(move |conn| {
             conn.execute(
-                "INSERT INTO backup_jobs(kind, target, cron_expr, keep_count, dest_dir, enabled)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![kind, target, cron, keep, dest, enabled],
+                "INSERT INTO backup_jobs(kind, target, cron_expr, keep_count, dest_dir, enabled, encrypt)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![kind, target, cron, keep, dest, enabled, encrypt],
             )
             .map(|_| panel_db::WriteAck { rows_changed: 1 })
             .map_err(|e| PanelError::Database(e.to_string()))
@@ -163,6 +175,8 @@ pub struct PatchReq {
     pub dest_dir: Option<String>,
     #[serde(default)]
     pub enabled: Option<bool>,
+    #[serde(default)]
+    pub encrypt: Option<bool>,
 }
 
 pub async fn patch(
@@ -182,13 +196,18 @@ pub async fn patch(
     let keep = req.keep_count.unwrap_or(cur.keep_count).clamp(1, 365);
     let enabled = req.enabled.unwrap_or(cur.enabled) as i32;
     let cron = req.cron_expr.clone().or(cur.cron_expr.clone());
+    let encrypt = req.encrypt.unwrap_or(cur.encrypt) as i32;
+    // 与 create 同理：主密钥不可用时**立刻**拒绝，而不是等到下次执行才失败
+    if encrypt != 0 {
+        let _ = state.require_secret_key()?;
+    }
 
     state
         .db
         .exec(move |conn| {
             conn.execute(
-                "UPDATE backup_jobs SET cron_expr = ?1, keep_count = ?2, dest_dir = ?3, enabled = ?4 WHERE id = ?5",
-                rusqlite::params![cron, keep, dest, enabled, id],
+                "UPDATE backup_jobs SET cron_expr = ?1, keep_count = ?2, dest_dir = ?3, enabled = ?4, encrypt = ?5 WHERE id = ?6",
+                rusqlite::params![cron, keep, dest, enabled, encrypt, id],
             )
             .map(|n| panel_db::WriteAck { rows_changed: n })
             .map_err(|e| PanelError::Database(e.to_string()))
@@ -259,6 +278,11 @@ struct BackupJob {
     /// 面板 SQLite 路径（panel 备份用；独立连接，绕开写者事务）
     db_path: PathBuf,
     writer: std::sync::Arc<panel_db::WriterActor>,
+    /// 是否对产物做静态加密
+    encrypt: bool,
+    /// 主密钥。`encrypt=false` 时为 `None` —— **不为不加密的计划持有密钥**，
+    /// 减少密钥在内存里的驻留面。
+    master: Option<panel_core::crypto::MasterKey>,
 }
 
 #[async_trait::async_trait]
@@ -319,6 +343,31 @@ impl BackupJob {
             }
         };
 
+        // 静态加密：加密成功后才删除明文产物——**不留双份**，
+        // 否则「我加密了」只是错觉，明文仍躺在盘上。
+        let out_path = if self.encrypt {
+            let key = self.master.as_ref().ok_or_else(|| {
+                PanelError::Internal("encrypt=true 但主密钥缺失（该任务本不该被提交）".into())
+            })?;
+            // plan1-123.db → plan1-123.db.enc；plan1-123.tar.gz → plan1-123.tar.gz.enc
+            let ext = out_path
+                .extension()
+                .map(|e| format!("{}.enc", e.to_string_lossy()))
+                .unwrap_or_else(|| "enc".to_string());
+            let enc = out_path.with_extension(ext);
+            progress.set(80, "加密产物").await;
+            panel_os::backup::encrypt_file(&out_path, &enc, key).await?;
+            std::fs::remove_file(&out_path).map_err(|e| {
+                PanelError::Io(format!(
+                    "加密已完成，但删除明文失败（明文仍在 {}）：{e}",
+                    out_path.display()
+                ))
+            })?;
+            enc
+        } else {
+            out_path
+        };
+
         progress.set(95, "记录结果").await;
         let id = self.id;
         self.writer
@@ -368,6 +417,9 @@ pub async fn run(
         _ => None,
     };
 
+    // 加密计划的密钥在**提交任务前**取：取不到就当场 501，
+    // 不让任务进队列后在后台反复失败（用户会以为备份在跑）
+    let master = if plan.encrypt { Some(state.require_secret_key()?) } else { None };
     let job = BackupJob {
         id,
         kind: plan.kind.clone(),
@@ -376,6 +428,8 @@ pub async fn run(
         keep_count: plan.keep_count,
         db_path: state.os.paths().sqlite_path(),
         writer: state.db.clone(),
+        encrypt: plan.encrypt,
+        master,
     };
     let (tid, _) = state
         .tasks
@@ -489,12 +543,20 @@ pub async fn restore(
             .ok_or_else(|| ApiError::bad_request("target", "site not found"))?,
     );
 
+    // 加密产物恢复前需要主密钥。**在这里就取**——取不到则当场 501，
+    // 不让一个注定失败的任务进队列（用户会以为恢复正在跑）。
+    let master = if panel_os::backup::is_encrypted_file(archive.as_path()) {
+        Some(state.require_secret_key()?)
+    } else {
+        None
+    };
     let job = RestoreJob {
         id,
         root,
         archive: archive.as_path().to_path_buf(),
         safety_dir: dest.as_path().to_path_buf(),
         writer: state.db.clone(),
+        master,
     };
     // 幂等键含产物名：同一产物重复提交返回同一任务，天然防误触两次
     let (tid, _) = state
@@ -521,12 +583,28 @@ struct RestoreJob {
     id: i64,
     /// 站点根目录（恢复目标）
     root: PathBuf,
-    /// 归档产物绝对路径
+    /// 归档产物绝对路径（可能是一个加密容器）
     archive: PathBuf,
     /// 安全快照落点（= 产物目录）
     safety_dir: PathBuf,
     /// 写者：失败时落站内通知
     writer: std::sync::Arc<panel_db::WriterActor>,
+    /// 产物为加密容器时的主密钥；明文产物为 `None`
+    master: Option<panel_core::crypto::MasterKey>,
+}
+
+/// 临时解密文件的清理守卫。
+///
+/// 用 `Drop` 而不是在函数尾部手动删：`execute` 里有多个 `?` 提前返回，
+/// 靠人工逐个补清理迟早会漏一条路径，把**解密后的明文**留在 /tmp。
+struct TempGuard(Option<PathBuf>);
+
+impl Drop for TempGuard {
+    fn drop(&mut self) {
+        if let Some(p) = &self.0 {
+            let _ = std::fs::remove_file(p);
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -558,9 +636,24 @@ impl panel_task::TaskBody for RestoreJob {
 
 impl RestoreJob {
     async fn execute(&self, progress: panel_task::Progress) -> Result<panel_task::TaskOutcome> {
+        // ⓪ 加密产物：先解密到临时文件。**绝不原地解密**——
+        //    中途失败会把唯一的那份备份毁掉；解密失败也不该动原产物分毫。
+        let decrypted: Option<PathBuf> = if let Some(key) = &self.master {
+            progress.set(5, "解密产物").await;
+            let tmp = std::env::temp_dir()
+                .join(format!("panel-restore-{}-{}.tar.gz", self.id, crate::now_unix()));
+            panel_os::backup::decrypt_file(&self.archive, &tmp, key).await?;
+            Some(tmp)
+        } else {
+            None
+        };
+        // 守卫负责在任意返回路径上删除临时明文
+        let _guard = TempGuard(decrypted.clone());
+        let archive: &std::path::Path = decrypted.as_deref().unwrap_or(self.archive.as_path());
+
         // ① 解压前校验归档条目：拒绝 `../` 逃逸与绝对路径
         progress.set(10, "校验归档").await;
-        let entries = panel_os::backup::list_tar_entries(&self.archive).await?;
+        let entries = panel_os::backup::list_tar_entries(archive).await?;
         if let Some(bad) = entries.iter().find(|e| !panel_os::backup::is_safe_entry(e)) {
             return Err(PanelError::Validation {
                 field: "archive".into(),
@@ -583,7 +676,7 @@ impl RestoreJob {
             .parent()
             .ok_or_else(|| PanelError::Internal("站点目录无父目录".into()))?
             .to_path_buf();
-        panel_os::backup::untar_gz(&self.archive, &parent).await?;
+        panel_os::backup::untar_gz(archive, &parent).await?;
 
         progress.set(100, "完成").await;
         // output_path 指向**恢复前的快照**：出问题可据此回滚

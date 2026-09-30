@@ -571,6 +571,7 @@ components:
         enabled:     { type: boolean, default: true }
         last_run_at: { type: [integer, "null"] }
         last_result: { type: [string, "null"] }
+        encrypt:     { type: boolean, default: false, description: "产物静态加密（AES-256-GCM 分块容器，见 panel-os/backup.rs）；主密钥来自 /etc/panel/master.key 且不落库。加密会抬高恢复门槛——主密钥丢失等于备份全废，故默认关闭，由用户显式选择" }
     BackupArtifact:
       type: object
       properties:
