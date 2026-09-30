@@ -10,7 +10,7 @@
 use crate::{
     auth::perm,
     error::{ok, ApiError, ApiResult},
-    routes::{audit, Auth, Shared},
+    routes::{Auth, Shared},
 };
 use axum::{
     extract::{Path as AxPath, Query, State},
@@ -119,16 +119,6 @@ async fn find_source(state: &Shared, id: &str) -> Result<panel_os::LogSource> {
     let srcs = state.os.logs().sources().await?;
     srcs.into_iter().find(|s| s.id == id)
         .ok_or_else(|| panel_core::PanelError::NotFound(format!("log source {id}")))
-}
-
-/// 清空面板自身日志（系统日志不允许清）
-pub async fn clear_panel(
-    State(state): State<Shared>, Auth(s): Auth,
-) -> ApiResult<Json<serde_json::Value>> {
-    crate::auth::require(&s, perm::LOG_VIEW)?;
-    // 只允许清面板自己的日志：清系统日志会破坏审计链
-    audit(&state, &s, "log.clear", "panel", "ok").await;
-    Ok(ok(serde_json::json!({ "cleared": "panel", "note": "系统日志不可通过面板清除" })))
 }
 
 // ─────────────── 文档式日志端点（M3 占位） ───────────────
