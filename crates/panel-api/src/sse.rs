@@ -14,7 +14,6 @@ use axum::{
         IntoResponse,
     },
 };
-use futures_util::stream::StreamExt;
 use serde::Deserialize;
 use panel_core::Tier;
 use std::{
@@ -32,6 +31,21 @@ pub static SSE_CONNS: AtomicUsize = AtomicUsize::new(0);
 
 pub fn max_clients(t: Tier) -> usize {
     match t { Tier::Nano => 3, Tier::Small => 10, Tier::Standard => 50 }
+}
+
+/// SSE 连接守卫：离开作用域即把进程内连接计数 -1。
+///
+/// 必须放在**流式生成器/任务的局部作用域**里，而非生成器末尾：
+/// 客户端断开时 axum 会直接 drop 整个 SSE body 流，生成器末尾的代码
+/// 不会被执行，进而 `SSE_CONNS` 只增不减——累计到档位上限后所有新连接
+/// 被拒（503 + "sse client limit reached"），挂在上面的实时面板（概览/日志/
+/// 任务）随之停止刷新。Drop 守卫能在「正常结束」与「客户端断开」两种路径
+/// 下都恰好回收一次，根治计数泄漏。
+struct SseConnGuard;
+impl Drop for SseConnGuard {
+    fn drop(&mut self) {
+        SSE_CONNS.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// 慢消费者丢弃阈值：channel 容量。超出即断开（背压策略）。
@@ -60,6 +74,8 @@ pub async fn metrics_stream(
                 format!("sse client limit reached ({limit})")).into_response();
     }
 
+    // 守卫在计数 +1 之后立刻持有：随流转移（或流未 poll 即被 drop 时随生成器回收），恰好 -1 一次
+    let conn = SseConnGuard;
     let (tx, mut rx) = mpsc::channel::<Event>(BACKLOG);
     let interval = Duration::from_millis(state.tier.sampling_interval_ms());
     let metrics = state.metrics.clone();
@@ -101,14 +117,10 @@ pub async fn metrics_stream(
     });
 
     let stream = async_stream::stream! {
+        // 守卫随生成器转移：流未 poll 即被 drop 时由生成器丢弃 upvar 回收，
+        // 正常结束/客户端断开时由局部 _guard 回收——两路都恰好 -1
+        let _guard = conn;
         while let Some(ev) = rx.recv().await { yield Ok::<_, Infallible>(ev); }
-    };
-    let stream = async_stream::stream! {
-        tokio::pin!(stream);
-        while let Some(ev) = StreamExt::next(&mut stream).await {
-            yield ev;
-        }
-        SSE_CONNS.fetch_sub(1, Ordering::SeqCst);
     };
 
     Sse::new(stream)
@@ -138,9 +150,12 @@ pub async fn task_stream(
                 format!("sse client limit reached ({limit})")).into_response();
     }
 
+    // 守卫在计数 +1 之后立刻持有（同 metrics_stream）
+    let conn = SseConnGuard;
     // 订阅全局任务总线：所有任务事件都从这里广播
     let mut bus_rx = state.tasks.bus().subscribe();
     let stream = async_stream::stream! {
+        let _guard = conn;
         while let Ok(ev) = bus_rx.recv().await {
             let (name, data) = match ev {
                 panel_task::TaskEvent::Progress { id, percent, message } => (
@@ -160,7 +175,6 @@ pub async fn task_stream(
             };
             yield Ok::<_, Infallible>(Event::default().event(name).data(data.to_string()));
         }
-        SSE_CONNS.fetch_sub(1, Ordering::SeqCst);
     };
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("ping"))
@@ -202,6 +216,8 @@ pub async fn follow_source(
                 format!("sse client limit reached ({cap})")).into_response();
     }
 
+    // 守卫在计数 +1 之后立刻持有；下方 follow() 失败提前返回时由守卫回收（替代旧的显式 fetch_sub）
+    let conn = SseConnGuard;
     let history = state.os.logs().read(&src, panel_os::LogQuery {
         lines: n, grep: filter.clone(), level: None, follow: false, since_unix: None,
     }).await.unwrap_or_default();
@@ -211,18 +227,18 @@ pub async fn follow_source(
     }).await {
         Ok(rx) => rx,
         Err(e) => {
-            SSE_CONNS.fetch_sub(1, Ordering::SeqCst);
+            // 计数回收交给 conn 守卫的 Drop（提前 return 也会触发），不得再显式 -1
             return ApiError::from(e).into_response();
         }
     };
 
     let stream = async_stream::stream! {
+        let _guard = conn;
         for l in history { yield Ok::<_, Infallible>(Event::default().event("log").data(line_json(&l))); }
         let mut rx = rx;
         while let Some(l) = rx.recv().await {
             yield Ok(Event::default().event("log").data(line_json(&l)));
         }
-        SSE_CONNS.fetch_sub(1, Ordering::SeqCst);
     };
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("ping"))
