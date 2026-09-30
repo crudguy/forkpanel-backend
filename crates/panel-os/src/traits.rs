@@ -237,7 +237,9 @@ pub enum Protocol { Tcp, Udp, Icmp, Any }
 pub enum PortSpec {
     Single(u16),
     Range(u16, u16),
-    List(Vec<u16>),
+    /// 多个端口规格的组合（如 "80,443,8000-8100"）。ufw 接受逗号分隔的端口/区间列表，
+    /// 因此渲染为 `80,443,8000:8100` 即可在单条规则内表达混合规格。
+    List(Vec<PortSpec>),
     All,
 }
 
@@ -521,6 +523,15 @@ pub trait WebServerProvider: Send + Sync {
     async fn validate(&self, rendered: &str) -> Result<()>;
     async fn deploy(&self, target: &std::path::Path, content: &str) -> Result<()>;
     async fn reload(&self) -> Result<()>;
+    /// 删除单个站点配置（按 apply 写入的 conf_path）。实现负责删除文件并 reload，
+    /// 使站点"真正下线"。默认实现直接删文件（nginx 等需 reload 的后端应重载配置）。
+    async fn remove(&self, conf_path: &std::path::Path) -> Result<()> {
+        if conf_path.exists() {
+            std::fs::remove_file(conf_path)
+                .map_err(|e| panel_core::PanelError::Io(format!("remove {}: {e}", conf_path.display())))?;
+        }
+        Ok(())
+    }
 }
 
 // ═══════════════════════════ 数据库引擎 ═══════════════════════════

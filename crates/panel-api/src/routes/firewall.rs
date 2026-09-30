@@ -91,8 +91,7 @@ fn render_ports(p: &panel_os::PortSpec) -> String {
     match p {
         panel_os::PortSpec::Single(x) => x.to_string(),
         panel_os::PortSpec::Range(a, b) => format!("{a}-{b}"),
-        panel_os::PortSpec::List(v) => v.iter().map(|x| x.to_string())
-            .collect::<Vec<_>>().join(","),
+        panel_os::PortSpec::List(v) => v.iter().map(render_ports).collect::<Vec<_>>().join(","),
         panel_os::PortSpec::All => "all".into(),
     }
 }
@@ -101,7 +100,8 @@ fn render_ports(p: &panel_os::PortSpec) -> String {
 pub fn parse_ports(s: &str) -> Option<panel_os::PortSpec> {
     let s = s.trim();
     if s == "all" || s == "*" { return Some(panel_os::PortSpec::All); }
-    let mut singles = Vec::new();
+    // 收集所有规格（单端口 + 区间），不再遇到区间就提前 return，避免同组单端口被静默丢弃。
+    let mut parts: Vec<panel_os::PortSpec> = Vec::new();
     for part in s.split(',') {
         let part = part.trim();
         if part.is_empty() { continue; }
@@ -109,15 +109,15 @@ pub fn parse_ports(s: &str) -> Option<panel_os::PortSpec> {
             let a: u16 = a.trim().parse().ok()?;
             let b: u16 = b.trim().parse().ok()?;
             if a > b { return None; }
-            // 单端口区间归一化为 Single
-            if a == b { singles.push(a); } else { return Some(panel_os::PortSpec::Range(a, b)); }
+            // 单端口区间归一化为 Single；否则保留 Range
+            if a == b { parts.push(panel_os::PortSpec::Single(a)); } else { parts.push(panel_os::PortSpec::Range(a, b)); }
         } else {
-            singles.push(part.parse::<u16>().ok()?);
+            parts.push(panel_os::PortSpec::Single(part.parse::<u16>().ok()?));
         }
     }
-    if singles.is_empty() { None }
-    else if singles.len() == 1 { Some(panel_os::PortSpec::Single(singles[0])) }
-    else { Some(panel_os::PortSpec::List(singles)) }
+    if parts.is_empty() { None }
+    else if parts.len() == 1 { Some(parts.pop().unwrap()) }
+    else { Some(panel_os::PortSpec::List(parts)) }
 }
 
 // ─────────────── 应用规则 ───────────────
@@ -235,7 +235,7 @@ fn locks_out_ssh(ports: &panel_os::PortSpec) -> bool {
         panel_os::PortSpec::All => true,   // 封全部端口必然封掉 22
         panel_os::PortSpec::Single(p) => PROTECTED_PORTS.contains(p),
         panel_os::PortSpec::Range(a, b) => PROTECTED_PORTS.iter().any(|p| p >= a && p <= b),
-        panel_os::PortSpec::List(v) => v.iter().any(|p| PROTECTED_PORTS.contains(p)),
+        panel_os::PortSpec::List(v) => v.iter().any(|p| locks_out_ssh(p)),
     }
 }
 
@@ -395,11 +395,11 @@ mod tests {
         assert!(locks_out_ssh(&panel_os::PortSpec::All));
         assert!(locks_out_ssh(&panel_os::PortSpec::Single(22)));
         assert!(locks_out_ssh(&panel_os::PortSpec::Range(20, 30)));
-        assert!(locks_out_ssh(&panel_os::PortSpec::List(vec![80, 22])));
+        assert!(locks_out_ssh(&panel_os::PortSpec::List(vec![panel_os::PortSpec::Single(80), panel_os::PortSpec::Single(22)])));
         // 正常规则不该被拦截
         assert!(!locks_out_ssh(&panel_os::PortSpec::Single(80)));
         assert!(!locks_out_ssh(&panel_os::PortSpec::Range(8000, 8100)));
-        assert!(!locks_out_ssh(&panel_os::PortSpec::List(vec![80, 443])));
+        assert!(!locks_out_ssh(&panel_os::PortSpec::List(vec![panel_os::PortSpec::Single(80), panel_os::PortSpec::Single(443)])));
     }
 
     #[test]

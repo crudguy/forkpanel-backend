@@ -155,6 +155,18 @@ fn proto_from(s: &str) -> Protocol {
     }
 }
 
+/// 把端口规格渲染成 ufw 可接受的参数片段（不含协议）。
+/// ufw 接受逗号分隔的「端口 / 区间」混合，如 `80,443,8000:8100`，
+/// 因此 List 直接递归拼接即可在单条规则内表达混合规格（此前被 silently 丢弃）。
+fn port_to_arg(spec: &PortSpec) -> String {
+    match spec {
+        PortSpec::Single(x) => format!("{x}"),
+        PortSpec::Range(a, b) => format!("{a}:{b}"),
+        PortSpec::List(v) => v.iter().map(port_to_arg).collect::<Vec<_>>().join(","),
+        PortSpec::All => "all".into(),
+    }
+}
+
 fn action_from(s: &str) -> Action {
     match s {
         "DENY" => Action::Deny,
@@ -228,11 +240,10 @@ impl FirewallProvider for LinuxFirewall {
                 rule.comment.clone().unwrap_or_default().trim());
             let mut args: Vec<String> = Vec::new();
             args.push(match rule.action { Action::Deny => "deny", Action::Reject => "reject", _ => "allow" }.into());
+            let port = port_to_arg(&rule.ports);
             match &rule.ports {
                 PortSpec::All => args.push("in".into()),
-                PortSpec::Single(p) => args.push(format!("{p}/{}", proto_str(rule.protocol))),
-                PortSpec::Range(a, b) => args.push(format!("{a}:{b}/{}", proto_str(rule.protocol))),
-                PortSpec::List(_) => { warnings.push(format!("规则 {} 的端口列表在 ufw 后端被忽略", rule.id)); continue; }
+                _ => args.push(format!("{port}/{}", proto_str(rule.protocol))),
             }
             if let Some(src) = &rule.source_cidr {
                 args.push("from".into());
@@ -301,11 +312,10 @@ impl FirewallProvider for LinuxFirewall {
             let comment = format!("panel-managed {} {}", id,
                 rule.comment.clone().unwrap_or_default().trim());
             let mut args: Vec<String> = vec![match rule.action { Action::Deny => "deny", Action::Reject => "reject", _ => "allow" }.into()];
+            let port = port_to_arg(&rule.ports);
             match &rule.ports {
                 PortSpec::All => args.push("in".into()),
-                PortSpec::Single(p) => args.push(format!("{p}/{}", proto_str(rule.protocol))),
-                PortSpec::Range(a, b) => args.push(format!("{a}:{b}/{}", proto_str(rule.protocol))),
-                PortSpec::List(_) => continue,
+                _ => args.push(format!("{port}/{}", proto_str(rule.protocol))),
             }
             if let Some(src) = &rule.source_cidr { args.push("from".into()); args.push(src.clone()); }
             args.push("comment".into());

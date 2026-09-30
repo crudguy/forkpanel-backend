@@ -1043,6 +1043,16 @@ impl WebServerProvider for LinuxWebServer {
         if o.code == Some(0) { Ok(()) }
         else { Err(PanelError::Command { bin: "nginx".into(), detail: truncate_err(&o.stderr) }) }
     }
+
+    async fn remove(&self, conf_path: &std::path::Path) -> Result<()> {
+        if self.name != Some("nginx") { return unsupported!("webserver.remove: 仅 nginx"); }
+        if conf_path.exists() {
+            std::fs::remove_file(conf_path)
+                .map_err(|e| PanelError::Io(format!("remove {}: {e}", conf_path.display())))?;
+        }
+        // 删完必须 reload：否则 nginx 仍按内存旧配置继续服务该站点（"已删除"却仍在线）
+        self.reload().await
+    }
 }
 
 // ───────────────── 数据库（SQLite 只读浏览） ─────────────────
