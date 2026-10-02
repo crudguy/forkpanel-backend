@@ -278,6 +278,9 @@ pub async fn restore(
         )
         .await
         .map_err(ApiError::from)?;
+    // 还原是**覆盖当前库**的破坏性操作，必须留痕（与 db.backup 一致：入队即记 queued）。
+    // 此前唯独本端点漏了审计：其余 db.create / db.backup / db.query 均已记录。
+    audit(&state, &s, "db.restore", &format!("conn={conn}:{}", req.file), "queued").await;
     Ok(ok(serde_json::json!({ "task_id": tid })))
 }
 
