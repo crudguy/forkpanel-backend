@@ -937,8 +937,16 @@ components:
         actor_ip: { type: [string, "null"] }
         action: { type: string }
         target: { type: [string, "null"] }
-        result: { type: string, enum: [ok, denied, error] }
+        # queued：任务类操作（如 package.install）入队即记录，终态另由任务表承载
+        result: { type: string, enum: [ok, denied, error, queued] }
         detail_json: { type: [string, "null"] }
+    AuditPage:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/AuditEntry' } }
+        page: { type: integer }
+        page_size: { type: integer }
+        total: { type: integer }
 
     TaskAccepted:
       type: object
@@ -2415,13 +2423,17 @@ paths:
   /api/v1/audit:
     get:
       tags: [audit]
-      summary: 审计日志查询
+      summary: 审计日志查询（分页 + 筛选）
       parameters:
         - { $ref: '#/components/parameters/Page' }
         - { $ref: '#/components/parameters/PageSize' }
-        - { name: action, in: query, schema: { type: string } }
-        - { name: actor, in: query, schema: { type: string } }
-      responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/AuditEntry' } } } } } } } }
+        - { name: action, in: query, schema: { type: string }, description: 动作精确匹配，如 auth.login }
+        - { name: actor,  in: query, schema: { type: string }, description: 操作人精确匹配 }
+        - { name: result, in: query, schema: { type: string }, description: "结果精确匹配（ok|denied|error|queued）" }
+        - { name: q,      in: query, schema: { type: string }, description: 关键词，模糊匹配 target / detail_json }
+        - { name: since,  in: query, schema: { type: integer }, description: 起始时间戳（含，Unix 秒） }
+        - { name: until,  in: query, schema: { type: integer }, description: 截止时间戳（含，Unix 秒）；不得早于 since，否则 400 }
+      responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/AuditPage' } } } } } } }
 
   # ───────── SSE 实时频道 ─────────
   /api/v1/events/metrics:
