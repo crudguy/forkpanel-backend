@@ -235,7 +235,10 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/containers/{id}/start", post(containers::start))
         .route("/api/v1/containers/{id}/stop", post(containers::stop))
         .route("/api/v1/containers/{id}/restart", post(containers::restart))
-        .route("/api/v1/containers/{id}", delete(containers::remove));
+        .route("/api/v1/containers/{id}", delete(containers::remove))
+        // 一键安装 Docker（仅 binary_missing 时可用，高危二次确认）。
+        // 复用 services 的 PackageTask 任务队列，按包管理器选对包名。
+        .route("/api/v1/containers/install", post(containers::install));
 
     // ── 任务中心 ──
     let task_r = Router::new()

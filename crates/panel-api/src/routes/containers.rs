@@ -23,6 +23,7 @@ use crate::{
     error::{ok, ApiError, ApiResult},
     routes::{audit, Auth, Shared},
 };
+use crate::routes::services::{PackageTask, PkgOp};
 use axum::{
     extract::{Path as AxPath, State},
     http::StatusCode,
@@ -31,6 +32,8 @@ use axum::{
 use panel_core::cap_keys;
 use panel_os::{ContainerAction, ContainerCreateReq, ContainerProvider};
 use serde::Deserialize;
+use std::time::Duration;
+use panel_task::{TaskRequest, TaskKind};
 
 /// 能力前置检查：不可用即诚实 501，并把原因透出（前端无需再请求 capabilities 才能解释原因）。
 fn ensure_supported(state: &Shared) -> Result<(), ApiError> {
@@ -185,3 +188,65 @@ pub async fn remove(
 /// （而不是直接摸平台模块——那会被 CI 门禁 [4c] 拦下）。
 #[allow(dead_code)]
 fn _assert_trait_object(_p: &dyn ContainerProvider) {}
+
+// ─────────────── 一键安装 Docker ───────────────
+
+/// 安装请求。**二次确认词** `confirm_token` 必须为「安装 Docker」——
+/// 装 Docker 是高危系统变更（装完后通常还需把面板用户加入 docker 组，
+/// 那一步等同授予 root 级权限），必须让用户手输确认词，不接受随手点的 OK。
+#[derive(Debug, Deserialize)]
+pub struct InstallReq {
+    pub confirm_token: Option<String>,
+}
+
+/// 二次确认词：手输才有效，防止误触一键安装宿主级服务。
+const INSTALL_CONFIRM: &str = "安装 Docker";
+
+/// 一键安装 Docker（仅当二进制缺失时可用）。
+///
+/// 与宝塔"点进去自己装"一致：菜单常亮，进入后若未装 Docker，提供安装入口。
+/// 要求 `container.manage` 权限 + 手输确认词 + 走任务队列（可审计、可取消、可查进度）。
+///
+/// 本端点**只装引擎**，不自动把面板用户加 docker 组——那等于授予 root 级权限，
+/// 保留为用户显式决策（前端安装完成后给出 `usermod -aG docker` 命令提示）。
+pub async fn install(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    Json(req): Json<InstallReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::CONTAINER_MANAGE)?;
+    // 仅 docker 二进制缺失时允许安装；已装但 daemon 不可达是权限/服务问题，无需重装
+    match state.os.containers().unavailable_reason() {
+        None => return Err(ApiError::bad_request("docker", "Docker 已安装且守护进程可达，无需安装")),
+        Some("daemon_unreachable") => return Err(ApiError::bad_request(
+            "docker",
+            "Docker 已安装但守护进程不可达：请检查 docker 服务是否运行、面板用户是否在 docker 组，无需重装",
+        )),
+        Some("binary_missing") => {}
+        Some(other) => return Err(ApiError::bad_request("docker", format!("未知的不可用原因：{other}"))),
+    }
+    if req.confirm_token.as_deref() != Some(INSTALL_CONFIRM) {
+        return Err(ApiError::bad_request("confirm_token", "需手输确认词「安装 Docker」"));
+    }
+    // 按包管理器选对引擎包名：Debian/Ubuntu 上 docker 引擎包为 docker.io（而非 docker）
+    let pkg = match state.os.packages().manager() {
+        Some("apt") => "docker.io",
+        Some("dnf") | Some("yum") => "docker-ce",
+        Some("apk") => "docker",
+        Some("zypper") => "docker",
+        _ => "docker",
+    };
+    let body = PackageTask { pkg: pkg.to_string(), os: state.os.clone(), op: PkgOp::Install };
+    let (task_id, created) = state.tasks.submit(
+        TaskRequest {
+            // 幂等键：重复提交只会执行一次（防双击 / 防重试风暴）
+            idempotency_key: "pkg.install:docker".into(),
+            kind: TaskKind::Package,
+            label: format!("安装 {pkg}"),
+            timeout: Duration::from_secs(1800),
+        },
+        body,
+    ).await.map_err(ApiError::from)?;
+    audit(&state, &s, "container.install_docker", pkg, "queued").await;
+    Ok(ok(serde_json::json!({ "task_id": task_id, "created": created, "package": pkg })))
+}

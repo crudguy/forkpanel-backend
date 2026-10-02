@@ -234,9 +234,9 @@ pub async fn install(
 
 /// 安装/卸载共用同一任务体：结构一致（白名单→队列→底层），仅动词不同。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PkgOp { Install, Remove }
+pub enum PkgOp { Install, Remove }
 
-struct PackageTask { pkg: String, os: std::sync::Arc<dyn panel_os::OsAdapter>, op: PkgOp }
+pub struct PackageTask { pub pkg: String, pub os: std::sync::Arc<dyn panel_os::OsAdapter>, pub op: PkgOp }
 
 #[async_trait::async_trait]
 impl panel_task::TaskBody for PackageTask {
