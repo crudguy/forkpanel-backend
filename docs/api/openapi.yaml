@@ -1918,6 +1918,42 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/ContainerImage' } } } }
         '501': { description: 容器能力不可用 }
+  /api/v1/containers/install:
+    post:
+      tags: [containers]
+      summary: 一键安装 Docker（仅当 docker 二进制缺失时可用）
+      description: |
+        高危系统变更：必须手输确认词「安装 Docker」，且走任务队列（可审计、可查进度）。
+        按包管理器选引擎包名（apt=docker.io，dnf/yum=docker-ce，apk/zypper=docker）。
+        本端点**只装引擎**，不自动把面板用户加入 docker 组——那等同授予 root 级权限，
+        保留为用户显式决策（装完再走 join-docker-group）。
+      security: [cookieAuth, csrfHeader]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [confirm_token]
+              properties:
+                confirm_token: { type: string, description: 必须为「安装 Docker」 }
+      responses:
+        '200': { description: 已入队，返回 task_id / created / package }
+        '400': { description: 已安装或守护进程不可达（无需重装），或确认词不正确 }
+  /api/v1/containers/join-docker-group:
+    post:
+      tags: [containers]
+      summary: 把面板进程用户加入 docker 组（修复 daemon_unreachable）
+      description: |
+        目标用户取**面板进程的 effective uid**（不是登录用户）——docker socket 权限取决于
+        面板进程身份，加错人对管理容器毫无帮助。
+        高危：docker 组等同 root 级权限（可借 docker 提权到宿主 root）。
+        需 container.manage 权限 + 前端二次确认词；完成后需重启面板使新组生效。
+      security: [cookieAuth, csrfHeader]
+      responses:
+        '200': { description: ok，返回 user 与命令输出 }
+        '400': { description: 守护进程已可达，无需加组 }
+        '30000': { description: usermod 执行失败（如面板非 root 运行） }
   /api/v1/containers/{id}/start:
     post:
       tags: [containers]
