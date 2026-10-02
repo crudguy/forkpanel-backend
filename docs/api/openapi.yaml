@@ -1174,8 +1174,8 @@ paths:
       tags: [services]
       summary: 服务列表
       parameters:
-        - { name: filter, in: query, schema: { type: string } }
-        - { name: state,  in: query, schema: { type: string } }
+        - { name: filter, in: query, schema: { type: string }, description: 名称/描述模糊匹配 }
+        - { name: managed_only, in: query, schema: { type: boolean }, description: 仅返回面板托管的服务 }
       responses:
         '200':
           description: ok
@@ -1355,7 +1355,8 @@ paths:
       parameters:
         - { name: id, in: path, required: true, schema: { type: integer } }
         - { name: kind, in: query, schema: { type: string, enum: [access, error] } }
-        - { name: follow, in: query, schema: { type: boolean, default: true } }
+        - { name: filter, in: query, schema: { type: string }, description: 关键词过滤 }
+        - { name: limit, in: query, schema: { type: integer }, description: 回溯行数上限 }
       responses: { '200': { description: text/event-stream } }
   /api/v1/sites/{id}/ssl/apply:
     post:
@@ -1531,7 +1532,11 @@ paths:
     get:
       tags: [files]
       summary: 文本读取（≤2MB，二进制拒绝）
-      parameters: [{ name: path, in: query, required: true, schema: { type: string } }]
+      parameters:
+        - { name: path, in: query, required: true, schema: { type: string } }
+        - { name: offset, in: query, schema: { type: integer }, description: 分块起点（大文件预览） }
+        - { name: len, in: query, schema: { type: integer }, description: 本次读取长度 }
+        - { name: text, in: query, schema: { type: boolean }, description: "强制按文本返回；二进制由服务端检测并拒绝" }
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: string } } } } } } }
   /api/v1/files/write:
     put:
@@ -2425,6 +2430,7 @@ paths:
       parameters:
         - { $ref: '#/components/parameters/Page' }
         - { $ref: '#/components/parameters/PageSize' }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1 }, description: "兼容旧调用方：未传 page_size 时作为每页条数，同样受 1..=100 约束" }
         - { name: action, in: query, schema: { type: string }, description: 动作精确匹配，如 auth.login }
         - { name: actor,  in: query, schema: { type: string }, description: 操作人精确匹配 }
         - { name: result, in: query, schema: { type: string }, description: "结果精确匹配（ok|denied|error|queued）" }
