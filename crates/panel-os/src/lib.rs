@@ -167,6 +167,10 @@ impl OsAdapter for linux::LinuxOsAdapter {
             None => Capability::yes(self.containers.engine().as_str()),
             Some(reason) => Capability::no(reason),
         });
+        // 容器"入口"能力：恒 supported（即使 engine=None 也 yes("none")）。
+        // 刻意与 CONTAINER_MANAGE 分离——菜单点亮与否不应被"daemon 是否可达"卡住，
+        // 否则用户会以为功能缺失/没做完。进入页面后再按 daemon 状态分流展示。
+        m.insert(k::CONTAINER_VIEW.into(), Capability::yes(self.containers.engine().as_str()));
         // 终端：本机有可用交互 shell 即可。**能力位只管"能不能开"**，
         // 真正的准入还叠加 SYSTEM_MANAGE 权限 + 只读模式拒绝（见 routes/terminal.rs）。
         m.insert(k::TERMINAL_MANAGE.into(), match self.terminal.shell() {

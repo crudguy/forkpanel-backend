@@ -159,6 +159,10 @@ pub mod cap_keys {
     /// 容器管理：依赖宿主 docker/podman **守护进程**可达（二进制存在 ≠ 可用，
     /// 常见的是 socket 权限不足或 daemon 未运行）。
     pub const CONTAINER_MANAGE: &str = "container.manage";
+    /// 容器查看/入口：恒 supported（只要平台支持容器概念）。与 `CONTAINER_MANAGE` 解耦——
+    /// 菜单是否点亮只看"功能是否可见"，不卡"daemon 是否可达"。daemon 不可达时进页面
+    /// 由 ContainersView 显示诊断/引导，而非把整个菜单置灰（宝塔式常亮体验）。
+    pub const CONTAINER_VIEW: &str = "container.view";
     /// 内置 Web 终端：本机存在可用交互 shell（bash/sh）即可。**高危面**——
     /// 能力位只管"能不能开"，真正的准入还叠加 SYSTEM_MANAGE 权限 + 只读拒绝。
     pub const TERMINAL_MANAGE: &str = "terminal.manage";
