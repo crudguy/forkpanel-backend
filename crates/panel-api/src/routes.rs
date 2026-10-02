@@ -238,7 +238,9 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/containers/{id}", delete(containers::remove))
         // 一键安装 Docker（仅 binary_missing 时可用，高危二次确认）。
         // 复用 services 的 PackageTask 任务队列，按包管理器选对包名。
-        .route("/api/v1/containers/install", post(containers::install));
+        .route("/api/v1/containers/install", post(containers::install))
+        // 修复 daemon_unreachable：把面板运行用户加入 docker 组（高危，需二次确认）。
+        .route("/api/v1/containers/join-docker-group", post(containers::join_docker_group));
 
     // ── 任务中心 ──
     let task_r = Router::new()

@@ -30,7 +30,7 @@ use axum::{
     Json,
 };
 use panel_core::cap_keys;
-use panel_os::{ContainerAction, ContainerCreateReq, ContainerProvider};
+use panel_os::{cmd, ContainerAction, ContainerCreateReq, ContainerProvider};
 use serde::Deserialize;
 use std::time::Duration;
 use panel_task::{TaskRequest, TaskKind};
@@ -249,4 +249,32 @@ pub async fn install(
     ).await.map_err(ApiError::from)?;
     audit(&state, &s, "container.install_docker", pkg, "queued").await;
     Ok(ok(serde_json::json!({ "task_id": task_id, "created": created, "package": pkg })))
+}
+
+// ─────────────── 把面板运行用户加入 docker 组 ───────────────
+
+/// 修复 `daemon_unreachable` 的核心一步：把**面板进程用户**加入 docker 组。
+///
+/// 与宝塔"点一下就好"一致——用户不必手敲 `usermod`。目标用户取 `panel_os::runtime_user()`
+/// （effective uid 映射），**不是登录用户**：docker socket 权限取决于面板进程身份，
+/// 加错人对管理容器毫无帮助（之前前端提示 `usermod -aG docker <登录用户>` 就是误导）。
+///
+/// 高危：docker 组等同 root 级权限（可借 docker 提权到宿主 root）。
+/// 权限（CONTAINER_MANAGE）+ 前端二次确认词「加入 docker 组」双重门禁。
+/// 完成后需重启面板使新组生效（前端再调 `services/panel/restart`）。
+pub async fn join_docker_group(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::CONTAINER_MANAGE)?;
+    // 已可达则无需操作（加了也白加）
+    if state.os.containers().unavailable_reason().is_none() {
+        return Err(ApiError::bad_request("docker", "Docker 守护进程已可达，无需加入 docker 组"));
+    }
+    let user = panel_os::runtime_user();
+    // run_checked：非零退出码即判失败（如非 root 调 usermod），避免"假成功"。
+    let out = cmd::run_checked(cmd::Bin::Usermod, &["-aG", "docker", user.as_str()], cmd::CmdOpt::default())
+        .await?;
+    audit(&state, &s, "container.join_docker_group", &user, "ok").await;
+    Ok(ok(serde_json::json!({ "user": user, "output": out.stdout })))
 }
