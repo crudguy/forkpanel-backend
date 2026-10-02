@@ -65,7 +65,8 @@ impl MetricsProvider for LinuxMetrics {
             ProcessSort::Memory => list.sort_by(|a, b| b.rss_kib.cmp(&a.rss_kib)),
             ProcessSort::Pid => list.sort_by_key(|p| p.pid),
         }
-        list.truncate(n);
+        // n==0 表示不截断（展示全部进程）；否则截断并兜底上限 8192，防异常大请求。
+        if n > 0 { list.truncate(n.min(8192)); }
         Ok(list)
     }
 }
@@ -325,7 +326,22 @@ fn read_proc_uid(pid: i32) -> Option<u32> {
 
 /// 进程扫描：仅读 /proc/<pid>/stat（平均 295B/进程），按需限制数量
 fn scan_processes(prev: &mut Prev) -> Result<Vec<ProcessInfo>> {
-    let hz = 100.0f32;   // 绝大多数 Linux CONFIG_HZ=100；精确值可由 sysconf 获取
+    // 真实时钟节拍：CONFIG_HZ 因内核/容器而异（Debian 常见 250，旧内核 100），
+    // 硬编码 100 会让 CPU% 整体偏差数倍。取系统真实值，失败回退 100。
+    let hz = match unsafe { libc::sysconf(libc::_SC_CLK_TCK) } {
+        n if n > 0 => n as f32,
+        _ => 100.0,
+    };
+    // 逻辑 CPU 数：进程 CPU% 按「占总算力份额」归一（与概览总 CPU% 口径一致，0~100%），
+    // 故除以在线核数；取不到时回退 1（退化为「单核归一」，仍不会溢出）。
+    let n_cpu = match unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) } {
+        n if n > 0 => n as f32,
+        _ => 1.0,
+    };
+    let now_ms = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_millis() as u64,
+        Err(_) => 0,
+    };
     let mut out = Vec::new();
     // 进程属主映射表：每次扫描构建一次，所有进程复用（避免逐进程重读 /etc/passwd）
     let uid_names = uid_name_map();
@@ -345,14 +361,18 @@ fn scan_processes(prev: &mut Prev) -> Result<Vec<ProcessInfo>> {
         let rss_pages: u64 = f[21].parse().unwrap_or(0);
         let ticks = utime + stime;
 
+        // CPU% = 本窗口内进程占用算力 / (窗口秒数 × 单核算力 × 核数) × 100，
+        // 即「占总算力份额」，与概览总 CPU% 口径一致（0~100%）。
+        // 窗口用真实采样间隔（prev 存上次扫描时间戳）而非写死 1s——写死 1s 会让
+        // 实际间隔 3s 的调用方（专业快照）算出的数值失真，出现 9770% 这类溢出值。
         let cpu_pct = match prev.proc_time.get(&pid) {
-            Some((pt, _)) if ticks >= *pt => {
-                // 与上次采样的间隔（秒），由调用方采样周期决定，此处以 1s 近似
-                ((ticks - pt) as f32 / hz) * 100.0
+            Some((pt, ts)) if ticks >= *pt && *ts > 0 => {
+                let dt = (now_ms.saturating_sub(*ts)) as f32 / 1000.0;
+                if dt > 0.0 { ((ticks - pt) as f32 / hz / dt / n_cpu) * 100.0 } else { 0.0 }
             }
             _ => 0.0,
         };
-        prev.proc_time.insert(pid, (ticks, 0));
+        prev.proc_time.insert(pid, (ticks, now_ms));
 
         let cmdline = std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
             .map(|c| c.replace('\0', " ").trim().to_string()).unwrap_or_default();

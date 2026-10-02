@@ -28,7 +28,8 @@ pub async fn list(
         Some("pid") => ProcessSort::Pid,
         _ => ProcessSort::Cpu,
     };
-    let n = q.limit.unwrap_or(20).clamp(1, 200);
+    // limit=0（或省略）= 展示全部进程；非零则截断并兜底上限 8192。
+    let n = q.limit.unwrap_or(0);
     let list = state.os.metrics().top_processes(n, sort).await?;
     Ok(ok(list))
 }
