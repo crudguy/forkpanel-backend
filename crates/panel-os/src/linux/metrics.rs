@@ -295,10 +295,40 @@ fn count_pids() -> u32 {
         .unwrap_or(0)
 }
 
+/// 进程属主用户名映射：读 /etc/passwd 一次构建 uid→name 表。
+fn uid_name_map() -> HashMap<u32, String> {
+    let mut m = HashMap::new();
+    if let Ok(s) = std::fs::read_to_string("/etc/passwd") {
+        for line in s.lines() {
+            let mut f = line.split(':');
+            let name = match f.next() { Some(n) => n, None => continue };
+            if f.next() != Some("x") { continue }
+            if let Some(uid) = f.next().and_then(|u| u.parse::<u32>().ok()) {
+                m.insert(uid, name.to_string());
+            }
+        }
+    }
+    m
+}
+
+/// 进程真实 uid：procfs 的 /proc/<pid>/stat 字段不含 uid，须读 /proc/<pid>/status 的 Uid 字段。
+fn read_proc_uid(pid: i32) -> Option<u32> {
+    let s = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    for line in s.lines() {
+        if line.starts_with("Uid:") {
+            // Uid: <real> <effective> <saved> <fs> —— 取真实 uid（第一个）
+            return line.split_whitespace().nth(1).and_then(|v| v.parse::<u32>().ok());
+        }
+    }
+    None
+}
+
 /// 进程扫描：仅读 /proc/<pid>/stat（平均 295B/进程），按需限制数量
 fn scan_processes(prev: &mut Prev) -> Result<Vec<ProcessInfo>> {
     let hz = 100.0f32;   // 绝大多数 Linux CONFIG_HZ=100；精确值可由 sysconf 获取
     let mut out = Vec::new();
+    // 进程属主映射表：每次扫描构建一次，所有进程复用（避免逐进程重读 /etc/passwd）
+    let uid_names = uid_name_map();
     let rd = std::fs::read_dir("/proc").map_err(|e| panel_core::PanelError::Internal(e.to_string()))?;
     for entry in rd.filter_map(|e| e.ok()) {
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else { continue };
@@ -326,13 +356,16 @@ fn scan_processes(prev: &mut Prev) -> Result<Vec<ProcessInfo>> {
 
         let cmdline = std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
             .map(|c| c.replace('\0', " ").trim().to_string()).unwrap_or_default();
+        // 属主用户名：stat 不含 uid，须读 status 的 Uid 再映射（见 read_proc_uid / uid_name_map）
+        let user = read_proc_uid(pid)
+            .map(|u| uid_names.get(&u).cloned().unwrap_or_else(|| u.to_string()));
 
         out.push(ProcessInfo {
             pid, ppid, name: if name.is_empty() { format!("[{state}]") } else { name },
             cpu_pct,
             rss_kib: rss_pages * 4,   // 页大小 4KiB（x86_64/aarch64 通用）
             cmdline,
-            user: None,
+            user,
         });
     }
     Ok(out)
