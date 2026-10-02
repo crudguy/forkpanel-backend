@@ -324,7 +324,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 }
 
 /// uid → 用户名。**绝不用子进程**（`id -un` 会引入命令注入面），只读 /etc/passwd。
-fn uid_to_name(uid: u32) -> Option<String> {
+pub(crate) fn uid_to_name(uid: u32) -> Option<String> {
     let s = std::fs::read_to_string("/etc/passwd").ok()?;
     for line in s.lines() {
         let mut f = line.split(':');

@@ -211,6 +211,18 @@ pub fn startup_fs_check(paths: &dyn PathLayout) -> panel_core::Result<()> {
     Ok(())
 }
 
+/// 面板进程当前的运行用户名（effective uid 映射）。
+///
+/// 用于"把谁加入 docker 组"这类需要面板**真实身份**的动作——docker socket 的权限
+/// 取决于面板进程用户，而不是登录用户；取错人（如登录用户）对管理容器毫无帮助。
+///
+/// 实现：读 /etc/passwd 把 effective uid 映射成用户名，**绝不调用子进程**
+/// （`id -un` 会引入命令注入面）。无对应条目时回退 "root"。
+pub fn runtime_user() -> String {
+    let uid = unsafe { libc::geteuid() };
+    crate::linux::files::uid_to_name(uid).unwrap_or_else(|| "root".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

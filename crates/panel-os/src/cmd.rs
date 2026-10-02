@@ -52,7 +52,7 @@ pub enum Bin {
     Sshd,                               // sshd -t 配置校验：改 SSH 配置前的强制安全网
     Certbot,                            // ACME 证书签发/续期（http-01 webroot）
     Fail2banClient,                     // fail2ban-client 入侵防御 jail 管理
-    UserAdd, GroupAdd, Chown, Chmod,    // 用户与权限
+    UserAdd, GroupAdd, Chown, Chmod, Usermod, // 用户与权限（Usermod：把用户加入附加组，仅内部白名单调用）
     Df, Stat,                           // 探测类（回退路径）
     /// 交互式登录 shell（Web 终端用）。**不经任何 shell 解释**——由 `spawn_pty`
     /// 以 argv 直接 exec；用户输入只写进 PTY 的 master，不参与本进程的 argv。
@@ -82,6 +82,7 @@ impl Bin {
             Tar => "tar", Gzip => "gzip", Sshd => "sshd", Certbot => "certbot",
             Fail2banClient => "fail2ban-client",
             UserAdd => "useradd", GroupAdd => "groupadd", Chown => "chown", Chmod => "chmod",
+            Usermod => "usermod",
             Df => "df", Stat => "stat",
             Sh => "sh",
         }
