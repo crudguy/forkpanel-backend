@@ -504,6 +504,7 @@ components:
         days_left:   { type: [integer, "null"] }
         auto_renew:  { type: boolean }
         renew_state: { type: string, enum: [idle, pending, ok, failed] }
+        source:      { type: string, enum: [acme, self-signed, manual] }
     SslApply:
       type: object
       required: [method]
@@ -1388,6 +1389,22 @@ paths:
       responses:
         '200': { description: 自签证书已重新签发 }
         '202': { description: ACME 续期已入队 }
+  /api/v1/certs/{id}/auto-renew:
+    patch:
+      tags: [sites]
+      summary: 开关证书自动续期（仅 ACME 证书有效；后台每日扫描 30 天内到期者入队续期）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [enabled], properties: { enabled: { type: boolean, description: 是否允许到期前自动续期 } } }
+      responses:
+        '200': { description: 已更新（返回 { id, auto_renew }） }
+        '400': { description: 非 ACME 证书不支持自动续期 }
+        '404': { description: 证书不存在 }
+        '501': { description: 平台未接入 ACME 能力 }
   /api/v1/certs/{id}:
     delete:
       tags: [sites]

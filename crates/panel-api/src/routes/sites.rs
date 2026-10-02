@@ -966,6 +966,8 @@ pub struct CertDto {
     pub auto_renew: bool,
     /// idle | pending | ok | failed
     pub renew_state: String,
+    /// acme | self-signed | manual（UI 据此决定自动续期开关是否可用）
+    pub source: String,
 }
 
 pub async fn certs(
@@ -978,7 +980,7 @@ pub async fn certs(
         .with(|conn| {
             let mut st = conn
                 .prepare(
-                    "SELECT id, domains, issuer, not_after, renew_state \
+                    "SELECT id, domains, issuer, not_after, renew_state, auto_renew, source \
                      FROM ssl_certs ORDER BY not_after",
                 )
                 .map_err(db_err)?;
@@ -990,6 +992,8 @@ pub async fn certs(
                         r.get::<_, Option<String>>(2)?,
                         r.get::<_, Option<i64>>(3)?,
                         r.get::<_, String>(4)?,
+                        r.get::<_, i64>(5).unwrap_or(0),
+                        r.get::<_, String>(6)?,
                     ))
                 })
                 .map_err(db_err)?;
@@ -1004,7 +1008,7 @@ pub async fn certs(
     let now = crate::now_unix();
     let dtos: Vec<CertDto> = rows
         .into_iter()
-        .map(|(id, domains_json, issuer, not_after, renew)| {
+        .map(|(id, domains_json, issuer, not_after, renew, auto_renew, source)| {
             // 证书覆盖多个域名（JSON 数组）；UI 单域名列展示主域名（首个）
             let domains: Vec<String> = serde_json::from_str(&domains_json).unwrap_or_default();
             let primary = domains.into_iter().next().unwrap_or_default();
@@ -1014,10 +1018,12 @@ pub async fn certs(
                 issuer,
                 days_left: not_after.map(|t| (t - now) / 86_400),
                 not_after,
-                // 自动续期开关：schema 尚未建模独立列，且 ACME 未实现，
-                // 故诚实置 false（不伪造"已开启自动续期"）
-                auto_renew: false,
+                // 真实开关（v10 起有 auto_renew 列）。注意它只表示"用户已允许自动续期"，
+                // 真正能否续还取决于 ssl.acme 能力位（certbot 是否可用）——
+                // UI 需结合能力位判断，别把"开关关着"和"根本用不了"混为一谈。
+                auto_renew: auto_renew != 0,
                 renew_state: renew,
+                source,
             }
         })
         .collect();
@@ -1229,8 +1235,10 @@ impl panel_task::TaskBody for AcmeTask {
                 conn.execute("DELETE FROM ssl_certs WHERE site_id = ?1", [site_id])
                     .map_err(|e| PanelError::Database(e.to_string()))?;
                 conn.execute(
-                    "INSERT INTO ssl_certs(site_id, domains, issuer, not_after, source, key_enc, cert, renew_state, created_at) \
-                     VALUES(?1, ?2, ?3, ?4, 'acme', ?5, ?6, 'ok', ?7)",
+                    // ACME 证书默认开启自动续期（有效期仅 90 天，靠人工点续期必然会漏）。
+                    // 用户可在证书列表关掉；selfsigned / manual 恒为 0（无法自动续）。
+                    "INSERT INTO ssl_certs(site_id, domains, issuer, not_after, source, key_enc, cert, renew_state, created_at, auto_renew) \
+                     VALUES(?1, ?2, ?3, ?4, 'acme', ?5, ?6, 'ok', ?7, 1)",
                     rusqlite::params![site_id, dj, issuer, not_after, key_enc, cert, now],
                 )
                 .map_err(|e| PanelError::Database(e.to_string()))?;
@@ -1347,6 +1355,180 @@ pub async fn cert_renew(
         "not_after": not_after,
         "days_left": SELF_SIGNED_DAYS,
     })))
+}
+
+/// 自动续期的提前量（天）：到期前多久开始尝试续期。
+///
+/// 取 30 天而非贴着过期线（如 7 天）：续期可能因 CA 限流、http-01 校验失败而失败，
+/// 留足窗口才能重试；Let's Encrypt 有效期 90 天，30 天意味着约有 2 个月的重试余量。
+const RENEW_WINDOW_DAYS: i64 = 30;
+
+/// 证书自动续期扫描——内部周期任务 `cert.renew_check` 的任务体。
+///
+/// 每天执行一次：找出 **30 天内到期** 且 `auto_renew=1` 的 **ACME** 证书，逐个
+/// 提交 `AcmeTask{Renew}`。刻意**不**在这里直接调 certbot：走任务队列才能被审计、
+/// 可看进度，并复用按小时幂等键天然规避 CA 限流（LE 5 次/小时/域名）。
+///
+/// 返回成功入队条数。能力位缺失（certbot 不在）或主密钥不可用时返回 **0 而不报错**——
+/// 周期任务失败不该拖垮面板，也不该每天刷同一条错误日志。
+pub async fn auto_renew_sweep(state: Shared) -> panel_core::Result<usize> {
+    // 没有 certbot 就没有可交互的 CA，提交必然失败，直接跳过
+    let acme_ok = state
+        .capabilities
+        .get(cap_keys::SSL_ACME)
+        .map(|c| c.supported)
+        .unwrap_or(false);
+    if !acme_ok {
+        return Ok(0);
+    }
+    let Ok(master) = state.require_secret_key() else {
+        return Ok(0);
+    };
+
+    let now = crate::now_unix();
+    let due_before = now + RENEW_WINDOW_DAYS * 86_400;
+
+    let rows: Vec<(i64, String)> = state
+        .pool
+        .with(move |conn| {
+            let mut st = conn
+                .prepare(
+                    "SELECT id, domains FROM ssl_certs \
+                     WHERE source='acme' AND auto_renew=1 \
+                       AND not_after IS NOT NULL AND not_after <= ?1",
+                )
+                .map_err(db_err)?;
+            let it = st
+                .query_map(rusqlite::params![due_before], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(db_err)?;
+            let mut v = Vec::new();
+            for x in it {
+                v.push(x.map_err(db_err)?);
+            }
+            Ok(v)
+        })
+        .await?;
+
+    let mut queued = 0usize;
+    for (id, domains_json) in rows {
+        let domains: Vec<String> = serde_json::from_str(&domains_json).unwrap_or_default();
+        if domains.is_empty() {
+            continue;
+        }
+        let (crt_p, key_p) = cert_paths_for(&state, &domains);
+        let job = AcmeTask {
+            mode: AcmeMode::Renew,
+            site_id: id,
+            domains,
+            // Renew 沿用 certbot 既有账户，无需邮箱与 webroot
+            email: String::new(),
+            webroot: std::path::PathBuf::new(),
+            crt_p,
+            key_p,
+            master,
+            db: state.db.clone(),
+        };
+        // 幂等键按小时：同一小时内重复触发返回同一任务，规避 CA 限流
+        let idem = format!("cert-renew:{id}:{}", now / 3600);
+        if state
+            .tasks
+            .submit(
+                panel_task::TaskRequest {
+                    idempotency_key: idem,
+                    kind: panel_task::TaskKind::CertIssue,
+                    label: format!("ACME 自动续期证书（#{id}）"),
+                    timeout: std::time::Duration::from_secs(900),
+                },
+                job,
+            )
+            .await
+            .is_ok()
+        {
+            queued += 1;
+        }
+        // 单条失败不影响其余证书，也不惊动周期任务（失败原因由任务自身记录）
+    }
+    Ok(queued)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AutoRenewReq {
+    pub enabled: bool,
+}
+
+/// 开关证书自动续期。**仅 ACME 证书可开**。
+///
+/// selfsigned / manual 没有可交互的 CA，给它们开关就是"能点但必失败"的假按钮，
+/// 故 SQL 里直接带 `source='acme'` 过滤（顺带避免先读后写的竞态）。
+/// 开启前还会校验 `ssl.acme` 能力位——否则用户开了开关却永远不会续，
+/// 那是最坏的失败方式（UI 显示"已开启"，实际持续过期）。
+pub async fn cert_auto_renew(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    AxPath(id): AxPath<i64>,
+    Json(req): Json<AutoRenewReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::SSL_MANAGE)?;
+    if req.enabled
+        && !state
+            .capabilities
+            .get(cap_keys::SSL_ACME)
+            .map(|c| c.supported)
+            .unwrap_or(false)
+    {
+        return Err(ApiError::unsupported("ssl.acme"));
+    }
+    // 先读后写：校验必须在**读路径**上返回 400/404。若把校验放进 db.exec 闭包，
+    // 写通道会把任何 Err 统一包装成 Database 错误 → 用户看到 500（实测踩过）。
+    let source: Option<String> = state
+        .pool
+        .with(move |conn| {
+            let mut st = conn
+                .prepare("SELECT source FROM ssl_certs WHERE id = ?1")
+                .map_err(db_err)?;
+            let mut it = st
+                .query_map(rusqlite::params![id], |r| r.get::<_, String>(0))
+                .map_err(db_err)?;
+            match it.next() {
+                Some(x) => Ok(Some(x.map_err(db_err)?)),
+                None => Ok(None),
+            }
+        })
+        .await?;
+    let Some(source) = source else {
+        return Err(ApiError::not_found("cert"));
+    };
+    if source != "acme" {
+        return Err(ApiError::bad_request(
+            "id",
+            "仅 ACME 证书支持自动续期：自签 / 手动证书没有可交互的 CA，给了开关也是点不动的",
+        ));
+    }
+
+    let enabled_i = if req.enabled { 1 } else { 0 };
+    state
+        .db
+        .exec(move |conn| {
+            let n = conn
+                .execute(
+                    "UPDATE ssl_certs SET auto_renew=?1 WHERE id=?2 AND source='acme'",
+                    rusqlite::params![enabled_i, id],
+                )
+                .map_err(|e| PanelError::Database(e.to_string()))?;
+            Ok(panel_db::WriteAck { rows_changed: n })
+        })
+        .await?;
+    audit(
+        &state,
+        &s,
+        "ssl.auto_renew",
+        &id.to_string(),
+        if req.enabled { "on" } else { "off" },
+    )
+    .await;
+    Ok(ok(serde_json::json!({ "id": id, "auto_renew": req.enabled })))
 }
 
 /// 删除证书（DB + 磁盘 cert/key 一并清理）。

@@ -247,7 +247,7 @@ fn run(cli: Cli) -> Result<()> {
                     os.clone(), writer.clone(), pool, tasks.clone(), metrics.clone(), tier, master_key));
 
                 // ── 内部周期任务 ──
-                register_internal_jobs(&sched_in, &os, writer.clone(), metrics.clone(), &layout, &cfg, tier).await;
+                register_internal_jobs(&sched_in, &os, writer.clone(), metrics.clone(), &layout, &cfg, tier, state.clone()).await;
                 let schedules = panel_task::builtin_schedules(tier);
                 let n_sched = schedules.len();
                 sched_in.start(schedules).await;
@@ -436,6 +436,8 @@ async fn register_internal_jobs(
     layout: &panel_os::paths::LinuxPathLayout,
     cfg: &Config,
     tier: Tier,
+    // 供证书自动续期使用（需要任务队列、读连接池与主密钥）
+    state: std::sync::Arc<panel_api::AppState>,
 ) {
     // ── 指标采样：只写内存环形缓冲，不落库 ──
     {
@@ -570,11 +572,16 @@ async fn register_internal_jobs(
         }).await;
     }
 
-    // ── 证书续期检查（M3 接入 ACME 前为空操作）──
-    sched.register("cert.renew_check", || async {
-        // M3：扫描 ssl_certs 中 30 天内到期且 auto_renew=1 的证书并签发
-        Ok(())
-    }).await;
+    // ── 证书自动续期扫描 ──
+    // 扫描 ssl_certs 中「30 天内到期 + auto_renew=1 + source=acme」的证书，
+    // 逐个提交 AcmeTask{Renew}。能力位缺失（certbot 不在）时内部自行跳过返回 0。
+    {
+        let state = state.clone();
+        sched.register("cert.renew_check", move || {
+            let state = state.clone();
+            async move { panel_api::routes::sites::auto_renew_sweep(state).await.map(|_| ()) }
+        }).await;
+    }
 }
 
 fn now_unix() -> i64 {
