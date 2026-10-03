@@ -9,6 +9,12 @@ use async_trait::async_trait;
 use panel_core::{PanelError, Result};
 use std::path::{Path, PathBuf};
 
+/// sshd 配置备份名的固定记号（`<原名>.conf.panel.bak-<秒级时间戳>`）。
+/// 既是文件名的组成部分，也用作"本次备份属于哪一批"的识别前缀。
+const BACKUP_MARKER: &str = ".panel.bak-";
+/// 保留最近几份 sshd 备份：回滚只需最近那次，留 10 份足够兜住连续误改。
+const SSH_BACKUP_KEEP: usize = 10;
+
 /// Linux 安全基线：读配置/探测既有事实，产出发现项。
 #[derive(Default)]
 pub struct LinuxSecurity;
@@ -265,6 +271,15 @@ pub(crate) async fn apply_ssh_item(key: &str) -> Result<SecurityApplyResult> {
     // ① 先备份
     let backup = path.with_extension(format!("conf.panel.bak-{}", now_secs()));
     std::fs::copy(&path, &backup).map_err(|e| PanelError::Io(e.to_string()))?;
+
+    // 备份文件名带秒级时间戳，每次改配置都是**新文件**、永不复用也从不清理，
+    // 目录会随改配置次数无限膨胀。只保留最近几份（回滚用得上最近的那次就够）：
+    // 前缀取自本次备份名（截到 ".panel.bak-" 为止），避免误删同目录其他文件。
+    if let (Some(dir), Some(name)) = (backup.parent(), backup.file_name().and_then(|n| n.to_str())) {
+        if let Some(i) = name.find(BACKUP_MARKER) {
+            crate::fs::prune_keep_newest(dir, &name[..i + BACKUP_MARKER.len()], SSH_BACKUP_KEEP);
+        }
+    }
 
     // ② 写（失败则备份仍在、原文件未变）
     if let Err(e) = std::fs::write(&path, &next) {

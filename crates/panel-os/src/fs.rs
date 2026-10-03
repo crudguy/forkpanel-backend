@@ -80,6 +80,41 @@ pub fn check_data_dir(dir: &Path) -> Result<(String, bool)> {
 
 /// 从终端读取一行且**不回显**（口令输入）。
 /// 无论读取成功与否都恢复终端回显，避免失败后终端"卡住"。
+/// 保留目录里**最近** `keep` 个文件名以 `prefix` 开头的普通文件，删除更旧的。
+///
+/// 用途：带时间戳/自增 id 的备份与日志（如 `sshd.conf.panel.bak-<ts>`、
+/// `panel-task-<id>.log`）每次生成新文件、从不复用，不清理会无限增长。
+///
+/// 排序依据**修改时间而非文件名**——文件名里的时间戳格式可能变，mtime 才可靠。
+///
+/// 失败一律静默（返回已删除个数）：清理是附带的收尾动作，
+/// 不该因为它失败就让"保存配置""写任务日志"这类主操作报错。
+pub fn prune_keep_newest(dir: &Path, prefix: &str, keep: usize) -> usize {
+    if keep == 0 { return 0; }
+    let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
+    let mut entries: Vec<(std::time::SystemTime, std::path::PathBuf)> = rd
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with(prefix))
+                    .unwrap_or(false)
+        })
+        .filter_map(|p| {
+            std::fs::metadata(&p).ok().and_then(|m| m.modified().ok()).map(|t| (t, p))
+        })
+        .collect();
+    // 新的在前：mtime 降序
+    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut removed = 0;
+    for (_, p) in entries.iter().skip(keep) {
+        if std::fs::remove_file(p).is_ok() { removed += 1; }
+    }
+    removed
+}
+
 pub fn read_password(prompt: &str) -> Result<String> {
     eprint!("{prompt}");
     #[cfg(unix)]
@@ -140,5 +175,39 @@ mod tests {
     #[test]
     fn mode_of_missing_file_is_none() {
         assert!(mode_of(Path::new("/definitely/not/here")).is_none());
+    }
+
+    #[test]
+    fn prune_keeps_newest_and_only_touches_matching_prefix() {
+        let d = std::env::temp_dir().join(format!("panel-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        ensure_dir(&d, 0o700).unwrap();
+
+        // 三份同名前缀的备份，mtime 依次变旧（0 最新、2 最旧）
+        let base = std::time::SystemTime::now();
+        for i in 0..3 {
+            let f = d.join(format!("sshd.conf.panel.bak-{i}"));
+            std::fs::write(&f, b"x").unwrap();
+            std::fs::File::options().write(true).open(&f).unwrap()
+                .set_modified(base - std::time::Duration::from_secs(i * 10)).unwrap();
+        }
+        // 同目录但**前缀不同**的文件：绝不能被误删
+        let other = d.join("sshd.conf.keepme");
+        std::fs::write(&other, b"x").unwrap();
+
+        assert_eq!(prune_keep_newest(&d, "sshd.conf.panel.bak-", 1), 2,
+            "保留 1 份 → 应删掉其余 2 份");
+        assert!(d.join("sshd.conf.panel.bak-0").exists(), "最新的一份必须留下");
+        assert!(!d.join("sshd.conf.panel.bak-1").exists());
+        assert!(!d.join("sshd.conf.panel.bak-2").exists());
+        assert!(other.exists(), "非本前缀的文件被误删了（前缀匹配失效）");
+
+        // 边界：目录不存在、前缀无匹配，都静默返回 0（清理失败不该打断主操作）
+        assert_eq!(prune_keep_newest(Path::new("/definitely/not/here"), "x-", 1), 0);
+        assert_eq!(prune_keep_newest(&d, "no-such-prefix-", 1), 0);
+        // keep=0 表示"不保留"应视为无效参数，直接不动任何文件
+        assert_eq!(prune_keep_newest(&d, "sshd.conf.panel.bak-", 0), 0);
+
+        std::fs::remove_dir_all(&d).ok();
     }
 }

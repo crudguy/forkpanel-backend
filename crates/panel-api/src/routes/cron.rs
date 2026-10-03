@@ -119,6 +119,14 @@ pub struct CreateReq {
 
 /// 任务超时上限：7 天。太长会让卡死的任务长期占住并发槽。
 const MAX_TIMEOUT_SEC: i64 = 86400 * 7;
+/// 计划任务日志的**专属子目录**（不用 temp_dir 根）。
+/// 独立成目录是为了清理时只扫这个小目录——直接扫 /tmp 会把机器上成千上万个
+/// 无关文件一起 stat 一遍。
+const TASK_LOG_DIRNAME: &str = "panel-cron-logs";
+/// 任务日志文件前缀（`<前缀><任务id>.log`）。
+const TASK_LOG_PREFIX: &str = "panel-task-";
+/// 保留最近多少份任务日志（够回溯最近的失败即可，避免无限增长）。
+const TASK_LOG_KEEP: usize = 50;
 
 /// 校验并归一化 `timeout_sec`（缺省 30 分钟）。
 ///
@@ -486,8 +494,16 @@ impl panel_task::TaskBody for CronRunTask {
         let mut output_path = None;
         let lines: Vec<String> = buf.lock().unwrap().clone();
         if !lines.is_empty() {
-            let p = std::env::temp_dir().join(format!("panel-task-{}.log", progress.id()));
-            if tokio::fs::write(&p, lines.join("\n")).await.is_ok() { output_path = Some(p); }
+            // 日志写进专属子目录而非 temp_dir 根：id 递增 → 每次都是新文件，
+            // 若散落在 /tmp 根既无法定向清理，也会污染临时目录。
+            let dir = std::env::temp_dir().join(TASK_LOG_DIRNAME);
+            let _ = tokio::fs::create_dir_all(&dir).await;
+            let p = dir.join(format!("{TASK_LOG_PREFIX}{}.log", progress.id()));
+            if tokio::fs::write(&p, lines.join("\n")).await.is_ok() {
+                output_path = Some(p);
+                // 只保留最近若干份（清理失败不影响任务结果，函数内部静默）
+                panel_os::prune_keep_newest(&dir, TASK_LOG_PREFIX, TASK_LOG_KEEP);
+            }
         }
 
         let (task_state, exit_code, status_text, failed) = match &r {
