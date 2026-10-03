@@ -337,17 +337,47 @@ async fn handler_404(req: Request) -> (StatusCode, axum::Json<Value>) {
 pub async fn audit(state: &AppState, s: &Session, action: &'static str,
                    target: &str, result: &'static str) {
     let actor = s.username.clone();
+    // 来源 IP 取自登录那一刻（Session::ip）。此前硬编码空串，导致审计列表
+    // 的「来源 IP」列永远是"—"，面板被爆破时无法追溯操作来源。
+    let ip = if s.ip.is_empty() { "unknown".to_string() } else { s.ip.clone() };
     let target = target.to_string();
-    let _ = state.db.exec(move |conn| {
+    // 审计写失败必须留痕：静默丢弃会让"操作已生效但无记录"，事后无法发现。
+    // 用 eprintln! 而非 tracing：panel-api 未引入日志设施（依赖预算纪律：零新依赖），
+    // serve 启动时 stderr 已重定向进日志文件，不会打到终端。
+    if let Err(e) = state.db.exec(move |conn| {
         conn.execute(
             "INSERT INTO audit_log(ts, actor, actor_ip, action, target, result, detail_json)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             rusqlite::params![
-                crate::now_unix(), actor, "", action, target, result, "{}"
+                crate::now_unix(), actor, ip, action, target, result, "{}"
             ],
         ).map_err(|e| panel_core::PanelError::Database(e.to_string()))?;
         Ok(panel_db::WriteAck { rows_changed: 1 })
-    }).await;
+    }).await {
+        eprintln!("[WARN] 审计日志写入失败（操作已生效但无留痕） action={action} error={e}");
+    }
+}
+
+/// 系统发起的操作（调度器 / 内部周期任务）留痕。
+///
+/// 与 `audit` 的区别：无用户 Session，actor 固定为 `"system"`、无来源 IP。
+/// 用于把"系统自动做了什么"也写进操作日志——否则自动续期、自动备份等
+/// 非人工动作在 UI 审计轨迹里完全不可见，出事时只能去翻服务端日志。
+pub async fn audit_system(state: &AppState, action: &'static str,
+                          target: &str, result: &'static str) {
+    let target = target.to_string();
+    if let Err(e) = state.db.exec(move |conn| {
+        conn.execute(
+            "INSERT INTO audit_log(ts, actor, actor_ip, action, target, result, detail_json)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                crate::now_unix(), "system", "", action, target, result, "{}"
+            ],
+        ).map_err(|e| panel_core::PanelError::Database(e.to_string()))?;
+        Ok(panel_db::WriteAck { rows_changed: 1 })
+    }).await {
+        eprintln!("[WARN] 系统操作审计写入失败 action={action} error={e}");
+    }
 }
 
 #[cfg(test)]

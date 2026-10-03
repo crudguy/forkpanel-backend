@@ -23,7 +23,7 @@
 use crate::{
     auth::perm,
     error::{ok, ApiError, ApiResult},
-    routes::{audit, Auth, MaybeAuth, Shared},
+    routes::{audit, audit_system, Auth, MaybeAuth, Shared},
 };
 use axum::{
     extract::{Path as AxPath, Query, State},
@@ -1455,7 +1455,7 @@ pub async fn auto_renew_sweep(state: Shared) -> panel_core::Result<usize> {
         let job = AcmeTask {
             mode: AcmeMode::Renew,
             site_id: id,
-            domains,
+            domains: domains.clone(),
             // Renew 沿用 certbot 既有账户，无需邮箱与 webroot
             email: String::new(),
             webroot: std::path::PathBuf::new(),
@@ -1481,6 +1481,15 @@ pub async fn auto_renew_sweep(state: Shared) -> panel_core::Result<usize> {
             .is_ok()
         {
             queued += 1;
+            // 系统发起的续期也写操作日志：actor 固定 "system"，
+            // 否则自动续期在 UI 审计轨迹里完全不可见（仅服务端 info 日志有）。
+            audit_system(
+                &state,
+                "cert.auto_renew",
+                &format!("#{id} {}", domains.join(",")),
+                "queued",
+            )
+            .await;
         }
         // 单条失败不影响其余证书，也不惊动周期任务（失败原因由任务自身记录）
     }

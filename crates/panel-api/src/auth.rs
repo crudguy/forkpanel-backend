@@ -156,6 +156,13 @@ pub struct Session {
     pub permissions: Vec<String>,
     /// 目录作用域：文件与站点操作被限制在这些根内
     pub allowed_roots: Vec<String>,
+    /// 登录时的客户端 IP，写入审计日志的 `actor_ip`。
+    ///
+    /// 只在登录那一刻采集：审计要回答"这次危险操作从哪来"，而请求中途
+    /// 的 HeaderMap 拿不到（`audit()` 只收 Session）。从库里重建会话
+    /// （进程重启后）无法还原，置 `unknown` 而非留空——空值会被前端
+    /// 渲染成"—"，看起来像"没记录"，实际是"记不了"，两者要能区分。
+    pub ip: String,
     pub created_at: i64,
     pub last_seen: i64,
     pub expires_at: i64,
@@ -415,6 +422,8 @@ impl SessionCache {
             permissions: permissions_for_role(&role),
             role,
             allowed_roots,
+            // 库不存 IP：进程重启后重建的会话丢失来源，诚实标 unknown
+            ip: "unknown".into(),
             created_at,
             last_seen: now,
             expires_at,
@@ -707,7 +716,7 @@ mod tests {
     fn session_expiry_and_rotation() {
         let c = SessionCache::new(Duration::from_secs(1), Duration::from_secs(3600));
         let s = Session { user_id: 1, username: "a".into(), role: "admin".into(),
-                          permissions: vec![], allowed_roots: vec![],
+                          permissions: vec![], allowed_roots: vec![], ip: "unknown".into(),
                           created_at: 0, last_seen: 0, expires_at: 0 };
         let sid = generate_sid();
         c.insert(sid.clone(), s);

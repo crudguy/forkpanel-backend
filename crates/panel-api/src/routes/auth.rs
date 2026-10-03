@@ -176,6 +176,8 @@ pub async fn login(
         role,
         permissions,
         allowed_roots,
+        // 登录这一刻的来源 IP，之后所有审计记录都带它（见 Session::ip）
+        ip: ip.clone(),
         created_at: 0, last_seen: 0, expires_at: 0,
     });
 
