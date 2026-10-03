@@ -113,6 +113,8 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/services/{unit}/restart", post(services::restart))
         .route("/api/v1/services/{unit}/enabled", put(services::set_enabled))
         .route("/api/v1/services/{unit}/journal", get(services::journal))
+        // 日志跟随（SSE）：底层 journalctl -f，先补历史再增量
+        .route("/api/v1/services/{unit}/journal/stream", get(crate::sse::service_journal_stream))
         .route("/api/v1/services/{unit}/config", get(services::config_get).put(services::config_put))
         .route("/api/v1/packages", get(services::packages_list))
         .route("/api/v1/packages/install", post(services::install))

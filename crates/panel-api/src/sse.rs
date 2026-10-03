@@ -276,6 +276,70 @@ pub async fn log_stream(
     follow_source(state.clone(), src, q.filter, q.limit.unwrap_or(200)).await
 }
 
+/// 服务日志跟随频道（契约：`/api/v1/services/{unit}/journal/stream`）。
+///
+/// 与一次性 `journal` 端点的区别：这里 `JournalQuery.follow=true`，底层走
+/// `journalctl -f` 持续吐行，经 SSE 推送。底层 `-n` 会先补读最近 N 行历史，
+/// 因此客户端连上即可看到上下文，随后才是增量——不会出现"关注后才发生的事才看得到"。
+#[derive(Debug, Deserialize)]
+pub struct JournalStreamQ { pub lines: Option<usize> }
+
+pub async fn service_journal_stream(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(unit): axum::extract::Path<String>,
+    MaybeAuth(session): MaybeAuth,
+    Query(q): Query<JournalStreamQ>,
+) -> axum::response::Response {
+    match &session {
+        Some(s) => {
+            if crate::auth::require(s, crate::auth::perm::SERVICE_VIEW).is_err() {
+                return ApiError::forbidden(crate::auth::perm::SERVICE_VIEW).into_response();
+            }
+        }
+        None => return ApiError::unauthorized().into_response(),
+    }
+    // 与一次性 journal 端点同口径：能力矩阵未开启 service.manage 时直接 501，
+    // 而不是建立一个永远收不到行的空连接
+    if !state.capabilities.get("service.manage").map(|c| c.supported).unwrap_or(false) {
+        return ApiError::unsupported("service.manage").into_response();
+    }
+    let unit = match panel_core::unit_name(&unit) {
+        Ok(u) => u,
+        Err(_) => return ApiError::bad_request("name", "invalid unit name").into_response(),
+    };
+
+    let limit = max_clients(state.tier);
+    if SSE_CONNS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+        if n >= limit { None } else { Some(n + 1) }
+    }).is_err() {
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                format!("sse client limit reached ({limit})")).into_response();
+    }
+    let conn = SseConnGuard;
+
+    let mut rx = match state.os.services().journal(&unit, panel_os::JournalQuery {
+        lines: q.lines.unwrap_or(200).min(2000),
+        follow: true,
+        ..Default::default()
+    }).await {
+        Ok(r) => r,
+        Err(e) => return ApiError::from(e).into_response(),
+    };
+
+    let stream = async_stream::stream! {
+        // 守卫必须放在生成器局部作用域（见 SseConnGuard 注释）
+        let _guard = conn;
+        while let Some(line) = rx.recv().await {
+            yield Ok::<_, Infallible>(
+                Event::default().event("log").data(serde_json::json!({ "line": line }).to_string())
+            );
+        }
+    };
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("ping"))
+        .into_response()
+}
+
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
