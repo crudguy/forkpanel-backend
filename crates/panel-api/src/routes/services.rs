@@ -418,7 +418,20 @@ pub async fn journal(
     Ok(ok(serde_json::json!({ "name": name, "lines": lines })))
 }
 
-// ─────────────── 服务配置（在线编辑单元文件） ───────────────
+// ─────────────── 服务配置（在线编辑单元文件 / drop-in） ───────────────
+
+/// `unit`（默认）| `dropin`。非法值一律 400，**不做静默回退**——
+/// 静默回退会让用户以为写的是 drop-in、实际却改写了单元文件本体。
+fn parse_config_target(raw: Option<&str>) -> std::result::Result<panel_os::ConfigTarget, ApiError> {
+    match raw.unwrap_or("unit") {
+        "unit" => Ok(panel_os::ConfigTarget::Unit),
+        "dropin" => Ok(panel_os::ConfigTarget::DropIn),
+        _ => Err(ApiError::bad_request("target", "must be 'unit' or 'dropin'")),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConfigGetQ { pub target: Option<String> }
 
 #[derive(Debug, Deserialize)]
 pub struct ConfigPutReq {
@@ -426,23 +439,30 @@ pub struct ConfigPutReq {
     pub content: String,
     /// 保存后是否重启服务（默认 false：仅 daemon-reload 重新加载单元）
     pub restart: Option<bool>,
+    /// 写入目标：`unit` | `dropin`（默认 unit）
+    pub target: Option<String>,
 }
 
 pub async fn config_get(
     State(state): State<Shared>, Auth(s): Auth, AxPath(name): AxPath<String>,
+    Query(q): Query<ConfigGetQ>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SERVICE_MANAGE)?;
     if !state.capabilities.get(cap_keys::SERVICE_MANAGE).map(|c| c.supported).unwrap_or(false) {
         return Err(ApiError::unsupported("service.manage"));
     }
+    let target = parse_config_target(q.target.as_deref())?;
     let unit = panel_core::unit_name(&name)
         .map_err(|_| ApiError::bad_request("name", "invalid unit name"))?;
-    let cfg = state.os.services().config_read(&unit).await?;
+    let cfg = state.os.services().config_read(&unit, target).await?;
     Ok(ok(serde_json::json!({
         "name": name,
         "path": cfg.path,
         "content": cfg.content,
         "writable": cfg.writable,
+        // exists=false 表示目标文件尚不存在（drop-in 新建场景），前端据此提示"保存即创建"
+        "exists": cfg.exists,
+        "target": if target == panel_os::ConfigTarget::DropIn { "dropin" } else { "unit" },
     })))
 }
 
@@ -454,6 +474,7 @@ pub async fn config_put(
     if !state.capabilities.get(cap_keys::SERVICE_MANAGE).map(|c| c.supported).unwrap_or(false) {
         return Err(ApiError::unsupported("service.manage"));
     }
+    let target = parse_config_target(req.target.as_deref())?;
     // 防御：单元文件不应无限大（256KiB 上限足够容纳任何真实 unit 文件）
     if req.content.len() > 256 * 1024 {
         return Err(ApiError::bad_request("content", "unit file too large (>256KiB)"));
@@ -461,9 +482,10 @@ pub async fn config_put(
     let unit = panel_core::unit_name(&name)
         .map_err(|_| ApiError::bad_request("name", "invalid unit name"))?;
     state.os.services()
-        .config_write(&unit, &req.content, req.restart.unwrap_or(false)).await?;
-    audit(&state, &s, "service.config_write", &name, "ok").await;
-    Ok(ok(serde_json::json!({ "name": name })))
+        .config_write(&unit, &req.content, req.restart.unwrap_or(false), target).await?;
+    let ts = if target == panel_os::ConfigTarget::DropIn { "dropin" } else { "unit" };
+    audit(&state, &s, "service.config_write", &format!("{name}:{ts}"), "ok").await;
+    Ok(ok(serde_json::json!({ "name": name, "target": ts })))
 }
 
 pub async fn packages_list(

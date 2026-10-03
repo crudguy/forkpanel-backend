@@ -122,55 +122,52 @@ impl ServiceProvider for LinuxServices {
         return cmd::spawn_stream(Bin::Journalctl, &args, 64);
     }
 
-    async fn config_read(&self, name: &UnitName) -> Result<ServiceConfig> {
+    async fn config_read(&self, name: &UnitName, target: crate::traits::ConfigTarget) -> Result<ServiceConfig> {
         match self.init {
             InitSystem::Systemd => {
-                let out = cmd::run(
-                    Bin::Systemctl,
-                    &["show", "-p", "FragmentPath", "--value", name.as_str()],
-                    CmdOpt { timeout: Duration::from_secs(5), ..Default::default() },
-                ).await?;
-                let path = out.stdout.trim().to_string();
-                if path.is_empty() {
-                    // 生成型单元（如 some.service 由其他 unit 反代）没有独立文件
-                    return Err(panel_core::PanelError::Unsupported(
-                        "service has no fragment path (generated unit?)"));
-                }
-                // 防御：只接受绝对路径且不含路径穿越（FragmentPath 来自 systemctl，
-                // 理论上安全，但写操作前必须再校验一次，绝不信任外部字符串拼路径）
-                if !path.starts_with('/') || path.contains("..") {
-                    return Err(panel_core::PanelError::Unsupported(
-                        "service config path is not a safe absolute path"));
-                }
-                let content = tokio::fs::read_to_string(&path).await
-                    .map_err(|e| panel_core::PanelError::Io(
-                        format!("read {path}: {e}")))?;
+                let path = match target {
+                    crate::traits::ConfigTarget::Unit => fragment_path(name).await?,
+                    crate::traits::ConfigTarget::DropIn => drop_in_path(name)?,
+                };
                 // 仅 /etc/systemd/ 下为可覆盖目录；/lib、/usr/lib 下是发行版文件，
                 // 直接改会在包升级时被覆盖，前端据此提示改用 drop-in。
                 let writable = path.starts_with("/etc/systemd/");
-                Ok(ServiceConfig { path, content, writable })
+                // drop-in 允许"文件尚不存在"：返回空内容 + exists=false，
+                // 前端据此提示"保存后将新建"，而不是报 404 / 不支持——
+                // 否则用户永远无法通过面板新建 drop-in。
+                let (content, exists) = match tokio::fs::read_to_string(&path).await {
+                    Ok(c) => (c, true),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound
+                        && target == crate::traits::ConfigTarget::DropIn => (String::new(), false),
+                    Err(e) => return Err(panel_core::PanelError::Io(
+                        format!("read {path}: {e}"))),
+                };
+                Ok(ServiceConfig { path, content, writable, exists })
             }
             _ => Err(panel_core::PanelError::Unsupported("service.config_read requires systemd")),
         }
     }
 
-    async fn config_write(&self, name: &UnitName, content: &str, restart: bool) -> Result<()> {
+    async fn config_write(&self, name: &UnitName, content: &str, restart: bool, target: crate::traits::ConfigTarget) -> Result<()> {
         match self.init {
             InitSystem::Systemd => {
-                // 先确认真实 FragmentPath，禁止把任意 content 写到任意文件
-                let out = cmd::run(
-                    Bin::Systemctl,
-                    &["show", "-p", "FragmentPath", "--value", name.as_str()],
-                    CmdOpt { timeout: Duration::from_secs(5), ..Default::default() },
-                ).await?;
-                let path = out.stdout.trim().to_string();
-                if path.is_empty() || !path.starts_with('/') || path.contains("..") {
-                    return Err(panel_core::PanelError::Unsupported(
-                        "service config path is not a safe absolute path"));
-                }
+                // 先确认真实写入路径，禁止把任意 content 写到任意文件
+                let path = match target {
+                    crate::traits::ConfigTarget::Unit => fragment_path(name).await?,
+                    crate::traits::ConfigTarget::DropIn => {
+                        let p = drop_in_path(name)?;
+                        let dir = p.rsplit_once('/').map(|(d, _)| d.to_string())
+                            .unwrap_or_else(|| "/etc/systemd/system".to_string());
+                        // drop-in 目录首次使用时尚不存在，幂等创建
+                        tokio::fs::create_dir_all(&dir).await
+                            .map_err(|e| panel_core::PanelError::Io(format!("mkdir {dir}: {e}")))?;
+                        p
+                    }
+                };
 
-                // 原子替换：先备份为 .panel.bak（best-effort），再写临时文件并 rename。
-                // 不原地写——半写状态会让 unit 文件损坏、该服务再也起不来。
+                // 原子替换：先备份为 .panel.bak（best-effort；文件可能尚不存在），
+                // 再写临时文件并 rename。不原地写——半写状态会让 unit 文件损坏、
+                // 该服务再也起不来。
                 let _ = tokio::fs::copy(&path, format!("{path}.panel.bak")).await;
                 let tmp = format!("{path}.panel.tmp");
                 tokio::fs::write(&tmp, content.as_bytes()).await
@@ -194,6 +191,39 @@ impl ServiceProvider for LinuxServices {
             _ => Err(panel_core::PanelError::Unsupported("service.config_write requires systemd")),
         }
     }
+}
+
+/// 单元文件真实路径（`systemctl show -p FragmentPath`）+ 路径安全校验。
+async fn fragment_path(name: &UnitName) -> Result<String> {
+    let out = cmd::run(
+        Bin::Systemctl,
+        &["show", "-p", "FragmentPath", "--value", name.as_str()],
+        CmdOpt { timeout: Duration::from_secs(5), ..Default::default() },
+    ).await?;
+    let path = out.stdout.trim().to_string();
+    if path.is_empty() {
+        // 生成型单元（如 some.service 由其他 unit 反代）没有独立文件
+        return Err(panel_core::PanelError::Unsupported(
+            "service has no fragment path (generated unit?)"));
+    }
+    // 防御：只接受绝对路径且不含路径穿越（FragmentPath 来自 systemctl，
+    // 理论上安全，但写操作前必须再校验一次，绝不信任外部字符串拼路径）
+    if !path.starts_with('/') || path.contains("..") {
+        return Err(panel_core::PanelError::Unsupported(
+            "service config path is not a safe absolute path"));
+    }
+    Ok(path)
+}
+
+/// drop-in 路径：`/etc/systemd/system/<unit>.d/override.conf`
+fn drop_in_path(name: &UnitName) -> Result<String> {
+    let u = name.as_str();
+    // 单元名已由 UnitName 校验，但拼路径前再兜一次：绝不允许穿越出目录
+    if u.trim().is_empty() || u.contains('/') || u.contains("..") {
+        return Err(panel_core::PanelError::Unsupported(
+            "invalid unit name for drop-in path"));
+    }
+    Ok(format!("/etc/systemd/system/{u}.d/override.conf"))
 }
 
 impl LinuxServices {

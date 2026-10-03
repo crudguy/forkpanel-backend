@@ -166,9 +166,26 @@ impl Default for JournalQuery {
     }
 }
 
+/// 服务配置的读写目标。
+///
+/// 为什么有两种：直接改写单元文件（尤其位于 `/lib`、`/usr/lib` 的发行版文件）
+/// 会在**软件包升级时被覆盖**；systemd 的 drop-in 机制
+/// （`/etc/systemd/system/<unit>.d/override.conf`）与单元文件合并生效、
+/// 不被包升级覆盖，是官方推荐做法。
+///
+/// 用枚举而非布尔（`drop_in: bool`）：与项目"多档操作用显式联合类型"的约定一致——
+/// 布尔会让"目标是哪个"散落在读与写两处判断里，将来加第三种目标必漏。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigTarget {
+    /// 单元文件本体（`systemctl show -p FragmentPath`）
+    Unit,
+    /// `/etc/systemd/system/<unit>.d/override.conf`
+    DropIn,
+}
+
 /// 服务单元文件（配置）快照。
 ///
-/// 对 systemd：来自 `systemctl show -p FragmentPath` 指向的文件。
+/// 对 systemd：来自 `systemctl show -p FragmentPath` 指向的文件，或 drop-in 文件。
 /// `writable=false` 表示该文件位于发行版目录（如 `/lib/systemd/system/`、
 /// `/usr/lib/systemd/system/`）——可直接改但**包升级时会被覆盖**，
 /// 业务层据此提示用户改用 drop-in（`/etc/systemd/system/<unit>.d/`）。
@@ -180,6 +197,8 @@ pub struct ServiceConfig {
     pub content: String,
     /// 是否位于用户可覆盖目录（`/etc/systemd/` 下）
     pub writable: bool,
+    /// 该文件当前是否存在（drop-in 目标下可为 false＝"保存即新建"）
+    pub exists: bool,
 }
 
 #[async_trait]
@@ -194,12 +213,14 @@ pub trait ServiceProvider: Send + Sync {
     async fn set_enabled(&self, name: &UnitName, enabled: bool) -> Result<()>;
     /// 返回日志行接收端；调用方通过 SSE 转发
     async fn journal(&self, name: &UnitName, q: JournalQuery) -> Result<Receiver<String>>;
-    /// 读取服务单元文件内容（修改配置功能的数据源）。
+    /// 读取服务配置（修改配置功能的数据源）。
     /// 非 systemd 或无可编辑配置时返回 Unsupported。
-    async fn config_read(&self, name: &UnitName) -> Result<ServiceConfig>;
-    /// 写回单元文件并经 `daemon-reload` 重新加载；`restart` 为真时随后重启服务。
+    /// `target=DropIn` 且文件尚不存在时，返回空 `content` + `exists=false`（待新建），
+    /// 而非报错——否则用户永远无法通过面板新建 drop-in。
+    async fn config_read(&self, name: &UnitName, target: ConfigTarget) -> Result<ServiceConfig>;
+    /// 写回配置并经 `daemon-reload` 重新加载；`restart` 为真时随后重启服务。
     /// 写入前自动备份为 `<path>.panel.bak`，并原子替换（先写临时文件再 rename）。
-    async fn config_write(&self, name: &UnitName, content: &str, restart: bool) -> Result<()>;
+    async fn config_write(&self, name: &UnitName, content: &str, restart: bool, target: ConfigTarget) -> Result<()>;
 }
 
 // ═══════════════════════════ 软件包 ═══════════════════════════

@@ -152,11 +152,11 @@ impl ServiceProvider for MockServices {
         Ok(rx)
     }
 
-    async fn config_read(&self, _n: &UnitName) -> Result<ServiceConfig> {
+    async fn config_read(&self, _n: &UnitName, _t: crate::traits::ConfigTarget) -> Result<ServiceConfig> {
         Err(panel_core::PanelError::Unsupported("service.config (mock adapter has no real unit files)"))
     }
 
-    async fn config_write(&self, _n: &UnitName, _content: &str, _restart: bool) -> Result<()> {
+    async fn config_write(&self, _n: &UnitName, _content: &str, _restart: bool, _t: crate::traits::ConfigTarget) -> Result<()> {
         Err(panel_core::PanelError::Unsupported("service.config (mock adapter has no real unit files)"))
     }
 }
