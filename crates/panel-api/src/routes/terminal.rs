@@ -134,6 +134,9 @@ async fn terminal_session(socket: WebSocket, shell: Bin, _permit: SemaphorePermi
 
     // 通知前端：终端已就绪（前端据此隐藏"连接中"并聚焦输入框）
     if !send_json(&mut sink, &json!({ "t": "ready", "shell": shell.as_str() })).await {
+        // PTY 已经起来了（bash 在跑），此路 return 必须显式收尾。
+        // PtyTx 的 Drop 会兜底强杀，但这里立刻回收更干净、不必等 drop。
+        tx.shutdown().await;
         return;
     }
 

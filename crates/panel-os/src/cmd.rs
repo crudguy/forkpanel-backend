@@ -345,6 +345,12 @@ pub struct PtyReader(pub tokio::fs::File);
 pub struct PtyTx {
     master: tokio::fs::File,
     child: tokio::process::Child,
+    /// 子进程是否已被 `shutdown()` 回收。
+    ///
+    /// 必须记录：pid 在子进程退出后会被内核回收并**分配给别的进程**，
+    /// 若 Drop 时再无条件 `kill(-pid, SIGHUP)`，就可能把信号发给一个
+    /// 完全无关的进程组——比泄漏更危险。
+    reaped: bool,
 }
 
 /// 一个已建立的交互式伪终端会话。
@@ -390,6 +396,30 @@ impl PtyTx {
             let _ = self.child.start_kill();
             let _ = self.child.wait().await;
         }
+        self.reaped = true;   // 之后 Drop 不得再对该 pid 发信号
+    }
+}
+
+impl Drop for PtyTx {
+    /// 兜底回收：**任何**离开作用域的路径都要清掉 shell 进程组。
+    ///
+    /// 正常路径会走 `shutdown()`（已 wait，此处无操作）。但会话循环存在
+    /// 提前 return 的分支（例如通知前端 ready 失败即 return），以及 future
+    /// 被取消的可能——这些路径下 `tokio::process::Child` 被 drop 时 tokio
+    /// **不会**替你 kill，bash 会连同它启动的前台程序一起留下（孤儿），
+    /// PTY master 也不再有人读。
+    ///
+    /// Drop 里不能 await，故只发 SIGHUP + SIGKILL；残留的 exit status 由
+    /// tokio 的 orphan reaper 回收，不会变僵尸。
+    fn drop(&mut self) {
+        if self.reaped { return; }
+        let pid = self.child.id().unwrap_or(0) as i32;
+        if pid > 0 {
+            // SAFETY: 仅为发信号，负 pid 表示整个进程组（shell 已 setsid 成为组长）
+            unsafe { libc::kill(-pid, libc::SIGHUP); }
+        }
+        let _ = self.child.start_kill();
+        self.reaped = true;
     }
 }
 
@@ -505,6 +535,7 @@ pub fn spawn_pty(shell: Bin, cols: u16, rows: u16, cwd: Option<&std::path::Path>
             tx: PtyTx {
                 master: tokio::fs::File::from_std(std::fs::File::from_raw_fd(write_fd)),
                 child,
+                reaped: false,
             },
         }
     })
