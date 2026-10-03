@@ -12,7 +12,10 @@ pub mod crypto; // 应用层密钥加密（AES-256-GCM，关闭 M0 阻塞项）
 
 pub type Result<T> = std::result::Result<T, PanelError>;
 
-#[derive(Debug, thiserror::Error)]
+// Clone：panel-db 的 writer actor 需要把错误克隆一份回传给发起者（见 panel-db 的
+// clone_err）。此前 PanelError 不可 Clone，只能把错误压成 Database 变体，
+// 导致错误类型（也就HTTP 状态码）在跨线程回传时丢失。
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum PanelError {
     /// 输入未通过校验器（携带字段级明细，映射 HTTP 10001）
     #[error("invalid input: {field}: {reason}")]

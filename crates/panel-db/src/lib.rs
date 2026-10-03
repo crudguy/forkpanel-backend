@@ -256,8 +256,14 @@ impl WriterActor {
     }
 }
 
+/// writer actor 把错误克隆一份回传给发起者。
+///
+/// 此前一律降级为 `PanelError::Database`（映射 500）：`db.exec` 闭包内抛出的
+/// Validation / Conflict 会被改写成"内部错误"，于是"用户名已存在""站点名重复"
+/// 这类**用户输入问题**报成 500，前端只能显示服务器内部错误，用户无从得知该怎么改。
+/// 保留原始类型后，这些场景能正确返回 400/409。
 fn clone_err(e: &PanelError) -> PanelError {
-    PanelError::Database(e.to_string())
+    e.clone()
 }
 
 // ═══════════════════════════ 读连接池 ═══════════════════════════
