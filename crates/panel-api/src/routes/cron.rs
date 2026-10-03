@@ -117,6 +117,22 @@ pub struct CreateReq {
     pub webhook_events: Option<Vec<String>>,
 }
 
+/// 任务超时上限：7 天。太长会让卡死的任务长期占住并发槽。
+const MAX_TIMEOUT_SEC: i64 = 86400 * 7;
+
+/// 校验并归一化 `timeout_sec`（缺省 30 分钟）。
+///
+/// 抽成独立函数是**为了消除 create / patch 两条路径的漏配**：此前只有
+/// `patch_job` 有范围校验，`create` 直接 `as u64`——负数会回绕成
+/// 18446744073709551615 秒，任务永远"运行中"且无法被超时终止。
+fn check_timeout(sec: Option<i64>) -> ApiResult<i64> {
+    let v = sec.unwrap_or(1800);
+    if v <= 0 || v > MAX_TIMEOUT_SEC {
+        return Err(ApiError::bad_request("timeout_sec", "需在 1~604800 之间"));
+    }
+    Ok(v)
+}
+
 pub async fn create(
     State(state): State<Shared>, Auth(s): Auth, Json(req): Json<CreateReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
@@ -145,6 +161,11 @@ pub async fn create(
         return Err(ApiError::bad_request("command", "长度需在 1~4096 之间"));
     }
 
+    // timeout_sec 范围校验（与 patch_job 的同名约束保持一致）。
+    // 必须显式校验：`as u64` 对负数是回绕转换，传 -1 会得到
+    // 18446744073709551615 秒，任务将永远"运行中"且无法被超时终止。
+    let timeout_sec = check_timeout(req.timeout_sec)?;
+
     // max_overlap：仅 0（不限）/ 1（互斥）合法；>1 未实装，诚实拒绝而非假装生效
     let max_overlap = req.max_overlap.unwrap_or(1);
     if max_overlap > 1 {
@@ -163,7 +184,7 @@ pub async fn create(
         command: req.command.clone(),
         user: user.clone(),
         enabled: req.enabled.unwrap_or(true),
-        timeout: std::time::Duration::from_secs(req.timeout_sec.unwrap_or(1800) as u64),
+        timeout: std::time::Duration::from_secs(timeout_sec as u64),
         max_overlap,
         webhook_url: webhook_url.clone(),
         webhook_events: webhook_events.clone(),
@@ -180,7 +201,7 @@ pub async fn create(
             // enabled 必须与调度器侧 ScheduledJob.enabled 保持一致（之前硬编码为 1，
             // 导致创建 enabled:false 的任务时 crontab 真禁用、列表却显示"启用"）
             rusqlite::params![name, req.expr, req.enabled.unwrap_or(true) as i64,
-                              req.timeout_sec.unwrap_or(1800), max_overlap as i64,
+                              timeout_sec, max_overlap as i64,
                               webhook_url, events_joined],
         ).map_err(|e| PanelError::Database(e.to_string()))?;
         Ok(panel_db::WriteAck { rows_changed: 1 })
@@ -316,7 +337,7 @@ pub async fn patch_job(
     if command.is_empty() || command.len() > 4096 {
         return Err(ApiError::bad_request("command", "长度需在 1~4096 之间"));
     }
-    if timeout_sec <= 0 || timeout_sec > 86400 * 7 {
+    if timeout_sec <= 0 || timeout_sec > MAX_TIMEOUT_SEC {
         return Err(ApiError::bad_request("timeout_sec", "需在 1~604800 之间"));
     }
 
@@ -676,6 +697,23 @@ mod tests {
     fn timeout_default_is_sane() {
         // 默认 30 分钟：太短会杀掉正常备份，太长会让卡死任务占住并发槽
         assert_eq!(1800, 30 * 60);
+    }
+
+    #[test]
+    fn timeout_bounds_are_enforced_on_both_paths() {
+        // 正常值：缺省与合法值都通过
+        assert_eq!(check_timeout(None).unwrap(), 1800);
+        assert_eq!(check_timeout(Some(60)).unwrap(), 60);
+        assert_eq!(check_timeout(Some(MAX_TIMEOUT_SEC)).unwrap(), MAX_TIMEOUT_SEC);
+
+        // 负数必须被拒：`as u64` 会把它回绕成 1.8e19 秒，任务永不超时
+        for bad in [-1i64, i64::MIN, -86400] {
+            assert!(check_timeout(Some(bad)).is_err(), "负数 {bad} 必须被拒");
+        }
+        // 0 与超上限必须被拒（0 会让任务瞬间被判超时）
+        assert!(check_timeout(Some(0)).is_err());
+        assert!(check_timeout(Some(MAX_TIMEOUT_SEC + 1)).is_err());
+        assert!(check_timeout(Some(i64::MAX)).is_err());
     }
 
     #[test]
