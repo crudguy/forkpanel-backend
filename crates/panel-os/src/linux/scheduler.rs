@@ -384,7 +384,9 @@ fn dow_from_days(z: i64) -> u8 {
 /// （东八区差 8 小时，等于给用户看错的时刻）。用 libc `localtime_r`
 /// （线程安全版）读 `tm_gmtoff`；任何失败一律退回 0（退化为 UTC 语义，
 /// 不 panic 不阻塞）。
-fn local_utc_offset_secs_at(now_unix: i64) -> i64 {
+/// 供 panel-task 的内部调度器复用：每日类任务同样必须以本地时间为准，
+/// 否则东八区上"03:10 执行"会漂到 11:10。
+pub fn local_utc_offset_secs_at(now_unix: i64) -> i64 {
     let t = now_unix as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     let ok = unsafe { libc::localtime_r(&t, &mut tm) };

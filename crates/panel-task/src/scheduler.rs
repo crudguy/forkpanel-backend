@@ -169,9 +169,13 @@ fn secs_until(hour: u8, minute: u8) -> Duration {
 }
 
 fn today_at(now: i64, hour: u8, minute: u8) -> i64 {
-    // 用 UTC 日的起点 + 偏移量对齐。精确时区处理（含 DST）不在 MVP 范围，
-    // 这里以"容器/宿主机的本地时区"为准，UI 展示为计划时刻。
-    let day_start = now - (now % 86_400);
+    // 以**本地时区**的今天 00:00 为基准，而不是 UTC 日的起点。
+    // 此前 `now - (now % 86_400)` 算的是 UTC 日 00:00：东八区下 UI 上写的
+    // 「03:10 执行」会到本地 11:10 才触发，与展示时刻整整差一个时区。
+    // 偏移换算复用 panel-os 里已有的 libc localtime_r 实现，不另引依赖。
+    let off = panel_os::linux::scheduler::local_utc_offset_secs_at(now);
+    let local = now + off;                 // 本地时刻（纪元秒口径）
+    let day_start = (local - local % 86_400) - off;  // 本地 00:00 对应的 UTC 纪元秒
     day_start + hour as i64 * 3600 + minute as i64 * 60
 }
 
@@ -183,6 +187,17 @@ fn now_unix() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn today_at_is_local_time_not_utc() {
+        // 钉死「每日任务是本地时间语义」：把结果换算回本地时刻，必须正好等于请求的
+        // 时:分。此前按 UTC 日起点计算，东八区会把 UI 上的 03:10 推到 11:10 才触发。
+        // 用"换算回本地再比对"而不是写死绝对时刻，测试就不依赖运行机器的时区。
+        let now = 1_700_000_000i64;
+        let off = panel_os::linux::scheduler::local_utc_offset_secs_at(now);
+        let t = today_at(now, 3, 10);
+        assert_eq!((t + off).rem_euclid(86_400), 3 * 3600 + 10 * 60);
+    }
 
     #[test]
     fn builtin_includes_core_jobs() {
