@@ -1401,7 +1401,7 @@ paths:
           application/json:
             schema: { type: object, required: [enabled], properties: { enabled: { type: boolean, description: 是否允许到期前自动续期 } } }
       responses:
-        '200': { description: 已更新（返回 { id, auto_renew }） }
+        '200': { description: '已更新（返回 { id, auto_renew }）' }
         '400': { description: 非 ACME 证书不支持自动续期 }
         '404': { description: 证书不存在 }
         '501': { description: 平台未接入 ACME 能力 }
@@ -1422,11 +1422,16 @@ paths:
           description: ok
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, required: [last_at, last_queued, next_at], properties: {
-                last_at:    { type: integer, description: 最近一次扫描的 Unix 秒；0=从未运行 }
-                last_queued:{ type: integer, description: 该次扫描入队的证书数 }
-                next_at:    { type: integer, description: 预计下次扫描的 Unix 秒；last_at=0 时为 0 }
-              } } } }
+              schema:
+                $ref: '#/components/schemas/Envelope'
+                properties:
+                  data:
+                    type: object
+                    required: [last_at, last_queued, next_at]
+                    properties:
+                      last_at:     { type: integer, description: 最近一次扫描的 Unix 秒；0=从未运行 }
+                      last_queued: { type: integer, description: 该次扫描入队的证书数 }
+                      next_at:     { type: integer, description: 预计下次扫描的 Unix 秒；last_at=0 时为 0 }
 
   # ───────── 文件 ─────────
   /api/v1/files/list:
