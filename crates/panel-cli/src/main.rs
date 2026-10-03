@@ -579,7 +579,20 @@ async fn register_internal_jobs(
         let state = state.clone();
         sched.register("cert.renew_check", move || {
             let state = state.clone();
-            async move { panel_api::routes::sites::auto_renew_sweep(state).await.map(|_| ()) }
+            async move {
+                match panel_api::routes::sites::auto_renew_sweep(state).await {
+                    Ok(n) => {
+                        if n > 0 {
+                            tracing::info!("证书自动续期扫描：已入队 {n} 张到期证书");
+                        }
+                        Ok(())
+                    }
+                    Err(e) => {
+                        tracing::warn!("证书自动续期扫描失败: {e}");
+                        Err(e)
+                    }
+                }
+            }
         }).await;
     }
 }
