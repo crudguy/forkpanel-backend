@@ -209,11 +209,13 @@ components:
 
     ServiceConfig:
       type: object
-      required: [path, content, writable]
+      required: [path, content, writable, exists, target]
       properties:
-        path:    { type: string, description: 单元文件绝对路径（systemd FragmentPath） }
-        content: { type: string, description: 文件内容（UTF-8） }
+        path:    { type: string, description: 配置文件绝对路径（unit=FragmentPath 指向的单元文件；dropin=/etc/systemd/system/<unit>.d/override.conf） }
+        content: { type: string, description: 文件内容（UTF-8）；dropin 且文件尚不存在时为空串 }
         writable: { type: boolean, description: "false=位于发行版目录，修改可能在包升级时被覆盖，建议改用 drop-in" }
+        exists:  { type: boolean, description: "该文件当前是否存在；dropin 目标下 false 表示保存即新建" }
+        target:  { type: string, enum: [unit, dropin], description: 本次读写的目标（与请求的 target 一致） }
 
     # ───────────── 认证 ─────────────
     BootstrapRequest:
@@ -1240,11 +1242,28 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: string } } }
 
+  /api/v1/services/{unit}/journal/stream:
+    get:
+      tags: [services]
+      summary: 服务日志跟随（SSE；先补最近 N 行历史，再 journalctl -f 增量）
+      parameters:
+        - { name: unit, in: path, required: true, schema: { type: string } }
+        - { name: lines, in: query, schema: { type: integer, default: 200, description: 补读的历史行数（上限 2000） } }
+      responses:
+        '200':
+          description: 'text/event-stream；事件名 log，data 为 { line }'
+          content:
+            text/event-stream:
+              schema: { type: string }
+        '10009': { description: 当前环境不支持服务管理 }
+
   /api/v1/services/{unit}/config:
     get:
       tags: [services]
-      summary: 读取服务单元文件（systemd FragmentPath 指向的文件）
-      parameters: [{ name: unit, in: path, required: true, schema: { type: string } }]
+      summary: 读取服务配置（unit=单元文件本体 / dropin=override.conf）
+      parameters:
+        - { name: unit, in: path, required: true, schema: { type: string } }
+        - { name: target, in: query, schema: { type: string, enum: [unit, dropin], default: unit } }
       responses:
         '200':
           description: ok
@@ -1254,14 +1273,20 @@ paths:
         '10009': { description: 该平台/单元不支持配置编辑 }
     put:
       tags: [services]
-      summary: 写回单元文件并 daemon-reload（可选重启）
+      summary: 写回配置并 daemon-reload（可选重启）；target=dropin 时写 override.conf
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: unit, in: path, required: true, schema: { type: string } }]
       requestBody:
         required: true
         content:
           application/json:
-            schema: { type: object, required: [content], properties: { content: { type: string }, restart: { type: boolean, default: false } } }
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content: { type: string }
+                restart: { type: boolean, default: false }
+                target: { type: string, enum: [unit, dropin], default: unit, description: 写入目标；非法值 400，不静默回退 }
       responses:
         '200': { description: 已保存并重新加载 }
         '10009': { description: 该平台/单元不支持配置编辑 }
