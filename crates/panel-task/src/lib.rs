@@ -216,7 +216,13 @@ impl TaskRunner {
             }
         }
 
-        // 2) 落库（短事务）
+        // 2) 落库（短事务）。
+        //
+        // 任务 id 必须**在插入的同一个闭包内**取回（last_insert_rowid），
+        // 不能插入后再查 MAX(id)：writer actor 虽串行处理闭包，但「INSERT」
+        // 与「SELECT MAX(id)」是两个闭包，中间可以被别的 submit 插进来，
+        // 两个任务就会拿到同一个 id —— 后到的那个会覆盖先到的状态行，
+        // 进度/终态互相打架，前端看到的是别人的任务结果。
         let kind = req.kind.as_str().to_string();
         let label = req.label.clone();
         let ikey = req.idempotency_key.clone();
@@ -226,12 +232,12 @@ impl TaskRunner {
                  VALUES(?1, ?2, 'queued', 0, ?3)",
                 rusqlite::params![ikey, kind, now_unix()],
             ).map_err(|e| PanelError::Database(e.to_string()))?;
-            Ok(panel_db::WriteAck { rows_changed: 1 })
+            // 本连接最后一次 INSERT 的 rowid，即刚插入这一行的 id。
+            // 借 WriteAck.rows_changed 回传（既有约定：见 last_task_id 注释）。
+            Ok(panel_db::WriteAck { rows_changed: conn.last_insert_rowid() as usize })
         }).await?;
-        let _ = ack;
         let _ = label;
-
-        let id = self.last_task_id().await?;
+        let id = ack.rows_changed as i64;
 
         {
             let mut m = self.idempotency.lock().unwrap_or_else(|e| e.into_inner());
@@ -288,16 +294,6 @@ impl TaskRunner {
         });
 
         Ok((id, true))
-    }
-
-    async fn last_task_id(&self) -> Result<i64> {
-        // 读连接池在 panel-api 侧；这里用一个极短的读查询。
-        // 实际实现应改为 INSERT ... RETURNING（SQLite ≥3.35），此处为兼容写法。
-        self.writer.exec(|conn| {
-            let id: i64 = conn.query_row("SELECT COALESCE(MAX(id), 0) FROM task_runs", [], |r| r.get(0))
-                .map_err(|e| PanelError::Database(e.to_string()))?;
-            Ok(panel_db::WriteAck { rows_changed: id as usize })
-        }).await.map(|a| a.rows_changed as i64)
     }
 
     async fn is_terminal(&self, id: i64) -> Result<bool> {
@@ -409,5 +405,55 @@ mod tests {
         assert_eq!(TaskKind::Package.as_str(), "package");
         assert_eq!(TaskKind::CertIssue.as_str(), "cert_issue");
         assert_eq!(TaskKind::Internal.as_str(), "internal");
+    }
+
+    /// 不变量：并发提交的两个任务必须拿到**不同** id。
+    ///
+    /// 钉住 `submit()` 里"INSERT 与取 id 必须在同一个闭包"这件事——
+    /// 若退回成"先 INSERT、再单独查 MAX(id)"，两次提交会撞成同一个 id，
+    /// 后完成的那个 UPDATE 会覆盖前一个的状态，前端看到的是别人的任务结果。
+    struct NoopBody;
+    #[async_trait::async_trait]
+    impl TaskBody for NoopBody {
+        async fn run(&self, _p: Progress) -> Result<TaskOutcome> {
+            Ok(TaskOutcome { state: TaskState::Ok, exit_code: Some(0), output_path: None })
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_submits_get_distinct_ids() {
+        let dir = std::env::temp_dir().join(format!("panel-task-id-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("panel.db");
+
+        // 建表：writer actor 只负责写，schema 由迁移负责
+        {
+            let mut c = rusqlite::Connection::open(&db).unwrap();
+            panel_db::migrate::apply(&mut c).unwrap();
+        }
+
+        let writer = std::sync::Arc::new(panel_db::WriterActor::spawn(db, Tier::Nano).unwrap());
+        let runner = TaskRunner::new(writer, Tier::Nano, dir.clone());
+
+        let req = |k: &str| TaskRequest {
+            idempotency_key: k.to_string(),
+            kind: TaskKind::Service,
+            label: k.to_string(),
+            timeout: Duration::from_secs(5),
+        };
+
+        // 并发提交：两个 future 同时推进，正是竞态发生的时机
+        let (a, b) = tokio::join!(
+            runner.submit(req("k-a"), NoopBody),
+            runner.submit(req("k-b"), NoopBody),
+        );
+        let (id_a, _) = a.expect("提交 A 失败");
+        let (id_b, _) = b.expect("提交 B 失败");
+
+        assert_ne!(id_a, id_b, "并发提交撞成了同一个任务 id（{id_a}）");
+        assert!(id_a > 0 && id_b > 0, "任务 id 必须来自自增主键，不能是 0");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
