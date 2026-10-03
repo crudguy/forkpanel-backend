@@ -70,7 +70,10 @@ panel serve --bind 127.0.0.1:2083
 
 - 唯一事实源：`docs/api/openapi.yaml`（OpenAPI 3.1）。
 - 前端消费其副本并生成类型；两端以 `GET /api/v1/version` 的 `api` 字段做版本协商。
-- 修改契约时：**先改 openapi.yaml，再改两端实现**，并跑 `ci/check-api-contract.sh`。
+- 修改契约时：**先改 openapi.yaml，再改两端实现**，并跑 `ci/check-api-contract.sh`
+  （含契约结构体检 `ci/check_openapi.py`：YAML 语法 + 前后端副本逐字节一致）。
+  契约正文大量使用 flow 风格单行（`{ a: 1 }`），**值里出现 `{`/`}` 必须加单引号**，
+  否则整份文件无法被 YAML 解析器读取——该脚本会定位到行号。
 
 ## 已知约束
 
