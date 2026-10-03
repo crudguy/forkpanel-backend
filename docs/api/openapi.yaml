@@ -1412,6 +1412,21 @@ paths:
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       responses: { '204': { description: ok } }
+  /api/v1/certs/renew-sweep:
+    get:
+      tags: [sites]
+      summary: 证书自动续期扫描的运行状态（上次/下次扫描时间）
+      security: [cookieAuth]
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, required: [last_at, last_queued, next_at], properties: {
+                last_at:    { type: integer, description: 最近一次扫描的 Unix 秒；0=从未运行 }
+                last_queued:{ type: integer, description: 该次扫描入队的证书数 }
+                next_at:    { type: integer, description: 预计下次扫描的 Unix 秒；last_at=0 时为 0 }
+              } } } }
 
   # ───────── 文件 ─────────
   /api/v1/files/list:

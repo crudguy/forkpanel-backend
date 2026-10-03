@@ -1030,6 +1030,40 @@ pub async fn certs(
     Ok(ok(dtos))
 }
 
+/// 证书自动续期扫描的最近运行状态（前端"上次/下次扫描"展示用）。
+///
+/// 由内部调度器每日 4:05 触发的 `auto_renew_sweep` 写入 `cert_sweep_state`；
+/// 本端点只读取，不参与调度。未运行过时整表为空 → 返回 `last_at=0`，
+/// 前端据此显示"尚未运行"。
+pub async fn cert_renew_sweep_state(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::SITE_VIEW)?;
+    let row: Option<(i64, i64)> = state
+        .pool
+        .with(|conn| {
+            match conn.query_row(
+                "SELECT last_at, last_queued FROM cert_sweep_state WHERE id = 1",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            ) {
+                Ok(v) => Ok(Some(v)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(db_err(e)),
+            }
+        })
+        .await?;
+    let (last_at, last_queued) = row.unwrap_or((0, 0));
+    // 调度为每日一次，下次 ≈ 上次 + 24h；从未运行则 0（前端显示"尚未运行"）
+    let next_at = if last_at > 0 { last_at + 86_400 } else { 0 };
+    Ok(ok(serde_json::json!({
+        "last_at": last_at,
+        "last_queued": last_queued,
+        "next_at": next_at,
+    })))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SslApplyReq {
     /// 留空则沿用站点现有域名
@@ -1450,6 +1484,24 @@ pub async fn auto_renew_sweep(state: Shared) -> panel_core::Result<usize> {
         }
         // 单条失败不影响其余证书，也不惊动周期任务（失败原因由任务自身记录）
     }
+
+    // 记录扫描时间（供前端展示"上次/下次扫描"）。即便本次入队 0 也写入——
+    // 说明扫描确实跑过、只是没有到期证书，而非"从未运行"。
+    let sweep_now = now;
+    let sweep_queued = queued as i64;
+    state
+        .pool
+        .with(move |conn| {
+            conn.execute(
+                "INSERT INTO cert_sweep_state(id, last_at, last_queued) VALUES(1, ?1, ?2) \
+                 ON CONFLICT(id) DO UPDATE SET last_at=excluded.last_at, last_queued=excluded.last_queued",
+                rusqlite::params![sweep_now, sweep_queued],
+            )
+            .map_err(db_err)?;
+            Ok(())
+        })
+        .await?;
+
     Ok(queued)
 }
 

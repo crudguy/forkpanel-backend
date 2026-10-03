@@ -129,6 +129,7 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/certs", get(sites::certs))
         .route("/api/v1/certs/{id}/renew", post(sites::cert_renew))
         .route("/api/v1/certs/{id}/auto-renew", patch(sites::cert_auto_renew))
+        .route("/api/v1/certs/renew-sweep", get(sites::cert_renew_sweep_state))
         .route("/api/v1/certs/{id}", delete(sites::cert_delete));
 
     // ── 文件 ──
