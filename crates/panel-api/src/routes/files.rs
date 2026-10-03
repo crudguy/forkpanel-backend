@@ -560,8 +560,15 @@ pub async fn chmod(
     let op = panel_os::PermissionOp::Posix {
         mode, owner: None, group: None,
     };
-    // 递归改权限只在目录上才合理，且由 StorageProvider 决定是否支持
-    let _recursive = req.recursive.unwrap_or(false);
+    // 此前写成 `let _recursive = req.recursive.unwrap_or(false);` —— 只赋值、从未使用，
+    // 于是用户勾了「递归」却只改了顶层，而且没有任何提示。静默失效比直接报错更危险：
+    // 用户以为整棵目录树都改了，子文件权限其实原封不动（安全相关操作尤其不能假成功）。
+    // 底层 StorageProvider::set_permissions 目前只作用于传入路径本身、无 recursive 语义，
+    // 在扩展该 trait 之前显式拒绝，而不是假装生效。
+    if req.recursive.unwrap_or(false) {
+        return Err(ApiError::bad_request(
+            "recursive", "recursive chmod is not supported: only the given path is changed"));
+    }
     state.os.storage().set_permissions(&p, op).await?;
     audit(&state, &s, "file.chmod", &req.path, "ok").await;
     Ok(ok(serde_json::json!({ "path": req.path, "mode": format!("{mode:o}") })))
