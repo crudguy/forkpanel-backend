@@ -30,10 +30,20 @@ pub fn apply(conn: &mut Connection) -> Result<u32> {
              version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL, checksum TEXT NOT NULL);",
     ).map_err(|e| PanelError::Database(e.to_string()))?;
 
-    // 快速路径：无待执行迁移时只做一次单行查询（微秒级），不触碰其他表
-    let current: u32 = conn
+    // 快速路径：无待执行迁移时只做一次单行查询（微秒级），不触碰其他表。
+    //
+    // 查询失败**绝不能**当成 v0：空表（正常新库）返回的是 `MAX=NULL → COALESCE 0`，
+    // 那才是 v0；而报错意味着库不可读或 schema_migrations 结构损坏。若在此兜成 0，
+    // 后面的循环会从头重跑 001（历史迁移用的是裸 CREATE TABLE，无 IF NOT EXISTS），
+    // 于是抛出 "table xxx already exists" —— 把真正的损坏原因彻底掩盖，
+    // 排障时会被这条误导性报错带偏。库损坏必须带着原始错误失败。
+    let current: u32 = match conn
         .query_row("SELECT COALESCE(MAX(version), 0) FROM schema_migrations", [], |r| r.get(0))
-        .unwrap_or(0);
+    {
+        Ok(v) => v,
+        Err(e) => return Err(PanelError::Database(
+            format!("读取 schema 版本失败（数据库可能已损坏）: {e}"))),
+    };
     if current >= LATEST { return Ok(current); }
 
     for (version, sql) in MIGRATIONS {
