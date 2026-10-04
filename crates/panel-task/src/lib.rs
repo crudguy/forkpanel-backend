@@ -176,10 +176,17 @@ pub struct TaskRunner {
     /// 任务输出落盘功能接入前未读取；构造签名保留该参数以维持注入契约。
     #[allow(dead_code)]
     output_dir: PathBuf,
+    /// 任务创建专用写库路径。
+    ///
+    /// ⚠️ 任务创建的 INSERT **不走 writer actor 的攒批事务**：同 key 两个并发
+    /// INSERT 一旦被收进同一批，会在一个事务里互相触发唯一约束、整批回滚，
+    /// 两个请求都失败且无法回退合并。故 submit 用此路径独立开连接单事务写入，
+    /// 确保"先到者提交、后到者唯一冲突后回退复用既有 id"。
+    db_path: PathBuf,
 }
 
 impl TaskRunner {
-    pub fn new(writer: Arc<WriterActor>, tier: Tier, output_dir: PathBuf) -> Self {
+    pub fn new(writer: Arc<WriterActor>, tier: Tier, output_dir: PathBuf, db_path: PathBuf) -> Self {
         Self {
             writer,
             bus: Arc::new(ProgressBus::new()),
@@ -187,6 +194,7 @@ impl TaskRunner {
             slots: Arc::new(Semaphore::new(tier.task_concurrency())),
             idempotency: Arc::new(Mutex::new(HashMap::new())),
             output_dir,
+            db_path,
         }
     }
 
@@ -216,28 +224,73 @@ impl TaskRunner {
             }
         }
 
-        // 2) 落库（短事务）。
+        // 2) 落库。
         //
-        // 任务 id 必须**在插入的同一个闭包内**取回（last_insert_rowid），
-        // 不能插入后再查 MAX(id)：writer actor 虽串行处理闭包，但「INSERT」
-        // 与「SELECT MAX(id)」是两个闭包，中间可以被别的 submit 插进来，
-        // 两个任务就会拿到同一个 id —— 后到的那个会覆盖先到的状态行，
-        // 进度/终态互相打架，前端看到的是别人的任务结果。
+        // ⚠️ 任务创建**不走 writer actor 的攒批事务**：writer 会把同一时间窗口内的
+        // 多个写 op 收进一个 conn.transaction() 执行，若同 key 的两个并发 INSERT
+        // 被收进同一批，第二个触发唯一约束会让**整批回滚**——两个请求都失败，且
+        // 回退查询因回滚后库中无 same-key 行而无从合并（实测：回归测试直接 Internal）。
+        // 故任务创建用独立连接单事务：先到者 INSERT 提交成功，后到者唯一冲突 →
+        // 走下方回退复用既有 id。任务提交频率极低（用户每次操作一次），独立连接的
+        // 写锁争用可忽略；且 db 是 WAL 模式，已提交写入对其他连接立即可见。
+        //
+        // 任务 id 必须**在同一连接内**取回（last_insert_rowid），不能插入后再查
+        // MAX(id)：那样会拿到别的任务插入的 id，覆盖其状态行。
         let kind = req.kind.as_str().to_string();
         let label = req.label.clone();
         let ikey = req.idempotency_key.clone();
-        let ack = self.writer.exec(move |conn| {
-            conn.execute(
+        let db_path = self.db_path.clone();
+        let tier = self.tier;
+        let ins = tokio::task::spawn_blocking(move || -> Result<i64> {
+            let conn = panel_db::open(&db_path, tier)
+                .map_err(|e| PanelError::Internal(format!("open task db: {e}")))?;
+            match conn.execute(
                 "INSERT INTO task_runs(task_id, kind, state, progress, started_at)
                  VALUES(?1, ?2, 'queued', 0, ?3)",
                 rusqlite::params![ikey, kind, now_unix()],
-            ).map_err(|e| PanelError::Database(e.to_string()))?;
-            // 本连接最后一次 INSERT 的 rowid，即刚插入这一行的 id。
-            // 借 WriteAck.rows_changed 回传（既有约定：见 last_task_id 注释）。
-            Ok(panel_db::WriteAck { rows_changed: conn.last_insert_rowid() as usize })
-        }).await?;
+            ) {
+                Ok(_) => Ok(conn.last_insert_rowid() as i64),
+                // 唯一约束命中：并发同 key 已先插入非终态任务（部分唯一索引保证）。
+                // 上层合并到既有任务，绝不重复执行——这是幂等语义的核心。
+                Err(e) if is_unique_violation(&e) => {
+                    Err(PanelError::Conflict(format!("重复幂等键 {ikey}")))
+                }
+                Err(e) => Err(PanelError::Database(e.to_string())),
+            }
+        }).await
+            .map_err(|e| PanelError::Internal(format!("submit task panicked: {e}")))?;
+
+        let id = match ins {
+            Ok(id) => id,
+            Err(PanelError::Conflict(_)) => {
+                // 回退：找到既有非终态任务，复用其 id（db 是唯一真相，独立连接已提交）。
+                let key = req.idempotency_key.clone();
+                let found = self.writer.exec(move |conn| {
+                    match conn.query_row(
+                        "SELECT id FROM task_runs
+                         WHERE task_id=?1 AND state IN ('queued','running')
+                         ORDER BY id DESC LIMIT 1",
+                        rusqlite::params![key], |r| r.get::<_, i64>(0),
+                    ) {
+                        Ok(v) => Ok(panel_db::WriteAck { rows_changed: v as usize }),
+                        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(panel_db::WriteAck { rows_changed: 0 }),
+                        Err(e) => Err(PanelError::Database(e.to_string())),
+                    }
+                }).await?;
+                if found.rows_changed != 0 {
+                    let eid = found.rows_changed as i64;
+                    // 同步内存 map，避免后续同 key 请求再走一次无谓的 INSERT+回退
+                    let mut m = self.idempotency.lock().unwrap_or_else(|e| e.into_inner());
+                    m.insert(req.idempotency_key.clone(), (eid, std::time::Instant::now()));
+                    return Ok((eid, false));
+                }
+                // 理论不可达：唯一约束冲突了却查不到活跃行，说明索引与数据不一致
+                return Err(PanelError::Internal(format!(
+                    "幂等键 {} 冲突但无可合并的活跃任务", req.idempotency_key)));
+            }
+            Err(e) => return Err(e),
+        };
         let _ = label;
-        let id = ack.rows_changed as i64;
 
         {
             let mut m = self.idempotency.lock().unwrap_or_else(|e| e.into_inner());
@@ -341,6 +394,16 @@ impl TaskRunner {
     }
 }
 
+/// 判定是否为 SQLite 唯一约束冲突。
+///
+/// 部分唯一索引（idx_task_runs_idempotent_active）的冲突也走 `ConstraintViolation`
+/// code；此处 INSERT 除该索引外无其他可能触发约束的列，故命中即"幂等键重复"。
+fn is_unique_violation(e: &rusqlite::Error) -> bool {
+    matches!(e,
+        rusqlite::Error::SqliteFailure(ref f, _)
+        if f.code == rusqlite::ErrorCode::ConstraintViolation)
+}
+
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
@@ -433,8 +496,8 @@ mod tests {
             panel_db::migrate::apply(&mut c).unwrap();
         }
 
-        let writer = std::sync::Arc::new(panel_db::WriterActor::spawn(db, Tier::Nano).unwrap());
-        let runner = TaskRunner::new(writer, Tier::Nano, dir.clone());
+        let writer = std::sync::Arc::new(panel_db::WriterActor::spawn(db.clone(), Tier::Nano).unwrap());
+        let runner = TaskRunner::new(writer, Tier::Nano, dir.clone(), db.clone());
 
         let req = |k: &str| TaskRequest {
             idempotency_key: k.to_string(),
@@ -453,6 +516,56 @@ mod tests {
 
         assert_ne!(id_a, id_b, "并发提交撞成了同一个任务 id（{id_a}）");
         assert!(id_a > 0 && id_b > 0, "任务 id 必须来自自增主键，不能是 0");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 不变量：并发提交**相同** idempotency_key 必须合并到同一个活跃任务，
+    /// 不能各 INSERT 一条（否则防双击 / 防重试风暴失效）。
+    ///
+    /// 钉住本次修复：submit() 的"查 map → INSERT"之间无原子保护，仅靠内存 map
+    /// 会在并发下两个请求都通过检查、各自建出一条任务。修复把原子性下沉到数据库
+    /// 部分唯一索引（idx_task_runs_idempotent_active），冲突时回退复用既有 id。
+    ///
+    /// 负向对照：若撤掉该唯一索引，writer actor 串行执行两个 INSERT 都会成功、
+    /// 拿到不同 id，本测试随即转红，故不会是永绿门禁。
+    #[tokio::test]
+    async fn concurrent_same_key_collapses_to_one() {
+        let dir = std::env::temp_dir().join(format!("panel-task-dup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("panel.db");
+        {
+            let mut c = rusqlite::Connection::open(&db).unwrap();
+            panel_db::migrate::apply(&mut c).unwrap();
+        }
+        let writer = std::sync::Arc::new(panel_db::WriterActor::spawn(db.clone(), Tier::Nano).unwrap());
+        let runner = TaskRunner::new(writer, Tier::Nano, dir.clone(), db.clone());
+
+        let req = |k: &str| TaskRequest {
+            idempotency_key: k.to_string(),
+            kind: TaskKind::Service,
+            label: k.to_string(),
+            timeout: Duration::from_secs(5),
+        };
+
+        // join! 先 poll A 到首个 await（writer.exec 挂起），再 poll B：
+        // B 的 map 检查一定发生在 A 写回 map 之前 → 两个都进 INSERT。
+        // writer 串行，第二个 INSERT 落到部分唯一索引冲突 → 回退复用 A 的 id。
+        let (a, b) = tokio::join!(
+            runner.submit(req("same-key"), NoopBody),
+            runner.submit(req("same-key"), NoopBody),
+        );
+        let (id_a, _) = a.expect("提交 A 失败");
+        let (id_b, _) = b.expect("提交 B 失败");
+        assert_eq!(id_a, id_b, "并发同 key 应合并到同一任务 id，却得到 {id_a} 与 {id_b}");
+
+        // 数据库侧确认：同 key 的非终态行只能有一条
+        let c = rusqlite::Connection::open(dir.join("panel.db")).unwrap();
+        let active: i64 = c.query_row(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id='same-key' AND state IN ('queued','running')",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(active, 1, "同 key 非终态行应为 1，实为 {active}");
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -215,7 +215,7 @@ fn run(cli: Cli) -> Result<()> {
             // 任务中心：输出落文件而非入库（实测：stdout 塞进 DB 会让体积失控）
             let task_out = layout.log_dir().join("tasks");
             std::fs::create_dir_all(&task_out).ok();
-            let tasks = Arc::new(panel_task::TaskRunner::new(writer.clone(), tier, task_out));
+            let tasks = Arc::new(panel_task::TaskRunner::new(writer.clone(), tier, task_out, db_path.clone()));
 
             // run() 是同步函数，所有 .await 都必须发生在 runtime 的 block_on 之内，
             // 因此 runtime 要在异步初始化之前就构建好。
