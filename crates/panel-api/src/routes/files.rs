@@ -24,7 +24,7 @@ use axum::{
 use panel_core::{PanelError, Result, SafePath};
 use panel_os::EntryKind;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// 单次读取的上限。**刻意不允许一次读完大文件**：
 /// 编辑器场景用 `offset`+`len` 分块，下载走流式。
@@ -42,6 +42,38 @@ pub(crate) fn resolve(_state: &Shared, s: &crate::auth::Session, input: &str) ->
 /// 「先登记、后落地」语义：目标允许尚不存在（上传/移动/复制的目标侧）。
 pub(crate) fn resolve_new(_state: &Shared, s: &crate::auth::Session, input: &str) -> Result<SafePath> {
     resolve_impl(_state, s, input, true)
+}
+
+/// 把用户输入归一化为「相对某个允许根」的形式；已是相对路径则原样返回。
+///
+/// ## 为什么必须有这一步
+/// 沙箱 [`panel_os::paths::resolve_within`] **拒绝绝对路径**（防 `/etc/passwd` 直传），
+/// 但回收站元数据里的 `original_path` 来自 `SafePath`（canonicalize 的产物）——
+/// **必然是绝对路径**。
+///
+/// ## 此前 bug：同一约束在两条路径上漏配
+/// owner 分支（root=/）做了 `trim_start_matches('/')`，非 owner 分支却把绝对路径
+/// **原样**交给沙箱，被 `is_absolute` 一律判为 `PathEscape`。后果是
+/// operator/viewer 的回收站**恢复** 100% 必失败（列表/删除/清空都正常，独独恢复坏），
+/// 且错误信息是含义不清的 "10006 path escape"，用户无从归因。
+///
+/// 之所以长期没暴露：本机 dev 库只有一个 owner（`allowed_roots=[]`），
+/// 走的是 owner 分支。抽成公共函数供两路共用，而不是在两处各抄一遍。
+///
+/// ## 安全性
+/// 落在该根**以外**的绝对路径 → `strip_prefix` 失败即拒绝；落在根内的才交给沙箱
+/// 做完整校验（`..` 拦截 / 存在性 / canonicalize 前缀断言全部保留）。
+fn relativize(root: &Path, input: &str) -> Result<String> {
+    let p = Path::new(input);
+    if !p.is_absolute() { return Ok(input.to_string()); }
+    match p.strip_prefix(root) {
+        Ok(r) => {
+            let rel = r.to_string_lossy().to_string();
+            Ok(if rel.is_empty() { ".".to_string() } else { rel })
+        }
+        // 绝对路径但不在该允许根内 —— 与该根无关，调用方会记下错误并试下一个根
+        Err(_) => Err(PanelError::PathEscape(input.to_string())),
+    }
 }
 
 fn resolve_impl(
@@ -63,13 +95,17 @@ fn resolve_impl(
         }
     };
     if s.role == "owner" && s.allowed_roots.is_empty() {
-        let rel = input.trim_start_matches('/');
-        let rel = if rel.is_empty() { "." } else { rel };
-        return pick(&PathBuf::from("/"), rel.to_string());
+        return pick(&PathBuf::from("/"), relativize(Path::new("/"), input)?);
     }
     let mut last_err = None;
     for root in &s.allowed_roots {
-        match pick(&PathBuf::from(root), input.to_string()) {
+        // 关键：绝对路径（回收站 original_path 就是这种）先转成相对该根的形式，
+        // 否则沙箱的 is_absolute 拦截会让非 owner 的恢复操作永远失败。
+        let rel = match relativize(Path::new(root), input) {
+            Ok(r) => r,
+            Err(e) => { last_err = Some(e); continue }
+        };
+        match pick(&PathBuf::from(root), rel) {
             Ok(p) => return Ok(p),
             Err(e) => last_err = Some(e),
         }
@@ -813,6 +849,63 @@ mod tests {
     #[test]
     fn trash_id_is_unique_across_calls() {
         assert_ne!(new_trash_id(), new_trash_id(), "纳秒时间戳 + pid 应保证不撞");
+    }
+
+    // ── relativize（回收站恢复的绝对路径归一化） ──
+    // 背景：非 owner 的回收站恢复曾 100% 失败——只有 owner 分支归一化了绝对路径。
+
+    #[test]
+    fn relativize_passes_relative_input_through() {
+        assert_eq!(relativize(Path::new("/srv/site"), "a/b.txt").unwrap(), "a/b.txt");
+        assert_eq!(relativize(Path::new("/srv/site"), "a").unwrap(), "a");
+    }
+
+    #[test]
+    fn relativize_strips_allowed_root_from_absolute_path() {
+        // 回收站 original_path 的真实形态：SafePath 经 canonicalize → 绝对路径
+        let root = Path::new("/srv/site");
+        assert_eq!(relativize(root, "/srv/site/a/b.txt").unwrap(), "a/b.txt");
+        // root 配置带尾斜杠时必须同样成立（strip_prefix 按组件比较）
+        assert_eq!(relativize(Path::new("/srv/site/"), "/srv/site/a/b.txt").unwrap(), "a/b.txt");
+    }
+
+    #[test]
+    fn relativize_maps_root_itself_to_dot() {
+        assert_eq!(relativize(Path::new("/srv/site"), "/srv/site").unwrap(), ".");
+        assert_eq!(relativize(Path::new("/srv/site/"), "/srv/site").unwrap(), ".");
+    }
+
+    #[test]
+    fn relativize_rejects_absolute_path_outside_root() {
+        // 落在允许根外的绝对路径必须拒绝——否则 allowed_roots 作用域形同虚设
+        let e = relativize(Path::new("/srv/site"), "/etc/passwd").unwrap_err();
+        assert!(matches!(e, PanelError::PathEscape(_)),
+            "根外绝对路径必须被拒，实际得到: {e:?}");
+    }
+
+    /// 端到端回归：非 owner 用**绝对路径**解析允许根内的文件，必须成功。
+    ///
+    /// 这条链路就是回收站恢复走的：restore 从元数据读出绝对路径的 original_path，
+    /// 再交给 `resolve_new`。修复前 absolute→resolve_within 必然 PathEscape。
+    #[test]
+    fn absolute_path_within_allowed_root_resolves_end_to_end() {
+        let root = std::env::temp_dir()
+            .join(format!("panel-relativize-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let f = root.join("sub").join("f.txt");
+        std::fs::write(&f, b"x").unwrap();
+
+        let abs = f.to_string_lossy().to_string();
+        let rel = relativize(Path::new(&root), &abs)
+            .unwrap_or_else(|e| panic!("allowed root 内的绝对路径应被归一化: {abs} -> {e}"));
+        assert_eq!(rel, "sub/f.txt");
+
+        // 归一化结果必须能通过完整沙箱（.. 拦截 / 存在性 / 前缀断言）
+        let sp = panel_os::paths::resolve_within(&root, &rel)
+            .unwrap_or_else(|e| panic!("沙箱应接受根内相对路径: {rel} -> {e}"));
+        assert_eq!(sp.as_path(), std::fs::canonicalize(&f).unwrap());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
