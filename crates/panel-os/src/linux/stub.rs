@@ -144,16 +144,25 @@ impl PackageProvider for LinuxPackages {
             // dpkg-query 一次查询全部候选：已安装的行回 `name\tversion`，
             // 未安装的走 stderr（整体退出码非 0）——解析 stdout 即可，无需报错
             "apt" => {
-                let fmt = "${Package}\t${Version}\n";
+                // 为什么要 `${db:Status-Abbrev}`：dpkg-query 对**未安装**的包名也会输出一行
+                // （名字 + 空版本），此前只按"有输出行"判定 → 没装过的 apache2 被列进
+                // "已安装软件"（本机实测 apache2 状态 unknown ok not-installed）。
+                // Status-Abbrev 形如 "ii "（已安装）/ "rc "（删剩配置）/ "un "（未知），
+                // 只认 "ii"。不能改用"版本非空"判断——那只是绕开同一个问题的表面现象。
+                let fmt = "${Package}\t${Version}\t${db:Status-Abbrev}\n";
                 let mut args: Vec<&str> = vec!["-W", "-f", fmt];
                 args.extend_from_slice(names);
                 let out = crate::cmd::run(Bin::Dpkg, &args,
                     CmdOpt { timeout: Duration::from_secs(30), ..Default::default() }).await?;
                 Ok(out.stdout.lines().filter_map(|l| {
-                    let (n, v) = l.split_once('\t')?;
+                    let mut it = l.split('\t');
+                    let n = it.next()?.trim();
+                    let v = it.next()?.trim();
+                    let status = it.next()?.trim();
+                    if !status.starts_with("ii") { return None }
                     Some(PackageInfo {
-                        name: n.trim().to_string(),
-                        version: Some(v.trim().to_string()).filter(|s| !s.is_empty()),
+                        name: n.to_string(),
+                        version: Some(v.to_string()).filter(|s| !s.is_empty()),
                         manager: "apt".into(),
                         binaries: Vec::new(),
                     })
