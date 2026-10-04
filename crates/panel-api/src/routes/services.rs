@@ -195,7 +195,7 @@ pub struct InstallReq { pub name: String }
 const ALLOWED_PACKAGES: &[&str] = &[
     "nginx", "caddy", "apache2", "mysql-server", "mariadb-server", "postgresql",
     "redis", "memcached", "php-fpm", "php8.1-fpm", "php8.2-fpm", "php8.3-fpm",
-    "certbot", "fail2ban", "ufw", "curl", "wget", "git", "unzip", "tar",
+    "certbot", "fail2ban", "ufw",
 ];
 
 pub async fn install(
