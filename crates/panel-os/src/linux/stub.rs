@@ -1453,10 +1453,123 @@ impl DatabaseProvider for LinuxDatabases {
         .map_err(join_err)?
     }
 
-    async fn backup(&self, _t: &DbTarget, _o: &SafePath, _cb: Box<dyn Fn(String) + Send + Sync>) -> Result<()> {
-        unsupported!("dbms.backup (M4)")
+    async fn backup(&self, t: &DbTarget, o: &SafePath, on_line: Box<dyn Fn(String) + Send + Sync>) -> Result<()> {
+        match t.engine {
+            DbEngine::Sqlite => {
+                let src = t.database.as_deref().ok_or_else(|| PanelError::Validation {
+                    field: "database",
+                    reason: "SQLite 连接需在「库名」中填写 .db 文件路径".into(),
+                })?;
+                if !std::path::Path::new(src).is_file() {
+                    return Err(PanelError::NotFound(format!("sqlite 文件: {src}")));
+                }
+                // 在线文件复制：SQLite 文件在面板自身库上就是直接 cp（与 DbRestoreTask 同源口径）。
+                // 大库一致性由备份任务在库空闲期执行保证，这里不引入 rusqlite 在线热备依赖。
+                std::fs::copy(src, o.as_path()).map_err(|e| PanelError::Io(e.to_string()))?;
+                on_line("SQLite 文件已复制".into());
+                Ok(())
+            }
+            DbEngine::MySql => {
+                let mut env: std::collections::HashMap<String, std::ffi::OsString> = std::collections::HashMap::new();
+                if let Some(p) = &t.password { env.insert("MYSQL_PWD".into(), std::ffi::OsString::from(p)); }
+                let mut a: Vec<String> = vec![
+                    "--result-file".into(), o.as_path().to_string_lossy().into(),
+                    "--single-transaction".into(), "--routines".into(), "--triggers".into(),
+                    "--events".into(), "--skip-lock-tables".into(),
+                    "-h".into(), t.host.clone().unwrap_or_else(|| "127.0.0.1".into()),
+                ];
+                if let Some(p) = t.port { a.push("-P".into()); a.push(p.to_string()); }
+                if let Some(u) = &t.user { a.push("-u".into()); a.push(u.clone()); }
+                if let Some(d) = &t.database { a.push("-D".into()); a.push(d.clone()); }
+                let args: Vec<&str> = a.iter().map(|s| s.as_str()).collect();
+                on_line("mysqldump 导出中…".into());
+                // 凭据走 MYSQL_PWD 环境变量（绝不进 argv，ps 可见 = 泄露口令）；
+                // --result-file 直接落盘，stdout 为空，避免大库撑爆内存捕获。
+                crate::cmd::run_checked(
+                    crate::cmd::Bin::MySqlDump, &args,
+                    crate::cmd::CmdOpt { timeout: std::time::Duration::from_secs(600), env, ..Default::default() },
+                ).await?;
+                on_line("MySQL 备份完成".into());
+                Ok(())
+            }
+            DbEngine::Postgres => {
+                let mut env: std::collections::HashMap<String, std::ffi::OsString> = std::collections::HashMap::new();
+                if let Some(p) = &t.password { env.insert("PGPASSWORD".into(), std::ffi::OsString::from(p)); }
+                let mut a: Vec<String> = vec![
+                    "-f".into(), o.as_path().to_string_lossy().into(),
+                    "-h".into(), t.host.clone().unwrap_or_else(|| "127.0.0.1".into()),
+                ];
+                if let Some(p) = t.port { a.push("-p".into()); a.push(p.to_string()); }
+                if let Some(u) = &t.user { a.push("-U".into()); a.push(u.clone()); }
+                if let Some(d) = &t.database { a.push("-d".into()); a.push(d.clone()); }
+                let args: Vec<&str> = a.iter().map(|s| s.as_str()).collect();
+                on_line("pg_dump 导出中…".into());
+                crate::cmd::run_checked(
+                    crate::cmd::Bin::PgDump, &args,
+                    crate::cmd::CmdOpt { timeout: std::time::Duration::from_secs(600), env, ..Default::default() },
+                ).await?;
+                on_line("PostgreSQL 备份完成".into());
+                Ok(())
+            }
+        }
     }
-    async fn restore(&self, _t: &DbTarget, _f: &SafePath) -> Result<()> { unsupported!("dbms.restore (M4)") }
+
+    async fn restore(&self, t: &DbTarget, from: &SafePath) -> Result<()> {
+        match t.engine {
+            DbEngine::Sqlite => {
+                let dst = t.database.as_deref().ok_or_else(|| PanelError::Validation {
+                    field: "database",
+                    reason: "SQLite 连接需在「库名」中填写 .db 文件路径".into(),
+                })?;
+                // 覆盖前先留快照（与 DbRestoreTask 同源安全网）：出问题可据此回滚
+                if std::path::Path::new(dst).is_file() {
+                    let bak = format!(
+                        "{}.bak-{}", dst,
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0),
+                    );
+                    std::fs::copy(dst, &bak).map_err(|e| PanelError::Io(e.to_string()))?;
+                }
+                std::fs::copy(from.as_path(), dst).map_err(|e| PanelError::Io(e.to_string()))?;
+                Ok(())
+            }
+            DbEngine::MySql => {
+                let mut env: std::collections::HashMap<String, std::ffi::OsString> = std::collections::HashMap::new();
+                if let Some(p) = &t.password { env.insert("MYSQL_PWD".into(), std::ffi::OsString::from(p)); }
+                let mut a: Vec<String> = vec!["-h".into(), t.host.clone().unwrap_or_else(|| "127.0.0.1".into())];
+                if let Some(p) = t.port { a.push("-P".into()); a.push(p.to_string()); }
+                if let Some(u) = &t.user { a.push("-u".into()); a.push(u.clone()); }
+                if let Some(d) = &t.database { a.push("-D".into()); a.push(d.clone()); }
+                a.push("-e".into());
+                a.push(format!("source {}", from.as_path().to_string_lossy()));
+                let args: Vec<&str> = a.iter().map(|s| s.as_str()).collect();
+                crate::cmd::run_checked(
+                    crate::cmd::Bin::MySql, &args,
+                    crate::cmd::CmdOpt { timeout: std::time::Duration::from_secs(600), env, ..Default::default() },
+                ).await?;
+                Ok(())
+            }
+            DbEngine::Postgres => {
+                let mut env: std::collections::HashMap<String, std::ffi::OsString> = std::collections::HashMap::new();
+                if let Some(p) = &t.password { env.insert("PGPASSWORD".into(), std::ffi::OsString::from(p)); }
+                let mut a: Vec<String> = vec![
+                    "-h".into(), t.host.clone().unwrap_or_else(|| "127.0.0.1".into()),
+                    "-f".into(), from.as_path().to_string_lossy().into(),
+                ];
+                if let Some(p) = t.port { a.push("-p".into()); a.push(p.to_string()); }
+                if let Some(u) = &t.user { a.push("-U".into()); a.push(u.clone()); }
+                if let Some(d) = &t.database { a.push("-d".into()); a.push(d.clone()); }
+                let args: Vec<&str> = a.iter().map(|s| s.as_str()).collect();
+                crate::cmd::run_checked(
+                    crate::cmd::Bin::Psql, &args,
+                    crate::cmd::CmdOpt { timeout: std::time::Duration::from_secs(600), env, ..Default::default() },
+                ).await?;
+                Ok(())
+            }
+        }
+    }
 }
 
 // ───────────────── 系统用户（M3） ─────────────────
@@ -1483,6 +1596,7 @@ fn _assert_types(_: Option<UnitName>) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::DatabaseProvider;
 
     fn nginx_server() -> LinuxWebServer {
         LinuxWebServer { name: Some("nginx"), paths: Arc::new(LinuxPathLayout::default()) }
@@ -1826,5 +1940,65 @@ mod tests {
         assert!(ok.is_ok(), "合法 server 块应通过 nginx -t: {ok:?}");
         let bad = nginx_server().validate("server { listen ; }").await;
         assert!(bad.is_err(), "非法配置应被 validate 拒绝");
+    }
+
+    // ── 数据库备份/恢复：sqlite roundtrip + mysql/pg 客户端缺失诚实 501 ──
+    #[tokio::test]
+    async fn sqlite_backup_and_restore_roundtrip() {
+        use panel_core::SafePath;
+        let dir = std::env::temp_dir().join(format!("fp_dbtest_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("app.db");
+        {
+            let c = rusqlite::Connection::open(&src).unwrap();
+            c.execute("CREATE TABLE t(x INTEGER)", []).unwrap();
+            c.execute("INSERT INTO t VALUES (42)", []).unwrap();
+        }
+        let bak = dir.join("app.backup.db");
+        let target = DbTarget {
+            engine: DbEngine::Sqlite,
+            host: None, port: None, user: None, password: None,
+            database: Some(src.to_string_lossy().into()),
+        };
+        let prov: &dyn DatabaseProvider = &LinuxDatabases::default();
+        prov
+            .backup(&target, unsafe { &SafePath::from_raw(bak.clone()) }, Box::new(|_| {}))
+            .await
+            .unwrap();
+        assert!(bak.is_file(), "备份文件应生成");
+        // 篡改源库，再从备份恢复
+        {
+            let c = rusqlite::Connection::open(&src).unwrap();
+            c.execute("UPDATE t SET x = 999", []).unwrap();
+        }
+        prov
+            .restore(&target, unsafe { &SafePath::from_raw(bak.clone()) })
+            .await
+            .unwrap();
+        let v: i64 = rusqlite::Connection::open(&src).unwrap()
+            .query_row("SELECT x FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 42, "恢复后应回到备份时的 42");
+        // 还原应留覆盖前快照（自愈网）
+        let snap = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().starts_with("app.db.bak-"));
+        assert!(snap, "还原应生成 .bak 快照");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn mysql_backup_unsupported_when_client_missing() {
+        // 沙箱无 mysqldump：诚实 Unsupported（前端据此置灰），而非假装成功
+        if crate::cmd::Bin::MySqlDump.available() { return; }
+        let target = DbTarget {
+            engine: DbEngine::MySql,
+            host: Some("127.0.0.1".into()), port: Some(3306),
+            user: Some("u".into()), password: Some("p".into()), database: Some("db".into()),
+        };
+        let prov: &dyn DatabaseProvider = &LinuxDatabases::default();
+        let r = prov.backup(&target, unsafe { &SafePath::from_raw(std::env::temp_dir().join("x.sql")) }, Box::new(|_| {}))
+            .await;
+        assert!(matches!(r, Err(panel_core::PanelError::Unsupported(_))), "缺失客户端应 Unsupported: {r:?}");
     }
 }

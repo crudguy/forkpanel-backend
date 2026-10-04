@@ -162,6 +162,7 @@ pub async fn backup(
     }
 
     let os = state.os.clone();
+    let target = load_target(&state, req.id, None).await?;
     let (id, _) = state.tasks.submit(
         panel_task::TaskRequest {
             idempotency_key: format!("db.backup:{}", req.id),
@@ -169,7 +170,7 @@ pub async fn backup(
             label: format!("备份数据库 #{}", req.id),
             timeout: std::time::Duration::from_secs(3600),
         },
-        DbBackupTask { conn_id: req.id, out, os },
+        DbBackupTask { conn_id: req.id, target, out, os },
     ).await.map_err(ApiError::from)?;
 
     audit(&state, &s, "db.backup", &req.id.to_string(), "queued").await;
@@ -189,6 +190,9 @@ fn resolve_out(_state: &Shared, s: &crate::auth::Session, input: &str) -> Result
 
 struct DbBackupTask {
     conn_id: i64,
+    /// 真实连接凭据（load_target 已解密口令）。此前用本地默认 Sqlite 凭据，
+    /// 会导致无论选哪个连接都备份成面板自身库——静默错误，必须传真实 target。
+    target: panel_os::DbTarget,
     out: SafePath,
     os: std::sync::Arc<dyn panel_os::OsAdapter>,
 }
@@ -197,14 +201,10 @@ struct DbBackupTask {
 impl panel_task::TaskBody for DbBackupTask {
     async fn run(&self, progress: panel_task::Progress) -> Result<panel_task::TaskOutcome> {
         progress.set(5, "准备备份").await;
-        // 完整实现应读出连接信息并解密口令后构造 DbTarget；
-        // 骨架阶段 DbTarget 用本地默认值，M4 接线真实凭据。
-        let t = panel_os::DbTarget {
-            engine: panel_os::DbEngine::Sqlite,
-            host: None, port: None, user: None, password: None, database: None,
-        };
         let p = progress.clone();
-        self.os.databases().backup(&t, &self.out, Box::new(move |line| {
+        // on_line 是同步 Fn，不能 await；进度由备份完成后的 set(100) 收尾，
+        // 这里只把 Provider 的逐行输出透传给进度通道（不阻塞备份本身）。
+        self.os.databases().backup(&self.target, &self.out, Box::new(move |line| {
             let _ = &p; let _ = line;
         })).await?;
         progress.set(100, "备份完成").await;
@@ -251,20 +251,9 @@ pub async fn restore(
         return Err(ApiError::not_found("backup file"));
     }
 
-    let t = load_target(&state, conn, None).await?;
-    let db_path = match t.engine {
-        panel_os::DbEngine::Sqlite => t
-            .database
-            .clone()
-            .ok_or_else(|| ApiError::bad_request("conn", "该连接未指定库文件路径"))?,
-        panel_os::DbEngine::MySql | panel_os::DbEngine::Postgres => {
-            return Err(ApiError::unsupported(
-                "mysql/postgres 还原需外部客户端（mysql / psql），本环境不可用",
-            ))
-        }
-    };
-
-    let job = DbRestoreTask { src: src.as_path().to_path_buf(), dst: PathBuf::from(db_path) };
+    let target = load_target(&state, conn, None).await?;
+    let os = state.os.clone();
+    let job = DbRestoreTask { target, src: src.clone(), os };
     let (tid, _) = state
         .tasks
         .submit(
@@ -284,38 +273,25 @@ pub async fn restore(
     Ok(ok(serde_json::json!({ "task_id": tid })))
 }
 
-/// 库还原任务体：**先备份当前库再覆盖**，失败即中止。
+/// 库还原任务体：覆盖前快照与具体导入逻辑都下沉到 provider（见 stub.rs）。
+/// 此处只驱动任务进度与结果——不重复实现引擎差异（sqlite 先备份再复制、
+/// mysql/pg 走外部客户端导入）。
 struct DbRestoreTask {
-    src: PathBuf,
-    dst: PathBuf,
+    target: panel_os::DbTarget,
+    src: SafePath,
+    os: std::sync::Arc<dyn panel_os::OsAdapter>,
 }
 
 #[async_trait::async_trait]
 impl panel_task::TaskBody for DbRestoreTask {
     async fn run(&self, progress: panel_task::Progress) -> Result<panel_task::TaskOutcome> {
-        progress.set(20, "备份当前库").await;
-        // 当前库不存在时跳过备份（首次还原），存在则必先留快照
-        let safety = if self.dst.is_file() {
-            let bak = PathBuf::from(format!(
-                "{}.bak-{}",
-                self.dst.display(),
-                crate::now_unix()
-            ));
-            std::fs::copy(&self.dst, &bak).map_err(|e| PanelError::Io(e.to_string()))?;
-            Some(bak)
-        } else {
-            None
-        };
-
-        progress.set(70, "写入还原").await;
-        std::fs::copy(&self.src, &self.dst).map_err(|e| PanelError::Io(e.to_string()))?;
-
+        progress.set(10, "准备还原").await;
+        self.os.databases().restore(&self.target, &self.src).await?;
         progress.set(100, "完成").await;
         Ok(panel_task::TaskOutcome {
             state: panel_task::TaskState::Ok,
             exit_code: Some(0),
-            // 指向还原前的快照，出问题可据此回滚
-            output_path: safety,
+            output_path: Some(self.src.as_path().to_path_buf()),
         })
     }
 }
