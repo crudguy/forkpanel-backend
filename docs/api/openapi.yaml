@@ -593,6 +593,8 @@ components:
         port:       { type: [integer, "null"] }
         username:   { type: [string, "null"] }
         default_db: { type: [string, "null"] }
+        # 仅表示外部客户端（psql / mysqldump 等）是否已安装；不代表该连接可以连通
+        client_ready: { type: boolean }
         tls_mode:   { type: string, enum: [disable, prefer, require], default: prefer }
     DbConnectionCreate:
       required: [name, engine]

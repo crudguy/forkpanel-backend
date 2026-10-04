@@ -63,7 +63,7 @@ pub(crate) fn resolve_new(_state: &Shared, s: &crate::auth::Session, input: &str
 /// ## 安全性
 /// 落在该根**以外**的绝对路径 → `strip_prefix` 失败即拒绝；落在根内的才交给沙箱
 /// 做完整校验（`..` 拦截 / 存在性 / canonicalize 前缀断言全部保留）。
-fn relativize(root: &Path, input: &str) -> Result<String> {
+pub(crate) fn relativize(root: &Path, input: &str) -> Result<String> {
     let p = Path::new(input);
     if !p.is_absolute() { return Ok(input.to_string()); }
     match p.strip_prefix(root) {

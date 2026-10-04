@@ -31,8 +31,13 @@ pub struct ConnDto {
     pub port: Option<i64>,
     /// 连接默认库（schema 列名 `default_db`，与 OpenAPI `DbConnection.default_db` 同名）
     pub default_db: Option<String>,
-    /// 是否可用（该引擎未实装时为 false，UI 据此置灰）
-    pub available: bool,
+    /// 该引擎所需的**外部客户端**是否可用（UI 据此置灰）。
+    ///
+    /// ⚠️ 语义边界：**不代表这个连接能连通**。它只回答「这台机器有没有装
+    /// psql / mysqldump」，不碰网络也不做认证——真正的连通性要在操作时才知道。
+    /// 旧名 `available` 让人误读为「连接可用」，UI 据此渲染成绿色「可用」徽标，
+    /// 用户点了「备份」却失败且无从归因（实证过一次）。命名必须诚实。
+    pub client_ready: bool,
     /// 是否有口令（**绝不返回口令本身**）
     pub has_password: bool,
 }
@@ -71,7 +76,7 @@ pub async fn list(
                                 panel_os::DbEngine::Postgres => "postgres",
                                 panel_os::DbEngine::Sqlite => "sqlite" },
             host, port, default_db,
-            available,
+            client_ready: available,
             has_password: pwd.is_some(),
         });
     }
@@ -155,11 +160,9 @@ pub async fn backup(
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_MANAGE)?;
 
-    // 输出路径必须在允许根内（防把备份写到 /etc 覆盖配置）
-    let out = resolve_out(&state, &s, &req.out)?;
-    if !panel_core::rules::is_valid_path_segment(&req.out) && req.out.contains('/') {
-        // 允许子目录，但不允许 `..` 逃逸 —— 由 resolve_out 兜底
-    }
+    // 输出路径必须在允许根内（防把备份写到 /etc 覆盖配置）。
+    // create=true：产物此刻尚不存在。`..` 逃逸由沙箱兜底，允许输出到允许根下的子目录。
+    let out = resolve_out(&s, &req.out, true)?;
 
     let os = state.os.clone();
     let target = load_target(&state, req.id, None).await?;
@@ -177,10 +180,40 @@ pub async fn backup(
     Ok(ok(serde_json::json!({ "task_id": id })))
 }
 
-fn resolve_out(_state: &Shared, s: &crate::auth::Session, input: &str) -> Result<SafePath> {
+/// 备份产物 / 还原源文件的路径沙箱。纪律与 [`super::files::resolve`] 完全一致。
+///
+/// `create`：备份输出文件**尚不存在**（用 `resolve_within_for_create`）；
+/// 还原源文件**必须已存在**（用 `resolve_within`）。两者的沙箱约束相同，
+/// 差别只在目标是否允许不存在。
+///
+/// ## 此前 bug（owner 完全用不了数据库备份）
+/// 原实现只有 `for r in &s.allowed_roots` 循环，没有 owner 特判。而 bootstrap 建的
+/// owner 是 `allowed_roots=[]`，循环一次都不执行 → `last=None` → 必返回 PathEscape。
+/// 实证：`POST /api/v1/db/1/backup` 返回 400 `path escapes allowed root`——
+/// 一个**完全无法使用**的功能，且错误信息把「owner 无允许根」误导成「你传了非法路径」。
+/// `_state` 此前是参数但实际未使用——保留它会让本函数无法脱离 AppState 做单测，
+/// 而下面的回归测试恰恰必须存在（这个 bug 就是 provider 层全绿、端点层全红）。
+fn resolve_out(s: &crate::auth::Session, input: &str, create: bool) -> Result<SafePath> {
+    let pick = |root: &PathBuf, rel: String| {
+        if create {
+            panel_os::paths::resolve_within_for_create(root, &rel)
+        } else {
+            panel_os::paths::resolve_within(root, &rel)
+        }
+    };
+    // owner 等价宿主管理员：bootstrap 时 allowed_roots 为空，按「空=全拒」会让
+    // owner 连面板自身的备份都做不了。
+    if s.role == "owner" && s.allowed_roots.is_empty() {
+        let rel = super::files::relativize(std::path::Path::new("/"), input)?;
+        return pick(&PathBuf::from("/"), rel);
+    }
     let mut last = None;
     for r in &s.allowed_roots {
-        match panel_os::paths::resolve_within(&PathBuf::from(r), input) {
+        let rel = match super::files::relativize(std::path::Path::new(r), input) {
+            Ok(p) => p,
+            Err(e) => { last = Some(e); continue }
+        };
+        match pick(&PathBuf::from(r), rel) {
             Ok(p) => return Ok(p),
             Err(e) => last = Some(e),
         }
@@ -246,7 +279,8 @@ pub async fn restore(
     }
 
     // 源文件必须落在允许根内 —— 否则可指定任意路径造成越权读取
-    let src = resolve_out(&state, &s, &req.file)?;
+    // create=false：还原源文件必须已存在（下面还有 is_file 复核）
+    let src = resolve_out(&s, &req.file, false)?;
     if !src.as_path().is_file() {
         return Err(ApiError::not_found("backup file"));
     }
@@ -610,6 +644,87 @@ fn scrub_sql(sql: &str) -> (String, usize) {
 mod tests {
     use super::*;
 
+    /// 构造会话：只填 resolve_out 会读到的字段。
+    fn sess(role: &str, roots: &[&str]) -> crate::auth::Session {
+        crate::auth::Session {
+            user_id: 1,
+            username: "u".into(),
+            role: role.into(),
+            permissions: vec![],
+            allowed_roots: roots.iter().map(|r| r.to_string()).collect(),
+            ip: "unknown".into(),
+            created_at: 0,
+            last_seen: 0,
+            expires_at: 0,
+        }
+    }
+
+    /// 回归：owner（bootstrap 建号时 allowed_roots 为空）必须能产出备份路径。
+    ///
+    /// 实证过的失败：`POST /api/v1/db/1/backup` → 400 `path escapes allowed root`。
+    /// 一个**完全不可用**的功能，且错误信息把「owner 无允许根」误导成「你传了非法路径」。
+    #[test]
+    fn owner_without_allowed_roots_can_write_backup_outside_roots() {
+        let dir = std::env::temp_dir()
+            .join(format!("panel-db-out-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = sess("owner", &[]); // ← bootstrap 出来的 owner 正是这个形态
+
+        // create=true：备份产物此刻还不存在，必须用 *_for_create 语义
+        let abs = dir.join("p.sql").to_string_lossy().to_string();
+        let got = resolve_out(&s, &abs, true)
+            .unwrap_or_else(|e| panic!("owner 应能备份到 {abs}，实际: {e}"));
+        assert_eq!(got.as_path(), dir.join("p.sql"), "应解析到目标绝对路径");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回归：非 owner 也要能把恢复源文件（绝对路径）解析进自己的允许根。
+    #[test]
+    fn operator_resolves_absolute_source_within_allowed_root() {
+        let root = std::env::temp_dir()
+            .join(format!("panel-db-src-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("dumps")).unwrap();
+        let f = root.join("dumps").join("x.sql");
+        std::fs::write(&f, b"x").unwrap();
+
+        let s = sess("operator", &[&root.to_string_lossy().to_string()]);
+        // create=false：还原源文件必须已存在
+        let got = resolve_out(&s, &f.to_string_lossy(), false)
+            .unwrap_or_else(|e| panic!("允许根内的源应可解析: {e}"));
+        assert_eq!(got.as_path(), std::fs::canonicalize(&f).unwrap());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_source_outside_allowed_root_is_rejected() {
+        let root = std::env::temp_dir()
+            .join(format!("panel-db-deny-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let s = sess("operator", &[&root.to_string_lossy().to_string()]);
+
+        // /etc/passwd 不落在允许根内 —— 绝不能因为绝对路径就放行
+        let e = resolve_out(&s, "/etc/passwd", false).unwrap_err();
+        assert!(matches!(e, PanelError::PathEscape(_)),
+            "根外路径必须拒绝，实际得到: {e:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// create=true / create=false 的语义差别不能被抹平：
+    /// 还原一个**不存在的**文件必须失败（否则等于把空 promise 当输入）。
+    #[test]
+    fn restore_source_must_already_exist() {
+        let root = std::env::temp_dir()
+            .join(format!("panel-db-missing-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let s = sess("operator", &[&root.to_string_lossy().to_string()]);
+        assert!(resolve_out(&s, "nope/ghost.sql", false).is_err(),
+            "不存在的源文件必须拒绝解析");
+        // 同一路径若作为「待创建产物」则合法
+        assert!(resolve_out(&s, "nope/ghost.sql", true).is_ok(),
+            "作为备份产物（尚待创建）应放行");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn read_only_sql_accepts_plain_selects() {
         for ok_sql in [
@@ -688,7 +803,7 @@ mod tests {
     fn password_is_never_returned() {
         // 列表接口只返回 has_password 布尔，不返回口令
         let dto = ConnDto { id: 1, name: "x".into(), engine: "mysql", host: None,
-            port: None, default_db: None, available: true, has_password: true };
+            port: None, default_db: None, client_ready: true, has_password: true };
         let v = serde_json::to_value(&dto).unwrap();
         assert!(!v.as_object().unwrap().contains_key("password"));
         assert_eq!(v["has_password"], true);
