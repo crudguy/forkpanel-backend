@@ -122,7 +122,12 @@ fn is_managed(name: &str) -> bool {
         "redis", "redis-server", "memcached", "docker", "sshd", "ssh",
         "fail2ban", "ufw", "firewalld", "nftables", "cron", "crond",
     ];
-    MANAGED.iter().any(|m| name == *m || name.starts_with(&format!("{m}@")))
+    // systemctl list-units 输出的单元名**带类型后缀**（redis-server.service），模板实例还形如
+    // postgresql@17-main.service。比对前必须剥掉后缀——否则与上面这份无后缀名单永远比不上，
+    // 结果是**所有服务都被标成"未托管"**（UI 上一片黄色徽标 + 停止要二次确认），
+    // managed_only 过滤也形同虚设。这是"看着像在判定、实际恒为 false"的假逻辑。
+    let base = name.strip_suffix(".service").unwrap_or(name);
+    MANAGED.iter().any(|m| base == *m || base.starts_with(&format!("{m}@")))
 }
 
 // ─────────────── 服务操作 ───────────────
@@ -198,6 +203,36 @@ const ALLOWED_PACKAGES: &[&str] = &[
     "certbot", "fail2ban", "ufw",
 ];
 
+/// 逻辑包名 → 各发行版的**真实包名**（槽位 0 = Debian 系 apt，槽位 1 = 其它/RHEL 系）。
+///
+/// 为什么需要：同一个软件在不同发行版叫不同名字。Debian/Ubuntu 上 Redis 的包名是
+/// `redis-server`（`redis` 是 Red Hat 系的名），此前探测只认 `redis` → Debian 上永远
+/// 探测不到，用户看到的是"Redis 明明装了却不显示在已安装列表里"（本机实测：
+/// redis-server 5:8.0.2 状态 ii，而白名单比对的是 redis，落空）。
+///
+/// 约定：`ALLOWED_PACKAGES` 里的都是**逻辑名**，对外一律用它（UI 展示、install/remove
+/// 入参、幂等键、审计）；只有真正要交给 apt/dnf 的那一刻才换成真实包名。
+const PKG_NAME_ALIASES: &[(&str, [&str; 2])] = &[
+    ("redis", ["redis-server", "redis"]),
+    ("apache2", ["apache2", "httpd"]),
+];
+
+/// 逻辑名 → 当前包管理器对应的真实包名（无别名条目则原样返回）。
+pub fn real_pkg_name(manager: Option<&str>, logical: &str) -> String {
+    match PKG_NAME_ALIASES.iter().find(|a| a.0 == logical) {
+        Some(a) => a.1[if manager == Some("apt") { 0 } else { 1 }].to_string(),
+        None => logical.to_string(),
+    }
+}
+
+/// 真实包名 → 逻辑名：探测结果回填用，保证返回给前端的始终是逻辑名
+/// （否则 Debian 上会吐出 `redis-server`，前端按逻辑名渲染的卡片/安装按钮就对不上了）。
+pub fn logical_pkg_name(real: &str) -> Option<&'static str> {
+    PKG_NAME_ALIASES.iter()
+        .find(|a| a.1.iter().any(|n| *n == real))
+        .map(|a| a.0)
+}
+
 pub async fn install(
     State(state): State<Shared>,
     Auth(s): Auth,
@@ -214,7 +249,9 @@ pub async fn install(
     }
 
     // 安装必须走任务队列：耗时不可预测 + 输出需流式返回
-    let pkg = req.name.clone();
+    // Debian 上 Redis 的真实包名是 redis-server —— 直接拿逻辑名去 apt install 会失败，
+    // 故此处换成当前发行版的真名（幂等键与审计仍用逻辑名，见下方 clone）。
+    let pkg = real_pkg_name(state.os.packages().manager(), &req.name);
     let os = state.os.clone();
     let body = PackageTask { pkg, os, op: PkgOp::Install };
     let (id, created) = state.tasks.submit(
@@ -497,12 +534,17 @@ pub async fn packages_list(
     }
     // 语义是"管理白名单内软件的安装状态"，不是通用包管理器枚举：
     // 只在白名单范围内探测，避免全量 rpm/dpkg 扫描（慢且暴露无关信息）。
-    let pkgs = state.os.packages().detect_installed(ALLOWED_PACKAGES).await?;
-    let items: Vec<serde_json::Value> = pkgs.into_iter().map(|p| serde_json::json!({
-        "name": p.name,
-        "version": p.version,
-        "manager": p.manager,
-    })).collect();
+    // 按当前发行版的**真实包名**去探测，再把结果回填为**逻辑名**：
+    // Debian 上 Redis 要查 redis-server，但对外仍要叫 redis（前端按逻辑名渲染、
+    // 卸载接口也按逻辑名校验），否则同一个软件在 UI 上会出现两个身份。
+    let manager = state.os.packages().manager();
+    let probe: Vec<String> = ALLOWED_PACKAGES.iter().map(|n| real_pkg_name(manager, n)).collect();
+    let probe: Vec<&str> = probe.iter().map(|s| s.as_str()).collect();
+    let pkgs = state.os.packages().detect_installed(&probe).await?;
+    let items: Vec<serde_json::Value> = pkgs.into_iter().map(|p| {
+        let name = logical_pkg_name(&p.name).unwrap_or(p.name.as_str()).to_string();
+        serde_json::json!({ "name": name, "version": p.version, "manager": p.manager })
+    }).collect();
     Ok(ok(serde_json::json!({ "packages": items })))
 }
 
@@ -519,7 +561,7 @@ pub async fn package_remove(
     }
 
     // 卸载与安装同权重：走任务队列 + 幂等键（与 install 不同键，避免互相吞并）
-    let pkg = name.clone();
+    let pkg = real_pkg_name(state.os.packages().manager(), &name);
     let os = state.os.clone();
     let body = PackageTask { pkg, os, op: PkgOp::Remove };
     let (id, created) = state.tasks.submit(
@@ -560,6 +602,41 @@ mod tests {
         // 任意包名必须被拒（面板以 root 运行，这是任意代码执行的入口）
         for bad in ["evil-miner", "../../bin/sh", "nginx; rm -rf /"] {
             assert!(!ALLOWED_PACKAGES.contains(&bad), "{bad} 绝不能在白名单里");
+        }
+    }
+
+    #[test]
+    fn is_managed_must_tolerate_systemd_suffix() {
+        // 回归守卫：systemctl list-units 输出的单元名带 .service 后缀（模板实例形如
+        // postgresql@17-main.service）。上面的 managed_whitelist_covers_web_stack 只测了
+        // 无后缀形态——于是线上真实数据（带后缀）全部匹配失败时，测试依然全绿。
+        // 这里补的就是真实形态。
+        for n in ["nginx.service", "redis-server.service", "mysql.service",
+                  "php8.2-fpm.service", "postgresql@17-main.service"] {
+            assert!(is_managed(n), "{n} 应被识别为托管服务");
+        }
+        // 未托管的仍必须是 false，别为了兼容后缀把判定放宽成"什么都算托管"
+        assert!(!is_managed("some-random-app.service"));
+        assert!(!is_managed("systemd-journald.service"));
+    }
+
+    #[test]
+    fn pkg_name_aliases_roundtrip() {
+        // Debian/Ubuntu 上 Redis 的真实包名是 redis-server，RHEL 上才是 redis
+        assert_eq!(real_pkg_name(Some("apt"), "redis"), "redis-server");
+        assert_eq!(real_pkg_name(Some("dnf"), "redis"), "redis");
+        assert_eq!(real_pkg_name(Some("apk"), "apache2"), "httpd");
+        // 探测结果要能回填成逻辑名，否则前端会同时看到 redis 与 redis-server 两个身份
+        assert_eq!(logical_pkg_name("redis-server"), Some("redis"));
+        // 无别名的包必须原样透传
+        assert_eq!(real_pkg_name(Some("apt"), "nginx"), "nginx");
+        assert_eq!(logical_pkg_name("nginx"), None);
+        // 每个别名槽位都能反查回同一个逻辑名（否则 install 与 list 会对不上）
+        for (logical, names) in PKG_NAME_ALIASES {
+            for real in names {
+                assert_eq!(logical_pkg_name(real), Some(*logical),
+                    "{real} 应回填为 {logical}");
+            }
         }
     }
 
