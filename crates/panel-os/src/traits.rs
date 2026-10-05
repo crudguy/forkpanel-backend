@@ -238,7 +238,7 @@ pub trait PackageProvider: Send + Sync {
     fn manager(&self) -> Option<&'static str>;   // apt / dnf / apk / None
     async fn detect_installed(&self, names: &[&str]) -> Result<Vec<PackageInfo>>;
     /// 安装/卸载必须走任务队列（外部命令，耗时）；输出通过回调流式返回
-    async fn install(&self, name: &str, on_line: Box<dyn Fn(String) + Send + Sync>) -> Result<()>;
+    async fn install(&self, name: &str, version: Option<&str>, on_line: Box<dyn Fn(String) + Send + Sync>) -> Result<()>;
     async fn remove(&self, name: &str) -> Result<()>;
 }
 

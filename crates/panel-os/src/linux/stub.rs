@@ -133,7 +133,21 @@ impl LinuxPackages {
     }
 }
 
+/// 拼装交给包管理器的安装目标（包名 + 可选版本）。
+/// apt 用 `name=version`（等号语法），dnf/yum/apk/zypper 用 `name-version`（连字符），
+/// 无版本则原样返回包名。纯函数、可单测——避免版本拼接散落各分支又不可测。
+pub(crate) fn pkg_install_target(manager: &str, name: &str, version: Option<&str>) -> String {
+    match version {
+        None => name.to_string(),
+        Some(v) => match manager {
+            "apt" => format!("{name}={v}"),
+            _ => format!("{name}-{v}"),
+        },
+    }
+}
+
 #[async_trait]
+
 impl PackageProvider for LinuxPackages {
     fn manager(&self) -> Option<&'static str> { self.manager }
 
@@ -229,11 +243,13 @@ impl PackageProvider for LinuxPackages {
         }
     }
 
-    async fn install(&self, n: &str, cb: Box<dyn Fn(String) + Send + Sync>) -> Result<()> {
+    async fn install(&self, n: &str, version: Option<&str>, cb: Box<dyn Fn(String) + Send + Sync>) -> Result<()> {
         let m = self.manager.ok_or(PanelError::Unsupported("package.manager"))?;
         // CmdOpt 的回调是 &str 签名；这里把 trait 的 String 回调包一层适配
         let on_line: std::sync::Arc<dyn Fn(&str) + Send + Sync> =
             std::sync::Arc::new(move |line: &str| cb(line.to_string()));
+        // 拼装交给包管理器的安装目标：apt 用 name=version，其余用 name-version，无版本则原样。
+        let target = pkg_install_target(m, n, version);
         match m {
             "apt" => {
                 // DEBIAN_FRONTEND 防止 debconf 弹窗卡死（stdin 已关，弹窗只会挂到超时）
@@ -247,7 +263,7 @@ impl PackageProvider for LinuxPackages {
                     env: env.clone(),
                     ..Default::default()
                 };
-                let args = ["install", "-y", "-o", "Dpkg::Options::=--force-confold", n];
+                let args = ["install", "-y", "-o", "Dpkg::Options::=--force-confold", target.as_str()];
                 let mut o = crate::cmd::run(Bin::Apt, &args, mk(on_line.clone())).await?;
                 let stale = o.code != Some(0) && (
                     o.stderr.contains("Unable to locate package")
@@ -260,14 +276,21 @@ impl PackageProvider for LinuxPackages {
                     o = crate::cmd::run(Bin::Apt, &args, mk(on_line)).await?;
                 }
                 if o.code != Some(0) {
-                    return Err(PanelError::Command { bin: "apt-get".into(), detail: truncate_err(&o.stderr) });
+                    // 指定版本但仓库里没有该版本时，apt 报 'Version x for y was not found'，
+                    // 原话甩给用户看不懂；转成中文提示，避免等 30 分钟超时后才懵。
+                    let detail = match version {
+                        Some(v) if o.stderr.contains("was not found") || o.stderr.contains("has no candidate") =>
+                            format!("指定版本 {v} 在软件源中不可用（可能未收录或需启用 backports/security 源）"),
+                        _ => truncate_err(&o.stderr),
+                    };
+                    return Err(PanelError::Command { bin: "apt-get".into(), detail });
                 }
                 Ok(())
             }
-            "dnf" => pkg_run_streamed(Bin::Dnf, &["install", "-y", n], on_line).await,
-            "yum" => pkg_run_streamed(Bin::Yum, &["install", "-y", n], on_line).await,
-            "apk" => pkg_run_streamed(Bin::Apk, &["add", n], on_line).await,
-            "zypper" => pkg_run_streamed(Bin::Zypper, &["--non-interactive", "install", "-y", n], on_line).await,
+            "dnf" => pkg_run_streamed(Bin::Dnf, &["install", "-y", target.as_str()], on_line).await,
+            "yum" => pkg_run_streamed(Bin::Yum, &["install", "-y", target.as_str()], on_line).await,
+            "apk" => pkg_run_streamed(Bin::Apk, &["add", target.as_str()], on_line).await,
+            "zypper" => pkg_run_streamed(Bin::Zypper, &["--non-interactive", "install", "-y", target.as_str()], on_line).await,
             _other => Err(PanelError::Unsupported("package.install")),
         }
     }
@@ -1635,6 +1658,16 @@ mod tests {
     /// 规则集必须遵守的硬约束：不含空白 / `;` / `{` / `}` / 反斜杠 / 引号。
     /// 前四者会破坏 nginx 的词法结构（正则里的 `{8,}` 量词因此不可用）；
     /// 反斜杠的转义语义在引号内外不一致——**不依赖它**才不用赌具体实现。
+    #[test]
+    fn pkg_install_target_formats_version_per_manager() {
+        // apt 用等号语法；dnf/yum/apk/zypper 用连字符；无版本原样返回包名。
+        assert_eq!(pkg_install_target("apt", "nginx", Some("1.22.1-9")), "nginx=1.22.1-9");
+        assert_eq!(pkg_install_target("dnf", "nginx", Some("1.22.1")), "nginx-1.22.1");
+        assert_eq!(pkg_install_target("yum", "redis", Some("5.0.2")), "redis-5.0.2");
+        assert_eq!(pkg_install_target("apt", "nginx", None), "nginx");
+        assert_eq!(pkg_install_target("dnf", "nginx", None), "nginx");
+    }
+
     #[test]
     fn waf_rule_sets_stay_token_safe() {
         for pat in [

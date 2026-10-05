@@ -256,7 +256,7 @@ impl PackageProvider for MockPackages {
             manager: "mock".into(), binaries: vec![PathBuf::from("/usr/bin").join(n)],
         }).collect())
     }
-    async fn install(&self, _n: &str, cb: Box<dyn Fn(String) + Send + Sync>) -> Result<()> {
+    async fn install(&self, _n: &str, _v: Option<&str>, cb: Box<dyn Fn(String) + Send + Sync>) -> Result<()> {
         cb("mock: installing".into()); Ok(())
     }
     async fn remove(&self, _n: &str) -> Result<()> { Ok(()) }
