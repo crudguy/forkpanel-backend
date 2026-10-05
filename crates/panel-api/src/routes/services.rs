@@ -642,9 +642,10 @@ pub async fn package_versions(
     }
     let manager = state.os.packages().manager();
     let real = real_pkg_name(manager, &name);
-    let versions = state.os.packages().list_versions(&real).await?;
+    let v = state.os.packages().list_versions(&real).await?;
     // 空列表不是错误：查不到就退回"装最新版"，前端据此只显示一个选项。
-    Ok(ok(serde_json::json!({ "name": name, "versions": versions })))
+    // installed 由包管理器给出，用于在下拉里标「（已安装）」。
+    Ok(ok(serde_json::json!({ "name": name, "versions": v.versions, "installed": v.installed })))
 }
 
 pub async fn package_remove(

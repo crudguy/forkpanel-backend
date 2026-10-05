@@ -1342,6 +1342,7 @@ paths:
                 properties:
                   name: { type: string }
                   versions: { type: array, items: { type: string }, description: 为空表示查不到可用版本，安装时按仓库最新版处理 }
+                  installed: { type: [string, "null"], description: 当前已安装版本（由包管理器给出）；未安装为 null，用于在下拉里标注 }
   /api/v1/packages/{name}:
     delete:
       tags: [packages]

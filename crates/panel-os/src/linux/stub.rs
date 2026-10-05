@@ -308,7 +308,7 @@ impl PackageProvider for LinuxPackages {
         pkg_run(bin, &args).await
     }
 
-    async fn list_versions(&self, n: &str) -> Result<Vec<String>> {
+    async fn list_versions(&self, n: &str) -> Result<PackageVersions> {
         let m = self.manager.ok_or(PanelError::Unsupported("package.manager"))?;
         match m {
             "apt" => {
@@ -319,11 +319,14 @@ impl PackageProvider for LinuxPackages {
                 let o = crate::cmd::run(Bin::AptCache, &["policy", n], CmdOpt {
                     timeout: Duration::from_secs(30), env, ..Default::default()
                 }).await?;
-                Ok(parse_apt_policy_versions(&o.stdout))
+                Ok(PackageVersions {
+                    versions: parse_apt_policy_versions(&o.stdout),
+                    installed: parse_apt_policy_installed(&o.stdout),
+                })
             }
             // dnf/yum 也有版本查询，但面板当前发行版支持面以 apt 为主；
             // 返回空列表让调用方退回"装最新版"，而不是报 unsupported 挡住安装。
-            _other => Ok(Vec::new()),
+            _other => Ok(PackageVersions::default()),
         }
     }
 }
@@ -368,6 +371,24 @@ pub(crate) fn parse_apt_policy_versions(out: &str) -> Vec<String> {
         }
     }
     versions
+}
+
+/// 从 `apt-cache policy` 输出里取当前**已安装**版本（`Installed:` 行）。
+///
+/// 未安装时 apt 输出 `Installed: (none)`，此时返回 None。
+/// 交给 apt 自己回答而不是让前端反查已安装列表：逻辑名↔真实包名不一致时
+/// （php-fpm ↔ php8.4-fpm）前端反查会漏，apt 不会。
+pub(crate) fn parse_apt_policy_installed(out: &str) -> Option<String> {
+    for line in out.lines() {
+        let t = line.trim();
+        if let Some(v) = t.strip_prefix("Installed:") {
+            let v = v.trim();
+            // (none) 是 apt 表示"未安装"的固定写法
+            if v.is_empty() || v == "(none)" { return None; }
+            return Some(v.to_string());
+        }
+    }
+    None
 }
 
 /// 安装类长命令统一出口：流式回调 + 30 分钟超时（对齐任务队列上限）。
@@ -1754,6 +1775,12 @@ mod tests {
             vec!["5:8.0.2-3+deb13u3".to_string(), "5:8.0.2-3+deb13u2".to_string()],
             "*** 标记的已安装版本必须被抽出"
         );
+        assert_eq!(parse_apt_policy_installed(installed), Some("5:8.0.2-3+deb13u3".to_string()));
+
+        // 未安装：apt 写 "Installed: (none)"，必须返回 None 而不是把 "(none)" 当版本号
+        let not_installed = "nginx:\n  Installed: (none)\n  Candidate: 1.26.3-3+deb13u9\n  Version table:\n\
+                             1.26.3-3+deb13u9 500\n";
+        assert_eq!(parse_apt_policy_installed(not_installed), None);
 
         // 没有 Version table（如包不存在）→ 空列表，调用方退回"装最新版"
         assert!(parse_apt_policy_versions("N: Unable to locate package foo\n").is_empty());

@@ -233,6 +233,17 @@ pub struct PackageInfo {
     pub binaries: Vec<PathBuf>,
 }
 
+/// 某包的可安装版本集合。
+///
+/// `installed` 由包管理器自己给出（apt policy 的 `Installed:` 行），比前端拿
+/// "已安装列表"去反查更可靠——逻辑名与真实包名不一致时（如 php-fpm ↔ php8.4-fpm）
+/// 前端反查会漏，而 apt 永远知道本机实际装的是哪一个。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PackageVersions {
+    pub versions: Vec<String>,          // 可供安装的版本（新→旧）
+    pub installed: Option<String>,      // 当前已安装版本；未安装为 None
+}
+
 #[async_trait]
 pub trait PackageProvider: Send + Sync {
     fn manager(&self) -> Option<&'static str>;   // apt / dnf / apk / None
@@ -245,7 +256,7 @@ pub trait PackageProvider: Send + Sync {
     /// 用途：安装弹窗把它渲染成下拉选项，用户点选而不必手输——手输版本号极易出错
     /// （Debian 版本号形如 `1.26.3-3+deb13u9`，含 epoch/修订号，凭记忆写几乎必错）。
     /// 返回空列表表示"查不到"，调用方应退回"装最新版"，不应视为错误。
-    async fn list_versions(&self, name: &str) -> Result<Vec<String>>;
+    async fn list_versions(&self, name: &str) -> Result<PackageVersions>;
 }
 
 // ═══════════════════════════ 防火墙（声明式） ═══════════════════════════
