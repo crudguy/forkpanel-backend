@@ -307,6 +307,67 @@ impl PackageProvider for LinuxPackages {
         };
         pkg_run(bin, &args).await
     }
+
+    async fn list_versions(&self, n: &str) -> Result<Vec<String>> {
+        let m = self.manager.ok_or(PanelError::Unsupported("package.manager"))?;
+        match m {
+            "apt" => {
+                // LC_ALL=C 是必须的：apt 输出标题随 locale 变化（中文下是"版本列表："，
+                // 英文才是 "Version table:"），按字面量找标题在非英语环境会直接解析为空。
+                let mut env = std::collections::HashMap::new();
+                env.insert("LC_ALL".to_string(), std::ffi::OsString::from("C"));
+                let o = crate::cmd::run(Bin::AptCache, &["policy", n], CmdOpt {
+                    timeout: Duration::from_secs(30), env, ..Default::default()
+                }).await?;
+                Ok(parse_apt_policy_versions(&o.stdout))
+            }
+            // dnf/yum 也有版本查询，但面板当前发行版支持面以 apt 为主；
+            // 返回空列表让调用方退回"装最新版"，而不是报 unsupported 挡住安装。
+            _other => Ok(Vec::new()),
+        }
+    }
+}
+
+/// 从 `apt-cache policy <pkg>` 输出里抽版本（新→旧由 apt 自身顺序决定）。
+///
+/// 输出形态（LC_ALL=C）：
+/// ```text
+/// nginx:
+///   Installed: (none)
+///   Candidate: 1.26.3-3+deb13u9
+///   Version table:
+///      1.26.3-3+deb13u9 500
+///         500 http://security.debian.org/... amd64 Packages
+///      1.26.3-3+deb13u7 500
+///         500 http://deb.debian.org/... amd64 Packages
+/// ```
+/// 版本行 = 缩进 + 版本 + 空白 + 优先级数字；其下更深的缩进是来源行，须跳过
+/// （来源行也可能以数字开头，按"缩进更浅 + 尾随优先级"才能区分）。
+pub(crate) fn parse_apt_policy_versions(out: &str) -> Vec<String> {
+    let mut versions: Vec<String> = Vec::new();
+    let mut in_table = false;
+    for line in out.lines() {
+        // 必须按 trim 后判定：apt 输出里该标题本身是缩进的（"  Version table:"），
+        // 直接用 starts_with 会永远匹配不上 → 解析结果恒为空（弹窗只余"最新版"）。
+        if line.trim_start().starts_with("Version table:") { in_table = true; continue; }
+        if !in_table { continue; }
+        let t = line.trim();
+        if t.is_empty() { continue; }
+        // apt 用 "***" 标记当前已安装的那一行（形如 "*** 5:8.0.2-3+deb13u3 500"），
+        // 不剥掉它就是三列 → 会被下面的"恰好两列"判定跳过，导致**已安装的包
+        // 漏掉自己正在用的版本**（nginx 未装不触发，redis 已装才暴露）。
+        let t = t.trim_start_matches('*').trim_start();
+        // 形如 "1.26.3-3+deb13u9 500"：两列，第二列是纯数字优先级
+        let mut it = t.split_whitespace();
+        match (it.next(), it.next(), it.next()) {
+            (Some(v), Some(prio), None) if prio.chars().all(|c| c.is_ascii_digit()) => {
+                if !versions.contains(&v.to_string()) { versions.push(v.to_string()); }
+            }
+            // 来源行（"500 http://..."）是三列，直接跳过
+            _ => {}
+        }
+    }
+    versions
 }
 
 /// 安装类长命令统一出口：流式回调 + 30 分钟超时（对齐任务队列上限）。
@@ -1666,6 +1727,38 @@ mod tests {
         assert_eq!(pkg_install_target("yum", "redis", Some("5.0.2")), "redis-5.0.2");
         assert_eq!(pkg_install_target("apt", "nginx", None), "nginx");
         assert_eq!(pkg_install_target("dnf", "nginx", None), "nginx");
+    }
+
+    #[test]
+    fn parse_apt_policy_versions_picks_only_version_rows() {
+        // 样本取自本机 LC_ALL=C apt-cache policy nginx 的真实形态
+        let out = "nginx:\n  Installed: (none)\n  Candidate: 1.26.3-3+deb13u9\n  Version table:\n\
+                   1.26.3-3+deb13u9 500\n    500 http://security.debian.org/debian-security amd64 Packages\n\
+                   1.26.3-3+deb13u7 500\n    500 http://deb.debian.org/debian amd64 Packages\n";
+        let v = parse_apt_policy_versions(out);
+        assert_eq!(v, vec!["1.26.3-3+deb13u9".to_string(), "1.26.3-3+deb13u7".to_string()]);
+
+        // 来源行（"500 http://..."）绝不能被当成版本——它以数字开头，极易误提
+        for got in &v {
+            assert!(!got.starts_with("500"), "来源行的优先级被误当版本：{got}");
+            assert!(!got.starts_with("http"), "来源 URL 被误当版本：{got}");
+        }
+
+        // 已安装的包：当前版本行带 "***" 前缀（本机 redis-server 真实形态）。
+        // 不剥掉该标记就会漏掉正在使用的版本——这是实测才暴露的 bug，钉住它。
+        let installed = "redis-server:\n  Installed: 5:8.0.2-3+deb13u3\n  Version table:\n\
+                         *** 5:8.0.2-3+deb13u3 500\n     500 http://security.debian.org amd64 Packages\n\
+                         5:8.0.2-3+deb13u2 500\n     500 http://deb.debian.org amd64 Packages\n";
+        assert_eq!(
+            parse_apt_policy_versions(installed),
+            vec!["5:8.0.2-3+deb13u3".to_string(), "5:8.0.2-3+deb13u2".to_string()],
+            "*** 标记的已安装版本必须被抽出"
+        );
+
+        // 没有 Version table（如包不存在）→ 空列表，调用方退回"装最新版"
+        assert!(parse_apt_policy_versions("N: Unable to locate package foo\n").is_empty());
+        // 中文 locale 下标题不同，解析器只看英文标题，故必须靠调用方传 LC_ALL=C
+        assert!(parse_apt_policy_versions("版本列表：\n     1.0 500\n").is_empty());
     }
 
     #[test]

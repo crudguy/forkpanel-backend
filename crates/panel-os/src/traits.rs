@@ -240,6 +240,12 @@ pub trait PackageProvider: Send + Sync {
     /// 安装/卸载必须走任务队列（外部命令，耗时）；输出通过回调流式返回
     async fn install(&self, name: &str, version: Option<&str>, on_line: Box<dyn Fn(String) + Send + Sync>) -> Result<()>;
     async fn remove(&self, name: &str) -> Result<()>;
+    /// 列出该包在**当前已配置软件源**里可供安装的版本（由新到旧）。
+    ///
+    /// 用途：安装弹窗把它渲染成下拉选项，用户点选而不必手输——手输版本号极易出错
+    /// （Debian 版本号形如 `1.26.3-3+deb13u9`，含 epoch/修订号，凭记忆写几乎必错）。
+    /// 返回空列表表示"查不到"，调用方应退回"装最新版"，不应视为错误。
+    async fn list_versions(&self, name: &str) -> Result<Vec<String>>;
 }
 
 // ═══════════════════════════ 防火墙（声明式） ═══════════════════════════

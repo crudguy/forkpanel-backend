@@ -260,6 +260,10 @@ impl PackageProvider for MockPackages {
         cb("mock: installing".into()); Ok(())
     }
     async fn remove(&self, _n: &str) -> Result<()> { Ok(()) }
+    async fn list_versions(&self, _n: &str) -> Result<Vec<String>> {
+        // 返回空列表：mock 没有真实软件源，调用方据此退回"装最新版"
+        Ok(Vec::new())
+    }
 }
 
 #[async_trait]

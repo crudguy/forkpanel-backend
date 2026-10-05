@@ -25,6 +25,9 @@ pub enum Bin {
     Systemctl, Service, RcService,      // 服务
     Nft, Iptables, Ufw, FirewallCmd,    // 防火墙
     Apt, Dnf, Yum, Apk, Zypper, Dpkg,   // 包管理
+    /// 只读查询软件源元数据（apt-cache policy 列可用版本）。与 Apt(apt-get) 分开：
+    /// 能力不同（只读 vs 写入），便于在审计与白名单层面区别对待。
+    AptCache,
     Journalctl,                         // 日志
     Crontab,                            // 计划任务（用户 crontab）
     /// 计划任务重叠保护（P2-3）：包裹 cron 命令实现互斥锁。
@@ -74,6 +77,7 @@ impl Bin {
             Systemctl => "systemctl", Service => "service", RcService => "rc-service",
             Nft => "nft", Iptables => "iptables", Ufw => "ufw", FirewallCmd => "firewall-cmd",
             Apt => "apt-get", Dnf => "dnf", Yum => "yum", Apk => "apk", Zypper => "zypper", Dpkg => "dpkg-query",
+            AptCache => "apt-cache",
             Journalctl => "journalctl", Crontab => "crontab", Flock => "flock", Curl => "curl",
             Nginx => "nginx", Caddy => "caddy",
             Docker => "docker",
