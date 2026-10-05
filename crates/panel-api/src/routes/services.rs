@@ -191,7 +191,18 @@ pub async fn status(
 // ─────────────── 软件包（走任务队列） ───────────────
 
 #[derive(Debug, Deserialize)]
-pub struct InstallReq { pub name: String }
+pub struct InstallReq { pub name: String, pub version: Option<String> }
+
+/// 版本号字符白名单：用户可控输入。后端以数组传参交给包管理器（不走 shell，无命令注入
+/// 风险），但奇字符会让 apt/dnf 直接报错、用户困惑。只允许版本号里合法出现的字符集。
+/// 抽成独立函数便于单测——内联在 handler 里的校验无法被测试覆盖（已踩过 any/静默吞错的坑）。
+fn validate_pkg_version(v: &str) -> ApiResult<()> {
+    if v.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '~' | ':' | '-')) {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request("version", "版本号只能包含字母、数字及 + . ~ : - 字符"))
+    }
+}
 
 /// 已支持的软件包白名单。
 ///
@@ -247,13 +258,19 @@ pub async fn install(
         return Err(ApiError::bad_request("name",
             "package not in the allowed list (panel runs as root; arbitrary installs are refused)"));
     }
+    // 版本是用户可控输入：虽然后端以数组传参交给 apt/dnf（不走 shell，无命令注入风险），
+    // 但奇字符会让包管理器直接报错、用户困惑。这里只允许版本号里合法出现的字符集，
+    // 把错误拦在入参阶段、给出清晰中文提示。
+    if let Some(v) = &req.version {
+        validate_pkg_version(v)?;
+    }
 
     // 安装必须走任务队列：耗时不可预测 + 输出需流式返回
     // Debian 上 Redis 的真实包名是 redis-server —— 直接拿逻辑名去 apt install 会失败，
     // 故此处换成当前发行版的真名（幂等键与审计仍用逻辑名，见下方 clone）。
     let pkg = real_pkg_name(state.os.packages().manager(), &req.name);
     let os = state.os.clone();
-    let body = PackageTask { pkg, os, op: PkgOp::Install };
+    let body = PackageTask { pkg, os, op: PkgOp::Install, version: req.version.clone() };
     let (id, created) = state.tasks.submit(
         panel_task::TaskRequest {
             // 幂等键：同一包在窗口期内重复提交只会执行一次（防双击 / 防重试风暴）
@@ -273,7 +290,7 @@ pub async fn install(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PkgOp { Install, Remove }
 
-pub struct PackageTask { pub pkg: String, pub os: std::sync::Arc<dyn panel_os::OsAdapter>, pub op: PkgOp }
+pub struct PackageTask { pub pkg: String, pub os: std::sync::Arc<dyn panel_os::OsAdapter>, pub op: PkgOp, pub version: Option<String> }
 
 #[async_trait::async_trait]
 impl panel_task::TaskBody for PackageTask {
@@ -318,7 +335,7 @@ impl panel_task::TaskBody for PackageTask {
 
             let tx_for_cb = tx;
             let r = self.os.packages()
-                .install(&self.pkg, Box::new(move |line| {
+                .install(&self.pkg, self.version.as_deref(), Box::new(move |line| {
                     // try_send 永不阻塞：消费者跟不上就丢弃，绝不拖慢安装本身
                     let _ = tx_for_cb.send(line);
                 }))
@@ -563,7 +580,7 @@ pub async fn package_remove(
     // 卸载与安装同权重：走任务队列 + 幂等键（与 install 不同键，避免互相吞并）
     let pkg = real_pkg_name(state.os.packages().manager(), &name);
     let os = state.os.clone();
-    let body = PackageTask { pkg, os, op: PkgOp::Remove };
+    let body = PackageTask { pkg, os, op: PkgOp::Remove, version: None };
     let (id, created) = state.tasks.submit(
         panel_task::TaskRequest {
             idempotency_key: format!("pkg.remove:{}", name),
@@ -602,6 +619,18 @@ mod tests {
         // 任意包名必须被拒（面板以 root 运行，这是任意代码执行的入口）
         for bad in ["evil-miner", "../../bin/sh", "nginx; rm -rf /"] {
             assert!(!ALLOWED_PACKAGES.contains(&bad), "{bad} 绝不能在白名单里");
+        }
+    }
+
+    #[test]
+    fn pkg_version_charset_is_restricted() {
+        // 合法字符集：Debian 版本号常见形态（epoch、点、连字符、ubuntu 后缀、build 号）。
+        for ok in ["1.2.3", "8.0.36-0ubuntu0.22.04.1", "1:1.24.0-1", "5:8.0.2", "1.0~rc1", "1.0+build2"] {
+            assert!(validate_pkg_version(ok).is_ok(), "{ok} 应合法");
+        }
+        // 非法：空格 / 分号 / 路径分隔 / 反引号 / 命令替换 —— 都该被拒（防注入与误装）。
+        for bad in ["1.0; rm -rf /", "../../bin/sh", "1 0", "$(id)", "1.0`whoami`"] {
+            assert!(validate_pkg_version(bad).is_err(), "{bad} 应被拒");
         }
     }
 

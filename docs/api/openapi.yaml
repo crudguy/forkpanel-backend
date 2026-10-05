@@ -1313,7 +1313,7 @@ paths:
         required: true
         content:
           application/json:
-            schema: { type: object, required: [name], properties: { name: { type: string } } }
+            schema: { type: object, required: [name], properties: { name: { type: string }, version: { type: string, description: "可选，指定要安装的版本；留空=仓库最新版" } } }
       responses:
         '202': { description: 已入队, content: { application/json: { schema: { $ref: '#/components/schemas/TaskAccepted' } } } }
         '80001': { description: 队列满 }
