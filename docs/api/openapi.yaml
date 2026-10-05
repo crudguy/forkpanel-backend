@@ -604,7 +604,7 @@ components:
         engine: { type: string, enum: [sqlite, mysql, postgres] }
         host: { type: string }
         port: { type: integer }
-        username: { type: string }
+        username: { type: string, description: "mysql/postgres 必填（连主机账号）；sqlite 为本地文件、可空" }
         password: { type: string, description: "明文传输，后端用主密钥加密存储" }
         default_db: { type: string }
         tls_mode: { type: string, enum: [disable, prefer, require] }

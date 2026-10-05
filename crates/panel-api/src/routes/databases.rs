@@ -116,6 +116,9 @@ pub async fn create(
         "mysql" | "postgres" | "sqlite" => req.engine.clone(),
         other => return Err(ApiError::bad_request("engine", format!("unsupported: {other}"))),
     };
+    // mysql/postgres 必填 user（见 validate_connection_create）。放在口令加密前先拦，
+    // 避免无账号的连接落库后才在备份/还原时炸出不可归因的认证失败。
+    validate_connection_create(&engine, &req.user)?;
 
     // 口令加密存储（AES-256-GCM，主密钥来自 master.key）。
     // 无主密钥时拒绝写入任何真实口令（降级关闭，绝不明文入库）。
@@ -361,6 +364,22 @@ fn validate_sqlite_path(state: &Shared, db: &str) -> ApiResult<()> {
     // 经跨平台入口判定：业务层不得直接引用 panel_os::linux::*（那会让非 Linux 目标编译不过）
     if state.os.files().is_sensitive_path(p) {
         return Err(ApiError::bad_request("database", "path not allowed"));
+    }
+    Ok(())
+}
+
+/// 创建连接时的业务校验（不碰 DB、不依赖 AppState，可单测）。
+///
+/// mysql/postgres 是「远端服务器」模型：连主机账号必填。
+/// 缺 user 的连接在备份/还原时 `pg_dump`/`mysqldump`/`mysql` 不带 `-U`/`-u`
+/// 会走 OS 当前用户认证 → 几乎必然失败，且错误信息对终端用户不可归因。
+/// 与其留一个「建出来必失败」的连接，不如创建时就拦下（负向对照见测试）。
+/// sqlite 是本地文件、无账号概念，user 可不填。
+fn validate_connection_create(engine: &str, user: &Option<String>) -> ApiResult<()> {
+    if (engine == "mysql" || engine == "postgres")
+        && user.as_ref().map_or(true, |u| u.trim().is_empty())
+    {
+        return Err(ApiError::bad_request("user", "mysql/postgres 连接必须指定账号（user 必填）"));
     }
     Ok(())
 }
@@ -788,6 +807,28 @@ mod tests {
         assert!(!panel_core::rules::is_valid_db_name("db; DROP TABLE x"));
         assert!(!panel_core::rules::is_valid_db_name("a b"));
         assert!(!panel_core::rules::is_valid_db_name(""));
+    }
+
+    #[test]
+    fn mysql_connection_requires_user() {
+        // 空 user / 纯空白 / 缺失 三种形态都必须拦下
+        assert!(validate_connection_create("mysql", &None).is_err());
+        assert!(validate_connection_create("mysql", &Some("".into())).is_err());
+        assert!(validate_connection_create("mysql", &Some("  ".into())).is_err());
+        assert!(validate_connection_create("mysql", &Some("root".into())).is_ok());
+    }
+
+    #[test]
+    fn postgres_connection_requires_user() {
+        assert!(validate_connection_create("postgres", &None).is_err());
+        assert!(validate_connection_create("postgres", &Some("postgres".into())).is_ok());
+    }
+
+    #[test]
+    fn sqlite_connection_does_not_require_user() {
+        // sqlite 是本地文件、无账号概念，user 可空、也可任意
+        assert!(validate_connection_create("sqlite", &None).is_ok());
+        assert!(validate_connection_create("sqlite", &Some("ignored".into())).is_ok());
     }
 
     #[test]
