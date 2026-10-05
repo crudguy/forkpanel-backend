@@ -229,6 +229,16 @@ const ALLOWED_PACKAGES: &[PkgDef] = &[
     PkgDef { name: "certbot",        label: "Certbot" },
     PkgDef { name: "fail2ban",       label: "Fail2ban" },
     PkgDef { name: "ufw",            label: "UFW" },
+    PkgDef { name: "minio",          label: "MinIO" },
+    PkgDef { name: "valkey-server",  label: "Valkey" },
+    PkgDef { name: "prometheus",     label: "Prometheus" },
+    PkgDef { name: "grafana",        label: "Grafana" },
+    PkgDef { name: "netdata",        label: "Netdata" },
+    PkgDef { name: "uptime-kuma",    label: "Uptime Kuma" },
+    PkgDef { name: "haproxy",        label: "HAProxy" },
+    PkgDef { name: "nodejs",         label: "Node.js" },
+    PkgDef { name: "default-jdk",    label: "OpenJDK" },
+    PkgDef { name: "wireguard-tools", label: "WireGuard" },
 ];
 
 /// 逻辑包名 → 各发行版的**真实包名**（槽位 0 = Debian 系 apt，槽位 1 = 其它/RHEL 系）。
