@@ -222,10 +222,11 @@ const ALLOWED_PACKAGES: &[PkgDef] = &[
     PkgDef { name: "postgresql",     label: "PostgreSQL" },
     PkgDef { name: "redis",          label: "Redis" },
     PkgDef { name: "memcached",      label: "Memcached" },
+    // 只保留元包 php-fpm：它 Depends 当前发行版的默认 phpX.Y-fpm，任何一代
+    // Debian/Ubuntu 上都必然可装。此前写死 php8.1/8.2/8.3-fpm 是想覆盖多发行版，
+    // 但 Debian 每代只提供 1 个 PHP 版本（13→8.4、12→8.2、11→7.4），实测本机
+    // 三条全部"仓库无此包"——即任意一台机器上最多 1 条有效，其余点了必失败。
     PkgDef { name: "php-fpm",        label: "PHP-FPM" },
-    PkgDef { name: "php8.1-fpm",     label: "PHP 8.1-FPM" },
-    PkgDef { name: "php8.2-fpm",     label: "PHP 8.2-FPM" },
-    PkgDef { name: "php8.3-fpm",     label: "PHP 8.3-FPM" },
     PkgDef { name: "certbot",        label: "Certbot" },
     PkgDef { name: "fail2ban",       label: "Fail2ban" },
     PkgDef { name: "ufw",            label: "UFW" },
@@ -239,6 +240,19 @@ const ALLOWED_PACKAGES: &[PkgDef] = &[
     PkgDef { name: "nodejs",         label: "Node.js" },
     PkgDef { name: "default-jdk",    label: "OpenJDK" },
     PkgDef { name: "wireguard-tools", label: "WireGuard" },
+];
+
+/// 白名单里**官方仓库通常不含**的包：需先在目标机上配好第三方软件源才能装。
+///
+/// 为什么单独维护而不是给 PkgDef 加字段：这只是"装之前要先配源"的提示信息，
+/// 与包的身份（name/label）无关，混进 PkgDef 会让 22 条字面量全部变长。
+/// 实测 Debian 13（trixie）：grafana / netdata / minio / uptime-kuma 官方源均无包
+/// （minio 只有 minio-client 客户端），mysql-server 是无人提供的空虚拟包
+/// ——Debian 13 已移除 MySQL，改用 MariaDB。
+///
+/// 面板仍保留这些入口（配好源后即可安装），只是 UI 上标注提示，避免用户白点一次。
+const EXTERNAL_SOURCE_PACKAGES: &[&str] = &[
+    "minio", "grafana", "uptime-kuma", "mysql-server", "netdata",
 ];
 
 /// 逻辑包名 → 各发行版的**真实包名**（槽位 0 = Debian 系 apt，槽位 1 = 其它/RHEL 系）。
@@ -598,7 +612,12 @@ pub async fn packages_list(
     // 完整白名单（name+label）随清单一起下发：前端据此给「已装」和「可装」两类都渲染
     // 友好品牌名，而不必在 CATEGORIES 里再维护一份标签（单一事实源在后端）。
     let catalog: Vec<serde_json::Value> = ALLOWED_PACKAGES.iter()
-        .map(|d| serde_json::json!({ "name": d.name, "label": d.label }))
+        .map(|d| serde_json::json!({
+            "name": d.name,
+            "label": d.label,
+            // 提示"官方源通常不含，需先配第三方源"；配好源后装上不受影响
+            "external": EXTERNAL_SOURCE_PACKAGES.contains(&d.name),
+        }))
         .collect();
     Ok(ok(serde_json::json!({ "packages": items, "catalog": catalog })))
 }

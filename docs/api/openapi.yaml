@@ -435,6 +435,7 @@ components:
       properties:
         name:  { type: string }
         label: { type: string }
+        external: { type: boolean, description: 官方仓库通常不含此包，需先在目标机配置第三方软件源才能安装 }
 
     # ───────────── 站点 / SSL ─────────────
     Site:
