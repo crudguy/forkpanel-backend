@@ -424,9 +424,17 @@ components:
       type: object
       properties:
         name:    { type: string }
+        label:   { type: string }
         version: { type: [string, "null"] }
         manager: { type: [string, "null"], example: apt }
         path:    { type: [string, "null"] }
+
+    PackageCatalog:
+      type: object
+      description: 白名单条目（完整集合），前端据此渲染友好品牌名
+      properties:
+        name:  { type: string }
+        label: { type: string }
 
     # ───────────── 站点 / SSL ─────────────
     Site:
@@ -1303,7 +1311,7 @@ paths:
           description: ok
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/Package' } } } }
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { packages: { type: array, items: { $ref: '#/components/schemas/Package' } }, catalog: { type: array, items: { $ref: '#/components/schemas/PackageCatalog' } } } } } }
   /api/v1/packages/install:
     post:
       tags: [packages]

@@ -208,10 +208,27 @@ fn validate_pkg_version(v: &str) -> ApiResult<()> {
 ///
 /// 为什么白名单而不是任意包名：面板以 root 运行，允许安装任意包等于
 /// 给了 Web 界面一个"任意代码执行"入口。白名单把风险收敛到已知集合。
-const ALLOWED_PACKAGES: &[&str] = &[
-    "nginx", "caddy", "apache2", "mysql-server", "mariadb-server", "postgresql",
-    "redis", "memcached", "php-fpm", "php8.1-fpm", "php8.2-fpm", "php8.3-fpm",
-    "certbot", "fail2ban", "ufw",
+/// 白名单条目：`name` 是对外逻辑名（UI 展示、install/remove 入参、幂等键、审计都用它），
+/// `label` 是给人看的品牌名——刻意不带版本后缀，避免把主版本焊死在展示上
+/// （例如 `apache2` 的 "2" 只是 Debian 给 Apache 2.x 打的包名后缀，真出 Apache 3 就尴尬了）。
+struct PkgDef { name: &'static str, label: &'static str }
+
+const ALLOWED_PACKAGES: &[PkgDef] = &[
+    PkgDef { name: "nginx",          label: "Nginx" },
+    PkgDef { name: "caddy",          label: "Caddy" },
+    PkgDef { name: "apache2",        label: "Apache" },
+    PkgDef { name: "mysql-server",   label: "MySQL" },
+    PkgDef { name: "mariadb-server", label: "MariaDB" },
+    PkgDef { name: "postgresql",     label: "PostgreSQL" },
+    PkgDef { name: "redis",          label: "Redis" },
+    PkgDef { name: "memcached",      label: "Memcached" },
+    PkgDef { name: "php-fpm",        label: "PHP-FPM" },
+    PkgDef { name: "php8.1-fpm",     label: "PHP 8.1-FPM" },
+    PkgDef { name: "php8.2-fpm",     label: "PHP 8.2-FPM" },
+    PkgDef { name: "php8.3-fpm",     label: "PHP 8.3-FPM" },
+    PkgDef { name: "certbot",        label: "Certbot" },
+    PkgDef { name: "fail2ban",       label: "Fail2ban" },
+    PkgDef { name: "ufw",            label: "UFW" },
 ];
 
 /// 逻辑包名 → 各发行版的**真实包名**（槽位 0 = Debian 系 apt，槽位 1 = 其它/RHEL 系）。
@@ -254,7 +271,7 @@ pub async fn install(
         .map(|c| c.supported).unwrap_or(false) {
         return Err(ApiError::unsupported("package.install"));
     }
-    if !ALLOWED_PACKAGES.contains(&req.name.as_str()) {
+    if !ALLOWED_PACKAGES.iter().any(|p| p.name == req.name.as_str()) {
         return Err(ApiError::bad_request("name",
             "package not in the allowed list (panel runs as root; arbitrary installs are refused)"));
     }
@@ -555,14 +572,25 @@ pub async fn packages_list(
     // Debian 上 Redis 要查 redis-server，但对外仍要叫 redis（前端按逻辑名渲染、
     // 卸载接口也按逻辑名校验），否则同一个软件在 UI 上会出现两个身份。
     let manager = state.os.packages().manager();
-    let probe: Vec<String> = ALLOWED_PACKAGES.iter().map(|n| real_pkg_name(manager, n)).collect();
+    let probe: Vec<String> = ALLOWED_PACKAGES.iter().map(|d| real_pkg_name(manager, d.name)).collect();
     let probe: Vec<&str> = probe.iter().map(|s| s.as_str()).collect();
     let pkgs = state.os.packages().detect_installed(&probe).await?;
     let items: Vec<serde_json::Value> = pkgs.into_iter().map(|p| {
-        let name = logical_pkg_name(&p.name).unwrap_or(p.name.as_str()).to_string();
-        serde_json::json!({ "name": name, "version": p.version, "manager": p.manager })
+        // 探测到的是真实包名（Debian 上 redis 查 redis-server），先还原成逻辑名，
+        // 再取对应 label；取不到（理论上不会）时退回逻辑名，保证 UI 至少有字可显示。
+        let logical = logical_pkg_name(&p.name).unwrap_or(p.name.as_str());
+        let (name, label) = match ALLOWED_PACKAGES.iter().find(|d| d.name == logical) {
+            Some(d) => (d.name.to_string(), d.label.to_string()),
+            None => (logical.to_string(), logical.to_string()),
+        };
+        serde_json::json!({ "name": name, "label": label, "version": p.version, "manager": p.manager })
     }).collect();
-    Ok(ok(serde_json::json!({ "packages": items })))
+    // 完整白名单（name+label）随清单一起下发：前端据此给「已装」和「可装」两类都渲染
+    // 友好品牌名，而不必在 CATEGORIES 里再维护一份标签（单一事实源在后端）。
+    let catalog: Vec<serde_json::Value> = ALLOWED_PACKAGES.iter()
+        .map(|d| serde_json::json!({ "name": d.name, "label": d.label }))
+        .collect();
+    Ok(ok(serde_json::json!({ "packages": items, "catalog": catalog })))
 }
 
 pub async fn package_remove(
@@ -572,7 +600,7 @@ pub async fn package_remove(
     if !state.capabilities.get(cap_keys::PACKAGE_INSTALL).map(|c| c.supported).unwrap_or(false) {
         return Err(ApiError::unsupported("package.install"));
     }
-    if !ALLOWED_PACKAGES.contains(&name.as_str()) {
+    if !ALLOWED_PACKAGES.iter().any(|p| p.name == name.as_str()) {
         return Err(ApiError::bad_request("name",
             "package not in the allowed list (panel runs as root; arbitrary removes are refused)"));
     }
@@ -615,10 +643,10 @@ mod tests {
 
     #[test]
     fn package_whitelist_is_closed() {
-        assert!(ALLOWED_PACKAGES.contains(&"nginx"));
+        assert!(ALLOWED_PACKAGES.iter().any(|p| p.name == "nginx"));
         // 任意包名必须被拒（面板以 root 运行，这是任意代码执行的入口）
         for bad in ["evil-miner", "../../bin/sh", "nginx; rm -rf /"] {
-            assert!(!ALLOWED_PACKAGES.contains(&bad), "{bad} 绝不能在白名单里");
+            assert!(!ALLOWED_PACKAGES.iter().any(|p| p.name == bad), "{bad} 绝不能在白名单里");
         }
     }
 
