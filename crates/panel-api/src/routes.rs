@@ -118,6 +118,8 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/services/{unit}/config", get(services::config_get).put(services::config_put))
         .route("/api/v1/packages", get(services::packages_list))
         .route("/api/v1/packages/install", post(services::install))
+        // 版本列表按需查询（安装弹窗打开时），刻意不放进 packages_list 全量拉取
+        .route("/api/v1/packages/{name}/versions", get(services::package_versions))
         .route("/api/v1/packages/{name}", delete(services::package_remove));
 
     // ── 站点与 SSL ──

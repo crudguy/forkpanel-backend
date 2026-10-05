@@ -1326,6 +1326,22 @@ paths:
       responses:
         '202': { description: 已入队, content: { application/json: { schema: { $ref: '#/components/schemas/TaskAccepted' } } } }
         '80001': { description: 队列满 }
+  /api/v1/packages/{name}/versions:
+    get:
+      tags: [packages]
+      summary: 查询该包在软件源里可供安装的版本（新→旧；空=查不到，按最新版安装）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: name, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200':
+          description: 版本列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: { type: string }
+                  versions: { type: array, items: { type: string }, description: 为空表示查不到可用版本，安装时按仓库最新版处理 }
   /api/v1/packages/{name}:
     delete:
       tags: [packages]

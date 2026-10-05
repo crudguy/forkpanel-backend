@@ -622,6 +622,31 @@ pub async fn packages_list(
     Ok(ok(serde_json::json!({ "packages": items, "catalog": catalog })))
 }
 
+/// 查询某个白名单包在当前软件源里可供安装的版本（新→旧）。
+///
+/// 为什么单独成端点而不是塞进 packages_list：列包是高频调用（页面加载/轮询），
+/// 而版本查询要为每个包跑一次 apt-cache——25 个包全查会明显拖慢列表。
+/// 改为安装弹窗打开时才按单个包查询（懒加载）。
+pub async fn package_versions(
+    State(state): State<Shared>, Auth(s): Auth, AxPath(name): AxPath<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::PACKAGE_MANAGE)?;
+    if !state.capabilities.get(cap_keys::PACKAGE_INSTALL)
+        .map(|c| c.supported).unwrap_or(false) {
+        return Err(ApiError::unsupported("package.install"));
+    }
+    // 与 install 同一道围栏：只查白名单内的包，避免把本端点变成任意包元数据探针。
+    if !ALLOWED_PACKAGES.iter().any(|p| p.name == name.as_str()) {
+        return Err(ApiError::bad_request("name",
+            "package not in the allowed list (panel runs as root; arbitrary installs are refused)"));
+    }
+    let manager = state.os.packages().manager();
+    let real = real_pkg_name(manager, &name);
+    let versions = state.os.packages().list_versions(&real).await?;
+    // 空列表不是错误：查不到就退回"装最新版"，前端据此只显示一个选项。
+    Ok(ok(serde_json::json!({ "name": name, "versions": versions })))
+}
+
 pub async fn package_remove(
     State(state): State<Shared>, Auth(s): Auth, AxPath(name): AxPath<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
