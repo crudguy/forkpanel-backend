@@ -265,7 +265,9 @@ const ALLOWED_PACKAGES: &[PkgDef] = &[
 const EXTERNAL_SOURCE_PACKAGES: &[&str] = &[
     "minio", "grafana", "netdata",
     // 自动加源（ensure_repo 表内有它）：UI 标"需配源"作弱提示，实际装/升级会自动加。
-    "postgresql", "redis",
+    // 2026-10-06 补齐：这四个在 Debian stable 源里版本明显落后官网，已接各自上游
+    // 官方源（NodeSource / PGDG / packages.redis.io / nginx.org），故一并列入。
+    "postgresql", "redis", "nginx", "nodejs",
     // 未接官方源（NodeSource 站点超时 + 拿不到公示指纹，见上方说明），由用户自行配源。
     "nodejs",
 ];
