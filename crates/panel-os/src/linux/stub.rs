@@ -355,11 +355,23 @@ impl PackageProvider for LinuxPackages {
         if mgr != "apt" { return Ok(Vec::new()) }
         // LC_ALL=C 必需：apt 输出含固定英文标记（"Listing..."、"[upgradable from:"），
         // 非英语环境下会本地化，按字面量匹配将解析为空（与 list_versions 同理）。
+        // 注意：必须用 Bin::AptList（即 `apt` 包装器），`apt-get` 不支持 `list` 子命令。
         let mut env = std::collections::HashMap::new();
         env.insert("LC_ALL".to_string(), std::ffi::OsString::from("C"));
-        let o = crate::cmd::run(Bin::Apt, &["list", "--upgradable"], CmdOpt {
+        let o = match crate::cmd::run(Bin::AptList, &["list", "--upgradable"], CmdOpt {
             timeout: Duration::from_secs(60), env, ..Default::default()
-        }).await?;
+        }).await {
+            Ok(o) => o,
+            // 探测是锦上添花：任何失败都降级为空列表，绝不拖累整页。
+            Err(e) => {
+                tracing::warn!("apt list --upgradable failed: {e}");
+                return Ok(Vec::new());
+            }
+        };
+        // `apt list` 退出 100 属致命错误（如源配置损坏），此时 stdout 为空，解析结果自然为空。
+        if o.code != Some(0) {
+            tracing::warn!("apt list --upgradable exited {:?}, treating as no upgradable", o.code);
+        }
         Ok(parse_apt_upgradable(&o.stdout))
     }
 }

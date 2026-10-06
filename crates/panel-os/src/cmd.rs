@@ -25,6 +25,11 @@ pub enum Bin {
     Systemctl, Service, RcService,      // 服务
     Nft, Iptables, Ufw, FirewallCmd,    // 防火墙
     Apt, Dnf, Yum, Apk, Zypper, Dpkg,   // 包管理
+    /// 只读列举可升级包（`apt list --upgradable`）。**只能用 `apt` 包装器**，因为
+    /// `apt-get` 不认 `list` 子命令（会报 "Command line option --upgradable is not
+    /// understood" → 退出码 100 → 误判为无更新）。`update`/`install`/`remove` 仍走
+    /// `Bin::Apt`(apt-get) 以遵循 Debian「脚本里用 apt-get」的约定、避开 apt 的交互态告警。
+    AptList,
     /// 只读查询软件源元数据（apt-cache policy 列可用版本）。与 Apt(apt-get) 分开：
     /// 能力不同（只读 vs 写入），便于在审计与白名单层面区别对待。
     AptCache,
@@ -82,6 +87,7 @@ impl Bin {
             Systemctl => "systemctl", Service => "service", RcService => "rc-service",
             Nft => "nft", Iptables => "iptables", Ufw => "ufw", FirewallCmd => "firewall-cmd",
             Apt => "apt-get", Dnf => "dnf", Yum => "yum", Apk => "apk", Zypper => "zypper", Dpkg => "dpkg-query",
+            AptList => "apt",
             AptCache => "apt-cache",
             Journalctl => "journalctl", Crontab => "crontab", Flock => "flock", Curl => "curl",
             Nginx => "nginx", Caddy => "caddy",
@@ -570,6 +576,19 @@ mod tests {
         assert_eq!(Bin::Nft.as_str(), "nft");
         assert_eq!(Bin::Systemctl.as_str(), "systemctl");
         assert_eq!(Bin::Bash.as_str(), "bash");
+    }
+
+    #[test]
+    fn apt_family_binaries_are_distinct() {
+        // 「包管理」三兄弟能力不同、不可互相替换——这是踩过的坑：
+        // `upgradable()` 曾用 Bin::Apt(apt-get) 跑 `apt-get list --upgradable`，
+        // 而 apt-get 不支持 list 子命令（报错、stdout 空）→ 解析为空 → 面板
+        // 永远探测不到任何可升级包。故钉死映射：只读列举走 AptList(apt)，
+        // 写入走 Apt(apt-get)，元数据查询走 AptCache(apt-cache)。
+        assert_eq!(Bin::AptList.as_str(), "apt");
+        assert_eq!(Bin::Apt.as_str(), "apt-get");
+        assert_eq!(Bin::AptCache.as_str(), "apt-cache");
+        assert_ne!(Bin::AptList.as_str(), Bin::Apt.as_str());
     }
 
     // ── PTY：真机集成测试（无 bash / 无 PTY 的环境自动跳过，不假绿）──
