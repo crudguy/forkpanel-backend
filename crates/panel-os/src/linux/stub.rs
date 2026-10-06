@@ -13,6 +13,26 @@ use std::time::Duration;
 
 use crate::cmd::{Bin, CmdOpt};
 
+/// apt 写操作的**等锁**参数：`-o DPkg::Lock::Timeout=<秒>`。
+///
+/// 为什么需要：apt/dpkg 的锁是**全局独占**的。外部 apt（终端里手敲的、
+/// unattended-upgrades）持锁时，apt 默认**立刻**以退出码 100 失败。
+/// 本机 `/var/log/apt/history.log` 实证：面板的 task 12/14 都是撞上用户终端里的
+/// `apt purge libreoffice …`(22:39) / `apt upgrade`(22:44) 而失败的——
+/// 面板内部排队救不了这种情况，只能让 apt 自己等。
+///
+/// 实测（Debian 13 / apt 3.x，两次并发 no-op install）：
+/// - 不带该选项 → 立即 exit 100《E: 无法获得锁 … 锁正由进程 N（apt-get）持有》
+/// - 带 `=8` → 打印《正在等待缓存锁》→ 等 2s → exit 0
+///
+/// 取 300s：覆盖常见的外部 apt 事务，又远小于任务超时（1800s），不会把任务卡死。
+/// 等待期间 apt 的《正在等待缓存锁》会作为日志行推到前端，用户看得见"在等什么"。
+///
+/// ⚠️ **刻意不用于只读页面路径**（`repo.rs` 的 ensure_repo → apt-get update）：
+/// 那条路径由 `GET /packages/*` 触发，必须快速失败；让它等锁会把一次普通页面
+/// 请求阻塞数分钟，比失败更糟。
+const APT_LOCK_TIMEOUT: &str = "DPkg::Lock::Timeout=300";
+
 macro_rules! unsupported {
     ($what:expr) => { Err(PanelError::Unsupported($what)) };
 }
@@ -263,7 +283,8 @@ impl PackageProvider for LinuxPackages {
                     env: env.clone(),
                     ..Default::default()
                 };
-                let args = ["install", "-y", "-o", "Dpkg::Options::=--force-confold", target.as_str()];
+                let args = ["install", "-y", "-o", "Dpkg::Options::=--force-confold",
+                            "-o", APT_LOCK_TIMEOUT, target.as_str()];
                 let mut o = crate::cmd::run(Bin::Apt, &args, mk(on_line.clone())).await?;
                 let stale = o.code != Some(0) && (
                     o.stderr.contains("Unable to locate package")
@@ -271,7 +292,7 @@ impl PackageProvider for LinuxPackages {
                 if stale {
                     // 软件源列表过期：刷新后重试一次（只重试一次，防止雪崩）
                     on_line("[panel] apt 软件源列表可能过期，执行 apt-get update 后重试");
-                    crate::cmd::run_checked(Bin::Apt, &["update"],
+                    crate::cmd::run_checked(Bin::Apt, &["-o", APT_LOCK_TIMEOUT, "update"],
                         CmdOpt { timeout: Duration::from_secs(300), on_line: Some(on_line.clone()), ..Default::default() }).await?;
                     o = crate::cmd::run(Bin::Apt, &args, mk(on_line)).await?;
                 }
@@ -298,7 +319,7 @@ impl PackageProvider for LinuxPackages {
     async fn remove(&self, n: &str) -> Result<()> {
         let m = self.manager.ok_or(PanelError::Unsupported("package.manager"))?;
         let (bin, args): (Bin, Vec<&str>) = match m {
-            "apt" => (Bin::Apt, vec!["remove", "-y", n]),
+            "apt" => (Bin::Apt, vec!["remove", "-y", "-o", APT_LOCK_TIMEOUT, n]),
             "dnf" => (Bin::Dnf, vec!["remove", "-y", n]),
             "yum" => (Bin::Yum, vec!["remove", "-y", n]),
             "apk" => (Bin::Apk, vec!["del", n]),
