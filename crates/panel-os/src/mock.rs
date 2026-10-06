@@ -264,6 +264,10 @@ impl PackageProvider for MockPackages {
         // 返回空列表：mock 没有真实软件源，调用方据此退回"装最新版"
         Ok(PackageVersions::default())
     }
+    async fn ensure_repo(&self, _logical: &str, _cb: Box<dyn Fn(String) + Send + Sync>) -> Result<()> {
+        // mock 不接真实软件源；第三方源加源在测试里是 no-op
+        Ok(())
+    }
 }
 
 #[async_trait]

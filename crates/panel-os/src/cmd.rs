@@ -50,6 +50,11 @@ pub enum Bin {
     /// 因此该能力默认大概率不可用（不在 docker 组），能力位据此诚实置灰。
     Docker,
     OpenSsl,                            // TLS 自签证书生成（仅签发，不参与其它任何用途）
+    /// 第三方 apt 源 GPG 密钥指纹校验（方案1：加官方源）。
+    /// 安全评估：① 只接受 `-n` + 文件名 argv，只读解析密钥指纹，绝不 `--import`/网络；
+    /// ② 指纹比对走硬编码白名单（THIRD_PARTY_REPOS 内置），MITM 替换密钥会因指纹不符被拒；
+    /// ③ 整个命令 argv 直传，不经 shell。仅用于校验，不参与任何密钥落地动作。
+    Gpg,
     MySql, MySqlDump, Psql, PgDump,     // 数据库（可选能力）
     Tar, Gzip,                          // 备份打包
     Sshd,                               // sshd -t 配置校验：改 SSH 配置前的强制安全网
@@ -81,7 +86,7 @@ impl Bin {
             Journalctl => "journalctl", Crontab => "crontab", Flock => "flock", Curl => "curl",
             Nginx => "nginx", Caddy => "caddy",
             Docker => "docker",
-            OpenSsl => "openssl",
+            OpenSsl => "openssl", Gpg => "gpg",
             MySql => "mysql", MySqlDump => "mysqldump", Psql => "psql", PgDump => "pg_dump",
             Tar => "tar", Gzip => "gzip", Sshd => "sshd", Certbot => "certbot",
             Fail2banClient => "fail2ban-client",

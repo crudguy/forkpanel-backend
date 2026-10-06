@@ -75,7 +75,7 @@ check(stop_allowed("sshd","restart"), "sshd 允许 restart")
 check(stop_allowed("nginx","stop"), "普通服务可停")
 
 # ═══════════ 5. 软件包白名单（封闭，防任意代码执行）═══════════
-ALLOWED = ["nginx","caddy","apache2","mysql-server","mariadb-server","postgresql",
+ALLOWED = ["nginx","caddy","apache2","mariadb-server","postgresql",
            "redis","memcached","php-fpm","php8.1-fpm","php8.2-fpm","php8.3-fpm",
            "certbot","fail2ban","ufw","curl","wget","git","unzip","tar"]
 check("nginx" in ALLOWED, "nginx 允许")

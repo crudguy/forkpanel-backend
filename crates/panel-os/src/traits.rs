@@ -257,6 +257,13 @@ pub trait PackageProvider: Send + Sync {
     /// （Debian 版本号形如 `1.26.3-3+deb13u9`，含 epoch/修订号，凭记忆写几乎必错）。
     /// 返回空列表表示"查不到"，调用方应退回"装最新版"，不应视为错误。
     async fn list_versions(&self, name: &str) -> Result<PackageVersions>;
+    /// 安装第三方官方源包前，确保对应的第三方 apt 源已就绪
+    /// （下载并校验 GPG 密钥指纹、写隔离 keyring + sources.list.d，再 apt-get update）。
+    ///
+    /// 仅对 `third_party_repo(logical)` 命中且当前为 apt 的包生效；其它情况
+    /// （白名单内普通包、非 apt 发行版、无第三方源的包如 minio）为 no-op，直接返回 Ok，
+    /// 不影响既有安装路径。调用方应在 `install` 之前调用，加源失败即中止安装。
+    async fn ensure_repo(&self, logical: &str, on_line: Box<dyn Fn(String) + Send + Sync>) -> Result<()>;
 }
 
 // ═══════════════════════════ 防火墙（声明式） ═══════════════════════════

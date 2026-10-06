@@ -236,7 +236,7 @@ pub async fn install(
         Some("zypper") => "docker",
         _ => "docker",
     };
-    let body = PackageTask { pkg: pkg.to_string(), os: state.os.clone(), op: PkgOp::Install, version: None };
+    let body = PackageTask { pkg: pkg.to_string(), os: state.os.clone(), op: PkgOp::Install, version: None, logical: "docker".to_string() };
     let (task_id, created) = state.tasks.submit(
         TaskRequest {
             // 幂等键：重复提交只会执行一次（防双击 / 防重试风暴）

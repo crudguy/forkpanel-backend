@@ -329,6 +329,20 @@ impl PackageProvider for LinuxPackages {
             _other => Ok(PackageVersions::default()),
         }
     }
+
+    async fn ensure_repo(&self, logical: &str, on_line: Box<dyn Fn(String) + Send + Sync>) -> Result<()> {
+        // 仅 apt 发行版支持加 apt 源；其它发行版（dnf/apk/...）无对应实现，直接报 unsupported
+        let m = self.manager.ok_or(PanelError::Unsupported("package.manager"))?;
+        if m != "apt" {
+            return Err(PanelError::Unsupported("package.ensure_repo (non-apt)"));
+        }
+        match crate::linux::repo::third_party_repo(logical) {
+            // 命中第三方源：下载校验 GPG → 写 keyring/sources → apt update
+            Some(repo) => crate::linux::repo::ensure_third_party_repo(repo, on_line).await,
+            // 白名单内普通包 / 无第三方源的包（含 minio）：no-op，不影响既有路径
+            None => Ok(()),
+        }
+    }
 }
 
 /// 从 `apt-cache policy <pkg>` 输出里抽版本（新→旧由 apt 自身顺序决定）。
