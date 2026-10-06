@@ -165,6 +165,23 @@ pub async fn login(
 
     state.logins.reset(&key);
 
+    // 写入最后登录时间：users 页「最后登录」列与账号审计都依赖它。
+    // 此前全后端对该列**只 SELECT 不 UPDATE**（users.rs 只读出 last_login_at），
+    // 于是它恒为 NULL、用户页永远显示"从未登录"，即便刚登录过——等于功能缺失。
+    // 纯写且失败不影响登录本身（不能因为一条审计字段写失败就拒绝登录），故忽略结果。
+    let uid_login_at = uid;
+    let _ = state
+        .db
+        .exec(move |conn| {
+            conn.execute(
+                "UPDATE users SET last_login_at = ?1 WHERE id = ?2",
+                rusqlite::params![crate::now_unix(), uid_login_at],
+            )
+            .map(|_| panel_db::WriteAck { rows_changed: 1 })
+            .map_err(|e| panel_core::PanelError::Database(e.to_string()))
+        })
+        .await;
+
     // 自定义角色的权限存在库里，故走异步解析；内置角色走"未命中则回退内置"的路径。
     // 权限在这里**快照**进会话：角色权限后续变更需重新登录才生效（已知边界）。
     let permissions = auth::permissions_for_role_resolved(&state, &role).await;
