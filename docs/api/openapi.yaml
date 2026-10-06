@@ -1317,14 +1317,20 @@ paths:
     post:
       tags: [packages]
       summary: 安装（任务化 → 202）
+      description: |
+        已装包再传版本即等价于升级。若目标跨主版本（如 PostgreSQL 17→18、Node.js 20→24）
+        且未带 confirm_major=true，会与 /packages/upgrade 共用同一守卫返回 409 强制二次确认
+        ——不能只靠前端拦截，否则换端点即可绕过警告。未装包时 current 取不到 → 不触发，
+        首次安装零影响。
       security: [cookieAuth, csrfHeader]
       requestBody:
         required: true
         content:
           application/json:
-            schema: { type: object, required: [name], properties: { name: { type: string }, version: { type: string, description: "可选，指定要安装的版本；留空=仓库最新版" } } }
+            schema: { type: object, required: [name], properties: { name: { type: string }, version: { type: string, description: "可选，指定要安装的版本；留空=仓库最新版" }, confirm_major: { type: [boolean, "null"], description: 跨主版本升级的二次确认标记；检测到跨主版本且为 false/省略时接口返回 409 } } }
       responses:
         '202': { description: 已入队, content: { application/json: { schema: { $ref: '#/components/schemas/TaskAccepted' } } } }
+        '409': { description: 跨主版本升级需二次确认（detail.kind=major_upgrade，附 from/to/note）；前端弹窗确认后带 confirm_major=true 重发 }
         '80001': { description: 队列满 }
   /api/v1/packages/{name}/versions:
     get:

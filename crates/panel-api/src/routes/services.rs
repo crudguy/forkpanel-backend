@@ -340,6 +340,10 @@ pub async fn install(
     if let Some(v) = &req.version {
         validate_pkg_version(v)?;
     }
+    // 跨主版本升级二次确认：install 也能触发升级（已装包传最新版即等于升级），
+    // 不能只在 upgrade 路径守，否则换端点即可绕过警告。未装包 current=None → 不触发，
+    // 首次安装零影响。
+    require_major_upgrade_confirm(&state, &req).await?;
 
     // 安装必须走任务队列：耗时不可预测 + 输出需流式返回
     // Debian 上 Redis 的真实包名是 redis-server —— 直接拿逻辑名去 apt install 会失败，
@@ -793,33 +797,8 @@ pub async fn package_upgrade(
     }
     let real = real_pkg_name(state.os.packages().manager(), &req.name);
 
-    // 跨主版本升级风险判定（如 PostgreSQL 17→18、Node.js 20→24）：此类升级可能不向后兼容，
-    // 需要数据迁移（pg_upgrade / 逻辑备份恢复）或服务重配。后端**强制**二次确认——
-    // 前端弹窗确认后须带 confirm_major=true，否则 409 拒绝；不能只靠前端拦截，
-    // 否则直接调 API 即可绕过警告。判定与解析共用 `version_major_jump`，单一事实源。
-    let up = state.os.packages().upgradable().await.unwrap_or_default();
-    let entry = up.iter().find(|u| u.name == real);
-    // candidate：用户显式指定版本优先，否则取 upgradable 探测到的目标版本
-    let candidate = req.version.clone()
-        .or_else(|| entry.as_ref().map(|u| u.candidate.clone()));
-    // current：upgradable 探测里的已装版本；不在探测列表里（用户显式指定旧/新版）时
-    // 退回 apt-cache policy 的已装版本（此处需 .await，故在 match 分支里算，而非闭包内）
-    let current = match entry {
-        Some(u) => Some(u.current.clone()),
-        None => state.os.packages().list_versions(&real).await.ok().and_then(|v| v.installed),
-    };
-    let major = match (&current, &candidate) {
-        (Some(c), Some(n)) => version_major_jump(c, n),
-        _ => false,
-    };
-    if major && !req.confirm_major.unwrap_or(false) {
-        return Err(ApiError::conflict("major_upgrade").with_detail(serde_json::json!({
-            "kind": "major_upgrade",
-            "from": current,
-            "to": candidate,
-            "note": "跨主版本升级可能不向后兼容，通常需要数据迁移或服务重配。例如 PostgreSQL 17→18 须先执行 pg_upgrade 或逻辑备份恢复，期间服务不可用。确认前请务必先完成数据备份。",
-        })));
-    }
+    // 跨主版本升级二次确认（与 install 共用同一守卫，单一事实源）。
+    require_major_upgrade_confirm(&state, &req).await?;
 
     let pkg = real;
     let os = state.os.clone();
@@ -838,6 +817,46 @@ pub async fn package_upgrade(
 
     audit(&state, &s, "package.upgrade", &req.name, "queued").await;
     Ok(ok(serde_json::json!({ "task_id": id, "created": created })))
+}
+
+/// 跨主版本升级二次确认守卫（install 与 upgrade 两路共用，单一事实源）。
+///
+/// 已装包升到**跨主版本**候选（PostgreSQL 17→18、Node.js 20→24 等）时，未带
+/// `confirm_major=true` 则 409 拒绝——不能只靠前端拦截，否则直接调 API 即可绕过。
+/// 判定从 `upgradable()` 探测结果取候选版本、从 `apt-cache policy` 取已装版本，
+/// 二者交 `version_major_jump` 判定，与 /packages/upgradable 列表里的 `major` 标记同源。
+///
+/// 未装包：`current` 经 upgradable + apt-cache policy 都取不到 → `major=false` → 不触发，
+/// 故对「首次安装」零影响；仅当包**已装且**目标跨主版本时才拦截。
+async fn require_major_upgrade_confirm(
+    state: &Shared,
+    req: &InstallReq,
+) -> ApiResult<()> {
+    let real = real_pkg_name(state.os.packages().manager(), &req.name);
+    let up = state.os.packages().upgradable().await.unwrap_or_default();
+    let entry = up.iter().find(|u| u.name == real);
+    // candidate：用户显式指定版本优先，否则取 upgradable 探测到的目标版本
+    let candidate = req.version.clone()
+        .or_else(|| entry.as_ref().map(|u| u.candidate.clone()));
+    // current：upgradable 探测里的已装版本；不在探测列表里（用户显式指定旧/新版）时
+    // 退回 apt-cache policy 的已装版本
+    let current = match entry {
+        Some(u) => Some(u.current.clone()),
+        None => state.os.packages().list_versions(&real).await.ok().and_then(|v| v.installed),
+    };
+    let major = match (&current, &candidate) {
+        (Some(c), Some(n)) => version_major_jump(c, n),
+        _ => false,
+    };
+    if major && !req.confirm_major.unwrap_or(false) {
+        return Err(ApiError::conflict("major_upgrade").with_detail(serde_json::json!({
+            "kind": "major_upgrade",
+            "from": current,
+            "to": candidate,
+            "note": "跨主版本升级可能不向后兼容，通常需要数据迁移或服务重配。例如 PostgreSQL 17→18 须先执行 pg_upgrade 或逻辑备份恢复，期间服务不可用。确认前请务必先完成数据备份。",
+        })));
+    }
+    Ok(())
 }
 
 pub async fn package_remove(
