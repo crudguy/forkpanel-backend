@@ -384,7 +384,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn apply_replaces_existing_directive_and_keeps_comments() {
         let src = "#PermitRootLogin yes\nPermitRootLogin yes\nPort 22\n";
         let out = super::apply_ssh_directive(src, "PermitRootLogin", "no");
@@ -418,6 +417,7 @@ mod tests {
         assert!(super::ssh_fix_target("ssh.permit_root_login; rm -rf /").is_none());
     }
 
+    #[test]
     fn ssh_missing_config_is_not_applicable() {
         let items = ssh_checks(Path::new("/nonexistent/sshd_config"));
         assert!(items.iter().all(|c| !c.applicable), "缺配置应标不适用（而非通过）");
