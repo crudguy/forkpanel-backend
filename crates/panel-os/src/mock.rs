@@ -268,6 +268,11 @@ impl PackageProvider for MockPackages {
         // mock 不接真实软件源；第三方源加源在测试里是 no-op
         Ok(())
     }
+
+    async fn upgradable(&self) -> Result<Vec<UpgradablePkg>> {
+        // mock 不跑 apt；返回空列表=「无可升级项」，调用方应隐藏入口而非报错
+        Ok(Vec::new())
+    }
 }
 
 #[async_trait]

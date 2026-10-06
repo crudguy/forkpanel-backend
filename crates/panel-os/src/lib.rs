@@ -113,6 +113,14 @@ impl OsAdapter for linux::LinuxOsAdapter {
             Some(mgr) => Capability::yes(mgr),
             None => Capability::no("no_package_manager"),
         });
+
+        // 升级能力与安装同源：apt 的 `install pkg=version` 本身就是覆盖升级。
+        // 同样只有"存在包管理器"才yes——没有包管理器时升级无从谈起（诚实置灰，
+        // 不能让菜单可见、点了才报错）。
+        m.insert(k::PACKAGE_UPGRADE.into(), match self.packages.manager() {
+            Some(mgr) => Capability::yes(mgr),
+            None => Capability::no("no_package_manager"),
+        });
         m.insert(k::FILE_READ.into(), Capability::yes("posix"));
         m.insert(k::FILE_WRITE.into(), Capability::yes("posix"));
         m.insert(k::FIREWALL_MANAGE.into(), self.firewall.capability());

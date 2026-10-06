@@ -146,6 +146,7 @@ pub mod cap_keys {
     pub const PROCESS_SIGNAL: &str = "process.signal";
     pub const SERVICE_MANAGE: &str = "service.manage";
     pub const PACKAGE_INSTALL: &str= "package.install";
+    pub const PACKAGE_UPGRADE: &str= "package.upgrade";
     pub const FILE_READ: &str      = "file.read";
     pub const FILE_WRITE: &str     = "file.write";
     pub const FIREWALL_MANAGE: &str= "firewall.manage";

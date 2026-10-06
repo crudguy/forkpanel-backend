@@ -674,6 +674,79 @@ pub async fn package_versions(
     Ok(ok(serde_json::json!({ "name": name, "versions": v.versions, "installed": v.installed })))
 }
 
+/// 探测白名单内**已安装且源里有新版**的包（B1：只读，供 UI 显示「有新版」徽标）。
+///
+/// 为什么单独成端点：与 packages_list 分开是因为它要跑一次 `apt list --upgradable`
+/// （秒级子进程），而 packages_list 是页面/轮询高频调用；混在一起会让每次刷新都多付这个开销。
+///
+/// 权限用 PACKAGE_MANAGE（与安装同级）：升级会改动系统，viewer 不该看到可升级清单。
+/// 探测失败**不报错**、返回空列表——探测是锦上添花，不该让整页软件列表挂掉。
+pub async fn packages_upgradable(
+    State(state): State<Shared>, Auth(s): Auth,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::PACKAGE_MANAGE)?;
+    if !state.capabilities.get(cap_keys::PACKAGE_UPGRADE)
+        .map(|c| c.supported).unwrap_or(false) {
+        return Err(ApiError::unsupported("package.upgrade"));
+    }
+    let up = state.os.packages().upgradable().await.unwrap_or_default();
+    // 过滤到白名单（用真包名比对，因为 upgradable 返的是 redis-server 这类真名），
+    // 再映射回逻辑名对外——与 install/remove 的"逻辑名对外"约定保持一致。
+    let items: Vec<serde_json::Value> = ALLOWED_PACKAGES.iter().filter_map(|p| {
+        let real = real_pkg_name(state.os.packages().manager(), p.name);
+        up.iter().find(|u| u.name == real).map(|u| serde_json::json!({
+            "name": p.name,            // 逻辑名（前端按它匹配已安装卡片）
+            "label": p.label,
+            "current": u.current,
+            "candidate": u.candidate,
+        }))
+    }).collect();
+    Ok(ok(serde_json::json!({ "items": items })))
+}
+
+/// 升级某个已安装软件到指定版本（A：复用 install pkg=version 路径）。
+///
+/// 为什么复用 install 而不新增 PkgOp::Upgrade：apt/dnf 的 `install pkg=version` 语义上
+/// **本身就是覆盖升级**（已装 1.0 时执行 install pkg=1.2.3 就是升到 1.2.3），
+/// 另立一个 op 只会让底层多一份完全同构的分支。升级与安装的差别只在 UI 语义与幂等键。
+///
+/// version 为空时表示"升到源里的最新版"（apt install pkg，不带版本约束）。
+pub async fn package_upgrade(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    Json(req): Json<InstallReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::PACKAGE_MANAGE)?;
+    if !state.capabilities.get(cap_keys::PACKAGE_UPGRADE)
+        .map(|c| c.supported).unwrap_or(false) {
+        return Err(ApiError::unsupported("package.upgrade"));
+    }
+    if !ALLOWED_PACKAGES.iter().any(|p| p.name == req.name.as_str()) {
+        return Err(ApiError::bad_request("name",
+            "package not in the allowed list (panel runs as root; arbitrary installs are refused)"));
+    }
+    if let Some(v) = &req.version {
+        validate_pkg_version(v)?;
+    }
+    let pkg = real_pkg_name(state.os.packages().manager(), &req.name);
+    let os = state.os.clone();
+    let body = PackageTask { pkg, os, op: PkgOp::Install, version: req.version.clone(), logical: req.name.clone() };
+    // 幂等键与 install 刻意不同（pkg.upgrade: vs pkg.install:）：否则用户先装了新版、
+    // 又点「更新到旧版本」会被 install 的窗口期幂等吞掉，任务静默不执行。
+    let (id, created) = state.tasks.submit(
+        panel_task::TaskRequest {
+            idempotency_key: format!("pkg.upgrade:{}", req.name),
+            kind: panel_task::TaskKind::Package,
+            label: format!("升级 {}", req.name),
+            timeout: Duration::from_secs(1800),
+        },
+        body,
+    ).await.map_err(ApiError::from)?;
+
+    audit(&state, &s, "package.upgrade", &req.name, "queued").await;
+    Ok(ok(serde_json::json!({ "task_id": id, "created": created })))
+}
+
 pub async fn package_remove(
     State(state): State<Shared>, Auth(s): Auth, AxPath(name): AxPath<String>,
 ) -> ApiResult<Json<serde_json::Value>> {

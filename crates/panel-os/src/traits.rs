@@ -244,6 +244,20 @@ pub struct PackageVersions {
     pub installed: Option<String>,      // 当前已安装版本；未安装为 None
 }
 
+/// 某个已安装包存在可用更新的信息（由包管理器的 upgradable 列表派生）。
+///
+/// 只报**白名单内**的包：探测结果直接驱动 UI 的「有新版」徽标与更新按钮，
+/// 若不过滤，用户会看到几百个自己并未在面板里管的系统库冒出来。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpgradablePkg {
+    /// 真实包名（包管理器口径，如 `redis-server`）。
+    pub name: String,
+    /// 当前已安装版本。
+    pub current: String,
+    /// 可升级到的版本。
+    pub candidate: String,
+}
+
 #[async_trait]
 pub trait PackageProvider: Send + Sync {
     fn manager(&self) -> Option<&'static str>;   // apt / dnf / apk / None
@@ -264,6 +278,12 @@ pub trait PackageProvider: Send + Sync {
     /// （白名单内普通包、非 apt 发行版、无第三方源的包如 minio）为 no-op，直接返回 Ok，
     /// 不影响既有安装路径。调用方应在 `install` 之前调用，加源失败即中止安装。
     async fn ensure_repo(&self, logical: &str, on_line: Box<dyn Fn(String) + Send + Sync>) -> Result<()>;
+    /// 列出**已安装且源里有新版**的包（只读探测，不改动系统）。
+    ///
+    /// 供 UI 显示「有新版」徽标。返回空列表表示"无可升级项"，**不是错误**
+    /// （多数机器本来就没有可升级的白名单包）。查不到（无包管理器/命令缺失）同样返回空列表，
+    /// 调用方据此隐藏入口而不是报错——探测失败不该让整页软件列表挂掉。
+    async fn upgradable(&self) -> Result<Vec<UpgradablePkg>>;
 }
 
 // ═══════════════════════════ 防火墙（声明式） ═══════════════════════════

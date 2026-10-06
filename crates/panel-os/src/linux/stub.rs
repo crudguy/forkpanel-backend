@@ -343,6 +343,25 @@ impl PackageProvider for LinuxPackages {
             None => Ok(()),
         }
     }
+
+    /// 只读探测可升级包：`apt list --upgradable`，不改动系统。
+    ///
+    /// 为什么用 `apt list` 而不是 `apt-get -s upgrade`：后者会**列出所有**可升级包
+    /// （本机实测 32+ 个 lib* / libreoffice* 等系统库），而 UI 只该关心白名单内的软件；
+    /// 前者输出同样是「包名/源 版本 arch [upgradable from: 旧版本]」，解析后按需过滤即可。
+    /// 无包管理器时返回空列表（而非 Unsupported）——探测是锦上添花，不该让整页报错。
+    async fn upgradable(&self) -> Result<Vec<UpgradablePkg>> {
+        let Some(mgr) = self.manager else { return Ok(Vec::new()) };
+        if mgr != "apt" { return Ok(Vec::new()) }
+        // LC_ALL=C 必需：apt 输出含固定英文标记（"Listing..."、"[upgradable from:"），
+        // 非英语环境下会本地化，按字面量匹配将解析为空（与 list_versions 同理）。
+        let mut env = std::collections::HashMap::new();
+        env.insert("LC_ALL".to_string(), std::ffi::OsString::from("C"));
+        let o = crate::cmd::run(Bin::Apt, &["list", "--upgradable"], CmdOpt {
+            timeout: Duration::from_secs(60), env, ..Default::default()
+        }).await?;
+        Ok(parse_apt_upgradable(&o.stdout))
+    }
 }
 
 /// 从 `apt-cache policy <pkg>` 输出里抽版本（新→旧由 apt 自身顺序决定）。
@@ -403,6 +422,40 @@ pub(crate) fn parse_apt_policy_installed(out: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// 从 `apt list --upgradable` 输出里解析可升级包（本机实测形态，LC_ALL=C）：
+/// ```text
+/// Listing...
+/// fonts-opensymbol/stable-security 4:102.12+LibO25.2.3-2+deb13u8 all [upgradable from: 4:102.12+LibO25.2.3-2+deb13u7]
+/// ```
+///
+/// 两个易踩的坑：
+/// 1. **包名与源之间用 `/` 分隔，而源名本身也可能含 `-` 但不含 `/`**——按**第一个** `/`
+///    切分即可（`split('/')` 取首段）；若按最后一个 `/`切或按空格切都会连源名一起带进包名。
+///    反之若误按 `/` 分割整个行，会把 `stable-security` 当成包名。
+/// 2. **版本号含 `:`（epoch，如 `4:102.12+…`）且可含 `+`/`~`**，不能按空白简单切；
+///    旧版本要从 `[upgradable from: X]` 里取，须按该标记切出尾部再trim。
+pub(crate) fn parse_apt_upgradable(out: &str) -> Vec<UpgradablePkg> {
+    const FROM_MARK: &str = "[upgradable from:";
+    let mut res: Vec<UpgradablePkg> = Vec::new();
+    for line in out.lines() {
+        let t = line.trim();
+        // 跳过 "Listing..." 头、空行
+        if t.is_empty() || !t.contains('/') || !t.contains(FROM_MARK) { continue; }
+        let head_and_from = t.split(FROM_MARK).next().unwrap_or("").trim();
+        let current = t.split(FROM_MARK).nth(1).unwrap_or("").trim().trim_end_matches(']').trim();
+        if current.is_empty() { continue; }
+        // head 形如 "包名/源 版本 arch"：按空白切成三段（末段 arch 可能为 all/amd64）
+        let mut it = head_and_from.split_whitespace();
+        let Some(name_with_repo) = it.next() else { continue };
+        let Some(candidate) = it.next() else { continue; };
+        // 只取第一个 '/' 之前的包名（源名在 '/ ' 之后）
+        let name = name_with_repo.split('/').next().unwrap_or("").to_string();
+        if name.is_empty() { continue; }
+        res.push(UpgradablePkg { name, current: current.to_string(), candidate: candidate.to_string() });
+    }
+    res
 }
 
 /// 安装类长命令统一出口：流式回调 + 30 分钟超时（对齐任务队列上限）。
@@ -2177,4 +2230,49 @@ mod tests {
             .await;
         assert!(matches!(r, Err(panel_core::PanelError::Unsupported(_))), "缺失客户端应 Unsupported: {r:?}");
     }
+    #[test]
+    fn parse_apt_upgradable_reads_real_output_shape() {
+        // 本机实测形态（LC_ALL=C，含 epoch 与源名带连字符两种真实情形）
+        let out = "Listing...\n\
+                    fonts-opensymbol/stable-security 4:102.12+LibO25.2.3-2+deb13u8 all [upgradable from: 4:102.12+LibO25.2.3-2+deb13u7]\n\
+                    redis-server/stable 5:8.0.2-3+deb13u3 amd64 [upgradable from: 5:8.0.2-3+deb13u2]\n";
+        let got = parse_apt_upgradable(out);
+        assert_eq!(got.len(), 2, "应解析出两行：{got:?}");
+        // 包名只取第一个 '/' 之前的部分，绝不能把源名(带-)混进包名
+        assert_eq!(got[0].name, "fonts-opensymbol");
+        assert_eq!(got[0].candidate, "4:102.12+LibO25.2.3-2+deb13u8");
+        assert_eq!(got[0].current, "4:102.12+LibO25.2.3-2+deb13u7");
+        assert_eq!(got[1].name, "redis-server");
+        assert_eq!(got[1].candidate, "5:8.0.2-3+deb13u3");
+    }
+
+    #[test]
+    fn parse_apt_upgradable_ignores_non_upgradable_lines() {
+        // "Listing..." 头、空行、以及不含 [upgradable from:] 的行都应被跳过
+        let out = "Listing...\n\
+                    nginx/stable 1.26.3-3+deb13u9 amd64\n\
+                    \n\
+                    redis/stable 8.0.2 amd64 [upgradable from: 8.0.1]\n";
+        let got = parse_apt_upgradable(out);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "redis");
+    }
+
+    #[test]
+    fn parse_apt_upgradable_empty_output_is_empty_list() {
+        // 空输出=无可升级项，必须是Ok(空)而非错误（探测不该让整页报错）
+        assert!(parse_apt_upgradable("").is_empty());
+        assert!(parse_apt_upgradable("Listing...\n").is_empty());
+    }
+
+    #[test]
+    fn parse_apt_upgradable_handles_tilde_and_plus_in_versions() {
+        // 版本号可能含 ~（debian 预发布）与 +（本地修订），不能因非数字被丢弃
+        let out = "foo/stable 1.2.3~rc1+deb1 amd64 [upgradable from: 1.2.2+deb1]\n";
+        let got = parse_apt_upgradable(out);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].candidate, "1.2.3~rc1+deb1");
+        assert_eq!(got[0].current, "1.2.2+deb1");
+    }
+
 }
