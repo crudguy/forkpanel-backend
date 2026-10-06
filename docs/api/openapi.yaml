@@ -1343,6 +1343,58 @@ paths:
                   name: { type: string }
                   versions: { type: array, items: { type: string }, description: 为空表示查不到可用版本，安装时按仓库最新版处理 }
                   installed: { type: [string, "null"], description: 当前已安装版本（由包管理器给出）；未安装为 null，用于在下拉里标注 }
+  /api/v1/packages/upgradable:
+    get:
+      tags: [packages]
+      summary: 探测白名单内已安装且源里有新版的包（只读；空=无可升级项，非错误）
+      description: |
+        跑 `apt list --upgradable` 后**过滤到白名单**并映射回逻辑名。
+        刻意不并入 GET /packages（后者是页面/轮询高频调用，本端点要跑一次秒级子进程）。
+        探测失败返回空列表而非报错——探测是锦上添花，不该让整页软件列表挂掉。
+      security: [cookieAuth, csrfHeader]
+      responses:
+        '200':
+          description: 可升级清单
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    description: 仅含白名单内可升级的包；为空表示当前无可升级项
+                    items:
+                      type: object
+                      properties:
+                        name: { type: string, description: 逻辑包名（与 GET /packages 的 name 同域，UI 按它匹配已安装卡片） }
+                        label: { type: string, description: 品牌展示名 }
+                        current: { type: string, description: 当前已安装版本 }
+                        candidate: { type: string, description: 可升级到的版本 }
+        '501': { description: 本机无可用包管理器（能力位 package.upgrade 不支持） }
+  /api/v1/packages/upgrade:
+    post:
+      tags: [packages]
+      summary: 升级到指定版本（任务化 → 202；不传 version = 升到源里最新版）
+      description: |
+        底层复用 `install pkg=version` 路径——apt/dnf 语义上「已装 1.0 时
+        install pkg=1.2.3」本就是覆盖升级，故不另立 PkgOp::Upgrade。
+        幂等键与 install 独立（pkg.upgrade: vs pkg.install:），避免「装完新版再
+        手动回退到旧版」被 install 的窗口期幂等静默吞掉。
+      security: [cookieAuth, csrfHeader]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, description: 逻辑包名；非白名单一律 400 }
+                version: { type: [string, "null"], description: 目标版本；省略/null 表示升到源里最新版 }
+      responses:
+        '202': { description: 已入队 }
+        '400': { description: 包不在白名单，或版本号含非法字符 }
+        '501': { description: 本机无可用包管理器（能力位 package.upgrade 不支持） }
   /api/v1/packages/{name}:
     delete:
       tags: [packages]
