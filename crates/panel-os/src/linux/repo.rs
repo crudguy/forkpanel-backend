@@ -105,6 +105,36 @@ pub static THIRD_PARTY_REPOS: &[ThirdPartyRepo] = &[
         suite: "{codename} main",
         codename_dependent: true,
     },
+    ThirdPartyRepo {
+        logical: "nginx",
+        url: "https://nginx.org/packages/debian",
+        format: RepoFormat::DebList,
+        key_url: "https://nginx.org/keys/nginx_signing.key",
+        // nginx 官方源主钥（三把，取其一即可；实测本机下载解析一致）。
+        // 注意 component 是 **nginx** 不是 main——实测 dists/trixie/ 下只有 nginx/
+        // 子目录，写成 main 会 404（与 PGDG/Redis 的 main 不同，别照抄）。
+        key_fingerprint: "9E9BE90EACBCDE69FE9B204CBCDCD8A38D88A2B3",
+        keyring_name: "nginx.gpg",
+        sources_name: "nginx.list",
+        suite: "{codename} nginx",
+        codename_dependent: true,
+    },
+    ThirdPartyRepo {
+        logical: "nodejs",
+        url: "https://deb.nodesource.com/node_24.x",
+        format: RepoFormat::DebList,
+        key_url: "https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key",
+        // NodeSource 主钥（实测本机下载解析一致）。
+        // 环境与网络坑：本机 IPv6 优先时该域名连接超时（curl 返回 000），**强制
+        // IPv4（-4）才 200**；cmd.rs 的 run 不强制 IPv4，故若所在网络 IPv6 不通，
+        // ensure_repo 会在此步失败——这是环境事实而非源不可用，排查时先 curl -4 验。
+        // suite 是固定的 nodistro（NodeSource 不按发行版代号分目录）。
+        key_fingerprint: "0FA5ECC8C0CA58863C0AC5867E9656125E955B26",
+        keyring_name: "nodesource.gpg",
+        sources_name: "nodesource.list",
+        suite: "nodistro main",
+        codename_dependent: false,
+    },
 ];
 
 /// 按逻辑包名查第三方源定义（无则返回 None → `ensure_repo` 视为 no-op）。
@@ -410,6 +440,52 @@ mod tests {
                 third_party_repo(logical).is_none(),
                 "{logical} 的上游源已失效，不应出现在自动加源表里"
             );
+        }
+    }
+
+    #[test]
+    fn repo_keys_are_unique_and_non_empty() {
+        // 每个源必须有独立的 keyring 与 sources 文件名：重名会互相覆盖
+        // （装 B 时把 A 的源定义冲掉），且这种失败只在多源并存时才暴露。
+        let mut keyrings = std::collections::HashSet::new();
+        let mut sources = std::collections::HashSet::new();
+        for r in THIRD_PARTY_REPOS {
+            assert!(!r.keyring_name.is_empty() && !r.sources_name.is_empty(), "{} 文件名不得为空", r.logical);
+            assert!(keyrings.insert(r.keyring_name), "keyring 重名: {}", r.keyring_name);
+            assert!(sources.insert(r.sources_name), "sources 重名: {}", r.sources_name);
+            assert!(r.url.starts_with("https://"), "{} 必须用 https", r.logical);
+            assert!(r.key_url.starts_with("https://"), "{} 密钥必须用 https", r.logical);
+        }
+    }
+
+    #[test]
+    fn version_lagging_packages_have_official_repos() {
+        // 这 4 个包在 Debian stable 源里明显落后于官网（2026-10-06 实测），
+        // 已接官方源。若被误删，用户又会装回旧版本——用断言钉住。
+        //   nodejs: Debian 20.19 → NodeSource 24.x
+        //   postgresql: Debian 17 → PGDG 18
+        //   redis: Debian 8.0.2 → 官方 8.10.2
+        //   nginx: Debian 1.26.3 → 官方 1.28.3
+        for logical in ["nodejs", "postgresql", "redis", "nginx"] {
+            assert!(
+                third_party_repo(logical).is_some(),
+                "{logical} 版本明显滞后于官网，应保留官方源"
+            );
+        }
+    }
+
+    #[test]
+    fn codename_dependent_repos_actually_use_placeholder() {
+        // 声明依赖代号却没写 {codename} 占位符 → 生成的 suite 会把字面量
+        // 原样写进 sources.list.d，apt update 必然失败且报错难懂。
+        for r in THIRD_PARTY_REPOS {
+            if r.codename_dependent {
+                assert!(
+                    r.suite.contains("{codename}"),
+                    "{} 声明了 codename_dependent 但 suite 无占位符: {}",
+                    r.logical, r.suite
+                );
+            }
         }
     }
 
