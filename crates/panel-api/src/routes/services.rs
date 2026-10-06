@@ -21,6 +21,7 @@ use axum::{
 use panel_core::{cap_keys, Result};
 use panel_os::version_major_jump;
 use serde::{Deserialize, Serialize};
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 /// 超过这个时长的操作必须走任务队列。
@@ -29,6 +30,14 @@ use std::time::Duration;
 /// 测试已锁定该值，接口落地前 `allow(dead_code)` 抑制未用告警。
 #[allow(dead_code)]
 const SYNC_LIMIT: Duration = Duration::from_secs(2);
+
+/// 第三方官方源「进程内确保一次」缓存：避免每次轮询都重跑 `apt-get update`。
+///
+/// 本机加源需 root（写 `/etc/apt/keyrings` + `sources.list.d` + `apt-get update`）。
+/// 面板非 root 时 `ensure_repo` 会失败（`Io` 权限），这里只记一次日志、不阻塞探测——
+/// 探测是锦上添花，绝不该让软件列表/可升级清单挂掉。
+static ENSURED_EXTERNAL_REPOS: LazyLock<Mutex<std::collections::HashSet<&'static str>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
 // ─────────────── 服务列表 ───────────────
 
@@ -644,6 +653,8 @@ pub async fn packages_list(
     if !state.capabilities.get(cap_keys::PACKAGE_INSTALL).map(|c| c.supported).unwrap_or(false) {
         return Err(ApiError::unsupported("package.install"));
     }
+    // 打开软件管理即确保官方源落地（进程内只一次），让安装候选版本也反映官方源。
+    ensure_external_repos_once(&state).await;
     // 语义是"管理白名单内软件的安装状态"，不是通用包管理器枚举：
     // 只在白名单范围内探测，避免全量 rpm/dpkg 扫描（慢且暴露无关信息）。
     // 按当前发行版的**真实包名**去探测，再把结果回填为**逻辑名**：
@@ -702,6 +713,26 @@ pub async fn package_versions(
     Ok(ok(serde_json::json!({ "name": name, "versions": v.versions, "installed": v.installed })))
 }
 
+/// 对「有官方源定义的外部包」确保源已落地（每个逻辑名进程内最多尝试一次）。
+///
+/// `ensure_repo` 内部对无源包（minio/netdata）是 no-op，故直接遍历白名单安全。
+/// 进程内只跑一次：成功则缓存、失败也缓存（权限类失败重试无意义），不反复打 `apt-get update`。
+/// 调用点：只读「可升级探测」与安装列表加载，确保「接官方源」在用户看到列表前就落地，
+/// 否则只读探测只能看到发行版源的旧版，「接官方源」等于没接。
+async fn ensure_external_repos_once(state: &Shared) {
+    for &logical in EXTERNAL_SOURCE_PACKAGES {
+        let first = ENSURED_EXTERNAL_REPOS.lock().unwrap().insert(logical);
+        if !first {
+            continue;
+        }
+        if let Err(e) = state.os.packages().ensure_repo(logical, Box::new(|_| {})).await {
+            eprintln!(
+                "[panel] 确保官方源 {logical} 失败（升级/探测将继续，但可能只能看到发行版源版本）：{e}"
+            );
+        }
+    }
+}
+
 /// 探测白名单内**已安装且源里有新版**的包（B1：只读，供 UI 显示「有新版」徽标）。
 ///
 /// 为什么单独成端点：与 packages_list 分开是因为它要跑一次 `apt list --upgradable`
@@ -717,6 +748,9 @@ pub async fn packages_upgradable(
         .map(|c| c.supported).unwrap_or(false) {
         return Err(ApiError::unsupported("package.upgrade"));
     }
+    // 探测前先确保官方源已落地：否则只读探测只能看到发行版源的旧版，「接官方源」等于没接。
+    // ensure_repo 进程内只跑一次（见 ensure_external_repos_once），不拖慢后续轮询。
+    ensure_external_repos_once(&state).await;
     let up = state.os.packages().upgradable().await.unwrap_or_default();
     // 过滤到白名单（用真包名比对，因为 upgradable 返的是 redis-server 这类真名），
     // 再映射回逻辑名对外——与 install/remove 的"逻辑名对外"约定保持一致。
