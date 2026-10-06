@@ -217,7 +217,6 @@ const ALLOWED_PACKAGES: &[PkgDef] = &[
     PkgDef { name: "nginx",          label: "Nginx" },
     PkgDef { name: "caddy",          label: "Caddy" },
     PkgDef { name: "apache2",        label: "Apache" },
-    PkgDef { name: "mysql-server",   label: "MySQL" },
     PkgDef { name: "mariadb-server", label: "MariaDB" },
     PkgDef { name: "postgresql",     label: "PostgreSQL" },
     PkgDef { name: "redis",          label: "Redis" },
@@ -235,7 +234,6 @@ const ALLOWED_PACKAGES: &[PkgDef] = &[
     PkgDef { name: "prometheus",     label: "Prometheus" },
     PkgDef { name: "grafana",        label: "Grafana" },
     PkgDef { name: "netdata",        label: "Netdata" },
-    PkgDef { name: "uptime-kuma",    label: "Uptime Kuma" },
     PkgDef { name: "haproxy",        label: "HAProxy" },
     PkgDef { name: "nodejs",         label: "Node.js" },
     PkgDef { name: "default-jdk",    label: "OpenJDK" },
@@ -246,13 +244,21 @@ const ALLOWED_PACKAGES: &[PkgDef] = &[
 ///
 /// 为什么单独维护而不是给 PkgDef 加字段：这只是"装之前要先配源"的提示信息，
 /// 与包的身份（name/label）无关，混进 PkgDef 会让 22 条字面量全部变长。
-/// 实测 Debian 13（trixie）：grafana / netdata / minio / uptime-kuma 官方源均无包
-/// （minio 只有 minio-client 客户端），mysql-server 是无人提供的空虚拟包
-/// ——Debian 13 已移除 MySQL，改用 MariaDB。
 ///
-/// 面板仍保留这些入口（配好源后即可安装），只是 UI 上标注提示，避免用户白点一次。
+/// 现状（2026-10-06 实测复核，Debian 13 trixie）：
+/// - `grafana`：**有官方 apt 源且实测可用**（`apt.grafana.com` 的 InRelease/Release 均 200，
+///   索引里 `Package: grafana` 有 567 个版本），已由 `ensure_repo`（方案1）在安装前自动加源
+///   （下载校验 GPG 指纹 → 写隔离 keyring + sources.list.d → apt-get update）。故标 external
+///   仅作"需联网加源"的弱提示，装时能自动就绪，且加源后「指定版本」可选 567 个版本。
+/// - `netdata` / `minio`：**上游 apt 仓库均已下线**，`ensure_repo` 是 no-op，不会尝试加源。
+///   netdata 的密钥仍能下载（指纹也对得上），但仓库元数据整体 404——连老牌 bookworm 的
+///   InRelease 都是 404，故非"Debian 13 太新"，是仓库本身不可用；目录列表页仍能打开，
+///   极易误判为可用，判定必须以 InRelease 200 为准（详见 `panel-os/src/linux/repo.rs` 注释）。
+///   两者需走「直接下载 .deb / 静态安装」路径（方案3），不在自动加源范围内。
+///
+/// 面板保留这些入口（配好源后即可安装），UI 上标注提示，避免用户白点一次。
 const EXTERNAL_SOURCE_PACKAGES: &[&str] = &[
-    "minio", "grafana", "uptime-kuma", "mysql-server", "netdata",
+    "minio", "grafana", "netdata",
 ];
 
 /// 逻辑包名 → 各发行版的**真实包名**（槽位 0 = Debian 系 apt，槽位 1 = 其它/RHEL 系）。
@@ -311,7 +317,7 @@ pub async fn install(
     // 故此处换成当前发行版的真名（幂等键与审计仍用逻辑名，见下方 clone）。
     let pkg = real_pkg_name(state.os.packages().manager(), &req.name);
     let os = state.os.clone();
-    let body = PackageTask { pkg, os, op: PkgOp::Install, version: req.version.clone() };
+    let body = PackageTask { pkg, os, op: PkgOp::Install, version: req.version.clone(), logical: req.name.clone() };
     let (id, created) = state.tasks.submit(
         panel_task::TaskRequest {
             // 幂等键：同一包在窗口期内重复提交只会执行一次（防双击 / 防重试风暴）
@@ -331,7 +337,10 @@ pub async fn install(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PkgOp { Install, Remove }
 
-pub struct PackageTask { pub pkg: String, pub os: std::sync::Arc<dyn panel_os::OsAdapter>, pub op: PkgOp, pub version: Option<String> }
+pub struct PackageTask { pub pkg: String, pub os: std::sync::Arc<dyn panel_os::OsAdapter>, pub op: PkgOp, pub version: Option<String>,
+    /// 逻辑包名（= 白名单 ALLOWED_PACKAGES.name）。第三方官方源包（grafana/netdata）据此
+    /// 在 install 前查 THIRD_PARTY_REPOS 自动加源；普通包在 ensure_repo 内是 no-op。
+    pub logical: String }
 
 #[async_trait::async_trait]
 impl panel_task::TaskBody for PackageTask {
@@ -374,7 +383,24 @@ impl panel_task::TaskBody for PackageTask {
                 })
             };
 
+            let tx_repo = tx.clone();
             let tx_for_cb = tx;
+            // 第三方官方源包（当前仅 grafana）：安装前先确保源就绪
+            // （下载并校验 GPG 指纹 → 写隔离 keyring + sources.list.d → apt-get update）。
+            // 普通包 / 非 apt 包 / netdata 与 minio（上游 apt 仓库均已下线）在 ensure_repo
+            // 内是 no-op，不影响既有路径。加源失败即中止安装，避免装到缺源/被篡改的包。
+            if let Err(e) = self.os.packages().ensure_repo(&self.logical, Box::new(move |line| {
+                let _ = tx_repo.send(line);
+            })).await {
+                let msg = e.to_string();
+                progress.log(&format!("加源失败：{msg}")).await;
+                // 加源失败：直接以失败结束任务，不再尝试安装（装到缺源的包只会更乱）。
+                // 不进入下面的 install/缓冲落盘流程，避免把一次"源未就绪"污染成"安装失败"。
+                let _ = consumer.await;
+                return Ok(panel_task::TaskOutcome {
+                    state: panel_task::TaskState::Failed, exit_code: Some(1), output_path: None,
+                });
+            }
             let r = self.os.packages()
                 .install(&self.pkg, self.version.as_deref(), Box::new(move |line| {
                     // try_send 永不阻塞：消费者跟不上就丢弃，绝不拖慢安装本身
@@ -663,7 +689,7 @@ pub async fn package_remove(
     // 卸载与安装同权重：走任务队列 + 幂等键（与 install 不同键，避免互相吞并）
     let pkg = real_pkg_name(state.os.packages().manager(), &name);
     let os = state.os.clone();
-    let body = PackageTask { pkg, os, op: PkgOp::Remove, version: None };
+    let body = PackageTask { pkg, os, op: PkgOp::Remove, version: None, logical: name.clone() };
     let (id, created) = state.tasks.submit(
         panel_task::TaskRequest {
             idempotency_key: format!("pkg.remove:{}", name),
