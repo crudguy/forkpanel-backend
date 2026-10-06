@@ -96,6 +96,24 @@ impl TaskKind {
         }
     }
 
+    /// 同组互斥：返回 `Some(组名)` 的任务**串行**执行；`None` 只受全局并发额度约束。
+    ///
+    /// 判据是"底层资源是否全局独占"：
+    /// - `Package` → `"package"`：apt/dpkg 有全局独占锁，并发必有一方失败，只能排队。
+    /// - 其余类型当前没有全局独占资源（备份 / 证书 / 服务启停可安全并行）。
+    ///
+    /// 刻意**穷举匹配、不写 `_ =>`**：将来新增 `TaskKind` 时编译器会强制在这里表态，
+    /// 而不是默默沿用默认值（默认"可并行"对新增的写操作类型往往就是错的）。
+    /// 将来若出现同类约束（例如都写同一个配置目录），给它们同一个组名即可复用，
+    /// 不需要在调度器里再加分支。
+    pub fn exclusive_group(&self) -> Option<&'static str> {
+        match self {
+            Self::Package => Some("package"),
+            Self::Backup | Self::CertIssue | Self::ConfigApply
+            | Self::Service | Self::Database | Self::Internal | Self::Restore => None,
+        }
+    }
+
     /// 默认重试策略。
     ///
     /// 关键判断：**副作用不可回滚的操作一律不自动重试**。
@@ -172,6 +190,13 @@ pub struct TaskRunner {
     slots: Arc<Semaphore>,
     /// 幂等键 → 已提交任务。窗口期内的重复提交直接返回既有任务 id。
     idempotency: Arc<Mutex<HashMap<String, (i64, std::time::Instant)>>>,
+    /// 同组任务互斥闸门：组名 → 容量恒为 1 的信号量（懒建）。
+    ///
+    /// 为什么单靠 `slots` 不够：`slots` 只限**总量**。Package 类任务会去抢 apt/dpkg
+    /// 的**全局独占锁**（/var/lib/dpkg/lock-frontend），两个同时放出去必然有一方
+    /// 拿不到锁而直接失败（实测 1 秒内 exit 1）。这里按组串行：后到者停在
+    /// `queued` 排队等锁，而不是撞锁报错。分组判据见 [`TaskKind::exclusive_group`]。
+    exclusive: Arc<Mutex<HashMap<&'static str, Arc<Semaphore>>>>,
     /// 输出目录（来自 PathLayout，不由任务中心自己拼）。
     /// 任务输出落盘功能接入前未读取；构造签名保留该参数以维持注入契约。
     #[allow(dead_code)]
@@ -193,9 +218,21 @@ impl TaskRunner {
             tier,
             slots: Arc::new(Semaphore::new(tier.task_concurrency())),
             idempotency: Arc::new(Mutex::new(HashMap::new())),
+            exclusive: Arc::new(Mutex::new(HashMap::new())),
             output_dir,
             db_path,
         }
+    }
+
+    /// 取（或建）任务组的互斥闸门。容量恒为 1 → 同组串行。
+    ///
+    /// 懒建：只有真的出现过该组任务才会分配信号量。
+    /// 这里用 `std::sync::Mutex` 是刻意的——临界区只有一次 HashMap 读写、无 await；
+    /// 且 guard 绝不跨 await（跨 await 持 std guard 会让 future 非 Send，
+    /// 所有 await 本函数的 axum handler 都会编译失败）。
+    fn group_gate(&self, group: &'static str) -> Arc<Semaphore> {
+        let mut m = self.exclusive.lock().unwrap_or_else(|e| e.into_inner());
+        m.entry(group).or_insert_with(|| Arc::new(Semaphore::new(1))).clone()
     }
 
     pub fn bus(&self) -> &Arc<ProgressBus> { &self.bus }
@@ -305,8 +342,20 @@ impl TaskRunner {
         let writer = self.writer.clone();
         let timeout = req.timeout;
         let rkind = req.kind;
+        // 组闸门在 spawn **之前**取好：group_gate 用 std Mutex，guard 不能跨 await。
+        let gate = rkind.exclusive_group().map(|g| self.group_gate(g));
 
         tokio::spawn(async move {
+            // 先占**组闸门**再占全局 slot，顺序不可反：若反序，一串同组任务会把全局
+            // 名额全占满并一起堵在组闸门前，备份等其它类型任务将永远拿不到名额。
+            // 排队期间任务在库中仍是 queued —— 前端因此能显示"排队中"而非假装在跑。
+            let _group_permit: Option<tokio::sync::OwnedSemaphorePermit> = match gate {
+                Some(g) => match g.acquire_owned().await {
+                    Ok(p) => Some(p),
+                    Err(_) => return,   // 闸门关闭（正在 shutdown）
+                },
+                None => None,
+            };
             let _permit: SemaphorePermit = match slots.acquire().await {
                 Ok(p) => p,
                 Err(_) => return,   // 闸门关闭（正在 shutdown）
@@ -566,6 +615,118 @@ mod tests {
             "SELECT COUNT(*) FROM task_runs WHERE task_id='same-key' AND state IN ('queued','running')",
             [], |r| r.get(0)).unwrap();
         assert_eq!(active, 1, "同 key 非终态行应为 1，实为 {active}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ─────────────── 并发闸门 ───────────────
+
+    // `use` 是 item，可出现在模块任意位置；就近声明，免得为新增用例再动文件头部。
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 探针任务体：记录"同时进入执行体"的最大条数，用来观测是否真的串行。
+    struct ProbeBody {
+        live: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl TaskBody for ProbeBody {
+        async fn run(&self, _p: Progress) -> Result<TaskOutcome> {
+            let n = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(n, Ordering::SeqCst);
+            // 留出足够的交叠窗口：闸门若失效，另一个任务能在这段时间内也进来 → peak=2
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            self.live.fetch_sub(1, Ordering::SeqCst);
+            Ok(TaskOutcome { state: TaskState::Ok, exit_code: Some(0), output_path: None })
+        }
+    }
+
+    /// 建一个带迁移的临时库 + TaskRunner。返回 (runner, 目录) 供收尾清理。
+    fn runner_for(tag: &str, tier: Tier) -> (TaskRunner, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("panel-task-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("panel.db");
+        {
+            let mut c = rusqlite::Connection::open(&db).unwrap();
+            panel_db::migrate::apply(&mut c).unwrap();
+        }
+        let writer = std::sync::Arc::new(panel_db::WriterActor::spawn(db.clone(), tier).unwrap());
+        (TaskRunner::new(writer, tier, dir.clone(), db), dir)
+    }
+
+    /// 轮询等所有任务进终态（上限 20s）。不用固定 sleep，避免偶发翻红。
+    async fn wait_all(runner: &TaskRunner, ids: &[i64]) {
+        for _ in 0..200 {
+            let mut all = true;
+            for &id in ids {
+                if !runner.is_terminal(id).await.unwrap_or(false) { all = false; break; }
+            }
+            if all { return }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("任务未在 20s 内进入终态：{ids:?}");
+    }
+
+    /// 不变量：Package 类任务必须**串行**，即便全局并发额度还有空位。
+    ///
+    /// 钉住：apt/dpkg 有全局独占锁（/var/lib/dpkg/lock-frontend），两个包任务同时
+    /// 放出去必然有一方拿不到锁、1 秒内 exit 1（实测线上 task 14：
+    /// `E: Could not get lock ... It is held by process 109738 (apt)`）。
+    ///
+    /// 刻意用 Standard 档（额度 4）而非 Nano：Nano 档全局额度本来就是 1，串行会被
+    /// `slots` 顺带保证，测不出组闸门是否真的生效——那就是一条永绿门禁。
+    /// 负向对照：把 `TaskKind::exclusive_group` 里 Package 改回 `None`，本条即转红。
+    #[tokio::test]
+    async fn package_tasks_are_serialized_despite_free_slots() {
+        let (runner, dir) = runner_for("serial", Tier::Standard);
+        assert_eq!(runner.tier().task_concurrency(), 4,
+                   "前提被破坏：Standard 档全局额度应为 4，否则本用例测不出组闸门");
+
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let body = || ProbeBody { live: live.clone(), peak: peak.clone() };
+        let req = |k: &str| TaskRequest {
+            idempotency_key: k.to_string(),
+            kind: TaskKind::Package,
+            label: k.to_string(),
+            timeout: Duration::from_secs(30),
+        };
+
+        let (a, _) = runner.submit(req("pkg.install:a"), body()).await.unwrap();
+        let (b, _) = runner.submit(req("pkg.install:b"), body()).await.unwrap();
+        wait_all(&runner, &[a, b]).await;
+
+        let p = peak.load(Ordering::SeqCst);
+        assert_eq!(p, 1, "两个 Package 任务同时进入了执行体（峰值 {p}）：同组必须串行排队");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 负向对照：串行必须来自**组闸门**，而不是"全局额度恰好被压成 1"。
+    /// 两个不属于任何互斥组的任务在 Standard 档下应能并行（峰值 2）。
+    /// 若把 `group_gate` 的容量写成 0、或让所有 kind 都落进同一个组，本条转红。
+    #[tokio::test]
+    async fn non_exclusive_kinds_still_run_in_parallel() {
+        let (runner, dir) = runner_for("parallel", Tier::Standard);
+
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let body = || ProbeBody { live: live.clone(), peak: peak.clone() };
+        let req = |k: &str| TaskRequest {
+            idempotency_key: k.to_string(),
+            kind: TaskKind::Internal,
+            label: k.to_string(),
+            timeout: Duration::from_secs(30),
+        };
+
+        let (a, _) = runner.submit(req("int-a"), body()).await.unwrap();
+        let (b, _) = runner.submit(req("int-b"), body()).await.unwrap();
+        wait_all(&runner, &[a, b]).await;
+
+        let p = peak.load(Ordering::SeqCst);
+        assert_eq!(p, 2, "无互斥组的任务被意外串行化了（峰值 {p}）：组闸门不该影响它们");
 
         std::fs::remove_dir_all(&dir).ok();
     }
