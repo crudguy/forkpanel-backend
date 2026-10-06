@@ -122,22 +122,24 @@ pub async fn list(State(state): State<Shared>, Auth(s): Auth) -> ApiResult<Json<
     crate::auth::require(&s, perm::USER_MANAGE)?;
     let rows = state.pool.with(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, username, role, allowed_roots, disabled, created_at, last_login_at \
+            "SELECT id, username, role, allowed_roots, disabled, created_at, last_login_at, mfa_enabled_at \
              FROM users ORDER BY id ASC")
             .map_err(|e| PanelError::Database(e.to_string()))?;
         let rows = stmt.query_map([], |r| Ok((
             r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
             r.get::<_, String>(3)?, r.get::<_, i32>(4)?, r.get::<_, i64>(5)?,
-            r.get::<_, Option<i64>>(6)?,
+            r.get::<_, Option<i64>>(6)?, r.get::<_, Option<i64>>(7)?,
         ))).map_err(|e| PanelError::Database(e.to_string()))?;
         let mut out = Vec::new();
         for row in rows { out.push(row.map_err(|e| PanelError::Database(e.to_string()))?); }
         Ok(out)
     }).await.map_err(ApiError::from)?;
 
-    let users: Vec<UserOut> = rows.into_iter().map(|(id, u, role, roots, dis, c, l)| UserOut {
+    let users: Vec<UserOut> = rows.into_iter().map(|(id, u, role, roots, dis, c, l, mfa_at)| UserOut {
         id, username: u, role, allowed_roots: parse_roots(&roots),
-        mfa_enabled: false, disabled: dis != 0, created_at: c, last_login_at: l,
+        // 与 /auth/me 同口径：mfa_enabled_at 非空即已启用。此前硬编码 false，
+        // 导致用户列表永远显示「未启用」、契约里的 mfa_enabled 字段形同虚设。
+        mfa_enabled: mfa_at.is_some(), disabled: dis != 0, created_at: c, last_login_at: l,
     }).collect();
     Ok(ok(users))
 }
