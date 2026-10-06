@@ -75,6 +75,36 @@ pub static THIRD_PARTY_REPOS: &[ThirdPartyRepo] = &[
         suite: "stable main",
         codename_dependent: false,
     },
+    ThirdPartyRepo {
+        logical: "postgresql",
+        url: "https://apt.postgresql.org/pub/repos/apt",
+        format: RepoFormat::DebList,
+        key_url: "https://www.postgresql.org/media/keys/ACCC4CF8.asc",
+        // PGDG 官方公示主钥（PostgreSQL Debian Repository，2022 起）。实测本机下载
+        // 解析得 B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8，与官网一致。
+        key_fingerprint: "B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8",
+        keyring_name: "pgdg.gpg",
+        sources_name: "pgdg.list",
+        // suite 依赖发行版代号（trixie-pgdg / bookworm-pgdg / jammy-pgdg…）。
+        suite: "{codename}-pgdg main",
+        codename_dependent: true,
+    },
+    ThirdPartyRepo {
+        logical: "redis",
+        url: "https://packages.redis.io/deb",
+        format: RepoFormat::DebList,
+        key_url: "https://packages.redis.io/gpg",
+        // Redis 官方源主钥（Redis Ltd，2024 起）。实测本机下载解析得一主一子，
+        // 主钥 54318FA4052D1E61A6B6F7BB5F4349D6BF53AA0C，与官网公示值一致。
+        key_fingerprint: "54318FA4052D1E61A6B6F7BB5F4349D6BF53AA0C",
+        keyring_name: "redis.gpg",
+        sources_name: "redis.list",
+        // 官方源用发行版代号分目录，trixie 上实测可选到 8.2.2（比 Debian 的
+        // 8.0.2 新。注意该源的版本是 RHEL 系构建（...~trixie1 后缀），
+        // 虽同为 deb 但打包方式不同，跨大版本前建议看上游 release notes。
+        suite: "{codename} main",
+        codename_dependent: true,
+    },
 ];
 
 /// 按逻辑包名查第三方源定义（无则返回 None → `ensure_repo` 视为 no-op）。
@@ -327,6 +357,48 @@ mod tests {
         assert!(got.contains("Signed-By: /etc/apt/keyrings/example.gpg"));
         // 未替换时不应残留占位符
         assert!(!got.contains("{codename}"));
+    }
+
+    #[test]
+    fn pgdg_and_redis_suites_fill_codename() {
+        // PGDG：suite 含空格（"{codename}-pgdg main"），占位符替换后仍应是合法
+        // 的一行 deb（codename 与 main 各占一段）。若误按空格 split codename，
+        // 会拼出 "deb ... trixie-pgdd" 缺 main 的坏行。
+        let pgdg = third_party_repo("postgresql").expect("PGDG 应在表内");
+        assert!(pgdg.codename_dependent);
+        let got = build_sources_content(pgdg, "trixie");
+        assert_eq!(
+            got,
+            "deb [signed-by=/etc/apt/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt trixie-pgdg main\n"
+        );
+
+        // Redis：suite 无空格（"{codename} main"），官方源用发行版代号分目录。
+        let redis = third_party_repo("redis").expect("Redis 应在表内");
+        let got = build_sources_content(redis, "trixie");
+        assert_eq!(
+            got,
+            "deb [signed-by=/etc/apt/keyrings/redis.gpg] https://packages.redis.io/deb trixie main\n"
+        );
+    }
+
+    #[test]
+    fn third_party_repos_all_have_pinned_fingerprints() {
+        // 防 MITM 的底线：表内每一条都必须钉死指纹。
+        // 一旦某条被改成空/占位，gpg 解析出的指纹就可能"匹配"任何密钥。
+        for r in THIRD_PARTY_REPOS {
+            assert_eq!(
+                r.key_fingerprint.len(), 40,
+                "{} 的指纹必须是 40 位十六进制，实际 {:?}",
+                r.logical, r.key_fingerprint
+            );
+            assert!(
+                r.key_fingerprint.chars().all(|c| c.is_ascii_hexdigit()),
+                "{} 的指纹含非十六进制字符: {:?}",
+                r.logical, r.key_fingerprint
+            );
+            assert!(r.key_url.starts_with("https://"), "{} 的密钥地址必须 https", r.logical);
+            assert!(r.url.starts_with("https://"), "{} 的源地址必须 https", r.logical);
+        }
     }
 
     #[test]

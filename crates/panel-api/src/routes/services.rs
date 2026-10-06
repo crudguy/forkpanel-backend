@@ -246,10 +246,15 @@ const ALLOWED_PACKAGES: &[PkgDef] = &[
 /// 与包的身份（name/label）无关，混进 PkgDef 会让 22 条字面量全部变长。
 ///
 /// 现状（2026-10-06 实测复核，Debian 13 trixie）：
-/// - `grafana`：**有官方 apt 源且实测可用**（`apt.grafana.com` 的 InRelease/Release 均 200，
-///   索引里 `Package: grafana` 有 567 个版本），已由 `ensure_repo`（方案1）在安装前自动加源
-///   （下载校验 GPG 指纹 → 写隔离 keyring + sources.list.d → apt-get update）。故标 external
-///   仅作"需联网加源"的弱提示，装时能自动就绪，且加源后「指定版本」可选 567 个版本。
+/// - `grafana` / `postgresql` / `redis`：**有官方 apt 源且实测可用**，由 `ensure_repo`
+///   （方案1）自动加源（下载校验 GPG 指纹 → 写隔离 keyring + sources.list.d → apt-get update）。
+///   实测（2026-10-06，隔离目录真实 apt-get update）加源后候选版本明显变新：
+///   postgresql `17+278`(Debian) → `18+293.pgdg13+1`(PGDG)；
+///   redis-server `8.0.2`(Debian) → `8.10.2`(Redis 官方源，与官网同步)。
+///   故标 external 仅作"需联网加源"的弱提示，装/升级时能自动就绪。
+/// - `nodejs`：**刻意不接NodeSource**——实测 deb.nodesource.com 连续 3 次超时
+///   （而PGDG/Redis 均 1-2 秒），且拿不到官网公示指纹就无法通过本项目的防 MITM
+///   硬校验（指纹必须与官网逐字一致，不允许凭记忆写）。故留在下方，用户可自行配源。
 /// - `netdata` / `minio`：**上游 apt 仓库均已下线**，`ensure_repo` 是 no-op，不会尝试加源。
 ///   netdata 的密钥仍能下载（指纹也对得上），但仓库元数据整体 404——连老牌 bookworm 的
 ///   InRelease 都是 404，故非"Debian 13 太新"，是仓库本身不可用；目录列表页仍能打开，
@@ -259,6 +264,10 @@ const ALLOWED_PACKAGES: &[PkgDef] = &[
 /// 面板保留这些入口（配好源后即可安装），UI 上标注提示，避免用户白点一次。
 const EXTERNAL_SOURCE_PACKAGES: &[&str] = &[
     "minio", "grafana", "netdata",
+    // 自动加源（ensure_repo 表内有它）：UI 标"需配源"作弱提示，实际装/升级会自动加。
+    "postgresql", "redis",
+    // 未接官方源（NodeSource 站点超时 + 拿不到公示指纹，见上方说明），由用户自行配源。
+    "nodejs",
 ];
 
 /// 逻辑包名 → 各发行版的**真实包名**（槽位 0 = Debian 系 apt，槽位 1 = 其它/RHEL 系）。
@@ -355,6 +364,31 @@ impl panel_task::TaskBody for PackageTask {
         const MAX_BUF: usize = 400;
         let buf: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
 
+        // 第三方官方源：无论安装、升级还是「换源」，都先确保源就绪。
+        //
+        // 为什么提到 Install 分支之外（原先只在 install 前调）：接官方源的主要目的
+        // 就是给**已装**的包换源（Debian 的 postgresql 停在 17、redis 停在 8.0.2，
+        // 想用 PGDG 的 18 / Redis 官方源的 8.2 就必须先加源再升级）。若只挂在 install
+        // 分支，已装的包走 upgrade 路径时加不上源，恰好漏掉最需要它的场景。
+        //
+        // 幂等由 ensure_third_party_repo 自己保证（keyring+sources 已一致则跳过），
+        // 故每次任务都调只是几次 stat，不产生额外 apt-get update。
+        // 无第三方源的包（普通包 / 非 apt 发行版 / netdata / minio）在其内是 no-op。
+        {
+            let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = seen.clone();
+            if let Err(e) = self.os.packages().ensure_repo(&self.logical, Box::new(move |line| {
+                if let Ok(mut g) = sink.lock() { g.push(line); }
+            })).await {
+                let msg = e.to_string();
+                progress.log(&format!("加源失败：{msg}")).await;
+                return Ok(panel_task::TaskOutcome {
+                    state: panel_task::TaskState::Failed, exit_code: Some(1), output_path: None,
+                });
+            }
+        }
+
         let result: Option<String> = if installing {
             // 同步回调 → 异步广播的桥接。
             // 用 unbounded 但在消费端限速：包管理器输出可能几万行，
@@ -383,24 +417,7 @@ impl panel_task::TaskBody for PackageTask {
                 })
             };
 
-            let tx_repo = tx.clone();
             let tx_for_cb = tx;
-            // 第三方官方源包（当前仅 grafana）：安装前先确保源就绪
-            // （下载并校验 GPG 指纹 → 写隔离 keyring + sources.list.d → apt-get update）。
-            // 普通包 / 非 apt 包 / netdata 与 minio（上游 apt 仓库均已下线）在 ensure_repo
-            // 内是 no-op，不影响既有路径。加源失败即中止安装，避免装到缺源/被篡改的包。
-            if let Err(e) = self.os.packages().ensure_repo(&self.logical, Box::new(move |line| {
-                let _ = tx_repo.send(line);
-            })).await {
-                let msg = e.to_string();
-                progress.log(&format!("加源失败：{msg}")).await;
-                // 加源失败：直接以失败结束任务，不再尝试安装（装到缺源的包只会更乱）。
-                // 不进入下面的 install/缓冲落盘流程，避免把一次"源未就绪"污染成"安装失败"。
-                let _ = consumer.await;
-                return Ok(panel_task::TaskOutcome {
-                    state: panel_task::TaskState::Failed, exit_code: Some(1), output_path: None,
-                });
-            }
             let r = self.os.packages()
                 .install(&self.pkg, self.version.as_deref(), Box::new(move |line| {
                     // try_send 永不阻塞：消费者跟不上就丢弃，绝不拖慢安装本身
