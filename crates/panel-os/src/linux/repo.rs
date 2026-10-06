@@ -113,7 +113,9 @@ pub static THIRD_PARTY_REPOS: &[ThirdPartyRepo] = &[
         // nginx 官方源主钥（三把，取其一即可；实测本机下载解析一致）。
         // 注意 component 是 **nginx** 不是 main——实测 dists/trixie/ 下只有 nginx/
         // 子目录，写成 main 会 404（与 PGDG/Redis 的 main 不同，别照抄）。
-        key_fingerprint: "9E9BE90EACBCDE69FE9B204CBCDCD8A38D88A2B3",
+        // nginx 官方源主密钥：2025 年轮换，当前主用为 8540A6F1...（rsa4096/2024-05-29）。
+        // 官方 key 文件仍含旧 9E9B E90E（signing-key-3）作为过渡，故 fingerprint_matches 宽松包含即可通过。
+        key_fingerprint: "8540A6F18833A80E9C1653A42FD21310B49F6B46",
         keyring_name: "nginx.gpg",
         sources_name: "nginx.list",
         suite: "{codename} nginx",
