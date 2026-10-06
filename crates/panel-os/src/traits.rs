@@ -256,6 +256,39 @@ pub struct UpgradablePkg {
     pub current: String,
     /// 可升级到的版本。
     pub candidate: String,
+    /// 是否跨主版本升级（current 与 candidate 首段数字不同）。
+    ///
+    /// 跨主版本升级（如 PostgreSQL 17→18、Node.js 20→24）可能**不向后兼容**，
+    /// 需要数据迁移（`pg_upgrade` / 逻辑备份恢复）或服务重配，升级前必须二次确认；
+    /// 而仅次/修订版本变化（如 Redis 8.0.2→8.10.2、Nginx 1.26→1.30、Node 18→18.x）
+    /// 是常规维护，可直接升级。后端据此在升级接口强制确认、前端弹窗警告。
+    pub major: bool,
+}
+
+/// 两个版本号是否跨主版本（首段数字不同）——用于升级前风险判定。
+///
+/// 规则：先剥 epoch（`N:` 前缀，Debian 版本常见如 `5:8.0.2`），再取开头连续数字段
+/// 作主版本号比较：
+/// - `17+278` vs `18+293.pgdg13+1` → 17≠18（PostgreSQL 跨主版本，需数据迁移）
+/// - `5:8.0.2` vs `5:8.10.2` → 8=8（仅次版本，常规升级）
+/// - `1.26.3` vs `1.30.5` → 1=1（仅次版本）
+/// - `20.19.0` vs `24.21.0` → 20≠24（Node.js 跨主版本）
+///
+/// 任一无法解析主版本号时返回 `false`（保守：解析不出就**不**当作跨主版本，
+/// 避免把可安全升级的包误判成高风险而阻断）。`stub.rs` 解析与 `services.rs`
+/// 升级守卫共用本函数，避免两处各写一份漂移。
+pub fn version_major_jump(a: &str, b: &str) -> bool {
+    let major = |v: &str| -> Option<u32> {
+        // 剥 epoch：取最后一个 ':' 之后的部分（无 ':' 时即原串）
+        let v = v.split(':').last().unwrap_or(v);
+        // 取开头连续数字段作主版本号（'17+278' → 17，'1.26.3' → 1）
+        let digits: String = v.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse::<u32>().ok()
+    };
+    match (major(a), major(b)) {
+        (Some(x), Some(y)) => x != y,
+        _ => false,
+    }
 }
 
 #[async_trait]

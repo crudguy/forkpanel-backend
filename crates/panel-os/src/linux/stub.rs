@@ -453,7 +453,14 @@ pub(crate) fn parse_apt_upgradable(out: &str) -> Vec<UpgradablePkg> {
         // 只取第一个 '/' 之前的包名（源名在 '/ ' 之后）
         let name = name_with_repo.split('/').next().unwrap_or("").to_string();
         if name.is_empty() { continue; }
-        res.push(UpgradablePkg { name, current: current.to_string(), candidate: candidate.to_string() });
+        res.push(UpgradablePkg {
+            name,
+            current: current.to_string(),
+            candidate: candidate.to_string(),
+            // 跨主版本判定（如 PostgreSQL 17→18 / Node.js 20→24）交给单一共享函数，
+            // 与升级接口守卫用同一套逻辑，避免两处各写一份漂移。
+            major: crate::traits::version_major_jump(&current, &candidate),
+        });
     }
     res
 }
@@ -2273,6 +2280,41 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].candidate, "1.2.3~rc1+deb1");
         assert_eq!(got[0].current, "1.2.2+deb1");
+    }
+
+    #[test]
+    fn version_major_jump_detects_cross_major_and_ignores_minor() {
+        // 跨主版本：PostgreSQL 17→18、Node.js 20→24
+        assert!(version_major_jump("17+278", "18+293.pgdg13+1"), "PG 17→18 应判跨主版本");
+        assert!(version_major_jump("20.19.0", "24.21.0"), "Node 20→24 应判跨主版本");
+        // 仅次/修订版本：Redis 8.0.2→8.10.2、Nginx 1.26→1.30、Node 18.19→18.20
+        assert!(!version_major_jump("5:8.0.2", "5:8.10.2"), "Redis 8.0.2→8.10.2 仅次版本");
+        assert!(!version_major_jump("1.26.3-3+deb13u9", "1.30.5-1"), "Nginx 1.26→1.30 仅次版本");
+        assert!(!version_major_jump("18.19.0", "18.20.0"), "Node 18→18 仅修订");
+        // 带 epoch 仍正确剥除：redis 5:8.x 同主版本
+        assert!(!version_major_jump("5:8.0.2", "5:8.1.0"));
+    }
+
+    #[test]
+    fn version_major_jump_handles_unparseable_gracefully() {
+        // 解析不出主版本号时保守返回 false（不当作跨主版本，避免误阻断常规升级）
+        assert!(!version_major_jump("nightly", "1.0.0"));
+        assert!(!version_major_jump("1.0.0", ""));
+        assert!(!version_major_jump("", ""));
+    }
+
+    #[test]
+    fn parse_apt_upgradable_marks_major_flag() {
+        // PostgreSQL 17→18 是跨主版本升级，major 必须为 true；
+        // Redis 8.0.2→8.0.3 仅修订版本，major 必须为 false。
+        let out = "postgresql/stable 18+293.pgdg13+1 all [upgradable from: 17+278]\n\
+                   redis-server/stable 5:8.0.3-1 amd64 [upgradable from: 5:8.0.2-3]\n";
+        let got = parse_apt_upgradable(out);
+        assert_eq!(got.len(), 2);
+        let pg = got.iter().find(|u| u.name == "postgresql").unwrap();
+        assert!(pg.major, "PG 17→18 应标 major=true");
+        let redis = got.iter().find(|u| u.name == "redis-server").unwrap();
+        assert!(!redis.major, "Redis 8.0.2→8.0.3 应标 major=false");
     }
 
 }

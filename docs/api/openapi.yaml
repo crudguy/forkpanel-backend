@@ -1370,6 +1370,7 @@ paths:
                         label: { type: string, description: 品牌展示名 }
                         current: { type: string, description: 当前已安装版本 }
                         candidate: { type: string, description: 可升级到的版本 }
+                        major: { type: boolean, description: 是否跨主版本升级（current 与 candidate 首段数字不同）；跨主版本可能不向后兼容，需数据迁移，前端据此弹窗二次确认 }
         '501': { description: 本机无可用包管理器（能力位 package.upgrade 不支持） }
   /api/v1/packages/upgrade:
     post:
@@ -1380,6 +1381,10 @@ paths:
         install pkg=1.2.3」本就是覆盖升级，故不另立 PkgOp::Upgrade。
         幂等键与 install 独立（pkg.upgrade: vs pkg.install:），避免「装完新版再
         手动回退到旧版」被 install 的窗口期幂等静默吞掉。
+        **跨主版本升级强制二次确认**：检测到 current 与 candidate 跨主版本
+        （如 PostgreSQL 17→18、Node.js 20→24）且请求未带 confirm_major=true 时，
+        返回 409（detail.kind=major_upgrade，附 from/to/note），前端须弹窗确认后
+        带 confirm_major=true 重发——不能只靠前端拦截，否则直接调 API 即可绕过警告。
       security: [cookieAuth, csrfHeader]
       requestBody:
         required: true
@@ -1391,9 +1396,11 @@ paths:
               properties:
                 name: { type: string, description: 逻辑包名；非白名单一律 400 }
                 version: { type: [string, "null"], description: 目标版本；省略/null 表示升到源里最新版 }
+                confirm_major: { type: [boolean, "null"], description: 跨主版本升级的二次确认标记；检测到跨主版本且为 false/省略时接口返回 409 }
       responses:
         '202': { description: 已入队 }
         '400': { description: 包不在白名单，或版本号含非法字符 }
+        '409': { description: 跨主版本升级需二次确认（detail.kind=major_upgrade，附 from/to/note）；前端弹窗确认后带 confirm_major=true 重发 }
         '501': { description: 本机无可用包管理器（能力位 package.upgrade 不支持） }
   /api/v1/packages/{name}:
     delete:

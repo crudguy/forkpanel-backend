@@ -19,6 +19,7 @@ use axum::{
     Json,
 };
 use panel_core::{cap_keys, Result};
+use panel_os::version_major_jump;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -191,7 +192,15 @@ pub async fn status(
 // ─────────────── 软件包（走任务队列） ───────────────
 
 #[derive(Debug, Deserialize)]
-pub struct InstallReq { pub name: String, pub version: Option<String> }
+pub struct InstallReq {
+    pub name: String,
+    pub version: Option<String>,
+    /// 跨主版本升级的二次确认标记。仅 `package_upgrade` 使用：检测到跨主版本
+    /// （如 PostgreSQL 17→18、Node.js 20→24）且为 false 时，升级接口返回 409
+    /// 强制前端弹窗确认——不能只靠前端拦截（直接调 API 即可绕过警告）。
+    /// `package.install` 忽略此字段（全新安装无"当前版本"可比，不触发跨主版本判定）。
+    pub confirm_major: Option<bool>,
+}
 
 /// 版本号字符白名单：用户可控输入。后端以数组传参交给包管理器（不走 shell，无命令注入
 /// 风险），但奇字符会让 apt/dnf 直接报错、用户困惑。只允许版本号里合法出现的字符集。
@@ -718,6 +727,7 @@ pub async fn packages_upgradable(
             "label": p.label,
             "current": u.current,
             "candidate": u.candidate,
+            "major": u.major,          // 跨主版本标记：前端据此弹窗二次确认
         }))
     }).collect();
     Ok(ok(serde_json::json!({ "items": items })))
@@ -747,7 +757,37 @@ pub async fn package_upgrade(
     if let Some(v) = &req.version {
         validate_pkg_version(v)?;
     }
-    let pkg = real_pkg_name(state.os.packages().manager(), &req.name);
+    let real = real_pkg_name(state.os.packages().manager(), &req.name);
+
+    // 跨主版本升级风险判定（如 PostgreSQL 17→18、Node.js 20→24）：此类升级可能不向后兼容，
+    // 需要数据迁移（pg_upgrade / 逻辑备份恢复）或服务重配。后端**强制**二次确认——
+    // 前端弹窗确认后须带 confirm_major=true，否则 409 拒绝；不能只靠前端拦截，
+    // 否则直接调 API 即可绕过警告。判定与解析共用 `version_major_jump`，单一事实源。
+    let up = state.os.packages().upgradable().await.unwrap_or_default();
+    let entry = up.iter().find(|u| u.name == real);
+    // candidate：用户显式指定版本优先，否则取 upgradable 探测到的目标版本
+    let candidate = req.version.clone()
+        .or_else(|| entry.as_ref().map(|u| u.candidate.clone()));
+    // current：upgradable 探测里的已装版本；不在探测列表里（用户显式指定旧/新版）时
+    // 退回 apt-cache policy 的已装版本（此处需 .await，故在 match 分支里算，而非闭包内）
+    let current = match entry {
+        Some(u) => Some(u.current.clone()),
+        None => state.os.packages().list_versions(&real).await.ok().and_then(|v| v.installed),
+    };
+    let major = match (&current, &candidate) {
+        (Some(c), Some(n)) => version_major_jump(c, n),
+        _ => false,
+    };
+    if major && !req.confirm_major.unwrap_or(false) {
+        return Err(ApiError::conflict("major_upgrade").with_detail(serde_json::json!({
+            "kind": "major_upgrade",
+            "from": current,
+            "to": candidate,
+            "note": "跨主版本升级可能不向后兼容，通常需要数据迁移或服务重配。例如 PostgreSQL 17→18 须先执行 pg_upgrade 或逻辑备份恢复，期间服务不可用。确认前请务必先完成数据备份。",
+        })));
+    }
+
+    let pkg = real;
     let os = state.os.clone();
     let body = PackageTask { pkg, os, op: PkgOp::Install, version: req.version.clone(), logical: req.name.clone() };
     // 幂等键与 install 刻意不同（pkg.upgrade: vs pkg.install:）：否则用户先装了新版、
