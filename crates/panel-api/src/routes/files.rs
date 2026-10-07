@@ -298,7 +298,9 @@ pub async fn mkdir(
     State(state): State<Shared>, Auth(s): Auth, Json(req): Json<MkdirReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FILE_WRITE)?;
-    let p = resolve(&state, &s, &req.path)?;
+    // 目标目录**尚不存在**，必须走 resolve_new(create=true)：resolve 会 canonicalize
+    // 目标本身并要求它已存在，否则一律 NotFound(10004) →「新建目录」100% 失败。
+    let p = resolve_new(&state, &s, &req.path)?;
     state.os.files().create_dir(&p, req.recursive.unwrap_or(true)).await?;
     audit(&state, &s, "file.mkdir", &req.path, "ok").await;
     Ok(ok(serde_json::json!({ "path": req.path })))
@@ -560,8 +562,10 @@ pub async fn rename(
     State(state): State<Shared>, Auth(s): Auth, Json(req): Json<RenameReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FILE_WRITE)?;
+    // from 必须已存在（resolve）；to 通常是**尚不存在的新名字**，必须 resolve_new，
+    // 否则「重命名到新名」一律 NotFound(10004)。覆盖已存在的 to 时 resolve_new 同样正确。
     let from = resolve(&state, &s, &req.from)?;
-    let to = resolve(&state, &s, &req.to)?;
+    let to = resolve_new(&state, &s, &req.to)?;
     ensure_not_sensitive(&state, &to)?;
 
     if req.copy.unwrap_or(false) {
