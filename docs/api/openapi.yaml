@@ -483,12 +483,13 @@ components:
         domains: { type: array, items: { type: string } }
         root:    { type: [string, "null"] }
         php:     { type: boolean }
+        enabled: { type: boolean, description: "创建后的初始启用状态，缺省 true。注意：本接口只写入站点定义，**不下发配置**——无论取值如何，站点都要等一次 apply 才会真正对外服务。该字段供编辑页开关回显" }
     SitePatch:
       type: object
       properties:
         domains: { type: array, items: { type: string } }
         root:    { type: string }
-        enabled: { type: boolean }
+        enabled: { type: boolean, description: "启用状态。与当前值**不相同**时会真正同步 Web 服务器：true=按当前设置渲染配置并下发 + reload（此前从未 apply 的站点在此补齐）；false=从 Web 服务器移除该站点配置 + reload，站点停止对外服务。与当前值相同则只写库" }
         force_https: { type: boolean }
     SiteApply:
       type: object
@@ -1429,10 +1430,10 @@ paths:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/Site' } } } }
     post:
       tags: [sites]
-      summary: 新建站点（配置闭环：render→validate→deploy→reload→落库）
+      summary: 新建站点（仅写入站点定义，不下发 Web 服务器配置）
       security: [cookieAuth, csrfHeader]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SiteCreate' } } } }
-      responses: { '201': { description: 已创建 }, '40002': { description: 配置校验失败（已回滚） } }
+      responses: { '201': { description: 已创建（此时站点尚未对外服务，需一次 apply，或在编辑页打开 enabled） }, '400': { description: 参数非法 } }
   /api/v1/sites/root:
     get:
       tags: [sites]
@@ -1459,11 +1460,11 @@ paths:
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/Site' } } } } } } }
     patch:
       tags: [sites]
-      summary: 更新站点
+      summary: 更新站点（enabled 翻转时真正同步 Web 服务器配置：停用=摘配置+reload）
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SitePatch' } } } }
-      responses: { '204': { description: ok } }
+      responses: { '204': { description: ok }, '502': { description: 配置已写入但 reload 失败（30000；此时库未改动，站点状态保持原样） } }
     delete:
       tags: [sites]
       summary: 删除站点（可选保留根目录）

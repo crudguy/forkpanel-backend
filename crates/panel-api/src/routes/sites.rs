@@ -316,6 +316,12 @@ pub struct CreateReq {
     pub root: Option<String>,
     /// 是否启用 PHP（当前 schema 未单独建模，仅占位接受）。
     pub php: Option<bool>,
+    /// 创建后是否「启用」（默认 true）。
+    ///
+    /// 注意 `create` 只写库、不下发配置——无论此处传什么，站点都要等一次
+    /// `apply` 才会真正对外服务。因此该字段决定的是**落库的初始状态**，
+    /// 供前端编辑页的开关回显；后续翻转由 `patch` 负责真正同步 Web 服务器。
+    pub enabled: Option<bool>,
 }
 
 pub async fn create(
@@ -338,6 +344,7 @@ pub async fn create(
         domains.push(dom.as_str().to_string());
     }
     let root = resolve_site_root(&state, req.root.as_deref().unwrap_or(""), &name)?;
+    let enabled = req.enabled.unwrap_or(true);
     // 实际落地站点目录（面板托管；目录缺失即创建）
     if let Err(e) = std::fs::create_dir_all(root.as_path()) {
         return Err(ApiError::from(PanelError::Internal(format!(
@@ -357,8 +364,8 @@ pub async fn create(
         .exec(move |conn| {
             conn.execute(
                 "INSERT INTO sites(name, domains, root, kind, webserver, enabled, created_at)
-                 VALUES(?1, ?2, ?3, 'static', 'nginx', 1, ?4)",
-                rusqlite::params![name_db, domains_json, root_db, now],
+                 VALUES(?1, ?2, ?3, 'static', 'nginx', ?4, ?5)",
+                rusqlite::params![name_db, domains_json, root_db, enabled as i32, now],
             )
             .map(|_| panel_db::WriteAck { rows_changed: 1 })
             .map_err(|e| {
@@ -422,8 +429,101 @@ pub struct PatchReq {
     pub domains: Option<Vec<String>>,
     pub root: Option<String>,
     pub enabled: Option<bool>,
-    /// 仅影响后续 apply 渲染的配置；本接口不重新下发配置。
+    /// `enabled` 翻转时本接口会**真正同步 Web 服务器配置**：停用=移除配置并 reload，
+    /// 启用=按落库行重新渲染下发。其余字段只写库，不重发配置。
+    /// `force_https` 仅影响后续 `apply` 渲染，库不单列存储。
     pub force_https: Option<bool>,
+}
+
+/// 重建某站点的 nginx 配置并渲染，返回 `(conf_path, 渲染文本)`。
+///
+/// `domains` / `root` 由调用方**显式传入**，而不是从 `row` 里读：`patch` 必须在写库
+/// **之前**就用新值下发配置，此时新值只存在于内存中。其余字段（WAF / 类型 / 证书）
+/// 都是 `patch` 不会改动的部分，从 `row` 取即可。
+/// `force_https` 未落库，按「有 TLS 即开启」的 apply 默认语义补齐。
+async fn render_spec_for_row(
+    state: &Shared,
+    row: &RawSite,
+    domains: &[String],
+    root: &str,
+) -> Result<(PathBuf, String)> {
+    if domains.is_empty() {
+        return Err(PanelError::Internal(format!(
+            "站点 {} 缺少域名，无法重新渲染配置",
+            row.name
+        )));
+    }
+    if root.trim().is_empty() {
+        return Err(PanelError::Internal(format!(
+            "站点 {} 根目录为空，无法重新渲染配置",
+            row.name
+        )));
+    }
+    let root = PathBuf::from(root);
+
+    // WAF：从落库值重建（与 apply 的 build_waf 落库口径一致）
+    let waf = if row.waf_enabled != 0 {
+        Some(panel_os::WafSpec {
+            profile: panel_os::WafProfile::parse(row.waf_profile.as_deref().unwrap_or("basic"))
+                .unwrap_or(panel_os::WafProfile::Basic),
+            rate_per_sec: row.waf_rate.map(|n| n as u32),
+            burst: row.waf_burst.map(|n| n as u32).unwrap_or(0),
+        })
+    } else {
+        None
+    };
+
+    // 类型：从 kind + upstreams_json / fpm 重建
+    let kind = match row.kind.as_str() {
+        "reverse_proxy" => {
+            let ups: Vec<String> = row
+                .upstreams_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+            panel_os::SiteKind::ReverseProxy { upstreams: ups }
+        }
+        "php" => panel_os::SiteKind::Php {
+            fpm: row.fpm.clone().unwrap_or_default(),
+        },
+        _ => panel_os::SiteKind::Static,
+    };
+
+    // 证书：沿用 apply 的查找逻辑（证书文件缺失则不启用 TLS）
+    let (tls_cert, tls_key) = match cert_domains_for_site(state, row.id).await? {
+        Some(ds) if !ds.is_empty() => {
+            let (c, k) = cert_paths_for(state, &ds);
+            if c.is_file() && k.is_file() {
+                (Some(c), Some(k))
+            } else {
+                (None, None)
+            }
+        }
+        _ => (None, None),
+    };
+    let has_tls = tls_cert.is_some() && tls_key.is_some();
+
+    let spec = panel_os::SiteSpec {
+        server_names: domains.to_vec(),
+        root,
+        listen: vec![80, 443],
+        kind,
+        access_log: None,
+        error_log: None,
+        tls_cert,
+        tls_key,
+        force_https: has_tls,
+        waf,
+    };
+
+    let (target, rendered) = state.os.webserver().render(&spec)?;
+    state
+        .os
+        .webserver()
+        .validate(&rendered)
+        .await
+        .map_err(|e| PanelError::ConfigInvalid { detail: e.to_string() })?;
+    Ok((target, rendered))
 }
 
 pub async fn patch(
@@ -459,16 +559,68 @@ pub async fn patch(
         cur.root.clone()
     };
 
-    let enabled = req.enabled.unwrap_or(cur.enabled != 0);
+    let old_enabled = cur.enabled != 0;
+    let enabled = req.enabled.unwrap_or(old_enabled);
     let _ = req.force_https; // 仅作用于 apply 渲染，DB 不单列存储
     let domains_json = serde_json::to_string(&domains).unwrap_or_else(|_| "[]".into());
+
+    // 当前落库的 conf_path：开关翻转时要改写它，未翻转则原样保留（含 NULL）。
+    let mut conf_path: Option<String> = state
+        .pool
+        .with(move |conn| {
+            conn.query_row(
+                "SELECT conf_path FROM sites WHERE id = ?1",
+                [id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .map_err(|e| PanelError::Database(e.to_string()))
+        })
+        .await?;
+
+    // 真启用 / 真停用：enabled 翻转时同步 Web 服务器配置。
+    //
+    // 顺序是刻意的：**先同步外部状态，成功后才写库**。反过来的话，deploy / reload
+    // 一旦失败，就会留下「库说已停用、站点却仍在对外服务」的假成功——用户看到开关
+    // 是关的，站点照常访问，正是本次要修的 bug 类型。
+    let web_manage = state
+        .capabilities
+        .get(cap_keys::WEBSERVER_MANAGE)
+        .map(|c| c.supported)
+        .unwrap_or(false);
+    if web_manage && old_enabled != enabled {
+        if enabled {
+            // 假→真：用「本次提交的新 domains/root + 行内不变字段」重建配置并下发。
+            // 站点此前可能从未 apply（无 conf_path），这里会补齐下发。
+            let (target, rendered) = render_spec_for_row(&state, &cur, &domains, &root).await?;
+            state.os.webserver().deploy(&target, &rendered).await?;
+            if let Err(e) = state.os.webserver().reload().await {
+                return Err(ApiError::from(PanelError::Command {
+                    bin: "reload".to_string(),
+                    detail: format!("配置已写入但 reload 失败：{e}"),
+                }));
+            }
+            conf_path = Some(target.display().to_string());
+        } else {
+            // 真→假：移除配置，使站点真正下线（`remove` 内部含 reload）。
+            if let Some(c) = conf_path.as_deref().filter(|c| !c.is_empty()) {
+                state
+                    .os
+                    .webserver()
+                    .remove(&PathBuf::from(c))
+                    .await
+                    .map_err(ApiError::from)?;
+            }
+            // 配置已从磁盘移除，落库的 conf_path 不再反映真实状态 → 置空。
+            conf_path = Some(String::new());
+        }
+    }
 
     state
         .db
         .exec(move |conn| {
             conn.execute(
-                "UPDATE sites SET domains = ?1, root = ?2, enabled = ?3 WHERE id = ?4",
-                rusqlite::params![domains_json, root, enabled as i32, id],
+                "UPDATE sites SET domains = ?1, root = ?2, enabled = ?3, conf_path = ?4 WHERE id = ?5",
+                rusqlite::params![domains_json, root, enabled as i32, conf_path, id],
             )
             .map(|n| panel_db::WriteAck { rows_changed: n })
             .map_err(|e| PanelError::Database(e.to_string()))
