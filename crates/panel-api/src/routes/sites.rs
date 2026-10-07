@@ -290,6 +290,22 @@ pub async fn list(
     Ok(ok(dtos))
 }
 
+/// 站点托管根目录（只读）。
+///
+/// 前端的「选择目录」用它作为初始定位：站点根目录**可被 config 的
+/// `[paths] site_root` 覆盖**（默认才是 /var/www），前端不能硬编码，
+/// 否则在自定义部署下打开选择器会直接落到一个不存在的目录。
+/// 顺带自愈式建目录（与 `resolve_site_root` 一致），避免首次打开即报 not found。
+pub async fn root_info(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::SITE_VIEW)?;
+    let root = state.os.paths().site_root();
+    let _ = std::fs::create_dir_all(&root);
+    Ok(ok(serde_json::json!({ "site_root": root.display().to_string() })))
+}
+
 // ─────────────── 创建站点（仅写库） ───────────────
 
 #[derive(Debug, Deserialize)]

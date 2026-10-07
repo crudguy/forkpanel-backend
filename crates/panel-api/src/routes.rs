@@ -131,6 +131,7 @@ pub fn build_router(state: Shared) -> Router {
     let site_r = Router::new()
         .route("/api/v1/sites", get(sites::list).post(sites::create))
         .route("/api/v1/sites/apply", post(sites::apply))
+        .route("/api/v1/sites/root", get(sites::root_info))
         .route("/api/v1/sites/{id}", get(sites::get).patch(sites::patch).delete(sites::delete))
         .route("/api/v1/sites/{id}/reload", post(sites::reload))
         .route("/api/v1/sites/{id}/logs", get(sites::logs))

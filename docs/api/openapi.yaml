@@ -1433,6 +1433,16 @@ paths:
       security: [cookieAuth, csrfHeader]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SiteCreate' } } } }
       responses: { '201': { description: 已创建 }, '40002': { description: 配置校验失败（已回滚） } }
+  /api/v1/sites/root:
+    get:
+      tags: [sites]
+      summary: 站点托管根目录（只读；前端「选择目录」的初始定位）
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { site_root: { type: string } } } } }
   /api/v1/sites/apply:
     post:
       tags: [sites]
