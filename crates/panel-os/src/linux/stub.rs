@@ -1048,13 +1048,23 @@ fn render_nginx(spec: &SiteSpec) -> String {
     out.push_str("server {\n");
     // force_https+tls 时主块只留 443（80 已交给重定向块）
     let main_http: Vec<u16> = if spec.force_https && has_tls { Vec::new() } else { http_ports.clone() };
-    for p in &main_http { out.push_str(&format!("    listen {p};\n")); }
-    for p in &https_ports {
-        if has_tls { out.push_str(&format!("    listen {p} ssl;\n")); }
-        else { out.push_str(&format!("    listen {p};\n")); }
+    // 无证书时**不**监听 443。443 是 HTTPS 专用端口，明文监听没有意义；更要命的是
+    // 同机只要有**任一**站点用了 `listen 443 ssl`，这个裸 `listen 443` 会让 nginx 以
+    // emerg 拒绝**整份**配置（"no ssl_certificate is defined for the listen ... ssl
+    // directive"）——一个没证书的站点不该有能力打死全机 nginx。
+    let mut wrote_listen = false;
+    for p in &main_http {
+        out.push_str(&format!("    listen {p};\n"));
+        wrote_listen = true;
     }
-    if main_http.is_empty() && https_ports.is_empty() {
-        out.push_str("    listen 80;\n");   // 兜底：listen 为空时不生成空 server
+    for p in &https_ports {
+        if has_tls {
+            out.push_str(&format!("    listen {p} ssl;\n"));
+            wrote_listen = true;
+        }
+    }
+    if !wrote_listen {
+        out.push_str("    listen 80;\n");   // 兜底：一个 listen 都没写时不生成无监听的 server
     }
     out.push_str(&format!("    server_name {names};\n\n"));
 
@@ -2191,11 +2201,35 @@ mod tests {
     fn render_static_contains_core_directives() {
         let out = render_nginx(&spec_static());
         assert!(out.contains("listen 80;"), "{out}");
-        assert!(out.contains("listen 443;"), "无证书时 443 不应带 ssl: {out}");
+        // 无证书时**不得**监听 443（详见 render_nginx 里的说明：裸 `listen 443` 会让
+        // 同机任一 `listen 443 ssl` 站点把**整份** nginx 配置拖成 emerg）。
+        assert!(!out.contains("listen 443"), "无证书时不应监听 443: {out}");
         assert!(!out.contains("ssl;"), "无证书时不应出现 ssl: {out}");
         assert!(out.contains("server_name example.com www.example.com;"), "{out}");
         assert!(out.contains("root /var/www/example;"), "{out}");
         assert!(out.contains("try_files $uri $uri/ =404;"), "{out}");
+    }
+
+    /// 回归防护：无证书站点与「有证书 + 443 ssl」的站点同机共存时，前者不得裸监听
+    /// 443 —— 那会让 nginx 直接 emerg，**整份**配置（含其它正常站点）全部加载失败。
+    /// 修好前此断言为 1（存在裸 `listen 443;`），修好后为 0。
+    #[test]
+    fn render_no_tls_site_never_bare_listens_443_beside_ssl_site() {
+        let no_tls = spec_static(); // listen=[80,443]，tls_cert/tls_key 均为 None
+        let mut with_tls = spec_static();
+        with_tls.server_names = vec!["secure.example".into()];
+        with_tls.tls_cert = Some(PathBuf::from("/tmp/secure.example.crt"));
+        with_tls.tls_key = Some(PathBuf::from("/tmp/secure.example.key"));
+
+        let combined = format!("{}{}", render_nginx(&no_tls), render_nginx(&with_tls));
+        assert!(combined.contains("listen 443 ssl;"), "有证书站点应 ssl 监听 443: {combined}");
+        assert_eq!(
+            combined.matches("listen 443;").count(),
+            0,
+            "无证书站点不得裸监听 443（会让整份 nginx 配置 emerg）: {combined}"
+        );
+        // 无证书站点仍须保留明文 80，别把站点一起修没了
+        assert!(combined.contains("listen 80;"), "{combined}");
     }
 
     #[test]
