@@ -279,12 +279,42 @@ async fn fetch_one_by_name(state: &Shared, name: &str) -> Result<Option<RawSite>
 ///
 /// 目标目录**允许尚不存在**（首次建站时必然如此），故走 `resolve_within_for_create`；
 /// 同时自愈式确保 `site_root` 根存在，避免根缺失导致解析失败。
+/// 把用户输入的站点根目录归一化为「相对 `site_root`」的形式，供 `resolve_within_for_create` 消费。
+///
+/// 目录选择器（`/files/list`，树根固定在 `/`）与库里落地的 `root` 都是**绝对路径**，
+/// 而沙箱 [`panel_os::paths::resolve_within_for_create`] 只收相对 `site_root` 的路径
+/// （防 `/etc/passwd` 直传）。故：
+/// - 落在 `base` 之内的绝对路径 → 剥掉 `base` 前缀，转成相对（与 `files.rs::relativize` 同源）；
+/// - 恰好等于 `base` 的绝对路径 → `.`（站点根目录本身）；
+/// - 落在 `base` 之外的绝对路径 → 原样返回，交给沙箱判 `PathEscape`（**绝不**放行越界）；
+/// - 相对路径 / 空串 → 原样返回（空串由调用方回填为站点名）。
+///
+/// 抽成纯函数便于单测：不碰 `state`、不触磁盘。
+fn site_root_rel(base: &Path, input: &str, name: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return name.to_string();
+    }
+    if Path::new(trimmed).is_absolute() {
+        match Path::new(trimmed).strip_prefix(base) {
+            Ok(rest) => {
+                let r = rest.to_string_lossy().to_string();
+                if r.is_empty() { ".".to_string() } else { r }
+            }
+            // 绝对但不属于 site_root：保持原样，下方沙箱会判越界
+            Err(_) => trimmed.to_string(),
+        }
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn resolve_site_root(state: &Shared, input: &str, name: &str) -> Result<SafePath> {
     let base = state.os.paths().site_root();
     // 自愈：托管根目录缺失时先创建（首次部署或目录被清理）
     let _ = std::fs::create_dir_all(&base);
-    let rel = if input.trim().is_empty() { name } else { input.trim() };
-    let resolved = panel_os::paths::resolve_within_for_create(&base, rel)
+    let rel = site_root_rel(&base, input, name);
+    let resolved = panel_os::paths::resolve_within_for_create(&base, &rel)
         .map_err(|_| PanelError::PathEscape(rel.to_string()))?;
     // 自愈：确保站点根目录存在且对 Web 服务器可读（0o755）。
     // 不再依赖 umask 隐式保证——否则 root:root + 严 umask 下 www-data 会 403。
@@ -2053,5 +2083,36 @@ mod tests {
             assert_eq!(m & 0o777, 0o755);
         }
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ── site_root_rel：绝对路径剥前缀 / 越界拒绝 / 空串回填 ──
+    // 回归：目录选择器返回绝对路径、库里 root 也是绝对路径，但沙箱只收相对 site_root
+    // 的路径。此前 resolve_site_root 直接把绝对路径交给 resolve_within_for_create →
+    // is_absolute 一律判 PathEscape(50001)，于是「编辑站点 → 保存」必报"路径超出允许范围"。
+    #[test]
+    fn site_root_rel_strips_prefix_for_absolute_within_root() {
+        let base = Path::new("/var/www");
+        // 选择器返回的 /var/www/my-site → 相对 my-site
+        assert_eq!(site_root_rel(base, "/var/www/my-site", "fallback"), "my-site");
+        // 库里落地、带结尾斜杠的绝对路径也应剥干净
+        assert_eq!(site_root_rel(base, "/var/www/sub/", "fallback"), "sub");
+        // 恰好等于 base（选了 site_root 本身）→ 用 "." 表示根目录
+        assert_eq!(site_root_rel(base, "/var/www", "fallback"), ".");
+    }
+
+    #[test]
+    fn site_root_rel_keeps_out_of_root_absolute_so_sandbox_rejects() {
+        // 越界绝对路径保持原样，交给 resolve_within_for_create 判 PathEscape（绝不放行）
+        assert_eq!(site_root_rel(Path::new("/var/www"), "/etc/passwd", "fb"), "/etc/passwd");
+        // 伪装前缀（/var/www-evil）不会被字符串前缀误判命中：strip_prefix 是组件级，
+        // /var/www-evil 不以 /var/www 为组件前缀 → 保持原样 → 沙箱拒绝
+        assert_eq!(site_root_rel(Path::new("/var/www"), "/var/www-evil/x", "fb"), "/var/www-evil/x");
+    }
+
+    #[test]
+    fn site_root_rel_empty_falls_back_to_name_and_relative_passthrough() {
+        assert_eq!(site_root_rel(Path::new("/var/www"), "", "my-site"), "my-site");
+        // 相对路径原样透传（含子目录与 .. 语义拦截交给沙箱）
+        assert_eq!(site_root_rel(Path::new("/var/www"), "my-site/blog", "fb"), "my-site/blog");
     }
 }
