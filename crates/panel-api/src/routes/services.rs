@@ -668,7 +668,11 @@ pub async fn packages_list(
     let probe: Vec<String> = ALLOWED_PACKAGES.iter().map(|d| real_pkg_name(manager, d.name)).collect();
     let probe: Vec<&str> = probe.iter().map(|s| s.as_str()).collect();
     let pkgs = state.os.packages().detect_installed(&probe).await?;
-    let items: Vec<serde_json::Value> = pkgs.into_iter().map(|p| {
+    // 软件卡片的「服务管理」入口：用 `dpkg -L` 直接问"这个包装了哪些 .service"，
+    // 绕过 systemctl list-units 对 enabled-but-dead 单元的遗漏（详见 PackageProvider::service_unit）。
+    // 状态取自 systemd（is-active 口径，与 /services 同源），故 dead 的服务也能正确显示入口与状态。
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    for p in pkgs {
         // 探测到的是真实包名（Debian 上 redis 查 redis-server），先还原成逻辑名，
         // 再取对应 label；取不到（理论上不会）时退回逻辑名，保证 UI 至少有字可显示。
         let logical = logical_pkg_name(&p.name).unwrap_or(p.name.as_str());
@@ -676,8 +680,20 @@ pub async fn packages_list(
             Some(d) => (d.name.to_string(), d.label.to_string()),
             None => (logical.to_string(), logical.to_string()),
         };
-        serde_json::json!({ "name": name, "label": label, "version": p.version, "manager": p.manager })
-    }).collect();
+        let unit = if let Ok(Some(u)) = state.os.packages().service_unit(&p.name).await {
+            let st = match panel_core::unit_name(&u) {
+                Ok(un) => state.os.services().status(&un).await
+                    .map(|s| format!("{s:?}").to_lowercase())
+                    .unwrap_or_else(|_| "unknown".to_string()),
+                Err(_) => "unknown".to_string(),
+            };
+            Some(serde_json::json!({ "name": u, "state": st }))
+        } else { None };
+        items.push(serde_json::json!({
+            "name": name, "label": label, "version": p.version,
+            "manager": p.manager, "unit": unit,
+        }));
+    }
     // 完整白名单（name+label）随清单一起下发：前端据此给「已装」和「可装」两类都渲染
     // 友好品牌名，而不必在 CATEGORIES 里再维护一份标签（单一事实源在后端）。
     let catalog: Vec<serde_json::Value> = ALLOWED_PACKAGES.iter()

@@ -428,6 +428,15 @@ components:
         version: { type: [string, "null"] }
         manager: { type: [string, "null"], example: apt }
         path:    { type: [string, "null"] }
+        unit:
+          type: object
+          nullable: true
+          description: 该软件包对应的主服务单元（用于软件卡片「服务管理」入口）。
+            直接由包文件清单（dpkg -L）推导，故 enabled 但当前未运行的服务也能正确关联，
+            不依赖 systemctl list-units 的运行时枚举。
+          properties:
+            name:  { type: string, description: 完整单元名（含 .service 后缀），如 nginx.service }
+            state: { type: string, description: 服务状态（systemd 口径，active/inactive/failed/activating/deactivating/unknown） }
 
     PackageCatalog:
       type: object

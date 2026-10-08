@@ -166,6 +166,34 @@ pub(crate) fn pkg_install_target(manager: &str, name: &str, version: Option<&str
     }
 }
 
+/// 从 `dpkg -L <pkg>` 的输出里挑出该包 shipping 的**主** systemd 单元：
+/// 位于 `.../systemd/system/` 下、以 `.service` 结尾、且**非模板**（不含 `@`）的单元。
+///
+/// 选择主单元的规则（避免 nginx 误选 `nginx-debug.service`）：
+/// 1. 优先 stem 与包名完全一致者（`nginx` → `nginx.service`，而非 `nginx-debug.service`）；
+/// 2. 否则取**最短**的 stem（主服务单元名通常最短，`*-debug`/`-worker` 等变体更长）。
+///
+/// 抽成纯函数以便单测——不依赖真实 dpkg，fixture 即 `dpkg -L` 的真实片段。
+fn service_unit_from_dpkg_list(out: &str, pkg: &str) -> Option<String> {
+    let exact = format!("{pkg}.service");
+    let mut candidates: Vec<&str> = Vec::new();
+    for l in out.lines() {
+        if l.ends_with(".service") && l.contains("systemd/system/") {
+            let base = l.rsplit('/').next().unwrap_or(l);
+            if base.contains('@') { continue; }   // 跳过模板单元（postgresql@.service 等）
+            candidates.push(base);
+        }
+    }
+    if candidates.is_empty() { return None; }
+    // 规则 1：stem 与包名完全一致优先
+    if let Some(m) = candidates.iter().find(|b| **b == exact.as_str()) {
+        return Some(m.to_string());
+    }
+    // 规则 2：否则取最短 stem（主服务单元名最短）
+    candidates.sort_by_key(|b| b.len());
+    Some(candidates[0].to_string())
+}
+
 #[async_trait]
 
 impl PackageProvider for LinuxPackages {
@@ -260,6 +288,21 @@ impl PackageProvider for LinuxPackages {
                 Ok(found)
             }
             _other => Err(PanelError::Unsupported("package.detect")),
+        }
+    }
+
+    async fn service_unit(&self, name: &str) -> Result<Option<String>> {
+        match self.manager {
+            // 直接问 dpkg 这个包装了哪些 .service 文件，绕开 systemctl list-units 对
+            // enabled-but-dead 单元的遗漏（详见 PackageProvider::service_unit 的说明）。
+            Some("apt") => {
+                let out = crate::cmd::run(
+                    Bin::Dpkg, &["-L", name],
+                    CmdOpt { timeout: Duration::from_secs(10), ..Default::default() },
+                ).await?;
+                Ok(service_unit_from_dpkg_list(&out.stdout, name))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -1849,6 +1892,26 @@ fn _assert_types(_: Option<UnitName>) {}
 mod tests {
     use super::*;
     use crate::traits::DatabaseProvider;
+
+    #[test]
+    fn service_unit_from_dpkg_list_picks_primary_unit() {
+        // nginx 同时 shipping nginx.service 与 nginx-debug.service：必须选主单元 nginx.service，
+        // 而非排在前面（dpkg -L 顺序）或名字更长的 nginx-debug.service。
+        let nginx = "/usr/lib/systemd/system/nginx-debug.service\n/usr/lib/systemd/system/nginx.service\n/usr/share/doc/nginx/copyright\n";
+        assert_eq!(service_unit_from_dpkg_list(nginx, "nginx").as_deref(), Some("nginx.service"));
+        // redis 真实包名是 redis-server，单元名与之同 stem
+        let redis = "/lib/systemd/system/redis-server.service\n";
+        assert_eq!(service_unit_from_dpkg_list(redis, "redis-server").as_deref(), Some("redis-server.service"));
+    }
+
+    #[test]
+    fn service_unit_from_dpkg_list_skips_template_and_absent() {
+        // 仅模板单元 → 不关联（避免把 postgresql@.service 当具体单元）
+        let pg = "/usr/lib/systemd/system/postgresql@.service\n";
+        assert_eq!(service_unit_from_dpkg_list(pg, "postgresql"), None);
+        // 包装里没有 .service（certbot/ufw 之类）→ 不关联
+        assert_eq!(service_unit_from_dpkg_list("no service file here\n", "certbot"), None);
+    }
 
     fn nginx_server() -> LinuxWebServer {
         LinuxWebServer { name: Some("nginx"), paths: Arc::new(LinuxPathLayout::default()) }

@@ -416,6 +416,18 @@ pub trait PackageProvider: Send + Sync {
     /// （白名单内普通包、非 apt 发行版、无第三方源的包如 minio）为 no-op，直接返回 Ok，
     /// 不影响既有安装路径。调用方应在 `install` 之前调用，加源失败即中止安装。
     async fn ensure_repo(&self, logical: &str, on_line: Box<dyn Fn(String) + Send + Sync>) -> Result<()>;
+    /// 返回该已装包 shipping 的**主服务单元名**（含 `.service` 后缀），如 `nginx` → `nginx.service`。
+    ///
+    /// 用途：软件卡片要渲染「服务管理」入口，但 `systemctl list-units`（服务页枚举命令）
+    /// 只列出**已加载进 systemd 运行时**的单元——对 `enabled` 却从未激活过的单元
+    /// （典型如装好 nginx 但没 start 过）整体遗漏，导致卡片匹配不到对应单元、不渲染入口。
+    /// 这里改为直接问包管理器"这个包装了哪些 `.service` 文件"（Debian 上 `dpkg -L`），
+    /// 与运行时加载状态解耦，故 enabled-but-dead 的服务也能被正确关联到。
+    ///
+    /// 一个包可能 shipping 多个单元（如 postgresql 的 `postgresql.service` + `postgresql@.service`），
+    /// 返回第一个**非模板**（不含 `@`）单元；没有任何 `.service` 则 `None`
+    /// （certbot/ufw 之类无常驻服务可管，调用方据此不渲染入口）。
+    async fn service_unit(&self, name: &str) -> Result<Option<String>>;
     /// 探测**给定包名**中「源里最高版本高于已安装版本」的项（只读，不改动系统）。
     ///
     /// 传名字列表而不做全系统扫描：调用方（软件页）只关心白名单这二十来个包，

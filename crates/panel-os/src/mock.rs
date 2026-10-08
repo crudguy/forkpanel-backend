@@ -270,6 +270,16 @@ impl PackageProvider for MockPackages {
         Ok(())
     }
 
+    async fn service_unit(&self, name: &str) -> Result<Option<String>> {
+        // 给已知白名单包一个稳定的单元名，便于前端联调；其余返回 None。
+        Ok(match name {
+            "nginx" | "nginx-core" => Some("nginx.service".into()),
+            "redis-server" | "redis" => Some("redis-server.service".into()),
+            "postgresql" | "postgresql-18" | "postgresql-16" => Some("postgresql.service".into()),
+            _ => None,
+        })
+    }
+
     async fn upgradable(&self, _names: &[&str]) -> Result<Vec<UpgradablePkg>> {
         // mock 不跑 apt；返回空列表=「无可升级项」，调用方应隐藏入口而非报错
         Ok(Vec::new())
