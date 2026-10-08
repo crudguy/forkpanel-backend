@@ -76,6 +76,18 @@ fn read_acme_pair(domain: &str) -> Result<(String, String)> {
     Ok((cert, key))
 }
 
+/// SAN 条目：IP 目标写 `IP:` 前缀、域名写 `DNS:`。
+///
+/// 浏览器按目标的**类型**分别匹配 IP SAN 与 DNS SAN —— 对 IP 地址写 `DNS:`
+/// 时，即便证书正常下发，访问 `https://<ip>` 仍会报名称不匹配（RFC 6125 / 浏览器行为）。
+fn san_entry(host: &str) -> String {
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        format!("IP:{host}")
+    } else {
+        format!("DNS:{host}")
+    }
+}
+
 /// 为 `domains` 生成自签证书（RSA-2048，多域名写入 SAN）。返回 `(cert_pem, key_pem)`。
 ///
 /// `tmp_dir` 为中间产物目录（由调用方经 `PathLayout` 提供，避免此处硬编码平台路径）；
@@ -89,7 +101,7 @@ pub async fn generate_self_signed(
         return Err(PanelError::ConfigInvalid { detail: "domains 为空".into() });
     }
     let cn = &domains[0];
-    let san = domains.iter().map(|d| format!("DNS:{d}")).collect::<Vec<_>>().join(",");
+    let san = domains.iter().map(|d| san_entry(d)).collect::<Vec<_>>().join(",");
     let dir = tmp_dir.join(format!("ssl-gen-{}-{}", std::process::id(), unique()));
     std::fs::create_dir_all(&dir).map_err(|e| PanelError::Internal(e.to_string()))?;
 
@@ -149,6 +161,15 @@ mod tests {
     fn available_never_executes() {
         // 只做存在性检查，返回 bool，不 panic（本机有无 openssl 都合法）
         let _ = available();
+    }
+
+    #[test]
+    fn san_prefix_matches_target_kind() {
+        // IP 走 IP SAN、域名走 DNS SAN；混用会让浏览器报名称不匹配
+        assert_eq!(san_entry("127.0.0.1"), "IP:127.0.0.1");
+        assert_eq!(san_entry("::1"), "IP:::1");
+        assert_eq!(san_entry("example.com"), "DNS:example.com");
+        assert_eq!(san_entry("sub.example.com"), "DNS:sub.example.com");
     }
 
     /// 需真机 openssl 的端到端：本沙箱有 openssl 时应真实生成一对可解析 PEM。
