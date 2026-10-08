@@ -497,6 +497,7 @@ components:
     SitePatch:
       type: object
       properties:
+        name:    { type: string, description: "站点名称，**支持改名**。nginx 配置按域名派生（conf 文件名取首个域名、server_name 即 domains）、root 建站时已固化为绝对路径、证书按 domain 绑定，三者都与 name 无关，故改名**不需要重新下发配置**；与其它站点同名返回 4090（site name exists）" }
         domains: { type: array, items: { type: string } }
         root:    { type: string }
         enabled: { type: boolean, description: "启用状态。与当前值**不相同**时会真正同步 Web 服务器：true=按当前设置渲染配置并下发 + reload（此前从未 apply 的站点在此补齐）；false=从 Web 服务器移除该站点配置 + reload，站点停止对外服务。与当前值相同则只写库" }

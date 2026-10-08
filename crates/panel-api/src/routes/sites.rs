@@ -489,6 +489,13 @@ pub async fn get(
 
 #[derive(Debug, Deserialize)]
 pub struct PatchReq {
+    /// 站点名称（**支持改名**）。
+    ///
+    /// 改名牵动的只有这块「登记标识」本身，其余三样都与 name 无关，因此改名不会让站点
+    /// 离线、也不需要重新下发配置：nginx 配置按**域名**派生（conf 文件名取首个 server_name
+    /// 的 slug、`server_name` 指令就是 domains 本身）、root 在**建站时已固化成绝对路径**、
+    /// 证书按 domain 绑定。唯一约束是全局唯一，冲突按 Conflict 如实返回。
+    pub name: Option<String>,
     pub domains: Option<Vec<String>>,
     pub root: Option<String>,
     pub enabled: Option<bool>,
@@ -589,6 +596,34 @@ async fn render_spec_for_row(
     Ok((target, rendered))
 }
 
+/// 清理「孤儿」站点配置：下发新配置后，若落库的旧路径与本次目标不同，就把旧文件删掉。
+///
+/// 必要性来自命名规则——conf 文件名是 `panel-<slug(首个域名)>.conf`（见 `conf_path()`），
+/// **域名一改文件名就跟着变**。只 deploy 新文件、不清理旧文件的话：旧域名的配置仍留在
+/// conf.d 里，nginx 会**继续对外服务它**（站点表里已经没有那个域名了）；更糟的是此后
+/// 「停用 / 删除站点」只按落库的 conf_path 删新文件，那个孤儿文件**永远删不掉**，
+/// 得有人手工去 conf.d 里翻。
+///
+/// 调用时机固定在 **deploy 新配置之后**：先删后写会让站点在这一瞬间真的不可用。
+/// `remove` 内部自带 reload，所以删过就不再需要调用方重载（返回 true 表示已重载过）。
+/// 删除失败一律上抛（`?`）——静默吞掉就会留下「站点显示已改、旧域名却仍在线」的假成功。
+async fn prune_stale_conf(
+    state: &Shared,
+    old_conf: Option<&str>,
+    target: &std::path::Path,
+) -> Result<bool> {
+    let Some(old) = old_conf.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(false);
+    };
+    let old_path = PathBuf::from(old);
+    // 路径相同 / 文件本就不存在：幂等跳过（站点从未 apply 过，或已被删过）
+    if old_path == target || !old_path.is_file() {
+        return Ok(false);
+    }
+    state.os.webserver().remove(&old_path).await?;
+    Ok(true)
+}
+
 pub async fn patch(
     State(state): State<Shared>,
     Auth(s): Auth,
@@ -601,6 +636,40 @@ pub async fn patch(
         .ok_or_else(|| ApiError::not_found("site"))?;
 
     // 计算新值（未提供的字段沿用现状）
+    //
+    // 名称：支持改名。nginx 配置按域名派生、root 已是绝对路径、证书按 domain 绑定，
+    // 三者都与 name 无关 → 改名不需要重新下发任何东西，只改这一列即可。
+    // root 的解析仍传**旧名**：只有 root 传空串时才会按 name 生成默认目录，沿用旧名
+    // 可避免"改个名字顺带把站点目录也换了地方"这种隐式漂移。
+    let new_name = match req.name.as_deref() {
+        Some(raw) => {
+            let n = raw.trim().to_string();
+            if n.is_empty() {
+                return Err(ApiError::bad_request("name", "name required"));
+            }
+            n
+        }
+        None => cur.name.clone(),
+    };
+    if new_name != cur.name {
+        // 唯一性**先读后判**，命中即 Conflict。不能指望写事务里的 UNIQUE 兜底：
+        // `db.exec` 会把闭包内任何错误一律包成 Database，端点就误报成 500 了。
+        let name_check = new_name.clone();
+        let dup: i64 = state
+            .pool
+            .with(move |conn| {
+                conn.query_row(
+                    "SELECT COUNT(1) FROM sites WHERE name = ?1 AND id != ?2",
+                    rusqlite::params![name_check, id],
+                    |r| r.get(0),
+                )
+                .map_err(|e| PanelError::Database(e.to_string()))
+            })
+            .await?;
+        if dup > 0 {
+            return Err(ApiError::from(PanelError::Conflict("site name exists".into())));
+        }
+    }
     let domains: Vec<String> = if let Some(ref ds) = req.domains {
         if ds.is_empty() {
             return Err(ApiError::bad_request("domains", "at least one domain required"));
@@ -656,11 +725,16 @@ pub async fn patch(
             // 站点此前可能从未 apply（无 conf_path），这里会补齐下发。
             let (target, rendered) = render_spec_for_row(&state, &cur, &domains, &root).await?;
             state.os.webserver().deploy(&target, &rendered).await?;
-            if let Err(e) = state.os.webserver().reload().await {
-                return Err(ApiError::from(PanelError::Command {
-                    bin: "reload".to_string(),
-                    detail: format!("配置已写入但 reload 失败：{e}"),
-                }));
+            // 域名改过则文件名跟着变：新配置已就位，**此刻**才轮到删旧域名遗留的孤儿
+            // 配置。`remove` 自带 reload —— 删过就等于重载过了，下面不必再 reload 一次。
+            let pruned = prune_stale_conf(&state, conf_path.as_deref(), &target).await?;
+            if !pruned {
+                if let Err(e) = state.os.webserver().reload().await {
+                    return Err(ApiError::from(PanelError::Command {
+                        bin: "reload".to_string(),
+                        detail: format!("配置已写入但 reload 失败：{e}"),
+                    }));
+                }
             }
             conf_path = Some(target.display().to_string());
         } else {
@@ -682,8 +756,8 @@ pub async fn patch(
         .db
         .exec(move |conn| {
             conn.execute(
-                "UPDATE sites SET domains = ?1, root = ?2, enabled = ?3, conf_path = ?4 WHERE id = ?5",
-                rusqlite::params![domains_json, root, enabled as i32, conf_path, id],
+                "UPDATE sites SET name = ?6, domains = ?1, root = ?2, enabled = ?3, conf_path = ?4 WHERE id = ?5",
+                rusqlite::params![domains_json, root, enabled as i32, conf_path, id, new_name],
             )
             .map(|n| panel_db::WriteAck { rows_changed: n })
             .map_err(|e| PanelError::Database(e.to_string()))
@@ -1033,12 +1107,19 @@ pub async fn apply(
     if deploy {
         state.os.webserver().deploy(&target, &rendered).await?;
 
+        // 5.5) 域名改过则旧文件名成了孤儿：新配置已就位，**此刻**才轮到删旧配置。
+        //      `remove` 自带 reload —— 删过就等于重载过了，不再重复 reload。
+        let stale_conf = cur_row.as_ref().and_then(|r| r.conf_path.as_deref());
+        let pruned = prune_stale_conf(&state, stale_conf, &target).await?;
+
         // 6) reload。失败时配置已写入但服务未加载 —— 这是可恢复的（配置语法已校验过）
-        if let Err(e) = state.os.webserver().reload().await {
-            return Err(ApiError::from(PanelError::Command {
-                bin: "reload".to_string(),
-                detail: format!("配置已写入但 reload 失败：{e}"),
-            }));
+        if !pruned {
+            if let Err(e) = state.os.webserver().reload().await {
+                return Err(ApiError::from(PanelError::Command {
+                    bin: "reload".to_string(),
+                    detail: format!("配置已写入但 reload 失败：{e}"),
+                }));
+            }
         }
     }
 
