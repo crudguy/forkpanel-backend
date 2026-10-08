@@ -1300,6 +1300,16 @@ pub async fn ssl_apply(
     Json(req): Json<SslApplyReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SSL_MANAGE)?;
+    // 无 Web 服务器底座时拒发证书：证书没有进程可加载，只会制造
+    // "已配置"却永远不生效的假象（与 create/apply 同一守卫，防绕过 UI）。
+    if !state
+        .capabilities
+        .get(cap_keys::WEBSERVER_MANAGE)
+        .map(|c| c.supported)
+        .unwrap_or(false)
+    {
+        return Err(ApiError::unsupported("webserver.manage"));
+    }
     let site = fetch_one(&state, id).await?.ok_or_else(|| ApiError::not_found("site"))?;
 
     // 域名：请求覆盖 或 沿用站点现有域名
@@ -1511,6 +1521,16 @@ pub async fn cert_renew(
     AxPath(id): AxPath<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SSL_MANAGE)?;
+    // 续期同样是"签发一张证书"，无底座时一并拒绝——否则旧证书可被续成一个
+    // 永远不生效的新证书，把"已配置"的假象重新造出来。
+    if !state
+        .capabilities
+        .get(cap_keys::WEBSERVER_MANAGE)
+        .map(|c| c.supported)
+        .unwrap_or(false)
+    {
+        return Err(ApiError::unsupported("webserver.manage"));
+    }
 
     let row = state
         .pool
