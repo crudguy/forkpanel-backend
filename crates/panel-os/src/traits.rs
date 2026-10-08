@@ -206,6 +206,14 @@ pub trait ServiceProvider: Send + Sync {
     fn init_system(&self) -> InitSystem;
     async fn list(&self, filter: ServiceFilter) -> Result<Vec<ServiceUnit>>;
     async fn status(&self, name: &UnitName) -> Result<ServiceState>;
+    /// 按单元名直接查单个服务，绕开 `list` 的 `list-units --all` 全量枚举。
+    ///
+    /// 为什么需要：systemd 的 `list-units` 只列出**已加载进运行时**的单元，
+    /// 所有 `enabled` 但从未启动（dead）的服务（典型如刚装好还没 start 的 nginx）
+    /// 整体不在列表里，于是详情页按列表反查必然"未找到该服务"。
+    /// 本方法用 `systemctl show <unit>` 按需加载单元，dead 也能查到；
+    /// 单元根本不存在时返回 `None`（路由据此回 404）。
+    async fn show(&self, name: &UnitName) -> Result<Option<ServiceUnit>>;
     async fn start(&self, name: &UnitName) -> Result<()>;
     async fn stop(&self, name: &UnitName) -> Result<()>;
     async fn restart(&self, name: &UnitName) -> Result<()>;

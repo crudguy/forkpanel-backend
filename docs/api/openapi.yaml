@@ -1208,6 +1208,20 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/ServiceUnit' } } } }
 
+  /api/v1/services/{unit}:
+    get:
+      tags: [services]
+      summary: 按单元名查单个服务（绕开 list，dead 服务也能查到）
+      parameters: [{ name: unit, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/ServiceUnit' } } }
+        '404':
+          description: 单元不存在
+
   /api/v1/services/{unit}/status:
     get:
       tags: [services]

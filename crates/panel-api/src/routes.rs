@@ -107,6 +107,7 @@ pub fn build_router(state: Shared) -> Router {
     // ── 软件与服务 ──
     let svc_r = Router::new()
         .route("/api/v1/services", get(services::list))
+        .route("/api/v1/services/{unit}", get(services::show))
         .route("/api/v1/services/{unit}/status", get(services::status))
         .route("/api/v1/services/{unit}/start", post(services::start))
         .route("/api/v1/services/{unit}/stop", post(services::stop))

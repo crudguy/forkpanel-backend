@@ -198,6 +198,44 @@ pub async fn status(
     Ok(ok(serde_json::json!({ "name": name, "state": format!("{st:?}").to_lowercase() })))
 }
 
+/// 按单元名直接查单个服务（绕开 `list` 的 `list-units --all`，dead 服务也能查到）。
+///
+/// 详情页用它加载服务，避免"刚装好还没启动的服务在列表反查里查不到 → 未找到该服务"。
+/// 单元不存在（`show` 返回 None）→ 404。
+pub async fn show(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    AxPath(name): AxPath<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::SERVICE_VIEW)?;
+    let unit = panel_core::unit_name(&name)
+        .map_err(|_| ApiError::bad_request("name", "invalid unit name"))?;
+    let found = state.os.services().show(&unit).await?;
+    match found {
+        Some(u) => {
+            let dto = ServiceDto {
+                managed: is_managed(u.name.as_str()),
+                name: u.name.as_str().to_string(),
+                state: match u.state {
+                    panel_os::ServiceState::Active => "active",
+                    panel_os::ServiceState::Inactive => "inactive",
+                    panel_os::ServiceState::Failed => "failed",
+                    panel_os::ServiceState::Activating => "activating",
+                    panel_os::ServiceState::Deactivating => "deactivating",
+                    panel_os::ServiceState::Unknown => "unknown",
+                },
+                enabled: u.enabled,
+                description: if u.description.is_empty() { None } else { Some(u.description) },
+            };
+            Ok(ok(serde_json::json!({
+                "init_system": init_name(state.os.services().init_system()),
+                "service": dto,
+            })))
+        }
+        None => Err(ApiError::not_found("service")),
+    }
+}
+
 // ─────────────── 软件包（走任务队列） ───────────────
 
 #[derive(Debug, Deserialize)]

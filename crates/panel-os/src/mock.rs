@@ -138,6 +138,19 @@ impl ServiceProvider for MockServices {
         Ok(st.service_states.get(name.as_str()).copied().unwrap_or(ServiceState::Unknown))
     }
 
+    async fn show(&self, name: &UnitName) -> Result<Option<ServiceUnit>> {
+        let st = self.state.lock().unwrap();
+        Ok(st.service_states.get(name.as_str()).map(|s| ServiceUnit {
+            // SAFETY: mock 内部数据，名称取自已校验集合
+            name: unsafe { UnitName::from_raw(name.as_str().to_string()) },
+            description: format!("mock {}", name.as_str()),
+            state: *s,
+            enabled: true,
+            pid: Some(1000),
+            memory_kib: Some(2048),
+        }))
+    }
+
     async fn start(&self, name: &UnitName) -> Result<()> { self.set(name, ServiceState::Active) }
     async fn stop(&self, name: &UnitName) -> Result<()> { self.set(name, ServiceState::Inactive) }
     async fn restart(&self, name: &UnitName) -> Result<()> { self.set(name, ServiceState::Active) }

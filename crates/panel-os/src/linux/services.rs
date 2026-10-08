@@ -84,6 +84,27 @@ impl ServiceProvider for LinuxServices {
         }
     }
 
+    async fn show(&self, name: &UnitName) -> Result<Option<ServiceUnit>> {
+        match self.init {
+            InitSystem::Systemd => {
+                let out = cmd::run(
+                    Bin::Systemctl,
+                    &[
+                        "show", name.as_str(),
+                        "-p", "LoadState", "-p", "ActiveState", "-p", "SubState",
+                        "-p", "UnitFileState", "-p", "Description",
+                        "--no-pager",
+                    ],
+                    CmdOpt { timeout: Duration::from_secs(5), ..Default::default() },
+                ).await?;
+                // 单元不存在（LoadState=not-found）或输出异常 → None，由路由回 404。
+                // 用 `name` 直接构造强类型（show 的入参已校验），无需再次解析。
+                Ok(parse_systemd_show(&out.stdout, name))
+            }
+            _ => Err(panel_core::PanelError::Unsupported("service.show requires systemd")),
+        }
+    }
+
     async fn start(&self, name: &UnitName) -> Result<()> { self.act("start", name).await }
     async fn stop(&self, name: &UnitName) -> Result<()> { self.act("stop", name).await }
     async fn restart(&self, name: &UnitName) -> Result<()> { self.act("restart", name).await }
@@ -246,6 +267,45 @@ impl LinuxServices {
     }
 }
 
+/// 解析 `systemctl show -p LoadState -p ActiveState -p SubState -p UnitFileState -p Description` 的输出。
+///
+/// - 单元不存在（`LoadState=not-found`）、被屏蔽或输出为空 → 返回 `None`。
+/// - 否则构造 `ServiceUnit`：`enabled` 取自 `UnitFileState`（enabled / enabled-runtime 视为已启用）；
+///   `description` 可为空；`pid` / `memory_kib` 该命令取不到，留 `None`（详情页这些数据非必需）。
+fn parse_systemd_show(out: &str, name: &UnitName) -> Option<ServiceUnit> {
+    let mut load = "";
+    let mut active = "";
+    let mut unit_file = "";
+    let mut desc = String::new();
+    for line in out.lines() {
+        if let Some(v) = line.strip_prefix("LoadState=") { load = v; }
+        else if let Some(v) = line.strip_prefix("ActiveState=") { active = v; }
+        else if let Some(v) = line.strip_prefix("UnitFileState=") { unit_file = v; }
+        else if let Some(v) = line.strip_prefix("Description=") { desc = v.to_string(); }
+    }
+    // 只认真正加载成功的单元；not-found / masked / error / generated 等一律视为"查不到"
+    if load != "loaded" {
+        return None;
+    }
+    let state = match active {
+        "active" => ServiceState::Active,
+        "inactive" => ServiceState::Inactive,
+        "failed" => ServiceState::Failed,
+        "activating" => ServiceState::Activating,
+        "deactivating" => ServiceState::Deactivating,
+        _ => ServiceState::Unknown,
+    };
+    let enabled = matches!(unit_file, "enabled" | "enabled-runtime");
+    Some(ServiceUnit {
+        name: name.clone(),
+        description: desc,
+        state,
+        enabled,
+        pid: None,
+        memory_kib: None,
+    })
+}
+
 fn parse_systemd_list(s: &str) -> Vec<ServiceUnit> {
     let mut out = Vec::new();
     for line in s.lines() {
@@ -300,5 +360,22 @@ mod tests {
         // 即便 systemctl 输出被污染，非法单元名也不会进入强类型
         let s = "evil;rm -rf /  loaded active running\n";
         assert!(parse_systemd_list(s).is_empty());
+    }
+
+    #[test]
+    fn parse_systemd_show_handles_dead_and_missing() {
+        // 刚装好、enabled 但 dead（从未 start）的服务：LoadState=loaded、ActiveState=inactive
+        let dead = "LoadState=loaded\nActiveState=inactive\nSubState=dead\n\
+                    UnitFileState=enabled\nDescription=A high performance web server\n";
+        let un = panel_core::unit_name("nginx.service").unwrap();
+        let u = parse_systemd_show(dead, &un).expect("dead 服务应可被查到");
+        assert_eq!(u.state, ServiceState::Inactive);
+        assert!(u.enabled);
+        assert_eq!(u.description, "A high performance web server");
+
+        // 单元根本不存在 → None（路由据此回 404）
+        assert!(parse_systemd_show("LoadState=not-found\n", &un).is_none());
+        // 输出为空（异常）也应 None
+        assert!(parse_systemd_show("", &un).is_none());
     }
 }
