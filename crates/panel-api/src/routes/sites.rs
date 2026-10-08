@@ -2033,11 +2033,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         ensure_site_root_dir(&d);
         assert!(d.is_dir(), "站点根目录应被创建");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&d).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o755, "目录应显式设为 755（不再依赖 umask）");
+        // 权限走跨平台 owner（panel_os::fs 内部已按平台分支实现），业务层不写平台条件编译。
+        // Linux 上 mode_of 恒返回 Some，断言必执行；非 unix 平台该特性本就为 no-op。
+        if let Some(m) = panel_os::fs::mode_of(&d) {
+            assert_eq!(m & 0o777, 0o755, "目录应显式设为 755（不再依赖 umask）");
         }
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -2050,11 +2049,8 @@ mod tests {
         ensure_site_root_dir(&d);
         ensure_site_root_dir(&d);
         assert!(d.is_dir());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&d).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o755);
+        if let Some(m) = panel_os::fs::mode_of(&d) {
+            assert_eq!(m & 0o777, 0o755);
         }
         let _ = std::fs::remove_dir_all(&d);
     }
