@@ -446,7 +446,8 @@ components:
         domains:  { type: array, items: { type: string } }
         root:     { type: string }
         kind:     { type: string, enum: [static, proxy, php], description: "站点类型（库内口径为 static | reverse_proxy | php；API 把 reverse_proxy 呈现为 proxy）" }
-        enabled:  { type: boolean }
+        enabled:  { type: boolean, description: "期望状态：是否已纳入 Web 服务器配置（新建默认 true）。它**不**代表站点正在对外服务——后者见 deployed" }
+        deployed: { type: boolean, description: "配置是否已真实下发到 Web 服务器（apply 成功写入 conf_path 后为 true）。enabled=true 而 deployed=false 即「已登记、未下发」，此时访问域名会连接失败" }
         tls:      { type: boolean }
         waf_enabled:      { type: boolean, description: "WAF 是否启用" }
         waf_profile:      { type: [string, "null"], enum: [basic, strict, null], description: "WAF 档位；未启用为 null" }
@@ -1430,10 +1431,10 @@ paths:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/Site' } } } }
     post:
       tags: [sites]
-      summary: 新建站点（仅写入站点定义，不下发 Web 服务器配置）
+      summary: 新建站点（写入站点定义；要求本机已有 Web 服务器底座）
       security: [cookieAuth, csrfHeader]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SiteCreate' } } } }
-      responses: { '201': { description: 已创建（此时站点尚未对外服务，需一次 apply，或在编辑页打开 enabled） }, '400': { description: 参数非法 } }
+      responses: { '201': { description: 已创建（此时站点尚未对外服务，需一次 apply，或在编辑页打开 enabled） }, '400': { description: 参数非法 }, '501': { description: '本机未接入 Web 服务器（webserver.manage 为 no，例如未安装 nginx）：拒绝建站，以免产生永远打不开的站点' } }
   /api/v1/sites/root:
     get:
       tags: [sites]

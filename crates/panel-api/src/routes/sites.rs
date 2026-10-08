@@ -57,6 +57,9 @@ struct RawSite {
     upstreams_json: Option<String>,
     /// php-fpm 目标（unix:/path.sock | host:port）；非 php 站点为 NULL
     fpm: Option<String>,
+    /// apply 写入的 nginx 配置路径；**从未成功下发则为 NULL / 空串**。
+    /// 这是「配置是否真落到 Web 服务器」的唯一判据——`enabled` 只表示期望状态。
+    conf_path: Option<String>,
 }
 
 impl RawSite {
@@ -88,6 +91,9 @@ pub struct SiteOut {
     /// API 口径：static | proxy（schema 内为 static | reverse_proxy）
     pub kind: String,
     pub enabled: bool,
+    /// 配置是否已真实下发到 Web 服务器（`conf_path` 非空）。
+    /// 与 `enabled`（期望状态）区分：新建后未 apply 时 enabled=true 而 deployed=false。
+    pub deployed: bool,
     /// 是否已有绑定的 SSL 证书
     pub tls: bool,
     pub created_at: i64,
@@ -135,6 +141,7 @@ fn to_out(r: &RawSite) -> SiteOut {
         root: r.root.clone(),
         kind: kind_to_api(&r.kind).to_string(),
         enabled: r.enabled != 0,
+        deployed: r.conf_path.as_deref().map(|p| !p.is_empty()).unwrap_or(false),
         tls: r.tls,
         created_at: r.created_at,
         waf_enabled: r.waf_enabled != 0,
@@ -154,7 +161,7 @@ fn db_err(e: rusqlite::Error) -> PanelError {
 const SITE_SELECT: &str = "s.id, s.name, s.domains, s.root, s.kind, s.enabled, s.created_at,
        (SELECT COUNT(*) FROM ssl_certs c WHERE c.site_id = s.id) AS tls_count,
        s.waf_enabled, s.waf_profile, s.waf_rate, s.waf_burst,
-       s.upstreams_json, s.fpm";
+       s.upstreams_json, s.fpm, s.conf_path";
 
 /// 站点查询 SQL。
 ///
@@ -189,6 +196,7 @@ async fn fetch_all(state: &Shared) -> Result<Vec<RawSite>> {
                         waf_burst: r.get(11)?,
                     upstreams_json: r.get(12)?,
                     fpm: r.get(13)?,
+                    conf_path: r.get(14)?,
                     })
                 })
                 .map_err(db_err)?;
@@ -224,6 +232,7 @@ async fn fetch_one(state: &Shared, id: i64) -> Result<Option<RawSite>> {
                     waf_burst: r.get(11)?,
                     upstreams_json: r.get(12)?,
                     fpm: r.get(13)?,
+                    conf_path: r.get(14)?,
                 })
             })
             .map_err(db_err)?;
@@ -256,6 +265,7 @@ async fn fetch_one_by_name(state: &Shared, name: &str) -> Result<Option<RawSite>
                     waf_burst: r.get(11)?,
                     upstreams_json: r.get(12)?,
                     fpm: r.get(13)?,
+                    conf_path: r.get(14)?,
                 })
             })
             .map_err(db_err)?;
@@ -347,6 +357,17 @@ pub async fn create(
     Json(req): Json<CreateReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SITE_MANAGE)?;
+    // 没有 Web 服务器底座就不许建站：否则用户拿到一个「建好了但永远打不开」的
+    // 空中楼阁，列表还会亮绿标。与 apply / reload 共用同一道守卫——绝不只在前端
+    // 置灰（那样绕开 UI 仍能造出打不开的站点）。
+    if !state
+        .capabilities
+        .get(cap_keys::WEBSERVER_MANAGE)
+        .map(|c| c.supported)
+        .unwrap_or(false)
+    {
+        return Err(ApiError::unsupported("webserver.manage"));
+    }
     let name = req.name.trim().to_string();
     if name.is_empty() {
         return Err(ApiError::bad_request("name", "name required"));
@@ -402,6 +423,7 @@ pub async fn create(
                     root: root_str,
                     kind: "static".into(),
                     enabled: true,
+                    deployed: false,
                     tls: false,
                     created_at: now,
                     // 兜底分支：站点刚建、WAF **默认关闭**——防护能力的默认值
