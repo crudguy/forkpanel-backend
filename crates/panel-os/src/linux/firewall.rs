@@ -185,6 +185,20 @@ fn gen_id() -> String {
 impl FirewallProvider for LinuxFirewall {
     fn backend(&self) -> FirewallBackend { self.backend }
 
+    fn capability(&self) -> Capability {
+        match self.backend {
+            // 只有 ufw 真能跑。其余后端报 no —— 否则前端显示"支持"，
+            // 用户一点删除才收到 501，是典型的"能力位撒谎"。
+            FirewallBackend::Ufw => Capability::yes("ufw"),
+            FirewallBackend::None => Capability::no("binary_missing"),
+            FirewallBackend::Nftables => Capability::no("仅支持 ufw，当前检测到 nftables"),
+            FirewallBackend::Iptables => Capability::no("仅支持 ufw，当前检测到 iptables"),
+            FirewallBackend::Firewalld => Capability::no("仅支持 ufw，当前检测到 firewalld"),
+            FirewallBackend::WindowsFirewall => Capability::no("仅支持 ufw，当前为 Windows 防火墙"),
+            FirewallBackend::Pf => Capability::no("仅支持 ufw，当前为 pf"),
+        }
+    }
+
     async fn is_active(&self) -> Result<bool> {
         self.ensure_ufw()?;
         let out = self.ufw(&["status"], Duration::from_secs(10)).await?;
@@ -437,22 +451,6 @@ fn parse_jail_detail(name: &str, text: &str) -> Fail2banJail {
         }
     }
     j
-}
-
-impl Capable for LinuxFirewall {
-    fn capability(&self) -> Capability {
-        match self.backend {
-            // 只有 ufw 真能跑。其余后端报 no —— 否则前端显示"支持"，
-            // 用户一点删除才收到 501，是典型的"能力位撒谎"。
-            FirewallBackend::Ufw => Capability::yes("ufw"),
-            FirewallBackend::None => Capability::no("binary_missing"),
-            FirewallBackend::Nftables => Capability::no("仅支持 ufw，当前检测到 nftables"),
-            FirewallBackend::Iptables => Capability::no("仅支持 ufw，当前检测到 iptables"),
-            FirewallBackend::Firewalld => Capability::no("仅支持 ufw，当前检测到 firewalld"),
-            FirewallBackend::WindowsFirewall => Capability::no("仅支持 ufw，当前为 Windows 防火墙"),
-            FirewallBackend::Pf => Capability::no("仅支持 ufw，当前为 pf"),
-        }
-    }
 }
 
 #[cfg(test)]

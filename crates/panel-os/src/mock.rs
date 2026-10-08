@@ -178,6 +178,7 @@ impl MockFirewall { pub(crate) fn new(state: Arc<Mutex<State>>) -> Self { Self {
 #[async_trait]
 impl FirewallProvider for MockFirewall {
     fn backend(&self) -> FirewallBackend { FirewallBackend::Nftables }
+    fn capability(&self) -> Capability { Capability::yes("mock") }
     async fn is_active(&self) -> Result<bool> { Ok(true) }
     async fn set_active(&self, _a: bool) -> Result<()> { Ok(()) }
 

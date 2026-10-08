@@ -9,6 +9,7 @@ pub mod files;
 /// 第三方官方 apt 源注入（方案1：加官方源；含 GPG 指纹校验）。
 pub mod repo;
 pub mod firewall;
+pub mod firewall_nft;
 pub mod metrics;
 pub mod scheduler;
 pub mod security;
@@ -17,6 +18,7 @@ pub mod stub;
 pub mod terminal;
 
 use crate::{
+    cmd::Bin,
     paths::LinuxPathLayout,
     traits::*,
 };
@@ -28,7 +30,7 @@ pub struct LinuxOsAdapter {
     pub paths: Arc<LinuxPathLayout>,
     pub metrics: Arc<metrics::LinuxMetrics>,
     pub services: Arc<services::LinuxServices>,
-    pub firewall: Arc<firewall::LinuxFirewall>,
+    pub firewall: Arc<dyn FirewallProvider>,
     pub packages: Arc<stub::LinuxPackages>,
     pub logs: Arc<stub::LinuxLogs>,
     pub scheduler: Arc<scheduler::LinuxScheduler>,
@@ -50,7 +52,7 @@ impl LinuxOsAdapter {
         Self {
             metrics: Arc::new(metrics::LinuxMetrics::new()),
             services: Arc::new(services::LinuxServices::detect()),
-            firewall: Arc::new(firewall::LinuxFirewall::detect()),
+            firewall: make_firewall(),
             packages: Arc::new(stub::LinuxPackages::detect()),
             logs: Arc::new(stub::LinuxLogs::detect(paths.clone())),
             scheduler: Arc::new(scheduler::LinuxScheduler::default()),
@@ -91,6 +93,21 @@ impl LinuxOsAdapter {
 }
 
 impl Default for LinuxOsAdapter { fn default() -> Self { Self::new() } }
+
+/// 选择防火墙后端：ufw 优先（仅它经过完整实现与测试），其次 nftables；
+/// 都没有则退回一个「诚实报不支持」的占位（LinuxFirewall 的 None 后端）。
+///
+/// 注意：`Arc<dyn FirewallProvider>` 是 trait object——能力位由具体实现决定，
+/// 路由层据此置灰 UI，绝不伪造成功。
+fn make_firewall() -> Arc<dyn FirewallProvider> {
+    if Bin::Ufw.available() {
+        Arc::new(firewall::LinuxFirewall::detect())
+    } else if firewall_nft::NftFirewall::available() {
+        Arc::new(firewall_nft::NftFirewall)
+    } else {
+        Arc::new(firewall::LinuxFirewall::detect())
+    }
+}
 
 /// 读取 /etc/os-release，避免硬编码发行版分支
 pub fn detect_platform() -> PlatformInfo {

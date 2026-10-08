@@ -394,6 +394,12 @@ pub struct Fail2banStatus {
 #[async_trait]
 pub trait FirewallProvider: Send + Sync {
     fn backend(&self) -> FirewallBackend;
+    /// 该后端的能力位（按二进制存在性等判定）。前端据此置灰，绝不伪造成功。
+    ///
+    /// 作为 trait 方法而非独立 `Capable` impl：路由层持有 `Arc<dyn FirewallProvider>`，
+    /// 只有落在 vtable 里的方法才能经 trait object 调用（单独 `impl Capable` 的方法
+    /// 不在 `FirewallProvider` 的 vtable 中，编译期即报 `no method named capability`）。
+    fn capability(&self) -> Capability;
     async fn is_active(&self) -> Result<bool>;
     async fn set_active(&self, active: bool) -> Result<()>;
     async fn list_rules(&self) -> Result<Vec<FirewallRule>>;
