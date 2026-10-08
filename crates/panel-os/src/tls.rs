@@ -8,7 +8,7 @@
 
 use crate::cmd::{Bin, CmdOpt};
 use panel_core::{PanelError, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// openssl 是否可用（供能力位 `ssl.selfsigned` 判定）。只做存在性检查。
@@ -132,7 +132,7 @@ pub async fn generate_self_signed(
         Ok(o) if o.code == Some(0) => {}
         Ok(o) => {
             cleanup(&dir);
-            return Err(PanelError::Command { bin: "openssl".into(), detail: truncate(&o.stderr) });
+            return Err(PanelError::Command { bin: "openssl".into(), detail: truncate(&o.stderr, 2000) });
         }
         Err(e) => { cleanup(&dir); return Err(e); }
     }
@@ -149,8 +149,188 @@ fn unique() -> u64 {
     C.fetch_add(1, Ordering::Relaxed)
 }
 
-fn truncate(s: &str) -> String {
-    if s.len() <= 2000 { s.to_string() } else { format!("{}…(truncated)", &s[..2000]) }
+fn truncate(s: &str, n: usize) -> String {
+    if s.len() <= n { s.to_string() } else { format!("{}…(truncated)", &s[..n]) }
+}
+
+// ─────────────── ForkPanel 本地根 CA ───────────────
+//
+// 自签证书打不开 HTTPS 的根本原因：浏览器只信任**已安装的根 CA**，
+// 而 `generate_self_signed` 产出的是「自签 leaf」（Issuer==Subject），
+// 没有可信链 → NET::ERR_CERT_AUTHORITY_INVALID，用户无法在不点「继续前往」
+// 的情况下正常打开。
+//
+// 修法（mkcert 模式）：面板持有**一张持久的根 CA**，所有自签 leaf 都由其签发。
+// 用户只需把这张根证书安装进系统/浏览器信任库一次，之后全部本地 HTTPS 站点
+// 都能无警告打开。根 CA 私钥只留在服务器（data/ssl/ca/），浏览器只需根证书。
+//
+// 目录布局由调用方（`panel-api` 的 ssl_dir）决定，本模块只接收 `ca_dir` 路径，
+// 保持「crypto 不碰业务目录」的分层。
+
+/// 根 CA 的主题名（即用户安装后看到的颁发者）。
+///
+/// `pub` 是刻意的：业务层写证书 `issuer` 字段时必须与真实签发者一致，
+/// 否则列表里显示「面板自签」而实际签发者是本 CA，用户看到的名字对不上。
+pub const CA_CN: &str = "ForkPanel Local CA";
+/// 根 CA 有效期（天）。本地开发用，给足 10 年避免频繁重签。
+const CA_DAYS: u32 = 3650;
+/// 自签 leaf 的本地访问兜底 SAN：无论站点域名是什么都附上这些，
+/// 让用户用 `localhost` / `127.0.0.1` / `[::1]` 访问也能匹配
+/// （否则按 IP/回环名访问必报名称不匹配）。
+const LOCAL_SAN: &[&str] = &["localhost", "127.0.0.1", "::1"];
+
+fn ca_cert_path(ca_dir: &Path) -> PathBuf { ca_dir.join("ca.crt") }
+fn ca_key_path(ca_dir: &Path) -> PathBuf { ca_dir.join("ca.key") }
+
+/// 确保 ForkPanel 本地根 CA 存在：缺失时生成一对 RSA-2048（`CA:TRUE,pathlen:0`）
+/// 落盘到 `ca_dir`；已存在则直接返回（幂等）。
+///
+/// 并发首跑的最坏情况：两个请求都判定缺失、各生成一张，后落的覆盖先落的——
+/// 本地开发可接受（用户重装一次根证书即可）。落盘前会再判一次，若此时已被
+/// 其它请求创建则丢弃本次生成，避免无谓覆盖。
+pub async fn ensure_root_ca(ca_dir: &Path, tmp_dir: &Path) -> Result<()> {
+    if ca_cert_path(ca_dir).is_file() && ca_key_path(ca_dir).is_file() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(ca_dir).map_err(|e| PanelError::Internal(e.to_string()))?;
+
+    let work = tmp_dir.join(format!("ca-gen-{}-{}", std::process::id(), unique()));
+    std::fs::create_dir_all(&work).map_err(|e| PanelError::Internal(e.to_string()))?;
+    let crt = work.join("ca.crt");
+    let key = work.join("ca.key");
+    let (cs, ks) = (
+        crt.to_str().ok_or_else(|| PanelError::Internal("tmp path not utf8".into()))?,
+        key.to_str().ok_or_else(|| PanelError::Internal("tmp path not utf8".into()))?,
+    );
+    let subj = format!("/CN={CA_CN}");
+    let req_args: Vec<String> = vec![
+        "req".into(), "-x509".into(), "-newkey".into(), "rsa:2048".into(),
+        "-nodes".into(), "-keyout".into(), ks.into(), "-out".into(), cs.into(),
+        "-days".into(), CA_DAYS.to_string(),
+        "-subj".into(), subj,
+        "-addext".into(), "basicConstraints=critical,CA:TRUE,pathlen:0".into(),
+        "-addext".into(), "keyUsage=critical,keyCertSign,cRLSign".into(),
+        "-addext".into(), "subjectKeyIdentifier=hash".into(),
+    ];
+    let a: Vec<&str> = req_args.iter().map(|s| s.as_str()).collect();
+    let r = crate::cmd::run(
+        Bin::OpenSsl, &a,
+        CmdOpt { timeout: Duration::from_secs(60), ..Default::default() },
+    ).await;
+    let cleanup = |dir: &Path| { let _ = std::fs::remove_dir_all(dir); };
+    match r {
+        Ok(o) if o.code == Some(0) => {}
+        Ok(o) => { cleanup(&work); return Err(PanelError::Command { bin: "openssl".into(), detail: truncate(&o.stderr, 2000) }); }
+        Err(e) => { cleanup(&work); return Err(e); }
+    }
+
+    // 落盘前再判一次：若已被并发请求创建，则丢弃本次生成，沿用既有根 CA
+    if ca_cert_path(ca_dir).is_file() && ca_key_path(ca_dir).is_file() {
+        cleanup(&work);
+        return Ok(());
+    }
+    std::fs::copy(&crt, ca_cert_path(ca_dir)).map_err(|e| PanelError::Internal(e.to_string()))?;
+    std::fs::copy(&key, ca_key_path(ca_dir)).map_err(|e| PanelError::Internal(e.to_string()))?;
+    #[cfg(unix)]
+    let _ = std::fs::set_permissions(
+        ca_key_path(ca_dir),
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    );
+    cleanup(&work);
+    Ok(())
+}
+
+/// 读取根证书 PEM（供「下载根证书」端点）。调用前应已 `ensure_root_ca`。
+pub fn root_ca_pem(ca_dir: &Path) -> Result<String> {
+    std::fs::read_to_string(ca_cert_path(ca_dir))
+        .map_err(|e| PanelError::NotFound(format!("根证书尚未生成：{e}")))
+}
+
+/// 由 ForkPanel 本地根 CA 签发一张 leaf 证书（含站点域名 + 本地回环 SAN）。
+/// 返回 `(leaf_cert_pem, leaf_key_pem)`。根 CA 不存在时自动创建。
+///
+/// 与 `generate_self_signed` 的区别：leaf 的 Issuer 是 `ForkPanel Local CA`，
+/// 而非自身 —— 浏览器装上根证书后即信任该 leaf，HTTPS 不再报「非私密连接」。
+pub async fn issue_leaf_signed_by_ca(
+    ca_dir: &Path,
+    tmp_dir: &Path,
+    domains: &[String],
+    days: u32,
+) -> Result<(String, String)> {
+    if domains.is_empty() {
+        return Err(PanelError::ConfigInvalid { detail: "domains 为空".into() });
+    }
+    ensure_root_ca(ca_dir, tmp_dir).await?;
+
+    let work = tmp_dir.join(format!("leaf-{}-{}", std::process::id(), unique()));
+    std::fs::create_dir_all(&work).map_err(|e| PanelError::Internal(e.to_string()))?;
+    let leaf_key = work.join("leaf.key");
+    let leaf_csr = work.join("leaf.csr");
+    let leaf_crt = work.join("leaf.crt");
+    let (lks, lcs, lcc) = (
+        leaf_key.to_str().ok_or_else(|| PanelError::Internal("tmp path not utf8".into()))?,
+        leaf_csr.to_str().ok_or_else(|| PanelError::Internal("tmp path not utf8".into()))?,
+        leaf_crt.to_str().ok_or_else(|| PanelError::Internal("tmp path not utf8".into()))?,
+    );
+
+    // SAN：站点域名 + 本地兜底名（去重保序）。IP 走 IP SAN、域名走 DNS SAN，
+    // 混用会让浏览器报名称不匹配（见 `san_entry`）。
+    // 两侧都先归一到 `&str` 才能 chain——`domains` 是 `&String`、`LOCAL_SAN` 是 `&str`。
+    let mut sans: Vec<String> = Vec::new();
+    for d in domains.iter().map(|s| s.as_str()).chain(LOCAL_SAN.iter().copied()) {
+        let e = san_entry(d);
+        if !sans.contains(&e) { sans.push(e); }
+    }
+    let san = sans.join(",");
+    let cn = &domains[0];
+    let subj = format!("/CN={cn}");
+    let addext = format!("subjectAltName={san}");
+
+    // 1) 生成 leaf 私钥 + CSR（SAN 作为 request 扩展写入，供签发时 copy 回来）
+    let req_args: Vec<String> = vec![
+        "req".into(), "-newkey".into(), "rsa:2048".into(), "-nodes".into(),
+        "-keyout".into(), lks.into(), "-out".into(), lcs.into(),
+        "-subj".into(), subj, "-addext".into(), addext,
+    ];
+    let a: Vec<&str> = req_args.iter().map(|s| s.as_str()).collect();
+    let r1 = crate::cmd::run(
+        Bin::OpenSsl, &a,
+        CmdOpt { timeout: Duration::from_secs(60), ..Default::default() },
+    ).await;
+
+    // 2) 用根 CA 签发 leaf（copy_extensions copyall 把 CSR 里的 SAN 带进证书）
+    let (cac, cak) = (
+        ca_cert_path(ca_dir).to_str().ok_or_else(|| PanelError::Internal("ca path not utf8".into()))?.to_string(),
+        ca_key_path(ca_dir).to_str().ok_or_else(|| PanelError::Internal("ca path not utf8".into()))?.to_string(),
+    );
+    let sign_args: Vec<String> = vec![
+        "x509".into(), "-req".into(), "-in".into(), lcs.into(),
+        "-CA".into(), cac, "-CAkey".into(), cak,
+        "-CAcreateserial".into(), "-out".into(), lcc.into(),
+        "-days".into(), days.to_string(),
+        "-copy_extensions".into(), "copyall".into(),
+    ];
+    let b: Vec<&str> = sign_args.iter().map(|s| s.as_str()).collect();
+    let r2 = crate::cmd::run(
+        Bin::OpenSsl, &b,
+        CmdOpt { timeout: Duration::from_secs(60), ..Default::default() },
+    ).await;
+
+    let cleanup = |dir: &Path| { let _ = std::fs::remove_dir_all(dir); };
+    if let Err(e) = &r1 { cleanup(&work); return Err(PanelError::Command { bin: "openssl".into(), detail: truncate(&e.to_string(), 2000) }); }
+    let (crt, key) = match (&r1, &r2) {
+        (Ok(o1), Ok(o2)) if o1.code == Some(0) && o2.code == Some(0) => {
+            let c = std::fs::read_to_string(&leaf_crt).map_err(|e| PanelError::Internal(e.to_string()))?;
+            let k = std::fs::read_to_string(&leaf_key).map_err(|e| PanelError::Internal(e.to_string()))?;
+            (c, k)
+        }
+        (Ok(o1), _) if o1.code != Some(0) => { cleanup(&work); return Err(PanelError::Command { bin: "openssl".into(), detail: truncate(&o1.stderr, 2000) }); }
+        (_, Ok(o2)) if o2.code != Some(0) => { cleanup(&work); return Err(PanelError::Command { bin: "openssl".into(), detail: truncate(&o2.stderr, 2000) }); }
+        (_, Err(e)) => { cleanup(&work); return Err(e.clone()); }
+        _ => { cleanup(&work); return Err(PanelError::Internal("unexpected openssl state".into())); }
+    };
+    cleanup(&work);
+    Ok((crt, key))
 }
 
 #[cfg(test)]
@@ -185,5 +365,27 @@ mod tests {
         // SubjectAltName 应包含两个域名（openssl 输出的文本里能看到）
         let _ = &domains;
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 本地根 CA 签发：leaf 应为合法 PEM，且根 CA 被创建、可被读取。
+    #[tokio::test]
+    async fn issue_leaf_by_ca_when_openssl_present() {
+        if !available() { return; }
+        let base = std::env::temp_dir().join(format!("panel-ca-test-{}", unique()));
+        let tmp = base.join("tmp");
+        let ca_dir = base.join("ca");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let domains = vec!["site.example".to_string()];
+        let (cert, key) = issue_leaf_signed_by_ca(&ca_dir, &tmp, &domains, 30)
+            .await
+            .expect("由本地根 CA 签发 leaf");
+        assert!(cert.contains("BEGIN CERTIFICATE"), "leaf cert 应为 PEM: {cert}");
+        assert!(key.contains("PRIVATE KEY"), "leaf key 应为 PEM: {key}");
+        // 根 CA 必须已落盘且可读
+        let ca = root_ca_pem(&ca_dir).expect("读取根证书");
+        assert!(ca.contains("BEGIN CERTIFICATE"), "根证书应为 PEM: {ca}");
+        assert!(ca_dir.join("ca.crt").is_file(), "ca.crt 应落盘");
+        assert!(ca_dir.join("ca.key").is_file(), "ca.key 应落盘");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -1527,6 +1527,21 @@ paths:
         '202': { description: ACME 申请已入队 }
         '501': { description: 无 Web 服务器底座（webserver.manage）时不签发——证书没有进程可加载，只会造成「已配置」却不生效的假象 }
 
+  /api/v1/ssl/ca:
+    get:
+      tags: [sites]
+      summary: 下载面板本地根证书（ca.crt）
+      description: |
+        自签证书（method=self-signed）的 leaf 全部由面板本地根 CA 签发；浏览器只信任已安装的根 CA，
+        所以「自签证书打不开 HTTPS」的解法是——下载本证书并导入系统/浏览器信任库一次，
+        此后全部本地 HTTPS 站点都不再报「非私密连接」。仅返回证书，绝不返回私钥（ca.key 始终留在服务器）。
+      responses:
+        '200':
+          description: 根证书（application/x-x509-ca-cert，附件名 forkpanel-local-ca.crt）
+          content:
+            application/x-x509-ca-cert:
+              schema: { type: string, format: binary }
+        '401': { description: 未登录 }
   /api/v1/certs:
     get:
       tags: [sites]

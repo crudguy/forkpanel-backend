@@ -137,6 +137,7 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/sites/{id}/reload", post(sites::reload))
         .route("/api/v1/sites/{id}/logs", get(sites::logs))
         .route("/api/v1/sites/{id}/ssl/apply", post(sites::ssl_apply))
+        .route("/api/v1/ssl/ca", get(sites::ssl_ca_download))
         .route("/api/v1/certs", get(sites::certs))
         .route("/api/v1/certs/{id}/renew", post(sites::cert_renew))
         .route("/api/v1/certs/{id}/auto-renew", patch(sites::cert_auto_renew))

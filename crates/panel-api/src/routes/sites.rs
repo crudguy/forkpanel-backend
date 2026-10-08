@@ -27,10 +27,10 @@ use crate::{
 };
 use axum::{
     extract::{Path as AxPath, Query, State},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     Json,
 };
-use axum::http::StatusCode;
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use panel_core::{cap_keys, domain, PanelError, Result, SafePath};
 use panel_os::{paths::slug, tls};
 use serde::{Deserialize, Serialize};
@@ -1162,6 +1162,11 @@ fn ssl_dir(state: &Shared) -> PathBuf {
     state.os.paths().data_dir().join("ssl")
 }
 
+/// 面板本地根 CA 目录（签发/验证自签 leaf 用；浏览器只需下载 `ca.crt`）。
+fn ca_dir(state: &Shared) -> PathBuf {
+    ssl_dir(state).join("ca")
+}
+
 /// 由首个域名派生该站点证书的 (crt, key) 落盘路径（与 provider 配置文件名同源命名）。
 fn cert_paths_for(state: &Shared, domains: &[String]) -> (PathBuf, PathBuf) {
     let stem = slug(domains.first().map(|s| s.as_str()).unwrap_or("site"));
@@ -1421,7 +1426,10 @@ pub async fn ssl_apply(
     let master = state.require_secret_key()?;
 
     let tmp = state.os.paths().tmp_dir();
-    let (cert_pem, key_pem) = tls::generate_self_signed(&tmp, &domains, SELF_SIGNED_DAYS).await?;
+    // 改为由面板本地根 CA 签发 leaf（而非裸自签）：装上根证书后浏览器即信任，
+    // HTTPS 不再报「非私密连接」。SAN 自动含 localhost/127.0.0.1/::1，本地任意访问方式都匹配。
+    let (cert_pem, key_pem) =
+        tls::issue_leaf_signed_by_ca(&ca_dir(&state), &tmp, &domains, SELF_SIGNED_DAYS).await?;
     let key_enc = master.encrypt(key_pem.as_bytes()).map_err(ApiError::from)?;
 
     // 落盘（nginx 读取）；私钥明文只存在于 0600 文件，库内为密文
@@ -1430,7 +1438,9 @@ pub async fn ssl_apply(
 
     let now = crate::now_unix();
     let not_after = now + (SELF_SIGNED_DAYS as i64) * 86_400;
-    let issuer = "ForkPanel Self-Signed".to_string();
+    // 签发者必须与真实签发者一致：leaf 由面板本地根 CA 签发，写成「Self-Signed」
+    // 会让用户在证书列表/浏览器里看到的名字与实际签发者对不上。
+    let issuer = tls::CA_CN.to_string();
     let domains_json = serde_json::to_string(&domains).unwrap_or_else(|_| "[]".into());
     let site_id = id;
     let (dj, iss, cert) = (domains_json.clone(), issuer.clone(), cert_pem);
@@ -1460,6 +1470,30 @@ pub async fn ssl_apply(
         "days_left": SELF_SIGNED_DAYS,
         "cert_path": crt_p.display().to_string(),
     })))
+}
+
+/// 下载面板本地根证书（`ca.crt`）。
+///
+/// 自签 leaf **全部**由这张根 CA 签发，而浏览器只信任「已安装的根 CA」——
+/// 所以「自签证书没法在本地用」的解法不是换证书，而是让用户把根证书装一次。
+/// 本端点即分发入口：返回 PEM 包装的 X.509，可被系统/浏览器信任库直接导入。
+///
+/// **只返回证书、绝不返回私钥**：`ca.key` 始终留在服务器（0600），浏览器不需要它。
+pub async fn ssl_ca_download(State(state): State<Shared>, Auth(s): Auth) -> ApiResult<Response> {
+    // 只读信息，站点查看权限即可——根证书不含私钥，泄露风险为零。
+    crate::auth::require(&s, perm::SITE_VIEW)?;
+    let tmp = state.os.paths().tmp_dir();
+    // 幂等：根 CA 尚未生成（用户还没申请过任何自签证书）时按需创建一张，
+    // 保证「先下载根证书、后申请站点证书」的顺序也能拿到同源的根。
+    tls::ensure_root_ca(&ca_dir(&state), &tmp).await?;
+    let pem = tls::root_ca_pem(&ca_dir(&state))?;
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/x-x509-ca-cert"));
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment; filename=\"forkpanel-local-ca.crt\""),
+    );
+    Ok((headers, pem).into_response())
 }
 
 // ─────────────── ACME 任务体（签发 / 续期） ───────────────
@@ -1623,14 +1657,19 @@ pub async fn cert_renew(
 
     let master = state.require_secret_key()?;
     let tmp = state.os.paths().tmp_dir();
-    let (cert_pem, key_pem) = tls::generate_self_signed(&tmp, &domains, SELF_SIGNED_DAYS).await?;
+    // 改为由面板本地根 CA 签发 leaf（而非裸自签）：装上根证书后浏览器即信任，
+    // HTTPS 不再报「非私密连接」。SAN 自动含 localhost/127.0.0.1/::1，本地任意访问方式都匹配。
+    let (cert_pem, key_pem) =
+        tls::issue_leaf_signed_by_ca(&ca_dir(&state), &tmp, &domains, SELF_SIGNED_DAYS).await?;
     let key_enc = master.encrypt(key_pem.as_bytes()).map_err(ApiError::from)?;
     let (crt_p, key_p) = cert_paths_for(&state, &domains);
     write_cert_files(&crt_p, &key_p, &cert_pem, &key_pem)?;
 
     let now = crate::now_unix();
     let not_after = now + (SELF_SIGNED_DAYS as i64) * 86_400;
-    let issuer = "ForkPanel Self-Signed".to_string();
+    // 签发者必须与真实签发者一致：leaf 由面板本地根 CA 签发，写成「Self-Signed」
+    // 会让用户在证书列表/浏览器里看到的名字与实际签发者对不上。
+    let issuer = tls::CA_CN.to_string();
     let iss2 = issuer.clone();
     let cert2 = cert_pem;
     state
