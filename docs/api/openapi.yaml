@@ -517,7 +517,7 @@ components:
         days_left:   { type: [integer, "null"] }
         auto_renew:  { type: boolean }
         renew_state: { type: string, enum: [idle, pending, ok, failed] }
-        source:      { type: string, enum: [acme, self-signed, manual] }
+        source:      { type: string, enum: [acme, selfsigned, manual], description: '证书记录的来源（落库值）。注意申请接口的 method 用连字符 self-signed，落库时统一为 selfsigned' }
     SslApply:
       type: object
       required: [method]
@@ -1492,13 +1492,14 @@ paths:
   /api/v1/sites/{id}/ssl/apply:
     post:
       tags: [sites]
-      summary: 申请证书（self-signed 同步完成 → 200；ACME 任务化 → 202）
+      summary: 申请证书（self-signed 同步完成 → 200；ACME 任务化 → 202；无 Web 服务器 → 501）
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SslApply' } } } }
       responses:
         '200': { description: 自签证书已签发并落盘（含 cert_path / not_after / days_left） }
         '202': { description: ACME 申请已入队 }
+        '501': { description: 无 Web 服务器底座（webserver.manage）时不签发——证书没有进程可加载，只会造成「已配置」却不生效的假象 }
 
   /api/v1/certs:
     get:
@@ -1513,12 +1514,13 @@ paths:
   /api/v1/certs/{id}/renew:
     post:
       tags: [sites]
-      summary: 手动续期（自签同步 → 200；ACME 任务化 → 202）
+      summary: 手动续期（自签同步 → 200；ACME 任务化 → 202；无 Web 服务器 → 501）
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       responses:
         '200': { description: 自签证书已重新签发 }
         '202': { description: ACME 续期已入队 }
+        '501': { description: 无 Web 服务器底座（webserver.manage）时不续期 }
   /api/v1/certs/{id}/auto-renew:
     patch:
       tags: [sites]
