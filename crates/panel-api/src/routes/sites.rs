@@ -877,6 +877,10 @@ pub async fn apply(
     // 取一次现运行配置：TLS 与 WAF 都要基于"当前状态"做缺省合并
     let cur_row = fetch_one_by_name(&state, &req.name).await?;
     let waf = build_waf(req.waf.as_ref(), cur_row.as_ref().and_then(|r| r.waf()).as_ref())?;
+    // 停用态守恒：站点已停用则只更新配置、不下发 Web 服务器（conf_path 留空），
+    // 与 `patch` 的「真停用」语义一致——避免「点一次应用就把刚停用的站点又拉起来」。
+    // 新建站点（无 cur_row）按默认启用对待，照常部署。
+    let deploy = cur_row.as_ref().map(|r| r.enabled != 0).unwrap_or(true);
     // 落库四元组在这里就算好：`waf` 随即被 move 进 SiteSpec。
     // 关掉 WAF 时一并清空——留着旧数值会让"下次重新打开"意外带上几年前的参数，
     // 而用户早就不记得了。
@@ -961,15 +965,18 @@ pub async fn apply(
         .await
         .map_err(|e| ApiError::from(PanelError::ConfigInvalid { detail: e.to_string() }))?;
 
-    // 5) 部署：实现内部负责原子替换
-    state.os.webserver().deploy(&target, &rendered).await?;
+    // 5) 部署（仅启用态）。停用态：上面已渲染+校验通过配置，但**不**下发到 Web 服务器，
+    //    配置不会进 nginx，与「真停用」一致；用户启用站点后再应用才会真正生效。
+    if deploy {
+        state.os.webserver().deploy(&target, &rendered).await?;
 
-    // 6) reload。失败时配置已写入但服务未加载 —— 这是可恢复的（配置语法已校验过）
-    if let Err(e) = state.os.webserver().reload().await {
-        return Err(ApiError::from(PanelError::Command {
-            bin: "reload".to_string(),
-            detail: format!("配置已写入但 reload 失败：{e}"),
-        }));
+        // 6) reload。失败时配置已写入但服务未加载 —— 这是可恢复的（配置语法已校验过）
+        if let Err(e) = state.os.webserver().reload().await {
+            return Err(ApiError::from(PanelError::Command {
+                bin: "reload".to_string(),
+                detail: format!("配置已写入但 reload 失败：{e}"),
+            }));
+        }
     }
 
     // 7) 落库：此时系统已处于期望状态（按 name upsert，与 create 不冲突）
@@ -978,22 +985,25 @@ pub async fn apply(
     let root_str = root.as_path().display().to_string();
     let conf = target.display().to_string();
     let now = crate::now_unix();
-    let conf_db = conf.clone();
+    // 停用态：conf_path 留空（配置未下发），enabled 保持 0；启用态 / 新建：正常写入。
+    let conf_db = if deploy { conf.clone() } else { String::new() };
+    let enabled_i32: i32 = if deploy { 1 } else { 0 };
     state
         .db
         .exec(move |conn| {
-            // upstreams_json / fpm_str 已在 apply 开头算出（kind 之后被 move 进 SiteSpec）
+            // ?5 = enabled, ?6 = conf_path；deploy=false 时两者分别为 0 / 空串。
+            // upstreams_json / fpm_str 已在 apply 开头算出（kind 之后被 move 进 SiteSpec）。
             conn.execute(
                 "INSERT INTO sites(name, domains, root, kind, webserver, enabled, conf_path, created_at,
                                    waf_enabled, waf_profile, waf_rate, waf_burst, upstreams_json, fpm)
-                 VALUES(?1, ?2, ?3, ?4, 'nginx', 1, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 VALUES(?1, ?2, ?3, ?4, 'nginx', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                  ON CONFLICT(name) DO UPDATE SET
-                    domains=excluded.domains, root=excluded.root, kind=excluded.kind, enabled=1,
-                    conf_path=excluded.conf_path, webserver='nginx',
+                    domains=excluded.domains, root=excluded.root, kind=excluded.kind, enabled=?5,
+                    conf_path=?6, webserver='nginx',
                     waf_enabled=excluded.waf_enabled, waf_profile=excluded.waf_profile,
                     waf_rate=excluded.waf_rate, waf_burst=excluded.waf_burst,
                     upstreams_json=excluded.upstreams_json, fpm=excluded.fpm",
-                rusqlite::params![name, domains_json, root_str, kind_db, conf_db, now,
+                rusqlite::params![name, domains_json, root_str, kind_db, enabled_i32, conf_db, now,
                                   waf_on, waf_profile, waf_rate, waf_burst,
                                   upstreams_json, fpm_str],
             )
@@ -1004,7 +1014,11 @@ pub async fn apply(
 
     audit(&state, &s, "site.apply", &req.name, "ok").await;
     Ok(ok(serde_json::json!({
-        "name": req.name, "config": conf, "reloaded": true,
+        "name": req.name,
+        "config": conf,
+        "deployed": deploy,
+        "reloaded": deploy,
+        "enabled": deploy,
     })))
 }
 
