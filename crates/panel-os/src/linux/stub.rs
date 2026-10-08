@@ -365,35 +365,58 @@ impl PackageProvider for LinuxPackages {
         }
     }
 
-    /// 只读探测可升级包：`apt list --upgradable`，不改动系统。
+    /// 只读探测：给定**真实包名**，报出其中「版本表最高版本高于已安装版本」的项。
     ///
-    /// 为什么用 `apt list` 而不是 `apt-get -s upgrade`：后者会**列出所有**可升级包
-    /// （本机实测 32+ 个 lib* / libreoffice* 等系统库），而 UI 只该关心白名单内的软件；
-    /// 前者输出同样是「包名/源 版本 arch [upgradable from: 旧版本]」，解析后按需过滤即可。
-    /// 无包管理器时返回空列表（而非 Unsupported）——探测是锦上添花，不该让整页报错。
-    async fn upgradable(&self) -> Result<Vec<UpgradablePkg>> {
+    /// 为什么不用 `apt list --upgradable`（此前实现）：它按 apt 的 **Candidate** 判定，
+    /// 而 Candidate 会被 pin / `NotAutomatic` / 源优先级压低。一旦 Candidate 低于已安装
+    /// 版本，apt 就**永不列出**该包——哪怕版本表里另有更高版本（实测：pin 后 Candidate
+    /// 降到 1.30.2，版本表最高仍是 1.30.5）。用户侧表现即「官方源明明有新版，面板却永远
+    /// 不提示有更新」。改用版本表最高版与已装版本直接比较，与安装弹窗默认值（versions[0]）
+    /// **同源**，两处判据不可能再打架。
+    ///
+    /// 只实现了 apt 的批量查询；其它包管理器返回空列表（探测是锦上添花，非错误）。
+    async fn upgradable(&self, names: &[&str]) -> Result<Vec<UpgradablePkg>> {
         let Some(mgr) = self.manager else { return Ok(Vec::new()) };
-        if mgr != "apt" { return Ok(Vec::new()) }
-        // LC_ALL=C 必需：apt 输出含固定英文标记（"Listing..."、"[upgradable from:"），
-        // 非英语环境下会本地化，按字面量匹配将解析为空（与 list_versions 同理）。
-        // 注意：必须用 Bin::AptList（即 `apt` 包装器），`apt-get` 不支持 `list` 子命令。
+        if mgr != "apt" || names.is_empty() { return Ok(Vec::new()) }
+        // LC_ALL=C 必需：解析依赖 "Version table:" / "Installed:" 两个英文标题，
+        // 非英语 locale 下会本地化（本机中文下是"版本列表："），解析将恒为空。
         let mut env = std::collections::HashMap::new();
         env.insert("LC_ALL".to_string(), std::ffi::OsString::from("C"));
-        let o = match crate::cmd::run(Bin::AptList, &["list", "--upgradable"], CmdOpt {
+        // 一次查全部：apt-cache policy 支持多包，逐个 spawn 实测 20 个包 ~1.5s，批量 ~0.6s。
+        let mut args: Vec<&str> = vec!["policy"];
+        args.extend_from_slice(names);
+        let o = match crate::cmd::run(Bin::AptCache, &args, CmdOpt {
             timeout: Duration::from_secs(60), env, ..Default::default()
         }).await {
             Ok(o) => o,
             // 探测是锦上添花：任何失败都降级为空列表，绝不拖累整页。
             Err(e) => {
-                tracing::warn!("apt list --upgradable failed: {e}");
+                tracing::warn!("apt-cache policy failed: {e}");
                 return Ok(Vec::new());
             }
         };
-        // `apt list` 退出 100 属致命错误（如源配置损坏），此时 stdout 为空，解析结果自然为空。
+        // 源配置损坏等致命错误下 apt 退出非 0，此时 stdout 为空，解析结果自然为空。
         if o.code != Some(0) {
-            tracing::warn!("apt list --upgradable exited {:?}, treating as no upgradable", o.code);
+            tracing::warn!("apt-cache policy exited {:?}, treating as no upgradable", o.code);
         }
-        Ok(parse_apt_upgradable(&o.stdout))
+        let mut res: Vec<UpgradablePkg> = Vec::new();
+        for (name, body) in split_apt_policy_blocks(&o.stdout) {
+            // apt 把"找不到的包"写 stderr、不产生块；这里再按请求名过滤一次，
+            // 防止解析意外把非请求包当结果返回。
+            if !names.contains(&name.as_str()) { continue; }
+            let installed = parse_apt_policy_installed(&body);
+            let versions = parse_apt_policy_versions(&body);
+            let Some((current, candidate)) =
+                crate::traits::upgradable_pair(installed.as_deref(), &versions)
+            else { continue };
+            // 跨主版本判定（PostgreSQL 17→18 / Node.js 20→24）交给共享函数，
+            // 与升级接口守卫同一套逻辑，避免两处各写一份漂移。
+            // 必须先算好：结构体字段按书写顺序求值，写在 current/candidate 之后
+            // 就是"借用已移动的值"，编译期直接报 E0382。
+            let major = crate::traits::version_major_jump(&current, &candidate);
+            res.push(UpgradablePkg { name, current, candidate, major });
+        }
+        Ok(res)
     }
 }
 
@@ -457,45 +480,53 @@ pub(crate) fn parse_apt_policy_installed(out: &str) -> Option<String> {
     None
 }
 
-/// 从 `apt list --upgradable` 输出里解析可升级包（本机实测形态，LC_ALL=C）：
-/// ```text
-/// Listing...
-/// fonts-opensymbol/stable-security 4:102.12+LibO25.2.3-2+deb13u8 all [upgradable from: 4:102.12+LibO25.2.3-2+deb13u7]
-/// ```
+/// 把 `apt-cache policy <pkg>...` 的**多包**输出切成 `(包名, 该包正文)` 对。
 ///
-/// 两个易踩的坑：
-/// 1. **包名与源之间用 `/` 分隔，而源名本身也可能含 `-` 但不含 `/`**——按**第一个** `/`
-///    切分即可（`split('/')` 取首段）；若按最后一个 `/`切或按空格切都会连源名一起带进包名。
-///    反之若误按 `/` 分割整个行，会把 `stable-security` 当成包名。
-/// 2. **版本号含 `:`（epoch，如 `4:102.12+…`）且可含 `+`/`~`**，不能按空白简单切；
-///    旧版本要从 `[upgradable from: X]` 里取，须按该标记切出尾部再trim。
-pub(crate) fn parse_apt_upgradable(out: &str) -> Vec<UpgradablePkg> {
-    const FROM_MARK: &str = "[upgradable from:";
-    let mut res: Vec<UpgradablePkg> = Vec::new();
+/// 多包一次查询是刻意的：逐个 spawn 实测 20 个包 ~1.5s，单次批量 ~0.6s。
+/// 块头是**行首顶格**（无缩进）的 `名字:`；其余行（`Installed:` / `Candidate:` /
+/// `Version table:` / 版本行 / 来源行）都缩进，属当前块。apt 把"找不到的包"写 stderr、
+/// 不产生块，故调用方仍需按请求名过滤。
+///
+/// 本机实测形态（LC_ALL=C）：
+/// ```text
+/// nginx:
+///   Installed: (none)
+///   Candidate: 1.30.5-1~trixie
+///   Version table:
+///      1.30.5-1~trixie 500
+///         500 https://nginx.org/packages/debian trixie/nginx amd64 Packages
+/// redis-server:
+///   Installed: 6:8.10.2-1rl1~trixie1
+/// ```
+pub(crate) fn split_apt_policy_blocks(out: &str) -> Vec<(String, String)> {
+    let mut res: Vec<(String, String)> = Vec::new();
     for line in out.lines() {
-        let t = line.trim();
-        // 跳过 "Listing..." 头、空行
-        if t.is_empty() || !t.contains('/') || !t.contains(FROM_MARK) { continue; }
-        let head_and_from = t.split(FROM_MARK).next().unwrap_or("").trim();
-        let current = t.split(FROM_MARK).nth(1).unwrap_or("").trim().trim_end_matches(']').trim();
-        if current.is_empty() { continue; }
-        // head 形如 "包名/源 版本 arch"：按空白切成三段（末段 arch 可能为 all/amd64）
-        let mut it = head_and_from.split_whitespace();
-        let Some(name_with_repo) = it.next() else { continue };
-        let Some(candidate) = it.next() else { continue; };
-        // 只取第一个 '/' 之前的包名（源名在 '/ ' 之后）
-        let name = name_with_repo.split('/').next().unwrap_or("").to_string();
-        if name.is_empty() { continue; }
-        res.push(UpgradablePkg {
-            name,
-            current: current.to_string(),
-            candidate: candidate.to_string(),
-            // 跨主版本判定（如 PostgreSQL 17→18 / Node.js 20→24）交给单一共享函数，
-            // 与升级接口守卫用同一套逻辑，避免两处各写一份漂移。
-            major: crate::traits::version_major_jump(&current, &candidate),
-        });
+        if let Some(name) = policy_block_header(line) {
+            res.push((name, String::new()));
+            continue;
+        }
+        if let Some((_, body)) = res.last_mut() {
+            body.push_str(line);
+            body.push('\n');
+        }
     }
     res
+}
+
+/// 判定某行是否为 `apt-cache policy` 的包块头：**顶格**且以 `:` 结尾，`:` 前是合法包名。
+///
+/// 顶格是必要条件（`Installed:` / `Version table:` 都缩进）；以 `:` 结尾则顺带排掉
+/// apt 写在第 0 列的错误行——它们是 `N: Unable to locate package foo` 这种"以包名
+/// 结尾"的形态，`strip_suffix(':')` 直接返回 None。
+fn policy_block_header(line: &str) -> Option<String> {
+    if line.starts_with(' ') || line.starts_with('\t') { return None; }
+    let name = line.strip_suffix(':')?;
+    if name.is_empty() { return None; }
+    // 排除 apt 的单字母消息前缀（N:/W:/E:）
+    if name.len() == 1 && matches!(name, "N" | "W" | "E") { return None; }
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        .then(|| name.to_string())
 }
 
 /// 安装类长命令统一出口：流式回调 + 30 分钟超时（对齐任务队列上限）。
@@ -2271,51 +2302,6 @@ mod tests {
         assert!(matches!(r, Err(panel_core::PanelError::Unsupported(_))), "缺失客户端应 Unsupported: {r:?}");
     }
     #[test]
-    fn parse_apt_upgradable_reads_real_output_shape() {
-        // 本机实测形态（LC_ALL=C，含 epoch 与源名带连字符两种真实情形）
-        let out = "Listing...\n\
-                    fonts-opensymbol/stable-security 4:102.12+LibO25.2.3-2+deb13u8 all [upgradable from: 4:102.12+LibO25.2.3-2+deb13u7]\n\
-                    redis-server/stable 5:8.0.2-3+deb13u3 amd64 [upgradable from: 5:8.0.2-3+deb13u2]\n";
-        let got = parse_apt_upgradable(out);
-        assert_eq!(got.len(), 2, "应解析出两行：{got:?}");
-        // 包名只取第一个 '/' 之前的部分，绝不能把源名(带-)混进包名
-        assert_eq!(got[0].name, "fonts-opensymbol");
-        assert_eq!(got[0].candidate, "4:102.12+LibO25.2.3-2+deb13u8");
-        assert_eq!(got[0].current, "4:102.12+LibO25.2.3-2+deb13u7");
-        assert_eq!(got[1].name, "redis-server");
-        assert_eq!(got[1].candidate, "5:8.0.2-3+deb13u3");
-    }
-
-    #[test]
-    fn parse_apt_upgradable_ignores_non_upgradable_lines() {
-        // "Listing..." 头、空行、以及不含 [upgradable from:] 的行都应被跳过
-        let out = "Listing...\n\
-                    nginx/stable 1.26.3-3+deb13u9 amd64\n\
-                    \n\
-                    redis/stable 8.0.2 amd64 [upgradable from: 8.0.1]\n";
-        let got = parse_apt_upgradable(out);
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].name, "redis");
-    }
-
-    #[test]
-    fn parse_apt_upgradable_empty_output_is_empty_list() {
-        // 空输出=无可升级项，必须是Ok(空)而非错误（探测不该让整页报错）
-        assert!(parse_apt_upgradable("").is_empty());
-        assert!(parse_apt_upgradable("Listing...\n").is_empty());
-    }
-
-    #[test]
-    fn parse_apt_upgradable_handles_tilde_and_plus_in_versions() {
-        // 版本号可能含 ~（debian 预发布）与 +（本地修订），不能因非数字被丢弃
-        let out = "foo/stable 1.2.3~rc1+deb1 amd64 [upgradable from: 1.2.2+deb1]\n";
-        let got = parse_apt_upgradable(out);
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].candidate, "1.2.3~rc1+deb1");
-        assert_eq!(got[0].current, "1.2.2+deb1");
-    }
-
-    #[test]
     fn version_major_jump_detects_cross_major_and_ignores_minor() {
         // 跨主版本：PostgreSQL 17→18、Node.js 20→24
         assert!(version_major_jump("17+278", "18+293.pgdg13+1"), "PG 17→18 应判跨主版本");
@@ -2337,17 +2323,80 @@ mod tests {
     }
 
     #[test]
-    fn parse_apt_upgradable_marks_major_flag() {
-        // PostgreSQL 17→18 是跨主版本升级，major 必须为 true；
-        // Redis 8.0.2→8.0.3 仅修订版本，major 必须为 false。
-        let out = "postgresql/stable 18+293.pgdg13+1 all [upgradable from: 17+278]\n\
-                   redis-server/stable 5:8.0.3-1 amd64 [upgradable from: 5:8.0.2-3]\n";
-        let got = parse_apt_upgradable(out);
-        assert_eq!(got.len(), 2);
-        let pg = got.iter().find(|u| u.name == "postgresql").unwrap();
-        assert!(pg.major, "PG 17→18 应标 major=true");
-        let redis = got.iter().find(|u| u.name == "redis-server").unwrap();
-        assert!(!redis.major, "Redis 8.0.2→8.0.3 应标 major=false");
+    fn split_apt_policy_blocks_reads_real_multi_package_output() {
+        // 本机实测：`LC_ALL=C apt-cache policy nginx redis-server` 的真实形态
+        let out = r"nginx:
+  Installed: (none)
+  Candidate: 1.30.5-1~trixie
+  Version table:
+     1.30.5-1~trixie 500
+        500 https://nginx.org/packages/debian trixie/nginx amd64 Packages
+     1.26.3-3+deb13u9 500
+        500 http://deb.debian.org/debian trixie/main amd64 Packages
+redis-server:
+  Installed: 6:8.10.2-1rl1~trixie1
+  Candidate: 6:8.10.2-1rl1~trixie1
+  Version table:
+ *** 6:8.10.2-1rl1~trixie1 500
+        500 https://packages.redis.io/deb trixie/main amd64 Packages
+";
+        let blocks = split_apt_policy_blocks(out);
+        assert_eq!(blocks.len(), 2, "应切出两个包块：{blocks:?}");
+        assert_eq!(blocks[0].0, "nginx");
+        assert_eq!(blocks[1].0, "redis-server");
+        // 每块正文喂给既有解析器，结果必须与单包查询一致（含 "*** " 已安装标记）
+        assert_eq!(parse_apt_policy_installed(&blocks[0].1), None);
+        assert_eq!(
+            parse_apt_policy_versions(&blocks[0].1),
+            vec!["1.30.5-1~trixie".to_string(), "1.26.3-3+deb13u9".to_string()]
+        );
+        assert_eq!(
+            parse_apt_policy_installed(&blocks[1].1),
+            Some("6:8.10.2-1rl1~trixie1".to_string())
+        );
+        assert_eq!(
+            parse_apt_policy_versions(&blocks[1].1),
+            vec!["6:8.10.2-1rl1~trixie1".to_string()]
+        );
     }
 
-}
+    #[test]
+    fn split_apt_policy_blocks_ignores_apt_error_lines() {
+        // apt 把"找不到的包"写在 col 0，且以包名（而非 ':'）结尾 → 绝不能被当成块头
+        let out = "N: Unable to locate package nosuchpkg\nnginx:\n  Installed: (none)\n";
+        let blocks = split_apt_policy_blocks(out);
+        assert_eq!(blocks.len(), 1, "错误行不该产生块：{blocks:?}");
+        assert_eq!(blocks[0].0, "nginx");
+    }
+
+    /// 真实复现（2026-10-08 受控 apt 沙箱实测，逐字取自 `LC_ALL=C apt-cache policy demo-pkg`）：
+    /// apt preferences 把包钉在**已安装版本**后，`Candidate` 被压低到 1.0，`apt list --upgradable`
+    /// 对该包**沉默**；但版本表里仍有更高版 2.0。旧口径（Candidate）会永远漏报这种更新，
+    /// 新口径必须据版本表报出「1.0 → 2.0」——这正是用户报告的「官方源有新版却总说已是最新」。
+    #[test]
+    fn pinned_candidate_below_installed_still_reports_update() {
+        let out = r"demo-pkg:
+  Installed: 1.0
+  Candidate: 1.0
+  Version table:
+     2.0 500
+        500 file:/tmp/apt-e2e/repo ./ Packages
+ *** 1.0 1001
+        500 file:/tmp/apt-e2e/repo ./ Packages
+        100 /tmp/apt-e2e/var/lib/dpkg/status
+";
+        let blocks = split_apt_policy_blocks(out);
+        assert_eq!(blocks.len(), 1);
+        let body = &blocks[0].1;
+        // 前置事实：真实输出确如所料——Installed = Candidate = 1.0（apt 自认无可升级），
+        // 但版本表最高仍是 2.0。
+        assert_eq!(parse_apt_policy_installed(body), Some("1.0".to_string()));
+        let versions = parse_apt_policy_versions(body);
+        assert_eq!(versions, vec!["2.0".to_string(), "1.0".to_string()]);
+        // 新口径：取版本表最高版与已装版本比较 → 必须报出更新。
+        assert_eq!(
+            crate::traits::upgradable_pair(Some("1.0"), &versions),
+            Some(("1.0".to_string(), "2.0".to_string())),
+            "Candidate 被 pin 压低时仍应据版本表报出更新（旧口径漏报的场景）"
+        );
+    }}

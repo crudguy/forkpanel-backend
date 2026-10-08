@@ -739,8 +739,12 @@ async fn ensure_external_repos_once(state: &Shared) {
 
 /// 探测白名单内**已安装且源里有新版**的包（B1：只读，供 UI 显示「有新版」徽标）。
 ///
-/// 为什么单独成端点：与 packages_list 分开是因为它要跑一次 `apt list --upgradable`
-/// （秒级子进程），而 packages_list 是页面/轮询高频调用；混在一起会让每次刷新都多付这个开销。
+/// 为什么单独成端点：与 packages_list 分开是因为它要对白名单跑一次 `apt-cache policy`
+/// （亚秒级子进程），而 packages_list 是页面/轮询高频调用；混在一起会让每次刷新都多付这个开销。
+///
+/// 判据是「版本表最高版本 > 已安装版本」，与安装弹窗默认选中项（versions[0]）**同源**；
+/// 刻意不用 `apt list --upgradable`——其判据 apt 的 Candidate 会被 pin / 源优先级压低，
+/// 一旦低于已安装版本就永不报告（详见 `PackageProvider::upgradable` 的说明）。
 ///
 /// 权限用 PACKAGE_MANAGE（与安装同级）：升级会改动系统，viewer 不该看到可升级清单。
 /// 探测失败**不报错**、返回空列表——探测是锦上添花，不该让整页软件列表挂掉。
@@ -755,11 +759,14 @@ pub async fn packages_upgradable(
     // 探测前先确保官方源已落地：否则只读探测只能看到发行版源的旧版，「接官方源」等于没接。
     // ensure_repo 进程内只跑一次（见 ensure_external_repos_once），不拖慢后续轮询。
     ensure_external_repos_once(&state).await;
-    let up = state.os.packages().upgradable().await.unwrap_or_default();
-    // 过滤到白名单（用真包名比对，因为 upgradable 返的是 redis-server 这类真名），
-    // 再映射回逻辑名对外——与 install/remove 的"逻辑名对外"约定保持一致。
+    let mgr = state.os.packages().manager();
+    // 只问白名单这二十来个包（按真包名探测，php-fpm ↔ php8.4-fpm 这类别名由
+    // real_pkg_name 统一处理），再映射回逻辑名对外——与 install/remove 的约定一致。
+    let reals: Vec<String> = ALLOWED_PACKAGES.iter().map(|p| real_pkg_name(mgr, p.name)).collect();
+    let refs: Vec<&str> = reals.iter().map(|s| s.as_str()).collect();
+    let up = state.os.packages().upgradable(&refs).await.unwrap_or_default();
     let items: Vec<serde_json::Value> = ALLOWED_PACKAGES.iter().filter_map(|p| {
-        let real = real_pkg_name(state.os.packages().manager(), p.name);
+        let real = real_pkg_name(mgr, p.name);
         up.iter().find(|u| u.name == real).map(|u| serde_json::json!({
             "name": p.name,            // 逻辑名（前端按它匹配已安装卡片）
             "label": p.label,
@@ -823,8 +830,8 @@ pub async fn package_upgrade(
 ///
 /// 已装包升到**跨主版本**候选（PostgreSQL 17→18、Node.js 20→24 等）时，未带
 /// `confirm_major=true` 则 409 拒绝——不能只靠前端拦截，否则直接调 API 即可绕过。
-/// 判定从 `upgradable()` 探测结果取候选版本、从 `apt-cache policy` 取已装版本，
-/// 二者交 `version_major_jump` 判定，与 /packages/upgradable 列表里的 `major` 标记同源。
+/// 判定与 /packages/upgradable 列表里的 `major` 标记同源：都取「版本表最高版本」作候选，
+/// 再交 `version_major_jump` 判定——两处各写一份必然漂移。
 ///
 /// 未装包：`current` 经 upgradable + apt-cache policy 都取不到 → `major=false` → 不触发，
 /// 故对「首次安装」零影响；仅当包**已装且**目标跨主版本时才拦截。
@@ -833,7 +840,7 @@ async fn require_major_upgrade_confirm(
     req: &InstallReq,
 ) -> ApiResult<()> {
     let real = real_pkg_name(state.os.packages().manager(), &req.name);
-    let up = state.os.packages().upgradable().await.unwrap_or_default();
+    let up = state.os.packages().upgradable(&[real.as_str()]).await.unwrap_or_default();
     let entry = up.iter().find(|u| u.name == real);
     // candidate：用户显式指定版本优先，否则取 upgradable 探测到的目标版本
     let candidate = req.version.clone()

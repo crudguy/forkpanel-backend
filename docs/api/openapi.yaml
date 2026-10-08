@@ -1356,7 +1356,10 @@ paths:
       tags: [packages]
       summary: 探测白名单内已安装且源里有新版的包（只读；空=无可升级项，非错误）
       description: |
-        跑 `apt list --upgradable` 后**过滤到白名单**并映射回逻辑名。
+        对白名单包跑一次 `apt-cache policy`，取每包**版本表最高版**（跨源，系统源/官方源
+        谁高新取谁）与 `Installed` 版本比对（dpkg 对齐的版本比较），高于已装即视为有更新，再映射回逻辑名。
+        刻意不用 `apt list --upgradable`：其判据 apt 的 Candidate 会被 pin / 源优先级压低，
+        一旦低于已安装版本就永远不报更新（即便官方源已有更高版）。与安装弹窗默认选中项同源（versions[0]）。
         刻意不并入 GET /packages（后者是页面/轮询高频调用，本端点要跑一次秒级子进程）。
         探测失败返回空列表而非报错——探测是锦上添花，不该让整页软件列表挂掉。
       security: [cookieAuth, csrfHeader]
@@ -1377,7 +1380,7 @@ paths:
                         name: { type: string, description: 逻辑包名（与 GET /packages 的 name 同域，UI 按它匹配已安装卡片） }
                         label: { type: string, description: 品牌展示名 }
                         current: { type: string, description: 当前已安装版本 }
-                        candidate: { type: string, description: 可升级到的版本 }
+                        candidate: { type: string, description: 可升级到的版本（版本表最高版，跨源） }
                         major: { type: boolean, description: 是否跨主版本升级（current 与 candidate 首段数字不同）；跨主版本可能不向后兼容，需数据迁移，前端据此弹窗二次确认 }
         '501': { description: 本机无可用包管理器（能力位 package.upgrade 不支持） }
   /api/v1/packages/upgrade:

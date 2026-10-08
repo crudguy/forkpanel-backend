@@ -270,7 +270,7 @@ impl PackageProvider for MockPackages {
         Ok(())
     }
 
-    async fn upgradable(&self) -> Result<Vec<UpgradablePkg>> {
+    async fn upgradable(&self, _names: &[&str]) -> Result<Vec<UpgradablePkg>> {
         // mock 不跑 apt；返回空列表=「无可升级项」，调用方应隐藏入口而非报错
         Ok(Vec::new())
     }

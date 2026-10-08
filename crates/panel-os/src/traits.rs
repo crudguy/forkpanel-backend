@@ -13,7 +13,7 @@ use panel_core::{
     Capability, FirewallBackend, InitSystem, LogBackend, PlatformInfo, Result, SafePath,
     UnitName,
 };
-use std::{path::PathBuf, time::Duration};
+use std::{cmp::Ordering, path::PathBuf, time::Duration};
 use tokio::sync::mpsc::Receiver;
 
 // ═══════════════════════════ 指标 ═══════════════════════════
@@ -244,7 +244,7 @@ pub struct PackageVersions {
     pub installed: Option<String>,      // 当前已安装版本；未安装为 None
 }
 
-/// 某个已安装包存在可用更新的信息（由包管理器的 upgradable 列表派生）。
+/// 某个已安装包存在可用更新的信息（由包管理器的**版本表**派生，见 `upgradable_pair`）。
 ///
 /// 只报**白名单内**的包：探测结果直接驱动 UI 的「有新版」徽标与更新按钮，
 /// 若不过滤，用户会看到几百个自己并未在面板里管的系统库冒出来。
@@ -291,6 +291,111 @@ pub fn version_major_jump(a: &str, b: &str) -> bool {
     }
 }
 
+/// Debian 版本号比较（Debian Policy §5.6.12，等价于 `dpkg --compare-versions`）。
+///
+/// 返回 `a` 相对 `b` 的大小。**不能退化成字符串比较**——版本号按
+/// 「[epoch:]upstream[-revision]」比较，段内又按「非数字片段逐字符、数字片段按数值」
+/// 交替切分，还有 `~` 排在**一切字符（含串尾）之前**这条反直觉规则。字符串比较会得出
+/// `"8.9" > "8.10"` 这种错误结论，而它直接决定「有没有新版」，错了就报错版本。
+///
+/// 实现逐条对齐本机 `dpkg --compare-versions` 的实测行为（含 `~`、epoch、前导零、
+/// 缺省 revision、串尾权重）。安装弹窗默认值与升级守卫都经它判定，故只能有一份。
+pub fn deb_version_cmp(a: &str, b: &str) -> Ordering {
+    let (ea, ra) = split_epoch(a);
+    let (eb, rb) = split_epoch(b);
+    match ea.cmp(&eb) {
+        Ordering::Equal => {}
+        o => return o,
+    }
+    let (ua, va) = split_revision(ra);
+    let (ub, vb) = split_revision(rb);
+    match verrevcmp(ua, ub) {
+        Ordering::Equal => verrevcmp(va, vb),
+        o => o,
+    }
+}
+
+/// 拆出 `(epoch, 其余)`。epoch 是第一个 `:` 之前**全为数字**的前缀，缺省为 0。
+fn split_epoch(v: &str) -> (u64, &str) {
+    if let Some((head, rest)) = v.split_once(':') {
+        if !head.is_empty() && head.bytes().all(|c| c.is_ascii_digit()) {
+            // 超长 epoch 用 MAX 兜底：真实版本号不会触及，且比较仍保持"更大"
+            return (head.parse::<u64>().unwrap_or(u64::MAX), rest);
+        }
+    }
+    (0, v)
+}
+
+/// 按**最后一个** `-` 拆出 `(upstream, revision)`；无 `-` 时 revision 为空串。
+///
+/// 空 revision 与 `"0"` 等价（dpkg 实测 `1.0 == 1.0-0`）：`verrevcmp` 会跳过前导零，
+/// 于是空串与 `"0"` 自然判等，无需特判。
+fn split_revision(v: &str) -> (&str, &str) {
+    match v.rfind('-') {
+        Some(i) => (&v[..i], &v[i + 1..]),
+        None => (v, ""),
+    }
+}
+
+/// dpkg `verrevcmp` 的等价实现：非数字片段逐字符比 `order()` 权重，
+/// 数字片段比数值（忽略前导零；位数不同则位数多者更大）。
+fn verrevcmp(a: &str, b: &str) -> Ordering {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() || j < b.len() {
+        let mut first_diff: i32 = 0;
+        // 1) 非数字片段：任一非数字即进入（另一方已到串尾则按 None 参与）
+        while (i < a.len() && !a[i].is_ascii_digit()) || (j < b.len() && !b[j].is_ascii_digit()) {
+            let ac = order(a.get(i).copied());
+            let bc = order(b.get(j).copied());
+            if ac != bc { return ac.cmp(&bc); }
+            i += 1;
+            j += 1;
+        }
+        // 2) 前导零不参与数值比较（"1.001" == "1.1"）
+        while i < a.len() && a[i] == b'0' { i += 1; }
+        while j < b.len() && b[j] == b'0' { j += 1; }
+        // 3) 数字片段：位数相同才用先出现的差异位，位数不同则位数多者更大
+        while i < a.len() && j < b.len() && a[i].is_ascii_digit() && b[j].is_ascii_digit() {
+            if first_diff == 0 { first_diff = a[i] as i32 - b[j] as i32; }
+            i += 1;
+            j += 1;
+        }
+        if i < a.len() && a[i].is_ascii_digit() { return Ordering::Greater; }
+        if j < b.len() && b[j].is_ascii_digit() { return Ordering::Less; }
+        if first_diff != 0 { return first_diff.cmp(&0); }
+    }
+    Ordering::Equal
+}
+
+/// 非数字字符的排序权重（对齐 dpkg 的 `order()`）：
+/// `~`(-1) < 串尾(0) < 大写字母 < 小写字母 < 其它 ASCII 符号。
+///
+/// 串尾取 0 由实测确定（`1.0 < 1.0a` 而 `1.0 > 1.0~`），即"短串在前"。
+/// 数字在非数字片段里不会出现，故 0 与数字权重重合无害。
+fn order(c: Option<u8>) -> i32 {
+    match c {
+        None => 0,
+        Some(b'~') => -1,
+        Some(c) if c.is_ascii_alphabetic() => c as i32,
+        Some(c) => c as i32 + 256,
+    }
+}
+
+/// 判定「源里最高版本是否高于已安装版本」，是则返回 `(已安装版本, 目标版本)`。
+///
+/// 判据**只看版本表**（`apt-cache policy` 的 `Version table:`），与安装弹窗默认选中的
+/// 那一项（`versions[0]`）同源。刻意不用 apt 的 `Candidate`／`apt list --upgradable`：
+/// Candidate 会被 pin、`NotAutomatic`、源优先级压低，一旦低于已安装版本，apt 就
+/// **永远不报告**该项——哪怕版本表里另有更高版本（实测：pin 后 `Candidate: 1.30.2`
+/// 而版本表最高仍是 `1.30.5`）。用户侧表现就是"官方源明明有新版，面板却总说已是最新"。
+pub fn upgradable_pair(installed: Option<&str>, versions: &[String]) -> Option<(String, String)> {
+    let cur = installed.filter(|s| !s.is_empty())?;
+    // 显式取最大，不依赖 apt"版本表已按新→旧排好"这一未文档化的保证
+    let best = versions.iter().max_by(|x, y| deb_version_cmp(x, y))?;
+    (deb_version_cmp(best, cur) == Ordering::Greater).then(|| (cur.to_string(), best.clone()))
+}
+
 #[async_trait]
 pub trait PackageProvider: Send + Sync {
     fn manager(&self) -> Option<&'static str>;   // apt / dnf / apk / None
@@ -311,12 +416,19 @@ pub trait PackageProvider: Send + Sync {
     /// （白名单内普通包、非 apt 发行版、无第三方源的包如 minio）为 no-op，直接返回 Ok，
     /// 不影响既有安装路径。调用方应在 `install` 之前调用，加源失败即中止安装。
     async fn ensure_repo(&self, logical: &str, on_line: Box<dyn Fn(String) + Send + Sync>) -> Result<()>;
-    /// 列出**已安装且源里有新版**的包（只读探测，不改动系统）。
+    /// 探测**给定包名**中「源里最高版本高于已安装版本」的项（只读，不改动系统）。
     ///
-    /// 供 UI 显示「有新版」徽标。返回空列表表示"无可升级项"，**不是错误**
-    /// （多数机器本来就没有可升级的白名单包）。查不到（无包管理器/命令缺失）同样返回空列表，
-    /// 调用方据此隐藏入口而不是报错——探测失败不该让整页软件列表挂掉。
-    async fn upgradable(&self) -> Result<Vec<UpgradablePkg>>;
+    /// 传名字列表而不做全系统扫描：调用方（软件页）只关心白名单这二十来个包，
+    /// 全量扫描既慢、又得再把几百个系统库过滤掉。返回项的 `name` 是**真实包名**
+    /// （包管理器口径，如 `redis-server`），由调用方映射回逻辑名对外。
+    ///
+    /// 判据必须是「版本表最高版本 > 已安装版本」而非 apt 的 Candidate，理由见
+    /// `upgradable_pair`——这是"官方源有新版却不提示"的根因所在。
+    ///
+    /// 返回空列表表示"无可升级项"，**不是错误**（多数机器本来就没有可升级的白名单包）；
+    /// 查不到（无包管理器 / 非 apt）同样返回空列表，调用方据此隐藏入口而不是报错
+    /// ——探测失败不该让整页软件列表挂掉。
+    async fn upgradable(&self, names: &[&str]) -> Result<Vec<UpgradablePkg>>;
 }
 
 // ═══════════════════════════ 防火墙（声明式） ═══════════════════════════
@@ -992,4 +1104,138 @@ pub trait FileProvider: Send + Sync {
     fn is_sensitive_path(&self, path: &std::path::Path) -> bool;
     /// 单文件大小上限（上传与写入共用）
     fn max_file_bytes(&self) -> usize { 100 * 1024 * 1024 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cmp::Ordering::{Equal, Greater, Less};
+
+    /// 期望值全部取自本机 `dpkg --compare-versions` 实测（Debian 版本比较的唯一权威），
+    /// 覆盖 `~` / epoch / 前导零 / 缺省 revision / 串尾权重这几条最容易写错的规则。
+    #[test]
+    fn deb_version_cmp_matches_dpkg_on_real_world_versions() {
+        // 数值序而非字典序：字符串比较会得出 "8.9" > "8.10" 的错误结论
+        assert_eq!(deb_version_cmp("8.10", "8.9"), Greater);
+        assert_eq!(deb_version_cmp("13.2.10", "13.2.3"), Greater);
+        // 本机白名单包的真实版本（apt-cache policy 实测）
+        assert_eq!(deb_version_cmp("1.30.5-1~trixie", "1.26.3-3+deb13u9"), Greater);
+        assert_eq!(deb_version_cmp("18+293.pgdg13+1", "18+291.pgdg13+1"), Greater);
+        assert_eq!(deb_version_cmp("5:8.0.2-3", "5:8.10.2-1"), Less);
+        assert_eq!(deb_version_cmp("6:8.10.2-1rl1~trixie1", "6:8.10.1-1rl1~trixie1"), Greater);
+        assert_eq!(deb_version_cmp("4.0.0-2+deb13u1", "4.0.0-2"), Greater);
+        // epoch 优先于其余各段
+        assert_eq!(deb_version_cmp("2:1.0", "1:9.9"), Greater);
+        assert_eq!(deb_version_cmp("1:1.0", "1.0"), Greater);
+        assert_eq!(deb_version_cmp("0:1.0", "1.0"), Equal);
+        // 前导零不参与数值比较
+        assert_eq!(deb_version_cmp("1.001", "1.1"), Equal);
+        assert_eq!(deb_version_cmp("1.0", "1.00"), Equal);
+        assert_eq!(deb_version_cmp("1.0-1", "1.0-01"), Equal);
+        // 缺省 revision 等价于 "0"（dpkg 实测 1.0 == 1.0-0）
+        assert_eq!(deb_version_cmp("1.0", "1.0-0"), Equal);
+        assert_eq!(deb_version_cmp("1.0-1", "1.0"), Greater);
+        // '~' 排在一切字符（含串尾）之前
+        assert_eq!(deb_version_cmp("1.0~rc1", "1.0"), Less);
+        assert_eq!(deb_version_cmp("1.0", "1.0~"), Greater);
+        assert_eq!(deb_version_cmp("1.2.3~rc1+deb1", "1.2.2+deb1"), Greater);
+        // 串尾排在大写字母之前；字母按 ASCII；其它符号排在字母之后
+        assert_eq!(deb_version_cmp("1.0", "1.0a"), Less);
+        assert_eq!(deb_version_cmp("1.0", "1.0A"), Less);
+        assert_eq!(deb_version_cmp("1.0A", "1.0a"), Less);
+        assert_eq!(deb_version_cmp("1.0a", "1.0aa"), Less);
+        assert_eq!(deb_version_cmp("1.0a", "1.0+"), Less);
+        assert_eq!(deb_version_cmp("1.0z", "1.0+"), Less);
+        // 数字段与非数字段交替切分
+        assert_eq!(deb_version_cmp("1.0a1", "1.01"), Less);
+        assert_eq!(deb_version_cmp("1.0a1", "1.0a"), Greater);
+        // 自反
+        assert_eq!(deb_version_cmp("1.30.5-1~trixie", "1.30.5-1~trixie"), Equal);
+    }
+
+    /// 判定「有更新」的口径：只看版本表最高版，与安装弹窗默认选中项同源。
+    /// 关键回归点是**无视 apt pin 后的候选版本**——本机实测 pin 后
+    /// `Candidate: 1.30.2`，而版本表最高仍是 `1.30.5`，旧口径会因此永远沉默。
+    #[test]
+    fn upgradable_pair_uses_version_table_top_not_apt_candidate() {
+        let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // 已装 1.30.4，版本表最高 1.30.5（候选被 pin 压到 1.30.2 也不影响判定）
+        assert_eq!(
+            upgradable_pair(
+                Some("1.30.4-1~trixie"),
+                &v(&["1.30.5-1~trixie", "1.30.4-1~trixie", "1.30.2-1~trixie"])
+            ),
+            Some(("1.30.4-1~trixie".to_string(), "1.30.5-1~trixie".to_string())),
+        );
+        // 已装即最高版 → 无更新
+        assert_eq!(
+            upgradable_pair(Some("1.30.5-1~trixie"), &v(&["1.30.5-1~trixie", "1.26.3-3+deb13u9"])),
+            None
+        );
+        // 已装版本比源里所有版本都新（源被移除或回退）→ 无更新，绝不提示"降级"
+        assert_eq!(upgradable_pair(Some("1.31.0-1~trixie"), &v(&["1.30.5-1~trixie"])), None);
+        // 未安装 → 交给安装路径，不报"有更新"
+        assert_eq!(upgradable_pair(None, &v(&["1.0"])), None);
+        assert_eq!(upgradable_pair(Some("1.0"), &v(&[])), None);
+        // 版本表乱序也要能挑出真正最高的（不依赖 apt 的排序这一未文档化保证）
+        assert_eq!(
+            upgradable_pair(Some("8.0.2"), &v(&["8.0.1", "8.10.2", "8.0.3"])),
+            Some(("8.0.2".to_string(), "8.10.2".to_string())),
+        );
+    }
+
+    /// 组合后的对外语义：跨主版本标记必须与版本表口径一致。
+    #[test]
+    fn upgradable_pair_feeds_major_jump_flag() {
+        let pg = upgradable_pair(Some("17+278"), &["18+293.pgdg13+1".to_string()]).unwrap();
+        assert!(version_major_jump(&pg.0, &pg.1), "PG 17→18 应判跨主版本");
+        let redis = upgradable_pair(Some("5:8.0.2"), &["5:8.10.2".to_string()]).unwrap();
+        assert!(!version_major_jump(&redis.0, &redis.1), "Redis 8.0.2→8.10.2 仅次版本");
+    }
+
+    /// 与 dpkg 的**差分对拍**：把一批刁钻片段做笛卡尔积，逐个与
+    /// `dpkg --compare-versions` 的真实结果比对。手写期望值只能覆盖"想得到的规则"，
+    /// 对拍才能发现没想到的（`~` 的插入位置、串尾权重、字母与符号的相对次序都极易写反）。
+    ///
+    /// 本机无 dpkg（非 Debian 系）时自行跳过——此时上面的手写期望值仍然有效。
+    #[test]
+    fn deb_version_cmp_agrees_with_dpkg_on_a_matrix() {
+        if std::process::Command::new("dpkg").arg("--version").output().is_err() {
+            eprintln!("跳过差分对拍：本机无 dpkg");
+            return;
+        }
+        // 片段刻意含 ~ / epoch / 前导零 / 大小写字母 / 符号 / 长数字 / 真实项目版本号
+        let parts = [
+            "1", "0", "2", "10", "9", "001", "0.9", "1.0", "1.10", "1.9", "1.0~rc1", "1.0~",
+            "1.0a", "1.0A", "1.0z", "1.0+", "1.0.", "1.0a1", "1.01", "18+293.pgdg13+1",
+            "5:8.0.2-3", "1.30.5-1~trixie", "1:1.0", "0:1.0", "2:1.0",
+        ];
+        let mut checked = 0usize;
+        for a in parts {
+            for b in parts {
+                let Some(want) = dpkg_cmp(a, b) else { continue };
+                let got = deb_version_cmp(a, b);
+                assert_eq!(got, want, "与 dpkg 不一致：{a} vs {b}");
+                checked += 1;
+            }
+        }
+        // 防"恒绿"：样本量异常小说明循环没真正跑起来（而非真的全对）
+        assert!(checked > 400, "对拍样本过少（{checked}），测试可能没跑起来");
+    }
+
+    /// 取 `dpkg --compare-versions` 的真实结论；版本号非法（dpkg 报语法错误）时返回 None，
+    /// 由调用方跳过该样本——绝不能把"解析失败"当成"相等"。
+    fn dpkg_cmp(a: &str, b: &str) -> Option<Ordering> {
+        let ops = [("gt", Greater), ("lt", Less), ("eq", Equal)];
+        ops.iter().find_map(|(op, ord)| {
+            let ok = std::process::Command::new("dpkg")
+                .args(["--compare-versions", a, op, b])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            ok.then_some(*ord)
+        })
+    }
 }
