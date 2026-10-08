@@ -274,8 +274,25 @@ fn resolve_site_root(state: &Shared, input: &str, name: &str) -> Result<SafePath
     // 自愈：托管根目录缺失时先创建（首次部署或目录被清理）
     let _ = std::fs::create_dir_all(&base);
     let rel = if input.trim().is_empty() { name } else { input.trim() };
-    panel_os::paths::resolve_within_for_create(&base, rel)
-        .map_err(|_| PanelError::PathEscape(rel.to_string()))
+    let resolved = panel_os::paths::resolve_within_for_create(&base, rel)
+        .map_err(|_| PanelError::PathEscape(rel.to_string()))?;
+    // 自愈：确保站点根目录存在且对 Web 服务器可读（0o755）。
+    // 不再依赖 umask 隐式保证——否则 root:root + 严 umask 下 www-data 会 403。
+    // create / apply 两路都经此函数，权限保障单一事实源。
+    ensure_site_root_dir(resolved.as_path());
+    Ok(resolved)
+}
+
+/// 确保站点根目录存在且权限为 `0o755`（目录对 Web 服务器运行身份可读+可进入）。
+///
+/// 设计为纯函数（只吃路径、不碰 `state`），便于单测；失败一律静默——
+/// 目录创建/权限是附带的收尾动作，不该因它失败就让建站/应用主流程报错
+/// （真实权限问题由 Web 服务器 reload 时的 403 暴露，比这里硬失败更易定位）。
+fn ensure_site_root_dir(dir: &Path) {
+    if panel_os::fs::ensure_dir(dir, 0o755).is_err() {
+        // 仅记录，不中断主流程
+        eprintln!("[sites] 确保站点根目录权限失败: {}", dir.display());
+    }
 }
 
 // ─────────────── 站点列表 ───────────────
@@ -345,13 +362,7 @@ pub async fn create(
     }
     let root = resolve_site_root(&state, req.root.as_deref().unwrap_or(""), &name)?;
     let enabled = req.enabled.unwrap_or(true);
-    // 实际落地站点目录（面板托管；目录缺失即创建）
-    if let Err(e) = std::fs::create_dir_all(root.as_path()) {
-        return Err(ApiError::from(PanelError::Internal(format!(
-            "无法创建站点目录 {}: {e}",
-            root.as_path().display()
-        ))));
-    }
+    // 目录已由 resolve_site_root 自愈式创建并设为 0o755（不再依赖 umask）
     let root_str = root.as_path().display().to_string();
     let domains_json = serde_json::to_string(&domains).unwrap_or_else(|_| "[]".into());
     let now = crate::now_unix();
@@ -1970,5 +1981,39 @@ mod tests {
             < steps.iter().position(|s| *s == "deploy").unwrap());
         assert!(steps.iter().position(|s| *s == "deploy").unwrap()
             < steps.iter().position(|s| *s == "reload").unwrap());
+    }
+
+    #[test]
+    fn ensure_site_root_dir_creates_with_explicit_755() {
+        // 验证站点根目录被创建且权限显式设为 0o755，不再依赖 umask 隐式保证
+        // （root:root + 严 umask 下，缺少这步会导致 www-data 读静态文件 403）。
+        let d = std::env::temp_dir().join(format!("panel-site-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        ensure_site_root_dir(&d);
+        assert!(d.is_dir(), "站点根目录应被创建");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&d).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o755, "目录应显式设为 755（不再依赖 umask）");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn ensure_site_root_dir_is_idempotent() {
+        // 幂等：重复调用不报错、权限保持 755
+        let d = std::env::temp_dir().join(format!("panel-site-root-idem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        ensure_site_root_dir(&d);
+        ensure_site_root_dir(&d);
+        assert!(d.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&d).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o755);
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
