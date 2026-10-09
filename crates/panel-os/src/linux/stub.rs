@@ -1096,6 +1096,17 @@ fn render_nginx(spec: &SiteSpec) -> String {
     if let Some(el) = &spec.error_log  { out.push_str(&format!("    error_log {};\n", el.display())); }
     if spec.access_log.is_some() || spec.error_log.is_some() { out.push('\n'); }
 
+    // ACME 挑战路径 + 敏感文件拒绝：**所有站点类型都发**，与 WAF 无关。
+    //
+    // 整站重定向例外：它只发 return、连 root 都不输出，挑战路径对它无意义
+    //（重定向站点的证书由**目标站**的站点负责）。
+    if !matches!(spec.kind, SiteKind::Redirect { .. }) {
+        out.push_str(&render_acme_challenge_location(&spec.root));
+        out.push_str(&render_deny_locations(
+            spec.waf.as_ref().is_some_and(|w| w.profile == WafProfile::Strict),
+        ));
+    }
+
     if let Some(w) = &spec.waf {
         out.push_str(&render_waf_server(&spec.server_names, w));
     }
@@ -1272,15 +1283,56 @@ fn render_waf_server(server_names: &[String], w: &WafSpec) -> String {
         o.push_str(&format!("    limit_req zone={t}_rl burst={} nodelay;\n", w.burst));
     }
 
-    // 隐藏文件 / 目录探测。
-    // **必须放行 `/.well-known`**：ACME http-01 的挑战文件就落在这里，一刀切会把
-    // 证书续期打死——"顺手加的一条规则让线上证书过期"是最难排查的那类事故。
+    o
+}
+
+/// 敏感文件拒绝规则。**默认站点就有，不依赖 WAF**。
+///
+/// 为什么单独抽出来、不做成 WAF 的一部分：WAF 是「可选的额外防护」，而
+/// `.git` / `.env` / `*.sql` 这类文件一旦能被下载走，老 CMS 源码与数据库
+/// 凭据就直接公开——这是**默认就该堵**的口子，不该等用户想起来开 WAF。
+///
+/// ⚠ **`/.well-known` 必须放行**：ACME http-01 的挑战文件就落在这里，
+/// 一刀切会把证书签发/续期打死——"顺手加的一条规则让线上证书过期"是最难
+/// 排查的那类事故（且表现为"证书莫名过期"，与本规则毫无字面关联）。
+///
+/// `strict` 仅在 WAF 严格档追加「目录类」规则：默认档只挡文件（误杀面极小），
+/// 目录名匹配面大（`logs` / `backup` 这类名字在真实项目里很常见），故归严格档。
+fn render_deny_locations(strict: bool) -> String {
+    let mut o = String::new();
+    o.push_str("\n    # ── 敏感文件拒绝（默认生效，无需开启任何防护）──\n");
+    // 隐藏文件（.git / .env / .htaccess / .svn…），放行 .well-known
     o.push_str("    location ~ /[.](?!well-known/) { deny all; }\n");
+    // 版本库目录本身（上面的规则只拦以 /. 开头的路径形态，这里补齐）
+    o.push_str("    location ~* /[.](git|svn|hg)(/|$) { deny all; }\n");
+    // 备份与编辑器残留：正常站点不需要对外提供这些
+    o.push_str("    location ~* [.](sql|bak|old|orig|swp|save|tar|gz|tgz|zip|7z|rar)$ { deny all; }\n");
     if strict {
-        // 备份与编辑器残留：正常站点不该被下载到这些
-        o.push_str("    location ~* [.](sql|bak|old|orig|swp|save|tar|gz|zip|env)$ { deny all; }\n");
+        o.push_str("    location ~* ^/(config|conf|configs|logs?|backup|backups|dumps?|db|database)(/|$) { deny all; }\n");
     }
     o
+}
+
+/// ACME http-01 挑战路径：**在反代/PHP 站点也必须存在**。
+///
+/// 面板签发 ACME 证书时用 `certbot --webroot -w <站点根目录>`，挑战文件落在
+/// `<站点根>/.well-known/acme-challenge/`。但反代站点只有一个
+/// `location / { proxy_pass … }`——它会把挑战请求**也转给后端**，于是 certbot
+/// 拉不到 token、签发静默失败（面板侧只看到"任务失败"，用户看不到原因）。
+///
+/// 用 `^~` 前缀匹配是关键：nginx 的 location 优先级是
+/// 「精确 `=` > 前缀（`^~`）> 正则 > 普通前缀」，`^~` 一旦命中就**不再走正则**，
+/// 因此 WAF/deny 里的正则规则不会把挑战路径抢走。
+///
+/// 只发这一条、覆盖所有站点类型（含静态）：静态站点本来就能从磁盘读到，
+/// 显式写出来是为了让"挑战路径不被任何 deny 规则拦"成为**配置自带的保证**，
+/// 而不是依赖别处的正则恰好放行。
+fn render_acme_challenge_location(root: &std::path::Path) -> String {
+    format!(
+        "\n    # ── ACME http-01 挑战路径（certbot 写入 <root>/.well-known/acme-challenge/）──\n{}    location ^~ /.well-known/acme-challenge/ {{\n        root {};\n        default_type \"text/plain\";\n        try_files $uri =404;\n    }}\n",
+        "",
+        root.display()
+    )
 }
 
 #[async_trait]
@@ -2090,10 +2142,15 @@ mod tests {
         let strict = render_nginx(&spec_waf(WafProfile::Strict, None, 0));
         assert!(strict.contains("_noua)   { return 403; }"), "{strict}");
         assert!(strict.contains("_method) { return 405; }"), "非白名单方法应 405 而非 403：\n{strict}");
-        // 严格档专有：备份 / 残留文件拒绝。基础档不该有（误杀风险更高）
-        assert!(strict.contains("env)$ { deny all; }"), "严格档应拦备份 / 残留文件：\n{strict}");
-        assert_eq!(basic.matches("deny all;").count(), 1, "基础档应只有一条 deny 规则（隐藏文件）：\n{basic}");
-        assert_eq!(strict.matches("deny all;").count(), 2, "严格档应多一条备份 / 残留文件拒绝：\n{strict}");
+        // 敏感文件拒绝已**默认生效**（不再随 WAF 档位变化）：两档都该有
+        // 隐藏文件 + 版本库 + 备份/残留三类 deny。
+        for (name, out) in [("basic", &basic), ("strict", &strict)] {
+            assert!(out.contains("/[.](git|svn|hg)(/|$) { deny all; }"), "{name} 缺版本库目录拒绝：\n{out}");
+            assert!(out.contains("swp|save|tar"), "{name} 缺备份 / 残留文件拒绝：\n{out}");
+        }
+        // 严格档专有：目录类规则（匹配面大、误杀风险更高，故不默认开）
+        assert!(!basic.contains("logs?|backup"), "基础档不该有目录类拒绝（误杀风险高）：\n{basic}");
+        assert!(strict.contains("logs?|backup"), "严格档应额外拦配置 / 日志 / 备份目录：\n{strict}");
     }
 
     #[test]
@@ -2109,9 +2166,14 @@ mod tests {
     #[test]
     fn no_waf_means_no_waf_directives() {
         let out = render_nginx(&spec_static());
-        for bad in ["map $", "limit_req", "WAF", "well-known"] {
+        // ⚠ 清单里**刻意不含 "well-known"**：ACME 挑战 location 与敏感文件拒绝
+        // 已改为默认生效（不再依附 WAF），它们出现是正确行为而非 WAF 泄漏。
+        for bad in ["map $", "limit_req", "WAF", "limit_req_zone"] {
             assert!(!out.contains(bad), "未启用 WAF 时不该出现 {bad:?}：\n{out}");
         }
+        // 反过来确认：默认生效的两项**确实在**（否则本测试就成了「什么都没查」的恒绿）
+        assert!(out.contains("location ^~ /.well-known/acme-challenge/"), "默认应含 ACME 挑战路径：\n{out}");
+        assert!(out.contains("{ deny all; }"), "默认应含敏感文件拒绝：\n{out}");
     }
 
     /// 真机语法校验：把渲染结果交给**真实的** `nginx -t`。
@@ -2285,7 +2347,15 @@ mod tests {
         assert!(out.contains("proxy_pass http://127.0.0.1:3000;"), "{out}");
         assert!(out.contains("proxy_set_header Host $host;"), "{out}");
         assert!(out.contains("proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;"), "{out}");
-        assert!(!out.contains("try_files"), "反代不应有 try_files: {out}");
+        // ⚠ 断言必须**只看主 location 块**：反代站点另有 ACME 挑战 location
+        // （合法地含 try_files），全文查 try_files 会误伤那条。
+        let main = out
+            .split("location / {")
+            .nth(1)
+            .and_then(|t| t.split('}').next())
+            .expect("应有主 location 块");
+        assert!(!main.contains("try_files"), "反代的主 location 不该用 try_files: {main}");
+        assert!(!main.contains("root "), "反代的主 location 不该自带 root（用 server 级 root）: {main}");
         // 单后端不该建 upstream 块：多一层间接没有收益
         assert!(!out.contains("upstream "), "单后端不应生成 upstream 块: {out}");
     }
@@ -2339,11 +2409,112 @@ mod tests {
         s.spa_fallback = true;
         let out = render_nginx(&s);
         assert!(out.contains("try_files $uri $uri/ /index.html;"), "{out}");
-        assert!(!out.contains("=404"), "SPA 不应回 404: {out}");
+        // 同上：ACME 挑战 location 合法地含 =404，只能查主 location 块
+        let main = out
+            .split("location / {")
+            .nth(1)
+            .and_then(|t| t.split('}').next())
+            .expect("应有主 location 块");
+        assert!(!main.contains("=404"), "SPA 的主 location 不该回 404: {main}");
         // 非 SPA 仍是 =404（避免把未知路径当成 index 引发漏洞）
         let mut plain = spec_static();
         plain.spa_fallback = false;
         assert!(render_nginx(&plain).contains("try_files $uri $uri/ =404;"), "{plain:?}");
+    }
+
+    /// 修复 #1：反代站点的 ACME http-01 挑战路径。
+    ///
+    /// 此前反代站点只有 `location / { proxy_pass … }`，certbot 的挑战请求会被
+    /// **转发给后端** → 拉不到 token → 签发静默失败。判据是「配置里必须有一条
+    /// 从磁盘 root 取挑战文件的 location，且优先级高于任何正则」。
+    #[test]
+    fn acme_challenge_path_survives_reverse_proxy() {
+        let mut s = spec_static();
+        s.kind = SiteKind::ReverseProxy { upstreams: vec!["http://127.0.0.1:3000".into()] };
+        let out = render_nginx(&s);
+        assert!(
+            out.contains("location ^~ /.well-known/acme-challenge/ {"),
+            "反代站点必须有 ACME 挑战 location，否则挑战请求会被转发给后端：\n{out}"
+        );
+        assert!(out.contains("root /var/www/example;"), "挑战 location 应复用站点 root：\n{out}");
+        // `^~` 是关键：命中后不再走正则，deny 规则抢不走挑战路径
+        let acme = out
+            .split("location ^~ /.well-known/acme-challenge/ {")
+            .nth(1)
+            .and_then(|t| t.split('}').next())
+            .expect("应能切出 ACME location 块");
+        assert!(acme.contains("try_files $uri =404;"), "挑战文件不存在应 404（不能当索引）：\n{acme}");
+        // 挑战 location 必须排在 proxy 的主 location **之前**（可读性/可维护性，
+        // 且让「挑战优先」在配置文本上就是显然的）
+        let acme_at = out.find("location ^~ /.well-known/acme-challenge/").unwrap();
+        let proxy_at = out.find("proxy_pass ").unwrap();
+        assert!(acme_at < proxy_at, "ACME location 应排在 proxy_pass 之前：\n{out}");
+    }
+
+    /// 修复 #1 的覆盖广度：三种「有 root」的类型都要有挑战路径，
+    /// 只有整站重定向（不输出 root）例外。
+    #[test]
+    fn acme_challenge_path_covers_all_root_bearing_kinds() {
+        let mut proxy = spec_static();
+        proxy.kind = SiteKind::ReverseProxy { upstreams: vec!["http://127.0.0.1:3000".into()] };
+        let mut php = spec_static();
+        php.kind = SiteKind::Php { fpm: "unix:/run/php/php8.2-fpm.sock".into() };
+
+        for (name, spec) in [
+            ("static", spec_static()),
+            ("proxy", proxy),
+            ("php", php),
+        ] {
+            let out = render_nginx(&spec);
+            assert!(
+                out.contains("location ^~ /.well-known/acme-challenge/ {"),
+                "{name} 站点缺 ACME 挑战 location：\n{out}"
+            );
+        }
+
+        // 重定向站不输出 root，挑战路径对它无意义（证书由目标站负责）
+        let mut rd = spec_static();
+        rd.kind = SiteKind::Redirect { target: "https://x.example.com".into(), code: 301 };
+        let out = render_nginx(&rd);
+        assert!(!out.contains("acme-challenge"), "重定向站不该输出挑战 location：\n{out}");
+    }
+
+    /// 修复 #3：敏感文件拒绝**默认生效**（不依赖 WAF）。
+    ///
+    /// 此前 deny 只在 `waf: Some(..)` 时才生成 —— 不开 WAF 的站点连 `.git` 都能下载。
+    #[test]
+    fn sensitive_files_are_denied_without_waf() {
+        let out = render_nginx(&spec_static());
+        assert!(out.contains("{ deny all; }"), "默认站点就该有 deny 规则：\n{out}");
+        // 隐藏文件（放行 .well-known）
+        assert!(out.contains("/[.](?!well-known/) { deny all; }"), "缺隐藏文件拒绝：\n{out}");
+        // 版本库目录
+        assert!(out.contains("/[.](git|svn|hg)(/|$) { deny all; }"), "缺版本库目录拒绝：\n{out}");
+        // 备份与编辑器残留
+        assert!(out.contains("swp|save|tar"), "缺备份 / 残留文件拒绝：\n{out}");
+        // 目录类规则误杀面大，**只**在严格档
+        assert!(!out.contains("logs?|backup"), "默认档不该有目录类 deny：\n{out}");
+    }
+
+    /// deny 放行 `/.well-known` 是硬要求——一刀切会把证书签发/续期打死，
+    /// 且症状是「证书莫名过期」，与这条规则毫无字面关联，最难排查。
+    #[test]
+    fn deny_rules_exempt_well_known() {
+        for (name, spec) in [
+            ("no-waf", spec_static()),
+            ("basic", spec_waf(WafProfile::Basic, None, 0)),
+            ("strict", spec_waf(WafProfile::Strict, None, 0)),
+        ] {
+            let out = render_nginx(&spec);
+            assert!(
+                out.contains("(?!well-known/)"),
+                "{name}: 隐藏文件规则必须放行 /.well-known：\n{out}"
+            );
+            assert!(
+                out.contains("location ^~ /.well-known/acme-challenge/"),
+                "{name}: 必须有显式的挑战 location：\n{out}"
+            );
+        }
     }
 
     #[test]
