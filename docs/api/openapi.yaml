@@ -493,7 +493,7 @@ components:
       required: [name, domains]
       properties:
         name:    { type: string, pattern: "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$", description: "站点名称（用户可见的虚拟主机标识）。白名单：字母数字开头，后可接字母数字与 . _ -，长度 1~63；不得含空格、/、以点开头或仅为 .。非法值返回 400" }
-        domains: { type: array, items: { type: string } }
+        domains: { type: array, items: { type: string }, description: "站点域名，至少一个。须为合法域名：≥2 级、每段字符集 [a-zA-Z0-9-] 且首尾非连字符、顶级域须为真实 IANA 根区后缀（.local/.lan/.internal 等私有后缀亦放行），或 IPv4 字面量（4 段且每段 0~255）。非法值返回 400" }
         root:    { type: [string, "null"] }
         php:     { type: boolean }
         enabled: { type: boolean, description: "创建后的初始启用状态，缺省 true。注意：本接口只写入站点定义，**不下发配置**——无论取值如何，站点都要等一次 apply 才会真正对外服务。该字段供编辑页开关回显" }
@@ -501,7 +501,7 @@ components:
       type: object
       properties:
         name:    { type: string, pattern: "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$", description: "站点名称，**支持改名**。白名单同 SiteCreate（字母数字开头，后可接字母数字与 . _ -，长度 1~63）；非法值返回 400。nginx 配置按域名派生（conf 文件名取首个域名、server_name 即 domains）、root 建站时已固化为绝对路径、证书按 domain 绑定，三者都与 name 无关，故改名**不需要重新下发配置**；与其它站点同名返回 409（site name exists）" }
-        domains: { type: array, items: { type: string } }
+        domains: { type: array, items: { type: string }, description: "站点域名，至少一个。须为合法域名：≥2 级、每段字符集 [a-zA-Z0-9-] 且首尾非连字符、顶级域须为真实 IANA 根区后缀（.local/.lan/.internal 等私有后缀亦放行），或 IPv4 字面量（4 段且每段 0~255）。非法值返回 400" }
         root:    { type: string }
         enabled: { type: boolean, description: "启用状态。与当前值**不相同**时会真正同步 Web 服务器：true=按当前设置渲染配置并下发 + reload（此前从未 apply 的站点在此补齐）；false=从 Web 服务器移除该站点配置 + reload，站点停止对外服务。与当前值相同则只写库" }
         force_https: { type: boolean }
@@ -510,7 +510,7 @@ components:
       required: [name, domains, root]
       properties:
         name:        { type: string }
-        domains:     { type: array, items: { type: string } }
+        domains:     { type: array, items: { type: string }, description: "站点域名，至少一个。校验规则同 SiteCreate.domains（语法 + 真实 TLD / IPv4 语义）。非法值返回 400" }
         root:        { type: string }
         force_https: { type: boolean }
         kind:        { type: string, enum: [static, proxy, php, redirect], default: static, description: "站点类型；默认静态" }

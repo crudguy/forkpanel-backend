@@ -286,15 +286,65 @@ pub mod rules {
         s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '@' | '-'))
     }
 
+    /// IANA 根区 TLD 白名单（编译期内嵌，运行时惰性建一次 HashSet）。
+    ///
+    /// 数据来自 <https://data.iana.org/TLD/tlds-alpha-by-domain.txt>（版本行见
+    /// `data/tlds.txt` 头部），**零 crate 依赖、零运行时 IO**。额外并入
+    /// RFC 6761/6762 与 ICANN 私有保留后缀——它们语法合法但不在根区委派表内，
+    /// 不显式例外就会误伤内网/测试域名（`app.local`、`h.lan`、`x.internal`）。
+    fn tld_allowlist() -> &'static std::collections::HashSet<&'static str> {
+        static SET: std::sync::OnceLock<std::collections::HashSet<&'static str>> =
+            std::sync::OnceLock::new();
+        SET.get_or_init(|| {
+            let mut set: std::collections::HashSet<&'static str> = include_str!("data/tlds.txt")
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .collect();
+            set.extend([
+                "local", "lan", "internal", "home", "test", "example", "invalid",
+                "localhost", "onion",
+            ]);
+            set
+        })
+    }
+
+    /// 域名校验：**语法 + TLD 真实性**。
+    ///
+    /// 语法层：非空、≤253、不以 `.` 起止、≥2 个 label、每个 label `[a-zA-Z0-9-]`
+    /// 且首尾非 `-`、长度 1~63。单词级串（`random` / `localhost` / `as`）在此被拒。
+    ///
+    /// 真实性层：
+    /// ① 纯数字组合按 **IPv4 字面量**语义校验——必须 4 段且每段 0~255，于是
+    ///    `1.2.3.4` 放行、`999.999.999.999` 拒绝；
+    /// ② 其余取最后一段作 TLD，必须命中 IANA 根区白名单，于是 `example.com`
+    ///    放行、`asdf.qwer`（编造的 TLD）拒绝。
+    ///
+    /// 此前只做语法校验，用户"随便乱填"一个语法合法的两级串就能落库；TLD 白名单
+    /// 把明显不存在的域名挡在写库之前。刻意**不**做 DNS 解析——那是运行时网络 IO，
+    /// 且会把「尚未解析的新域名」误拒。
     pub fn is_valid_domain(s: &str) -> bool {
         if s.is_empty() || s.len() > 253 { return false; }
         if s.starts_with('.') || s.ends_with('.') { return false; }
-        s.split('.').all(|label| {
+        // 必须至少两级（含 '.'）。nginx 的 server_name 接不住单词级值。
+        let labels: Vec<&str> = s.split('.').collect();
+        if labels.len() < 2 { return false; }
+        // 语法：每个 label 的字符集与首尾约束
+        let syntax_ok = labels.iter().all(|label| {
             let n = label.len();
             n >= 1 && n <= 63
                 && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
                 && !label.starts_with('-') && !label.ends_with('-')
-        })
+        });
+        if !syntax_ok { return false; }
+        // 纯数字（形似 IPv4）：只接受 4 段且每段 0~255，挡掉 999.999.999.999
+        if labels.iter().all(|l| l.chars().all(|c| c.is_ascii_digit())) {
+            return labels.len() == 4
+                && labels.iter().all(|l| l.parse::<u16>().map(|n| n <= 255).unwrap_or(false));
+        }
+        // TLD 必须真实存在（大小写不敏感）
+        let tld = labels.last().unwrap().to_ascii_lowercase();
+        tld_allowlist().contains(tld.as_str())
     }
 
     pub fn is_valid_system_user(s: &str) -> bool {
@@ -375,10 +425,24 @@ mod tests {
 
     #[test]
     fn domain_rules() {
-        assert!(is_valid_domain("example.com"));
-        assert!(is_valid_domain("a.b.c.example.org"));
-        for bad in ["-a.com", "a-.com", ".com", "exa mple.com", "a".repeat(254).as_str(), ""] {
-            assert!(!is_valid_domain(bad), "should reject {bad:?}");
+        // 合法：真实 TLD / 多级 / IP 字面量 / punycode TLD / 私有后缀例外 / 大小写
+        for ok in [
+            "example.com", "a.b.c.example.org", "sub.example.com",
+            "host.lan", "app.local", "svc.internal",          // 私有后缀例外
+            "1.2.3.4", "0.0.0.0", "255.255.255.255",          // IPv4 字面量
+            "example.xn--fiqs8s", "Example.COM",              // punycode TLD / 大小写
+        ] {
+            assert!(is_valid_domain(ok), "应放行: {ok}");
+        }
+        // 非法
+        for bad in [
+            "random", "test123", "localhost", "as", "a",       // 单词级（无 TLD）
+            "-a.com", "a-.com", ".com", "exa mple.com",        // label 语法 / 空格
+            "asdf.qwer", "host.zzz", "example.notreal",        // TLD 不存在（编造）
+            "999.999.999.999", "256.1.1.1", "1.2.3",           // 伪 IP / 段数不足
+            "a".repeat(254).as_str(), "",                      // 超长 / 空
+        ] {
+            assert!(!is_valid_domain(bad), "必须拒绝: {bad:?}");
         }
     }
 
