@@ -2121,8 +2121,88 @@ impl UserProvider for LinuxUsers {
             .map_err(|e| PanelError::Internal(e.to_string()))?;
         Ok(s.lines().any(|l| l.split(':').next() == Some(name)))
     }
-    async fn ensure(&self, _n: &str, _s: bool, _l: bool) -> Result<()> { unsupported!("user.ensure (M3)") }
-    async fn uid_gid(&self, _n: &str) -> Result<(u32, u32)> { unsupported!("user.uid_gid (M3)") }
+
+    /// 确保用户存在（不存在则创建）。**幂等**：已存在直接返回 Ok。
+    ///
+    /// 参数语义刻意做成显式布尔而非一串选项字符串——调用方在这里能一眼看出
+    /// 自己是不是在创建一个「能登录的人」（服务账号应为 `system=true` +
+    /// `shell_nologin=true`，否则会给系统开出一个能 SSH 进去的账号）。
+    ///
+    /// `useradd` 的参数选择：
+    /// - `--system`：分配系统 uid（不占用 1000+ 的「真人」区间，也不在 useradd
+    ///   默认创建 mail spool / 家目录 —— 服务账号要目录由面板 chown 就够）；
+    /// - `--no-create-home`：同上，避免为每个应用在家目录里堆一个空壳目录；
+    /// - `--shell /usr/sbin/nologin`：禁止登录。这是**安全底线**：服务账号
+    ///   一旦能被 SSH 登录，等于给攻击者留了一个 shell 落点。
+    async fn ensure(&self, name: &str, system: bool, shell_nologin: bool) -> Result<()> {
+        if self.exists(name).await? {
+            return Ok(());
+        }
+        // 名合法性由业务层 `rules::is_valid_system_user` 保证；这里再挡一道
+        // `--` 开头（会被 useradd 当选项）与含空白，防止参数注入。
+        if name.is_empty() || name.starts_with('-') || name.contains(char::is_whitespace) {
+            return Err(PanelError::Validation { field: "user", reason: format!("非法用户名：{name:?}") });
+        }
+        // ⚠ **不要传 `--`**：实测 `useradd -- --system …` 直接打 Usage 失败
+        //   （useradd 不认「选项结束符」这种 GNU 惯例）。防注入靠上面的名字校验：
+        //   名字已过 `is_valid_system_user` 白名单（小写字母数字 _ -，字母/下划线开头），
+        //   不可能以 `-` 开头，故不可能被解释成选项。
+        let mut args: Vec<String> = Vec::new();
+        if system {
+            args.push("--system".into());
+        }
+        args.push("--no-create-home".into());
+        if shell_nologin {
+            // 发行版的 nologin 路径不同，逐个存在性探测而不是硬编码
+            let nologin = ["/usr/sbin/nologin", "/sbin/nologin", "/bin/false"]
+                .into_iter()
+                .find(|p| Path::new(p).exists())
+                .unwrap_or("/bin/false");
+            args.push("--shell".into());
+            args.push(nologin.into());
+        }
+        args.push(name.into());
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        crate::cmd::run_checked(
+            Bin::UserAdd,
+            &argv,
+            CmdOpt { timeout: Duration::from_secs(20), ..Default::default() },
+        ).await.map_err(|e| PanelError::Command {
+            bin: "useradd".into(), detail: format!("创建系统用户 {name}: {e}"),
+        })?;
+        Ok(())
+    }
+
+    /// 查 uid/gid。**只读**：读 `/etc/passwd` / `/etc/group`，不 spawn 子进程。
+    async fn uid_gid(&self, name: &str) -> Result<(u32, u32)> {
+        let passwd = tokio::fs::read_to_string("/etc/passwd").await
+            .map_err(|e| PanelError::Internal(e.to_string()))?;
+        let uid = passwd
+            .lines()
+            .find_map(|l| {
+                let mut f = l.split(':');
+                (f.next()? == name).then(|| f.nth(1)?.parse::<u32>().ok())?
+            })
+            .ok_or_else(|| PanelError::Validation { field: "user", reason: format!("用户不存在：{name}") })?;
+        let group = tokio::fs::read_to_string("/etc/group").await.unwrap_or_default();
+        // 优先取同名主组（useradd --system 默认建同名组）；找不到再从 gecos 字段
+        // 里的主组号兜底（Debian 的 passwd 第 4 列）。
+        let gid = group
+            .lines()
+            .find_map(|l| {
+                let mut f = l.split(':');
+                (f.next()? == name).then(|| f.nth(2)?.parse::<u32>().ok())?
+            })
+            .or_else(|| {
+                passwd
+                    .lines()
+                    .find(|l| l.split(':').next() == Some(name))
+                    .and_then(|l| l.split(':').nth(3))
+                    .and_then(|s| s.parse::<u32>().ok())
+            })
+            .ok_or_else(|| PanelError::Validation { field: "user", reason: format!("找不到用户 {name} 的组") })?;
+        Ok((uid, gid))
+    }
 }
 
 // 未在 stub 中使用的导入显式标记，避免 dead_code 警告干扰评审

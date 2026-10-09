@@ -392,6 +392,121 @@ fn validate_exec(raw: &str) -> ApiResult<String> {
     Ok(e)
 }
 
+/// ELF 架构预检：把「Exec format error」这种要翻日志的玄学，变成创建时就说的原因。
+///
+/// 刻意做成**预检而非拒绝**：只在文件确实是 ELF 且架构与本机不符时报错。
+/// 脚本、解释器启动（`node server.js`）、文件尚未编译（`app` 还不存在）都放行——
+/// 那三种情况都不是架构问题，拦下反而挡正常用法。
+fn check_exec_arch(workdir: &str, exec: &str) -> ApiResult<()> {
+    if let Some(msg) = panel_os::exec_arch_mismatch(std::path::Path::new(workdir), exec) {
+        return Err(ApiError::bad_request("exec_start", msg));
+    }
+    Ok(())
+}
+
+/// 端口占用预检：**别的应用**占着这个端口 → 拒（附占用者名字）；
+/// 系统里有进程在监听 → 只**放行但不作数**（那多半就是这个应用自己，或
+/// 用户刻意先起了调试进程）。绝不因为「端口被占」就把常见用法全禁掉。
+///
+/// 同时查「库内其它 app 的端口」——两个 app 抢 8080 会互相把对方的进程踢掉，
+/// 这是**面板自己制造的**冲突，必须拦。系统级监听检测放在 `panel_os::port_in_use`，
+/// 读 `/proc/net/tcp`（零子进程）。
+async fn check_port(
+    state: &Shared,
+    port: u16,
+    self_id: i64,
+    self_name: &str,
+) -> ApiResult<()> {
+    // ① 面板内的冲突：另一个 app 已经登记了同一端口
+    if let Some(other) = find_port_owner(state, port, self_id).await {
+        return Err(ApiError::bad_request(
+            "port",
+            format!(
+                "端口 {port} 已被应用「{other}」占用——两个应用抢同一端口会互相把对方踢下线，请换一个",
+            ),
+        ));
+    }
+    // ② 系统级监听：仅提示性质，不拒（自我占用是常态）
+    let _ = (self_name, panel_os::port_in_use(port));
+    Ok(())
+}
+
+/// 查库内占用某端口的**其它**应用名（`self_id` 排除自己，便于编辑时复用）。
+async fn find_port_owner(state: &Shared, port: u16, self_id: i64) -> Option<String> {
+    let p = i64::from(port);
+    let sid = self_id;
+    state
+        .pool
+        .with(move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT name FROM apps WHERE port = ?1 AND id != ?2 LIMIT 1",
+                    rusqlite::params![p, sid],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok())
+        })
+        .await
+        .ok()
+        .flatten()
+}
+
+/// 应用默认运行用户：`site-<应用名>`。
+///
+/// 站点隔离的**最小可用粒度**。此前 `run_user` 字段虽在单元渲染里生效，
+/// 但**没人给它赋值** → 业务应用默认以 root 跑：一旦应用被拿下（RCE、
+/// 依赖投毒、反代 SSRF），攻击者直接拿到 root。这是托管型面板最不该留的默认。
+///
+/// 命名用 `site-` 前缀而不是裸应用名：`site-blog` 与系统里可能存在的 `blog`
+/// 用户彻底分开，且一眼能看出是面板托管的（`useradd` 的系统用户也会带
+/// `system` 标记，两边都能查）。
+pub fn default_run_user(app_name: &str) -> String {
+    format!("site-{app_name}")
+}
+
+/// 确保运行用户存在；用户显式填了 `root` 等既有用户时**只校验、不创建**。
+///
+/// 返回实际使用的运行用户。刻意**不递归 chown 工作目录**——那会改掉用户
+/// 仓库里所有文件的所有者（可能正被 git 跟踪，且是不可逆的副作用）；
+/// 只把 `User=` 写进单元，目录权限由用户自己按需调整。
+async fn ensure_run_user(state: &Shared, app_name: &str, explicit: Option<&str>) -> ApiResult<String> {
+    let wanted: String = explicit
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| default_run_user(app_name));
+    if !panel_core::rules::is_valid_system_user(&wanted) {
+        return Err(ApiError::bad_request(
+            "run_user",
+            format!("运行用户「{wanted}」不合法（只允许小写字母/数字/下划线/连字符，且须字母或下划线开头）"),
+        ));
+    }
+    // 已存在的用户（root / www-data / 上次建的 site-*）直接复用，不碰系统
+    if state.os.users().exists(&wanted).await.unwrap_or(false) {
+        return Ok(wanted);
+    }
+    // 用户显式指定了一个不存在的名字 → **不擅自创建**：那很可能是拼错了。
+    // 只有面板自己派生的 `site-<应用名>` 才自动创建。
+    if explicit.is_some() {
+        return Err(ApiError::bad_request(
+            "run_user",
+            format!("系统里没有用户「{wanted}」，请先创建，或留空由面板自动分配 site-<应用名>"),
+        ));
+    }
+    state
+        .os
+        .users()
+        .ensure(&wanted, true, true)
+        .await
+        .map_err(|e| {
+            ApiError::bad_request(
+                "run_user",
+                format!("无法创建运行用户「{wanted}」（面板需 root 权限）：{e}"),
+            )
+        })?;
+    Ok(wanted)
+}
+
 fn validate_port(p: u16) -> ApiResult<u16> {
     if p == 0 {
         return Err(ApiError::bad_request("port", "端口须在 1~65535 之间"));
@@ -547,7 +662,11 @@ pub async fn create(
             d.to_string()
         }
     };
+    check_exec_arch(&workdir, &exec)?;
     let port = validate_port(req.port.unwrap_or(runtime.default_port()))?;
+    // 端口冲突要在写库**之前**查：库里已有同名应用会走另一条分支，
+    // 但端口冲突与「是否已存在」无关，新建时同样要拦。
+    check_port(&state, port, 0, &name).await?;
     let env = validate_env(&req.env)?;
     let enabled = req.enabled.unwrap_or(true);
     // 停用态**仍校验并保存域名**：否则用户「先建后启用」时会发现域名全丢、还得重填。
@@ -575,12 +694,9 @@ pub async fn create(
         runtime: runtime.key().to_string(),
         workdir,
         exec_start: exec,
-        run_user: req
-            .run_user
-            .as_deref()
-            .map(str::trim)
-            .filter(|u| !u.is_empty())
-            .map(str::to_string),
+        // 运行用户：缺省自动分配 `site-<应用名>`（系统用户 + nologin），
+        // 并确保它存在。此前留空 = 以 root 跑业务进程。
+        run_user: Some(ensure_run_user(&state, &name, req.run_user.as_deref()).await?),
         env,
         port: i64::from(port),
         auto_restart: i64::from(req.auto_restart.unwrap_or(true)),
@@ -626,8 +742,10 @@ pub async fn patch(
     if let Some(e) = req.exec_start.as_deref() {
         next.exec_start = validate_exec(e)?;
     }
-    if let Some(u) = req.run_user.as_deref() {
-        next.run_user = Some(u.trim().to_string()).filter(|s| !s.is_empty());
+    if req.run_user.is_some() {
+        // 显式传了（含传空串 = 「改回自动」）才重算；没传这个字段就沿用库里的值，
+        // 免得每次编辑都去碰系统用户。
+        next.run_user = Some(ensure_run_user(&state, &cur.name, req.run_user.as_deref()).await?);
     }
     if let Some(env) = req.env.as_ref() {
         next.env = validate_env(env)?;
@@ -641,6 +759,17 @@ pub async fn patch(
     if let Some(d) = req.domains.as_ref() {
         next.domains = validate_domains(d)?;
     }
+    // 架构预检放在**所有字段合并之后**：改的可能是 workdir、也可能是 exec_start，
+    // 只在「exec 变化」时查会漏掉「换到另一个目录里的同架构错产物」。
+    if req.exec_start.is_some() || req.workdir.is_some() {
+        check_exec_arch(&next.workdir, &next.exec_start)?;
+    }
+    // 端口冲突同理：**任何**字段变化都可能带着新端口进来（含 runtime 切换
+    // 改写 default_port 的情况），故在合并后统一查，并排除自己。
+    if req.port.is_some() || req.runtime.is_some() {
+        check_port(&state, next.port as u16, id, &next.name).await?;
+    }
+
     let new_enabled = req.enabled.unwrap_or(cur.enabled != 0);
     let was_enabled = cur.enabled != 0;
     next.enabled = i64::from(new_enabled);
@@ -909,6 +1038,58 @@ mod tests {
         assert!(validate_name("a b").is_err());
         assert!(validate_name("-lead").is_err());
         assert!(validate_name(".").is_err());
+    }
+
+    /// 造一个可渲染单元的最小应用行。
+    fn raw_app_for_test() -> RawApp {
+        RawApp {
+            id: 1,
+            name: "blog".into(),
+            runtime: "go".into(),
+            workdir: "/opt/blog".into(),
+            exec_start: "app".into(),
+            run_user: None,
+            env: Vec::new(),
+            port: 8080,
+            auto_restart: 1,
+            enabled: 1,
+            domains: vec!["blog.example.com".into()],
+            created_at: 0,
+        }
+    }
+
+    /// 默认运行用户必须是 `site-<应用名>`：业务进程**绝不该以 root 跑**。
+    ///
+    /// 这条判据的价值在于「字段在、但没人赋值」这类静默失效——`run_user`
+    /// 从第一天起就在单元渲染里生效，却始终为 None，于是所有应用默认 root。
+    #[test]
+    fn default_run_user_is_site_scoped() {
+        assert_eq!(default_run_user("blog"), "site-blog");
+        assert_eq!(default_run_user("my-app"), "site-my-app");
+        // 派生的名字必须能过系统用户校验（否则 ensure 一律失败）
+        for n in ["blog", "my-app", "a", "app_2"] {
+            let u = default_run_user(n);
+            assert!(
+                panel_core::rules::is_valid_system_user(&u),
+                "{u} 必须是通过系统用户校验的名字"
+            );
+        }
+    }
+
+    /// 单元渲染里 `User=` / `Group=` 必须真的落进去（此前字段永远为 None，
+    /// 于是渲染出的单元**根本没有** User= 行）。
+    #[test]
+    fn app_unit_contains_user_directive() {
+        let mut a = raw_app_for_test();
+        a.run_user = Some("site-blog".into());
+        let unit = build_unit(&a).expect("应能渲染单元");
+        assert!(unit.contains("User=site-blog"), "单元应含 User=:\n{unit}");
+        assert!(unit.contains("Group=site-blog"), "单元应含 Group=:\n{unit}");
+        // run_user 为 None 时不应输出空的 User=（systemd 会因空值拒载）
+        let mut root_run = raw_app_for_test();
+        root_run.run_user = None;
+        let u2 = build_unit(&root_run).unwrap();
+        assert!(!u2.contains("User="), "无运行用户时不该输出 User=:\n{u2}");
     }
 
     /// systemd 的硬约束：`ExecStart` 不接受相对路径（实测 bad unit file setting）。

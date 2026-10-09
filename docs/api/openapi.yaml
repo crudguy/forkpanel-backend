@@ -487,7 +487,7 @@ App:
         runtime_label: { type: string, description: "运行时展示名（由后端给出，前端不自行翻译）" }
         workdir:       { type: string, description: "工作目录绝对路径（须已存在）" }
         exec_start:    { type: string, description: "进 systemd ExecStart= 的启动命令" }
-        run_user:      { type: [string, "null"], description: "运行用户；null = root（⚠ 当前默认以root 跑业务进程，隔离见待办）" }
+        run_user:      { type: [string, "null"], description: "运行用户。**新建时缺省自动分配 `site-<应用名>`**（系统用户 + nologin 禁止登录）；显式传 `root` 则以 root 跑（不推荐）。删应用**不会**删除该系统用户（可能被别处引用）" }
         env:           { type: array, description: "环境变量 [[k, v], ...]。**面板不代存秘密**（无加密存储），敏感值请勿填" }
         port:          { type: integer, description: "监听端口（反代上游指向 http://127.0.0.1:<port>）" }
         auto_restart:  { type: boolean, description: "崩溃自动重启（systemd Restart=always）" }
@@ -514,7 +514,7 @@ App:
         runtime:      { type: string, enum: [node, go, rust, java, python, dotnet, php, custom] }
         workdir:      { type: string, description: "已存在的绝对路径（刻意不受站点根沙箱约束——那是给静态文件用的）" }
         exec_start:   { type: [string, "null"], description: "留空则用运行时默认命令；custom 运行时必填" }
-        run_user:     { type: [string, "null"] }
+        run_user:     { type: [string, "null"], description: "运行用户。**留空 = 自动分配 `site-<应用名>`**（面板会`useradd --system --no-create-home --shell nologin` 创建）。显式指定一个**不存在**的用户会报 400（视为拼错，面板不擅自创建）；指定已存在的的（root/www-data）则直接复用" }
         env:          { type: array, description: "[[k, v], ...]；键禁含换行与 =" }
         port:         { type: [integer, "null"], description: "留空则用运行时默认端口" }
         auto_restart: { type: [boolean, "null"] }
@@ -526,7 +526,7 @@ App:
         runtime:      { type: string, enum: [node, go, rust, java, python, dotnet, php, custom] }
         workdir:      { type: string }
         exec_start:   { type: string }
-        run_user:     { type: [string, "null"] }
+        run_user:     { type: [string, "null"], description: "运行用户。**省略 = 沿用现有值**；传空串 = 改回自动分配 `site-<应用名>`" }
         env:          { type: array }
         port:         { type: integer }
         auto_restart: { type: boolean }
