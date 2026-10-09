@@ -42,20 +42,38 @@ pub struct ConnDto {
     pub has_password: bool,
 }
 
+/// 列表端点的目标列。**列序即 `conn_row` 的索引**——加列必须同步改这两处。
+const CONN_SELECT: &str =
+    "SELECT id, name, engine, host, port, default_db, password_enc FROM db_connections";
+
+/// 一行 `db_connections` 的原始形态（与 `CONN_SELECT` 列序严格对应）。
+type ConnRow = (i64, String, String, Option<String>, Option<i64>, Option<String>, Option<Vec<u8>>);
+
+/// 行 → 元组。
+///
+/// **刻意抽成独立函数**：回归测试要能直接拿它跑一次真查询。若把映射留在闭包里，
+/// 测试只能另抄一份逻辑——抄的那份必然与原实现漂移，等于没测。
+fn conn_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ConnRow> {
+    Ok((
+        r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?,
+        // ⚠ 第 7 列 `password_enc` 是 **BLOB**（migration 001 · `password_enc BLOB`；create
+        // 处按 `Option<Vec<u8>>` 写入）。这里曾误读成 `Option<String>` → rusqlite 类型
+        // 不匹配，**列表端点直接 500**（`Invalid column type Blob at index: 6`）。
+        // 下游只用 `pwd.is_some()`，取字节即可，无需解密。
+        r.get(6)?,
+    ))
+}
+
 pub async fn list(
     State(state): State<Shared>, Auth(s): Auth,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_VIEW)?;
 
     let rows = state.pool.with(|conn| {
-        let mut st = conn.prepare(
-            "SELECT id, name, engine, host, port, default_db, password_enc FROM db_connections")
+        let mut st = conn.prepare(CONN_SELECT)
             .map_err(|e| PanelError::Database(e.to_string()))?;
-        let it = st.query_map([], |r| Ok((
-            r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
-            r.get::<_, Option<String>>(3)?, r.get::<_, Option<i64>>(4)?,
-            r.get::<_, Option<String>>(5)?, r.get::<_, Option<String>>(6)?,
-        ))).map_err(|e| PanelError::Database(e.to_string()))?;
+        let it = st.query_map([], conn_row)
+            .map_err(|e| PanelError::Database(e.to_string()))?;
         let mut v = Vec::new();
         for x in it { v.push(x.map_err(|e| PanelError::Database(e.to_string()))?); }
         Ok(v)
@@ -848,5 +866,44 @@ mod tests {
         let v = serde_json::to_value(&dto).unwrap();
         assert!(!v.as_object().unwrap().contains_key("password"));
         assert_eq!(v["has_password"], true);
+    }
+
+    /// 回归：`password_enc` 是 **BLOB** 列，按 `String` 读会让列表端点直接 500。
+    ///
+    /// 实证过的失败：`GET /api/v1/db/connections` → 500
+    /// `database: Invalid column type Blob at index: 6, name: password_enc`。
+    /// 这类错误**编译期看不见、纯函数单测也抓不到**——必须真跑一次带 BLOB 的查询。
+    /// 故本测试建真表、插真数据，并直接调用生产用的 `conn_row`（不另抄一份映射）。
+    #[test]
+    fn conn_row_reads_blob_password_and_null() {
+        let mut c = rusqlite::Connection::open_in_memory().unwrap();
+        panel_db::migrate::apply(&mut c).unwrap();
+
+        // 两种形态都要能读：有口令（BLOB 密文）/ 无口令（NULL）
+        c.execute(
+            "INSERT INTO db_connections(name, engine, host, port, password_enc) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "with-pwd", "mysql", "127.0.0.1", 3306, Some(vec![0xDEu8, 0xAD, 0xBE, 0xEF])
+            ],
+        ).unwrap();
+        c.execute(
+            "INSERT INTO db_connections(name, engine) VALUES (?1, ?2)",
+            rusqlite::params!["no-pwd", "sqlite"],
+        ).unwrap();
+
+        let mut st = c.prepare(CONN_SELECT).unwrap();
+        let rows: Vec<ConnRow> = st
+            .query_map([], conn_row)
+            .unwrap()
+            .map(|x| x.expect("含 BLOB 的行必须能被 conn_row 读出（此前正是在此 500）"))
+            .collect();
+
+        assert_eq!(rows.len(), 2);
+        let pick = |n: &str| rows.iter().find(|r| r.1 == n).expect("缺行").clone();
+        // 有口令：密文原样取回（下游只用 is_some，不解密）
+        assert_eq!(pick("with-pwd").6.as_deref(), Some(&[0xDEu8, 0xAD, 0xBE, 0xEF][..]));
+        // 无口令：NULL 必须映射成 None，而不是报类型错
+        assert!(pick("no-pwd").6.is_none(), "NULL 口令应映射为 None");
     }
 }
