@@ -415,10 +415,16 @@ mod tests {
 
     #[test]
     fn unit_name_rejects_injection() {
-        assert!(is_valid_unit_name("nginx.service"));
-        assert!(is_valid_unit_name("panel@1.service"));
-        // 注入类输入必须全部拒绝
-        for bad in ["nginx; rm -rf /", "../../etc/passwd", "$(id)", "`id`", "-bad", "a..b", ""] {
+        // 合法：systemd 单元名的真实形态
+        for ok in ["nginx.service", "panel@1.service", "sshd", "mysql_1.service", "a.b-c@d"] {
+            assert!(is_valid_unit_name(ok), "应放行: {ok}");
+        }
+        // 注入 / 越界 / 超长 必须全部拒绝
+        for bad in [
+            "nginx; rm -rf /", "../../etc/passwd", "$(id)", "`id`", "-bad", "a..b", "",
+            "nginx|cat /etc/shadow", "nginx\nrm -rf /", "unit&id",  // 管道 / 换行 / `&` 注入
+            &"x".repeat(300),                                       // 超长（>256）
+        ] {
             assert!(!is_valid_unit_name(bad), "should reject {bad:?}");
         }
     }
@@ -438,8 +444,12 @@ mod tests {
         for bad in [
             "random", "test123", "localhost", "as", "a",       // 单词级（无 TLD）
             "-a.com", "a-.com", ".com", "exa mple.com",        // label 语法 / 空格
+            "a..b",                                            // 空 label
             "asdf.qwer", "host.zzz", "example.notreal",        // TLD 不存在（编造）
             "999.999.999.999", "256.1.1.1", "1.2.3",           // 伪 IP / 段数不足
+            "example.com;rm -rf /",                            // 分号注入
+            "example.com\nSet-Cookie:x",                       // 换行头注入（CRLF）
+            "$(id).com",                                       // 命令替换
             "a".repeat(254).as_str(), "",                      // 超长 / 空
         ] {
             assert!(!is_valid_domain(bad), "必须拒绝: {bad:?}");
@@ -448,17 +458,55 @@ mod tests {
 
     #[test]
     fn db_name_excludes_dash() {
-        assert!(is_valid_db_name("wp_db1"));
-        assert!(!is_valid_db_name("wp-db"));   // 反引号陷阱
-        assert!(!is_valid_db_name("db;drop"));
+        // 合法：大小写字母 / 数字 / 下划线（`Panel` 验证大写不被误拒）
+        for ok in ["wp_db1", "Panel", "a"] {
+            assert!(is_valid_db_name(ok), "应放行: {ok}");
+        }
+        // 非法
+        for bad in [
+            "wp-db",                       // '-' 会诱出 MySQL 反引号陷阱，刻意排除
+            "db;drop table", "db'or 1=1--", // SQL 注入
+            "db`x",                        // 反引号（反引号陷阱的元凶字符本身）
+            "", &"d".repeat(65),           // 空 / 超长（>64）
+        ] {
+            assert!(!is_valid_db_name(bad), "必须拒绝: {bad:?}");
+        }
+    }
+
+    /// 系统用户名（cron / 服务运行身份）：首字符须小写字母或 `_`，其余 `[a-z0-9_-]`。
+    ///
+    /// 该值会进 crontab 的 `-u` 参数与 systemd 单元，故大写、空格、注入字符全拒。
+    /// 单独在 rules 层覆盖——路由层（`routes/cron.rs`）也有一份断言，但那是"cron
+    /// 路由顺带校验"，规则的边界（如 `_apps` 走 `c == '_'` 分支）应在此处兜住。
+    #[test]
+    fn system_user_rules() {
+        for ok in ["www-data", "_apps", "nginx1", "root"] {
+            assert!(is_valid_system_user(ok), "应放行: {ok}");
+        }
+        for bad in [
+            "-root",       // 首字符 '-'（CLI 选项注入）
+            "Root",        // 大写（Linux 用户名惯例全小写）
+            "user name",   // 空格
+            "root;id", "user$(id)",  // 注入
+            "", &"u".repeat(33),     // 空 / 超长（>32）
+        ] {
+            assert!(!is_valid_system_user(bad), "必须拒绝: {bad:?}");
+        }
     }
 
     #[test]
     fn path_segment_rejects_traversal() {
-        assert!(is_valid_path_segment("site-a"));
-        assert!(!is_valid_path_segment(".."));
-        assert!(!is_valid_path_segment("a/b"));
-        assert!(!is_valid_path_segment("a\0b"));
+        for ok in ["site-a", "index.html"] {
+            assert!(is_valid_path_segment(ok), "应放行: {ok}");
+        }
+        for bad in [
+            "..", ".",                    // 上级 / 当前目录
+            "a/b", "a\\b", "a\0b",        // 路径分隔符与 NUL（反斜杠在 Windows 上也是分隔符）
+            "a b", "a;b",                 // 空格破坏 crontab 字段切分；分号可被 shell 解释
+            "", &"s".repeat(256),         // 空 / 超长（>255）
+        ] {
+            assert!(!is_valid_path_segment(bad), "必须拒绝: {bad:?}");
+        }
     }
 
     /// 站点名共享校验（后端 create / patch 共用）：白名单而非黑名单。
