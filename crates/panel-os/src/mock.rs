@@ -172,6 +172,11 @@ impl ServiceProvider for MockServices {
     async fn config_write(&self, _n: &UnitName, _content: &str, _restart: bool, _t: crate::traits::ConfigTarget) -> Result<()> {
         Err(panel_core::PanelError::Unsupported("service.config (mock adapter has no real unit files)"))
     }
+
+    // mock 无真实单元文件，但装/删是"声明式写操作"——与 start/stop/set_enabled 一致地
+    // 假装成功，让上层业务逻辑（apps → systemd → 站点）在 mock 下也能跑通。
+    async fn install_unit(&self, _n: &UnitName, _content: &str) -> Result<()> { Ok(()) }
+    async fn remove_unit(&self, _n: &UnitName) -> Result<()> { Ok(()) }
 }
 
 impl MockServices {

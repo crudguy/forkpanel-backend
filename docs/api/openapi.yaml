@@ -467,6 +467,60 @@ components:
         spa:              { type: boolean, description: "SPA 回退（kind=static 时有效）：true 时未命中文件的路径交给 /index.html（history 路由单页应用）。缺省 false" }
         redirect_target:  { type: [string, "null"], description: "整站重定向目标 URL（kind=redirect 时存在，绝对 http(s)://）；其余为 null" }
         redirect_code:    { type: [integer, "null"], description: "整站重定向状态码（kind=redirect 时存在；301/302/307/308）；其余为 null" }
+    App:
+      type: object
+      properties:
+        id:            { type: integer }
+        name:          { type: string, description: "应用名（同时派生 systemd 单元名与反代站点名）" }
+        runtime:       { type: string, enum: [node, go, rust, java, python, dotnet, php, custom] }
+        runtime_label: { type: string, description: "运行时展示名（由后端给出，前端不自行翻译）" }
+        workdir:       { type: string, description: "工作目录绝对路径（须已存在）" }
+        exec_start:    { type: string, description: "进 systemd ExecStart= 的启动命令" }
+        run_user:      { type: [string, "null"], description: "运行用户；null = root（⚠ 当前默认以root 跑业务进程，隔离见待办）" }
+        env:           { type: array, description: "环境变量 [[k, v], ...]。**面板不代存秘密**（无加密存储），敏感值请勿填" }
+        port:          { type: integer, description: "监听端口（反代上游指向 http://127.0.0.1:<port>）" }
+        auto_restart:  { type: boolean, description: "崩溃自动重启（systemd Restart=always）" }
+        enabled:       { type: boolean, description: "期望状态：是否已托管（单元已装 + 站点已下发）" }
+        domains:       { type: array, items: { type: string }, description: "自动反代站点的域名" }
+        created_at:    { type: integer }
+        unit:          { type: string, description: "systemd 单元名（panel-app-<name>.service），可拿去日志页看输出" }
+        state:         { type: [string, "null"], description: "systemd 状态；探测失败为 null（不因此让整页失败）" }
+    AppRuntimeInfo:
+      type: object
+      properties:
+        key:           { type: string }
+        label:         { type: string }
+        default_port:  { type: integer }
+        runtime_pkg:   { type: [string, "null"], description: "面板包白名单里的系统包名；null = 面板不托管该运行时（前端据此不显示安装状态，不做「你没有 X」的断言）" }
+        default_exec:  { type: string }
+        typical:       { type: string }
+        build_hint:    { type: string, description: "构建步骤提示（纯文案，面板不执行构建）" }
+    AppCreate:
+      type: object
+      required: [name, runtime, workdir]
+      properties:
+        name:         { type: string, pattern: "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$", description: "字母数字开头，后可接字母数字与 . _ -，长度 1~63；派生的 systemd 单元名须同样合法" }
+        runtime:      { type: string, enum: [node, go, rust, java, python, dotnet, php, custom] }
+        workdir:      { type: string, description: "已存在的绝对路径（刻意不受站点根沙箱约束——那是给静态文件用的）" }
+        exec_start:   { type: [string, "null"], description: "留空则用运行时默认命令；custom 运行时必填" }
+        run_user:     { type: [string, "null"] }
+        env:          { type: array, description: "[[k, v], ...]；键禁含换行与 =" }
+        port:         { type: [integer, "null"], description: "留空则用运行时默认端口" }
+        auto_restart: { type: [boolean, "null"] }
+        domains:      { type: array, items: { type: string }, description: "启用态必填（据此自动建反代站点）；每项须为≥2 级且顶级域真实存在的域名" }
+        enabled:      { type: [boolean, "null"], description: "缺省 true；false = 只登记不装单元不建站点" }
+    AppPatch:
+      type: object
+      properties:
+        runtime:      { type: string, enum: [node, go, rust, java, python, dotnet, php, custom] }
+        workdir:      { type: string }
+        exec_start:   { type: string }
+        run_user:     { type: [string, "null"] }
+        env:          { type: array }
+        port:         { type: integer }
+        auto_restart: { type: boolean }
+        domains:      { type: array, items: { type: string } }
+        enabled:      { type: boolean, description: "切到 false 会撤下反代站点并删除单元文件" }
     SiteWaf:
       type: object
       required: [enabled]
@@ -1505,6 +1559,82 @@ paths:
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       responses: { '204': { description: ok } }
+  /api/v1/apps:
+    get:
+      tags: [apps]
+      summary: 应用列表（含 systemd 状态；探测失败时该项 state 为 null）
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/App' } } } }
+    post:
+      tags: [apps]
+      summary: 新建应用（渲染 systemd 单元 + 自动建反向代理站点）
+      description: |
+        面板只负责把进程按 systemd 拉起；**构建与依赖安装仍需用户在 workdir 自行完成**
+        （runtime 的 build_hint 仅作提示，面板不执行）。
+        启用态会依次：安装单元 → `sites/apply` 建反代站点 → 落库。
+      security: [cookieAuth, csrfHeader]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/AppCreate' } } } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/App' } } }
+        '400': { description: 校验失败（detail.field 指明字段） }
+        '409': { description: 同名应用已存在 }
+  /api/v1/apps/catalog:
+    get:
+      tags: [apps]
+      summary: 受支持运行时目录（前端下拉的**唯一**数据源，勿在前端另硬编码一份）
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { runtimes: { type: array, items: { $ref: '#/components/schemas/AppRuntimeInfo' } } } } } }
+  /api/v1/apps/{id}:
+    get:
+      tags: [apps]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/App' } } }
+        '404': { description: 应用不存在 }
+    patch:
+      tags: [apps]
+      summary: 更新应用（enabled 切到 false 时撤下站点并删除单元文件）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/AppPatch' } } } }
+      responses: { '200': { description: ok }, '400': { description: 校验失败 }, '404': { description: 应用不存在 } }
+    delete:
+      tags: [apps]
+      summary: 删除应用（顺序：撤站点 → 停单元 → 删单元文件 → 删库行）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses: { '204': { description: ok }, '404': { description: 应用不存在 } }
+  /api/v1/apps/{id}/act:
+    post:
+      tags: [apps]
+      summary: 启停/重启单元（act=start|stop|restart；stop 不删单元文件）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [act]
+              properties: { act: { type: string, enum: [start, stop, restart] } }
+      responses: { '200': { description: ok }, '400': { description: 不支持的 act } }
   /api/v1/sites/{id}/reload:
     post:
       tags: [sites]

@@ -293,6 +293,11 @@ const ALLOWED_PACKAGES: &[PkgDef] = &[
     PkgDef { name: "haproxy",        label: "HAProxy" },
     PkgDef { name: "nodejs",         label: "Node.js" },
     PkgDef { name: "default-jdk",    label: "OpenJDK" },
+    // Go / Rust 是元包：`golang-go` → 当前发行版的 golang-1.XX-go；`cargo` Depends
+    // `rustc`（实测 apt-cache depends），装一个包即得完整工具链。二者与上面的
+    // nodejs / default-jdk 同属「应用运行时」，供「应用」页的运行时安装提示联动。
+    PkgDef { name: "golang-go",      label: "Go" },
+    PkgDef { name: "cargo",          label: "Rust" },
     PkgDef { name: "wireguard-tools", label: "WireGuard" },
 ];
 

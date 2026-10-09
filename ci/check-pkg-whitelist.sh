@@ -107,4 +107,38 @@ else
 fi
 
 echo
+echo "== [E] AppRuntime.runtime_pkg 必须落在白名单内 =="
+# 防"能力位撒谎"：面板若声称某运行时可从「软件」页安装（runtime_pkg: Some("x")），
+# 那个 x 就必须真在白名单里——否则界面永远显示「未装」且无处可点。这类漏配
+# **不会编译报错**（match 已穷尽），只在运行时暴露，故必须靠脚本把守。
+# 该约束跨 crate（panel-os 不依赖 panel-api），无法写成 Rust 单测。
+TRAITS_SRC="crates/panel-os/src/traits.rs"
+if [ ! -f "$TRAITS_SRC" ]; then
+  fail "找不到 $TRAITS_SRC"
+else
+  # 必须**收窄到 fn runtime_pkg 的函数体**：traits.rs 里还有别的 Some("…")
+  # （版本号解析工具），全文件 grep 会把 "1.0" / "17+278" 这类误当包名。
+  RP=$(awk '/fn runtime_pkg/,/^    }/' "$TRAITS_SRC" 2>/dev/null \
+    | grep -oE 'Some\("[a-z0-9][a-z0-9.+-]*"\)' | grep -oE '"[a-z0-9][a-z0-9.+-]*"' \
+    | tr -d '"' | sort -u)
+  RP_N=$(count "$RP")
+  if [ "$RP_N" -eq 0 ]; then
+    fail "未提取到任何 runtime_pkg（正则失效，还是全改成 None 了？）"
+  else
+    pass "runtime_pkg 提取到 $RP_N 项：$(printf '%s' "$RP" | tr '\n' ' ')"
+    if [ "$BE_N" -eq 0 ]; then
+      fail "跳过 [E] 差集：上方后端白名单为空"
+    else
+      MISS=$(comm -23 <(printf '%s\n' "$RP") <(printf '%s\n' "$BE"))
+      if [ -n "$MISS" ]; then
+        fail "以下 runtime_pkg 不在 ALLOWED_PACKAGES 内（界面会永远显示「未装」且无处可装）："
+        printf '%s\n' "$MISS" | sed 's/^/      /'
+      else
+        pass "runtime_pkg 全部在白名单内"
+      fi
+    fi
+  fi
+fi
+
+echo
 if [ "$FAIL" -eq 0 ]; then echo "PASS：软件包白名单前后端一致"; exit 0; else echo "FAIL：白名单不一致"; exit 1; fi

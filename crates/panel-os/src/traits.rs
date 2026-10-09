@@ -229,6 +229,24 @@ pub trait ServiceProvider: Send + Sync {
     /// 写回配置并经 `daemon-reload` 重新加载；`restart` 为真时随后重启服务。
     /// 写入前自动备份为 `<path>.panel.bak`，并原子替换（先写临时文件再 rename）。
     async fn config_write(&self, name: &UnitName, content: &str, restart: bool, target: ConfigTarget) -> Result<()>;
+
+    /// **新建**一个单元文件（`/etc/systemd/system/<name>`）并 `daemon-reload`。
+    ///
+    /// 与 `config_write` 的区别：那个改**已存在**的单元（靠 `FragmentPath` 定位），
+    /// 本方法用于**面板自建**的应用单元——文件尚不存在，没有 FragmentPath 可查，
+    /// 故路径由单元名直接派生（`/etc/systemd/system/<name>`，`UnitName` 已校验安全）。
+    ///
+    /// `name` 必须带 `.service` 后缀（如 `panel-app-blog.service`）；实现方需再兜一次
+    /// 后缀与路径穿越校验——**绝不信任调用方拼好的字符串直接落盘**。
+    /// 写入采用「先写临时文件再 rename」的原子替换，避免半写文件把单元改坏。
+    /// 幂等：同名单元已存在时**覆盖**（面板自建的单元以 DB 为真相源，DB 改了就该重写）。
+    async fn install_unit(&self, name: &UnitName, content: &str) -> Result<()>;
+
+    /// 删除面板自建的应用单元（`/etc/systemd/system/<name>`）并 `daemon-reload`。
+    ///
+    /// 与 `install_unit` 对称：删应用时必须把单元文件一并清掉，否则留下**孤儿单元**
+    /// （systemd 仍会按残留的 `[Install]` 段尝试拉起它）。文件不存在时不报错（幂等）。
+    async fn remove_unit(&self, name: &UnitName) -> Result<()>;
 }
 
 // ═══════════════════════════ 软件包 ═══════════════════════════
@@ -674,6 +692,252 @@ pub trait SchedulerProvider: Send + Sync {
     async fn remove(&self, id: &str) -> Result<()>;
     async fn runs(&self, id: &str, limit: usize) -> Result<Vec<JobRun>>;
 }
+
+// ═══════════════════════════ 应用托管（systemd 单元） ═══════════════════════════
+
+/// 受支持的应用运行时。
+///
+/// **只描述「怎么把进程拉起来」**——运行时不改变 nginx 的接入方式：Node / Go / Rust / Java /
+/// Python / .NET 在 nginx 侧一律走 `proxy_pass` 到本机端口，配置逐字节相同。差异只在
+/// 「装哪个系统包、用什么命令启动、默认监听哪个端口」，故做成运行时元数据而非 `SiteKind`
+/// 变体（加变体＝加一份产出同一份 nginx 配置的 match 分支，纯重复）。
+///
+/// 与 `SiteKind` 的分工是**正交**的：`SiteKind` 管接入协议（静态/反向代理/FastCGI/重定向），
+/// 本枚举管进程怎么起。一个 Go 应用 = `AppRuntime::Go` + `SiteKind::ReverseProxy`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppRuntime {
+    Node,
+    Go,
+    Rust,
+    Java,
+    Python,
+    DotNet,
+    Php,
+    /// 自定义：用户自备启动命令，面板不提供任何默认值或运行时提示。
+    Custom,
+}
+
+impl AppRuntime {
+    /// 全部运行时（前端下拉与 catalog 端点的数据源）。
+    pub const ALL: [AppRuntime; 8] = [
+        AppRuntime::Node, AppRuntime::Go, AppRuntime::Rust, AppRuntime::Java,
+        AppRuntime::Python, AppRuntime::DotNet, AppRuntime::Php, AppRuntime::Custom,
+    ];
+
+    /// 稳定标识（落库 / API 传输用）。**不可随意改**——改了会读不出已有数据。
+    pub fn key(&self) -> &'static str {
+        match self {
+            AppRuntime::Node => "node",
+            AppRuntime::Go => "go",
+            AppRuntime::Rust => "rust",
+            AppRuntime::Java => "java",
+            AppRuntime::Python => "python",
+            AppRuntime::DotNet => "dotnet",
+            AppRuntime::Php => "php",
+            AppRuntime::Custom => "custom",
+        }
+    }
+
+    /// 由落库标识反解；未知值返回 `None`（调用方据此回退到 `Custom`，不 panic）。
+    pub fn from_key(k: &str) -> Option<AppRuntime> {
+        AppRuntime::ALL.into_iter().find(|r| r.key() == k)
+    }
+
+    /// 展示名。
+    pub fn label(&self) -> &'static str {
+        match self {
+            AppRuntime::Node => "Node.js",
+            AppRuntime::Go => "Go",
+            AppRuntime::Rust => "Rust",
+            AppRuntime::Java => "Java",
+            AppRuntime::Python => "Python",
+            AppRuntime::DotNet => ".NET",
+            AppRuntime::Php => "PHP",
+            AppRuntime::Custom => "自定义",
+        }
+    }
+
+    /// 默认监听端口（仅作预填，用户可改；`Custom` 无默认故给 0）。
+    pub fn default_port(&self) -> u16 {
+        match self {
+            AppRuntime::Node => 3000,
+            AppRuntime::Go => 8080,
+            AppRuntime::Rust => 8080,
+            AppRuntime::Java => 8081,
+            AppRuntime::Python => 8000,
+            AppRuntime::DotNet => 5000,
+            AppRuntime::Php => 9000,
+            AppRuntime::Custom => 0,
+        }
+    }
+
+    /// 面板包白名单里的系统包名，用于「已装 / 未装」提示。
+    ///
+    /// `None` = 面板不托管该运行时（如 Python 用系统自带、.NET 需微软源），
+    /// 此时前端不显示安装状态——**不做「你没有 X」这种面板无权判断的断言**。
+    ///
+    /// ⚠ 口径是**包管理器里的系统包**，不等于「这台机器上有没有该语言」：
+    /// 用 nvm / 官方安装包装好的 node 不出现在 apt 的已装列表里（本机实测如此）。
+    pub fn runtime_pkg(&self) -> Option<&'static str> {
+        match self {
+            AppRuntime::Node => Some("nodejs"),
+            AppRuntime::Go => Some("golang-go"),
+            AppRuntime::Rust => Some("cargo"),
+            AppRuntime::Java => Some("default-jdk"),
+            AppRuntime::Php => Some("php-fpm"),
+            AppRuntime::Python | AppRuntime::DotNet | AppRuntime::Custom => None,
+        }
+    }
+
+    /// 默认启动命令（进 systemd `ExecStart=`）。刻意是**可跑的示例**而非占位符——
+    /// 用户改起来比从空白开始快，也顺带示范了该运行时的常见入口形式。
+    pub fn default_exec(&self) -> &'static str {
+        match self {
+            AppRuntime::Node => "node server.js",
+            AppRuntime::Go => "app",
+            AppRuntime::Rust => "app",
+            AppRuntime::Java => "java -jar app.jar",
+            AppRuntime::Python => "gunicorn app:app -b 127.0.0.1:8000",
+            AppRuntime::DotNet => "dotnet App.dll",
+            AppRuntime::Php => "php-fpm -F -y /etc/php/8.4/fpm/php-fpm.conf",
+            AppRuntime::Custom => "",
+        }
+    }
+
+    /// 典型框架（帮用户确认没选错运行时）。
+    pub fn typical(&self) -> &'static str {
+        match self {
+            AppRuntime::Node => "Express / NestJS / Next.js",
+            AppRuntime::Go => "net/http / Gin / Echo",
+            AppRuntime::Rust => "Axum / Actix Web / Rocket",
+            AppRuntime::Java => "Spring Boot（内置 Tomcat）",
+            AppRuntime::Python => "Django / Flask / FastAPI",
+            AppRuntime::DotNet => "ASP.NET Core（Kestrel）",
+            AppRuntime::Php => "Laravel / Symfony（php-fpm 常驻）",
+            AppRuntime::Custom => "任意自托管服务",
+        }
+    }
+
+    /// 构建步骤提示（纯文案，前端展示；面板**不执行**构建——那属于用户自己的 CI/流水线）。
+    pub fn build_hint(&self) -> &'static str {
+        match self {
+            AppRuntime::Node => "先 npm ci && npm run build，再以启动命令拉起",
+            AppRuntime::Go => "先 go build -o app .（本机需 Go 工具链或交叉编译产物）",
+            AppRuntime::Rust => "先 cargo build --release，产物在 target/release/（拷或链接为工作目录下的 app）",
+            AppRuntime::Java => "先 mvn package / gradle build 产出可执行 jar",
+            AppRuntime::Python => "先建虚拟环境并 pip install -r requirements.txt",
+            // ci-allow-layering[2]: 纯提示文案里的 dotnet publish -c Release；并非 shell 调用（无引号包裹的 -c）
+            AppRuntime::DotNet => "先 dotnet publish -c Release 产出可部署目录", // ci-allow-layering[2]: 文案里的 `-c Release` 被正则误判为 shell 参数，非真实 shell 调用
+            AppRuntime::Php => "通常无需构建；依赖用 composer install 装到项目目录",
+            AppRuntime::Custom => "自行准备可执行文件或解释器命令",
+        }
+    }
+}
+
+/// 一个「面板托管的应用」的规格（渲染成 systemd 单元）。
+///
+/// 面板的职责边界：**只负责把进程按 systemd 拉起来**，构建/依赖安装仍由用户在项目
+/// 目录自行完成（`build_hint` 仅作提示）。这样面板不需要理解语言的包管理器，
+/// 也不会因为某语言的构建工具变更而失效。
+#[derive(Debug, Clone)]
+pub struct AppUnitSpec {
+    /// systemd 单元名（`panel-app-<name>.service`，由 `app_unit_name` 派生）
+    pub unit: String,
+    /// 人读描述（进 `Description=`）
+    pub description: String,
+    /// 工作目录（`WorkingDirectory=`）；必须是已存在的绝对路径，否则 systemd 以 CHDIR 失败
+    pub workdir: PathBuf,
+    /// 启动命令（`ExecStart=`）。面板**不解析**它——语义完全交由 systemd
+    pub exec_start: String,
+    /// 运行用户（`User=` / `Group=`）；`None` = 以 root 运行
+    pub run_user: Option<String>,
+    /// 追加环境变量（逐条 `Environment=`）
+    pub env: Vec<(String, String)>,
+    /// 监听端口——**仅供描述与前端展示**，systemd 本身不读它
+    pub port: u16,
+    /// 崩溃后自动重启（`Restart=always`）；关闭则 `Restart=no`
+    pub auto_restart: bool,
+}
+
+/// 应用名 → systemd 单元名：统一 `panel-app-<名>.service` 前缀，便于与系统单元区分、
+/// 也便于按前缀反查「哪些单元是面板托管的」。
+///
+/// ⚠ 应用名先经站点名白名单（`rules::is_valid_site_name`）校验，但那条规则**允许 `..`**
+/// （如 `a..b`），而 systemd 单元名**禁止** `..`——故此处再折叠一次，保证派生结果一定
+/// 能过 `rules::is_valid_unit_name`（否则会出现"校验通过却装不进 systemd"的死角）。
+pub fn app_unit_name(app: &str) -> String {
+    let safe = app.replace("..", "-");
+    format!("panel-app-{safe}.service")
+}
+
+/// systemd 配置值里的 `%` 必须写成 `%%`——否则 `%` 后跟字符会被当 **specifier** 展开
+/// （`%i` / `%n` / `%H` …），路径里的 `%` 会被静默替换掉。
+fn sd_pct(s: &str) -> String {
+    s.replace('%', "%%")
+}
+
+/// `Environment="K=V"` 的转义：反斜杠与双引号需转义；**换行直接剔除**——
+/// 换行会打断单元文件结构（等于把 V 里的内容注入成新的 systemd 指令），是实打实的注入点。
+fn env_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace(['\n', '\r'], " ")
+}
+
+
+/// 渲染 systemd 单元文本（纯字符串生成，不落盘；与 `render_nginx` 同性质）。
+///
+/// 刻意**输出最小可用集**：不写 `Type=` 之外的进程管理细节、不加多余 `After=`——
+/// 写得越多越容易与用户的实际需求冲突，而 systemd 的默认值对本场景已经够用。
+/// systemd 的 `ExecStart` 只接受**纯命令名**（走 PATH）或**绝对路径**——
+/// 相对路径（`./app`）会被判`bad unit file setting` 且**单元永不启动**
+/// （实测 `systemd-analyze verify`：Neither a valid executable name nor an absolute path）。
+/// 这里提前拦下，别让用户建完应用才发现 systemd 拒绝加载。
+pub fn exec_start_is_valid(cmd: &str) -> bool {
+    let c = cmd.trim();
+    if c.is_empty() {
+        return false;
+    }
+    // 首个 token 之前的部分即「程序名」；含空格时按 shell 词法粗切（systemd 语义更严格，
+    // 但足以拦住「以 ./ 开头的相对路径」这一实际踩到的坑）。
+    let first = c.split_whitespace().next().unwrap_or("");
+    if first.starts_with('/') || first.starts_with('~') {
+        return true;
+    }
+    // 相对路径（含 ./ ../）一律不合法
+    !first.contains('/')
+}
+
+pub fn render_app_unit(spec: &AppUnitSpec) -> String {
+    let mut out = String::new();
+    out.push_str("# 由 ForkPanel 生成 —— 请勿手工编辑\n");
+    out.push_str("# 面板以数据库为真相源，下次保存会整体覆盖本文件。\n");
+    out.push_str("# 对应的 nginx 反代站点在「网站」页管理。\n\n");
+    out.push_str("[Unit]\n");
+    out.push_str(&format!("Description={}\n", sd_pct(&spec.description)));
+    out.push_str("After=network-online.target\n");
+    out.push_str("Wants=network-online.target\n\n");
+    out.push_str("[Service]\n");
+    out.push_str("Type=simple\n");
+    out.push_str(&format!("WorkingDirectory={}\n", sd_pct(&spec.workdir.display().to_string())));
+    out.push_str(&format!("ExecStart={}\n", sd_pct(&spec.exec_start)));
+    if let Some(u) = &spec.run_user {
+        out.push_str(&format!("User={u}\n"));
+        out.push_str(&format!("Group={u}\n"));
+    }
+    for (k, v) in &spec.env {
+        out.push_str(&format!("Environment=\"{}={}\"\n", env_escape(k), env_escape(v)));
+    }
+    if spec.auto_restart {
+        out.push_str("Restart=always\n");
+        out.push_str("RestartSec=3\n");
+    } else {
+        out.push_str("Restart=no\n");
+    }
+    out.push_str("\n[Install]\nWantedBy=multi-user.target\n");
+    out
+}
+
 
 // ═══════════════════════════ Web 服务器 ═══════════════════════════
 
@@ -1264,5 +1528,44 @@ mod tests {
                 .unwrap_or(false);
             ok.then_some(*ord)
         })
+    }
+
+    /// 运行时元数据必须自洽——这些字符串**直接进 systemd 单元与前端下拉**，
+    /// 任一处漏配都不会编译报错（match 已穷尽），只会在运行时表现为
+    /// 「选项点了没反应」或「永远显示未装」，属最难查的一类。
+    #[test]
+    fn app_runtime_metadata_is_consistent() {
+        // key 唯一：落库标识，重复会让 from_key 静默取到第一个
+        let mut keys: Vec<&str> = AppRuntime::ALL.iter().map(|r| r.key()).collect();
+        let n = keys.len();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), n, "AppRuntime::ALL 的 key 有重复");
+
+        for r in AppRuntime::ALL {
+            // key 必须能反解回**同一个**变体，否则落库后读不出来
+            assert_eq!(AppRuntime::from_key(r.key()), Some(r), "round-trip 失败: {}", r.key());
+            // 展示项为空会让界面出现空白行
+            assert!(!r.label().is_empty(), "{} label 为空", r.key());
+            assert!(!r.typical().is_empty(), "{} typical 为空", r.key());
+            assert!(!r.build_hint().is_empty(), "{} build_hint 为空", r.key());
+        }
+
+        // Custom = 用户自备：无默认端口 / 无默认命令 / 不托管运行时
+        assert_eq!(AppRuntime::Custom.default_port(), 0);
+        assert!(AppRuntime::Custom.default_exec().is_empty());
+        assert_eq!(AppRuntime::Custom.runtime_pkg(), None);
+
+        // 其余变体必须有非零默认端口与可跑示例命令（否则模板预填等于没填）
+        for r in AppRuntime::ALL.iter().filter(|r| **r != AppRuntime::Custom) {
+            assert!(r.default_port() > 0, "{} 缺默认端口", r.key());
+            assert!(!r.default_exec().is_empty(), "{} 缺默认启动命令", r.key());
+        }
+
+        // 未知识别符不得 panic，须返回 None 交由调用方回退 Custom
+        assert_eq!(AppRuntime::from_key("cobol"), None);
+        assert_eq!(AppRuntime::from_key(""), None);
+        // ⚠ runtime_pkg 的字符串必须存在于后端 ALLOWED_PACKAGES —— 该约束跨 crate
+        //   （panel-os 不依赖 panel-api），故由 ci/check-pkg-whitelist.sh 的 [E] 项把守。
     }
 }

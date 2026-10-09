@@ -2358,6 +2358,78 @@ mod tests {
         assert!(!out.contains("try_files"), "重定向不应输出 try_files: {out}");
     }
 
+    // ── 应用托管（systemd 单元渲染） ──
+
+    fn app_spec() -> AppUnitSpec {
+        AppUnitSpec {
+            unit: app_unit_name("blog"),
+            description: "ForkPanel 应用 blog".into(),
+            workdir: PathBuf::from("/srv/apps/blog"),
+            exec_start: "node server.js".into(),
+            run_user: Some("www-data".into()),
+            env: vec![("NODE_ENV".into(), "production".into())],
+            port: 3000,
+            auto_restart: true,
+        }
+    }
+
+    #[test]
+    fn render_app_unit_emits_core_directives() {
+        let out = render_app_unit(&app_spec());
+        for want in [
+            "[Unit]", "[Service]", "[Install]",
+            "WorkingDirectory=/srv/apps/blog",
+            "ExecStart=node server.js",
+            "User=www-data",
+            "Environment=\"NODE_ENV=production\"",
+            "Restart=always",
+            "WantedBy=multi-user.target",
+        ] {
+            assert!(out.contains(want), "缺 {want}: {out}");
+        }
+    }
+
+    #[test]
+    fn render_app_unit_restart_toggle() {
+        let mut s = app_spec();
+        s.auto_restart = false;
+        let out = render_app_unit(&s);
+        assert!(out.contains("Restart=no"), "{out}");
+        assert!(!out.contains("Restart=always"), "{out}");
+    }
+
+    #[test]
+    fn render_app_unit_escapes_specifier_and_injection() {
+        let mut s = app_spec();
+        // `%` 必须双写成 `%%`：否则 systemd 当 specifier 展开（路径里的 % 被静默替换掉）
+        s.workdir = PathBuf::from("/srv/100%/app");
+        s.exec_start = "node /srv/100%/s.js".into();
+        // 换行是**注入点**：不剔除会让值里的内容变成新的 systemd 指令
+        s.env = vec![("A".into(), "x\nRestart=no".into())];
+        let out = render_app_unit(&s);
+        assert!(out.contains("WorkingDirectory=/srv/100%%/app"), "{out}");
+        assert!(out.contains("ExecStart=node /srv/100%%/s.js"), "{out}");
+        assert!(!out.contains("x\nRestart=no"), "换行必须被剔除（注入点）: {out}");
+        assert!(out.contains("Environment=\"A=x Restart=no\""), "{out}");
+        // 整个单元里只能有一条 **以 Restart= 开头的指令行** —— 值里那条必须已被折平。
+        // 注意按「行首」判定：折叠后的 env 值里合法地含有 "Restart=no" 这个文本片段
+        // （它在 Environment= 行内部，不是独立指令），直接 `matches("Restart=")` 会误计。
+        let directive_lines = out.lines().filter(|l| l.starts_with("Restart=")).count();
+        assert_eq!(directive_lines, 1, "{out}");
+    }
+
+    #[test]
+    fn app_unit_name_is_valid_systemd_name() {
+        // 站点名白名单**允许** `..`（如 `a..b`），而 systemd 单元名禁止 → 派生时必须折叠，
+        // 否则会出现"校验通过却装不进 systemd"的死角。
+        for app in ["blog", "my-app", "a.b", "a..b", "api_v2"] {
+            let u = app_unit_name(app);
+            assert!(!u.contains(".."), "单元名残留 `..`: {u}");
+            assert!(panel_core::rules::is_valid_unit_name(&u), "派生单元名不合法: {u}");
+            assert!(u.starts_with("panel-app-") && u.ends_with(".service"), "{u}");
+        }
+    }
+
     #[test]
     fn slug_sanitizes_and_defaults() {
         assert_eq!(slug("example.com"), "example.com");

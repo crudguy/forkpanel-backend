@@ -7,6 +7,7 @@
 //! path；新增路由前先更新契约。尚未实现的端点返回 501 Unsupported（统一 `ApiError::unsupported`），
 //! 不伪造数据、不留"半成品假成功"——能力缺失 = 明确告知，而非伪装成功。
 
+pub mod apps;
 pub mod auth;
 pub mod cron;
 pub mod assistant;
@@ -134,6 +135,13 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/sites/apply", post(sites::apply))
         .route("/api/v1/sites/root", get(sites::root_info))
         .route("/api/v1/sites/{id}", get(sites::get).patch(sites::patch).delete(sites::delete))
+        .route("/api/v1/apps", get(apps::list).post(apps::create))
+        .route("/api/v1/apps/catalog", get(apps::catalog))
+        .route(
+            "/api/v1/apps/{id}",
+            get(apps::get).patch(apps::patch).delete(apps::delete),
+        )
+        .route("/api/v1/apps/{id}/act", post(apps::act))
         .route("/api/v1/sites/{id}/reload", post(sites::reload))
         .route("/api/v1/sites/{id}/logs", get(sites::logs))
         .route("/api/v1/sites/{id}/ssl/apply", post(sites::ssl_apply))

@@ -212,6 +212,68 @@ impl ServiceProvider for LinuxServices {
             _ => Err(panel_core::PanelError::Unsupported("service.config_write requires systemd")),
         }
     }
+
+    async fn install_unit(&self, name: &UnitName, content: &str) -> Result<()> {
+        match self.init {
+            InitSystem::Systemd => {
+                let path = system_unit_path(name)?;
+                // 原子替换：先写临时文件再 rename。不原地写——半写状态会让单元文件损坏，
+                // systemd 随后连 `daemon-reload` 都会拒绝整份单元。
+                // 刻意**不**备份成 `.panel.bak`：面板自建的单元以 DB 为真相源，
+                // 重写就是最新，留着旧备份反而会被误当成"用户的原始配置"。
+                let tmp = format!("{path}.panel.tmp");
+                tokio::fs::write(&tmp, content.as_bytes()).await
+                    .map_err(|e| panel_core::PanelError::Io(format!("write {tmp}: {e}")))?;
+                tokio::fs::rename(&tmp, &path).await
+                    .map_err(|e| panel_core::PanelError::Io(format!("rename to {path}: {e}")))?;
+                daemon_reload().await
+            }
+            _ => Err(panel_core::PanelError::Unsupported("service.install_unit requires systemd")),
+        }
+    }
+
+    async fn remove_unit(&self, name: &UnitName) -> Result<()> {
+        match self.init {
+            InitSystem::Systemd => {
+                let path = system_unit_path(name)?;
+                // 幂等：文件不存在不算错（可能删过一次，或从未成功安装过）
+                match tokio::fs::remove_file(&path).await {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(panel_core::PanelError::Io(format!("remove {path}: {e}"))),
+                }
+                daemon_reload().await
+            }
+            _ => Err(panel_core::PanelError::Unsupported("service.remove_unit requires systemd")),
+        }
+    }
+}
+
+/// 面板自建单元的落盘路径：`/etc/systemd/system/<unit>`。
+///
+/// 与 `fragment_path`（走 `systemctl show` 查已装单元的 FragmentPath）的区别：本函数
+/// 用于**尚未安装**的单元——此刻没有任何 FragmentPath 可查。因此安全性完全依赖
+/// `UnitName` 的校验 + 本函数再兜的一次后缀与穿越检查：写系统目录前**绝不**信任
+/// 调用方拼好的字符串。
+fn system_unit_path(name: &UnitName) -> Result<String> {
+    let u = name.as_str();
+    if !u.ends_with(".service") || u.contains('/') || u.contains("..") || u.starts_with('-') {
+        return Err(panel_core::PanelError::Validation {
+            field: "unit",
+            reason: format!("refuse to install unit with unsafe name: {u:?}"),
+        });
+    }
+    Ok(format!("/etc/systemd/system/{u}"))
+}
+
+/// `systemctl daemon-reload`——装/删单元后必须调用，否则 systemd 仍持旧单元表。
+async fn daemon_reload() -> Result<()> {
+    cmd::run_checked(
+        Bin::Systemctl, &["daemon-reload"],
+        CmdOpt { timeout: Duration::from_secs(15), ..Default::default() },
+    ).await.map_err(|e| panel_core::PanelError::Command {
+        bin: "systemctl".into(), detail: format!("daemon-reload: {e}"),
+    }).map(|_| ())
 }
 
 /// 单元文件真实路径（`systemctl show -p FragmentPath`）+ 路径安全校验。
