@@ -180,7 +180,7 @@ fn service_unit_from_dpkg_list(out: &str, pkg: &str) -> Option<String> {
     for l in out.lines() {
         if l.ends_with(".service") && l.contains("systemd/system/") {
             let base = l.rsplit('/').next().unwrap_or(l);
-            if base.contains('@') { continue; }   // 跳过模板单元（postgresql@.service 等）
+            if base.contains("@") { continue; }   // 跳过模板单元（postgresql@.service 等）
             candidates.push(base);
         }
     }
@@ -917,7 +917,7 @@ fn relative_includes(rendered: &str) -> Vec<String> {
         }
         let Some(name) = rest.trim().strip_suffix(';') else { continue };
         let name = name.trim();
-        if name.is_empty() || name.starts_with('/') || name.contains('*') || name.contains("..") {
+        if name.is_empty() || name.starts_with('/') || name.contains("*") || name.contains("..") {
             continue;
         }
         if !name
@@ -1432,14 +1432,33 @@ fn render_waf_server(server_names: &[String], w: &WafSpec) -> String {
 fn render_deny_locations(strict: bool) -> String {
     let mut o = String::new();
     o.push_str("\n    # ── 敏感文件拒绝（默认生效，无需开启任何防护）──\n");
-    // 隐藏文件（.git / .env / .htaccess / .svn…），放行 .well-known
-    o.push_str("    location ~ /[.](?!well-known/) { deny all; }\n");
-    // 版本库目录本身（上面的规则只拦以 /. 开头的路径形态，这里补齐）
-    o.push_str("    location ~* /[.](git|svn|hg)(/|$) { deny all; }\n");
+    // ⚠⚠ **必须用 server 级 `if`，不能用 `location ~` 正则**——这是本项目踩过的
+    // 一个真坑（多路由上线后 `/.env` 直接 200 下载走源码）：
+    //   nginx 的 location 优先级是「`=` > 前缀 `^~` > 正则 > 普通前缀」，
+    //   而多路由的每条路由都是 `location ^~ /xxx`。前缀一旦 ^~ 就**永不再走正则**，
+    //   于是 `location ^~ /` 命中 `/.env` 后，deny 的正则 location 被彻底跳过。
+    // `if ($uri ~ …) { return 403; }` 在 rewrite 阶段执行、**早于 location 匹配**，
+    // `^~` 拦不住它 —— 这是唯一能同时覆盖「静态/反代/PHP/多路由」四种站点的位置。
+    // nginx 官方明确：`if` 里只用 `return` 是安全的（不要在 if 里放 proxy_pass 等）。
+    //
+    // 用 `$uri`（已解码、不含查询串）而非 `$request_uri`（含 ?query）：扩展名锚定 `$`
+    // 才对得上，否则 `/a.sql?x=1` 会漏。
+    //
+    // ⚠ **`(?!)` 前面刻意不加 `^` 锚点**——要拦的是**任意层级**的隐藏文件。
+    //   写成 `^/[.]` 时只拦顶层：`/admin/.env`、`/api/.env` 全部漏过（多路由让站点
+    //   有了子路径，这个漏洞才暴露；实测 `/admin/.env` 直接返回了文件内容）。
+    //   不加锚点后 `/[.]` 匹配任意位置的 `/.`，而 `/a.b.c` 这类正常名不受影响
+    //   （`.` 前面是字母而非 `/`）。
+    //   `(?!)` 是 PCRE 否定前瞻：放行 `/.well-known/`（ACME http-01 挑战文件落在这里，
+    //   一刀切会把证书签发/续期打死，且症状是「证书莫名过期」，与本规则毫无字面关联）。
+    o.push_str("    if ($uri ~ \"/[.](?!well-known/)\") { return 403; }\n");
+    // 版本库目录：同样**不加 `^` 锚点**，覆盖任意层级（`/x/.git/config` 也拦）。
+    // 上一条 `"/[.]"` 已能拦 `/.git/…`，但拦不住 `/x/.git/…`，故这条针对目录名。
+    o.push_str("    if ($uri ~* \"/[.](git|svn|hg)(/|$)\") { return 403; }\n");
     // 备份与编辑器残留：正常站点不需要对外提供这些
-    o.push_str("    location ~* [.](sql|bak|old|orig|swp|save|tar|gz|tgz|zip|7z|rar)$ { deny all; }\n");
+    o.push_str("    if ($uri ~* \"[.](sql|bak|old|orig|swp|save|tar|gz|tgz|zip|7z|rar)$\") { return 403; }\n");
     if strict {
-        o.push_str("    location ~* ^/(config|conf|configs|logs?|backup|backups|dumps?|db|database)(/|$) { deny all; }\n");
+        o.push_str("    if ($uri ~* \"^/(config|conf|configs|logs?|backup|backups|dumps?|db|database)(/|$)\") { return 403; }\n");
     }
     o
 }
@@ -2297,7 +2316,7 @@ mod tests {
         // 敏感文件拒绝已**默认生效**（不再随 WAF 档位变化）：两档都该有
         // 隐藏文件 + 版本库 + 备份/残留三类 deny。
         for (name, out) in [("basic", &basic), ("strict", &strict)] {
-            assert!(out.contains("/[.](git|svn|hg)(/|$) { deny all; }"), "{name} 缺版本库目录拒绝：\n{out}");
+            assert!(out.contains(r#"if ($uri ~* "/[.](git|svn|hg)(/|$)") { return 403; }"#), "{name} 缺版本库目录拒绝：\n{out}");
             assert!(out.contains("swp|save|tar"), "{name} 缺备份 / 残留文件拒绝：\n{out}");
         }
         // 严格档专有：目录类规则（匹配面大、误杀风险更高，故不默认开）
@@ -2309,7 +2328,7 @@ mod tests {
     fn well_known_is_exempt_from_the_dotfile_deny() {
         let out = render_nginx(&spec_waf(WafProfile::Basic, None, 0));
         assert!(
-            out.contains("(?!well-known/)"),
+            out.contains(r#"if ($uri ~ "/[.](?!well-known/)") { return 403; }"#),
             "隐藏文件规则必须放行 /.well-known —— ACME http-01 挑战文件就落在那里，\
              一刀切会把证书续期打死：\n{out}"
         );
@@ -2325,7 +2344,7 @@ mod tests {
         }
         // 反过来确认：默认生效的两项**确实在**（否则本测试就成了「什么都没查」的恒绿）
         assert!(out.contains("location ^~ /.well-known/acme-challenge/"), "默认应含 ACME 挑战路径：\n{out}");
-        assert!(out.contains("{ deny all; }"), "默认应含敏感文件拒绝：\n{out}");
+        assert!(out.contains("return 403; }"), "默认应含敏感文件拒绝：\n{out}");
     }
 
     /// 真机语法校验：把渲染结果交给**真实的** `nginx -t`。
@@ -2611,7 +2630,7 @@ mod tests {
             );
         }
         // 反向确认：防护规则确实还在（且是正则形态）
-        assert!(out.contains("location ~ /[.](?!well-known/) { deny all; }"), "{out}");
+        assert!(out.contains(r#"if ($uri ~ "/[.](?!well-known/)") { return 403; }"#), "{out}");
         // 反代请求头一行不能少（Host/真实 IP 是反代的 basics）
         assert!(out.contains("proxy_set_header Host $host;"), "{out}");
         assert!(out.contains("proxy_set_header X-Real-IP $remote_addr;"), "{out}");
@@ -2717,7 +2736,7 @@ mod tests {
     fn routed_site_keeps_acme_and_deny_guards() {
         let out = render_nginx(&spec_routed());
         assert!(out.contains("location ^~ /.well-known/acme-challenge/"), "{out}");
-        assert!(out.contains("(?!well-known/) { deny all; }"), "{out}");
+        assert!(out.contains(r#"if ($uri ~ "/[.](?!well-known/)") { return 403; }"#), "{out}");
     }
 
     /// 修复 #1：反代站点的 ACME http-01 挑战路径。
@@ -2783,15 +2802,67 @@ mod tests {
     #[test]
     fn sensitive_files_are_denied_without_waf() {
         let out = render_nginx(&spec_static());
-        assert!(out.contains("{ deny all; }"), "默认站点就该有 deny 规则：\n{out}");
+        assert!(out.contains("return 403; }"), "默认站点就该有 deny 规则：\n{out}");
         // 隐藏文件（放行 .well-known）
-        assert!(out.contains("/[.](?!well-known/) { deny all; }"), "缺隐藏文件拒绝：\n{out}");
+        assert!(out.contains(r#"if ($uri ~ "/[.](?!well-known/)") { return 403; }"#), "缺隐藏文件拒绝：\n{out}");
         // 版本库目录
-        assert!(out.contains("/[.](git|svn|hg)(/|$) { deny all; }"), "缺版本库目录拒绝：\n{out}");
+        assert!(out.contains(r#"if ($uri ~* "/[.](git|svn|hg)(/|$)") { return 403; }"#), "缺版本库目录拒绝：\n{out}");
         // 备份与编辑器残留
         assert!(out.contains("swp|save|tar"), "缺备份 / 残留文件拒绝：\n{out}");
         // 目录类规则误杀面大，**只**在严格档
         assert!(!out.contains("logs?|backup"), "默认档不该有目录类 deny：\n{out}");
+    }
+
+    /// 回归：多路由上线后实测 `/.env` 返回 **200 + 文件内容**（源码直接被下载走）。
+    ///
+    /// 根因是 `location ^~` 会**屏蔽同级正则 location** —— deny 原先是
+    /// `location ~ …`，被 `location ^~ /` 抢先命中后整条规则不执行。
+    /// 因此 deny 必须落在 **server 级 `if`**（rewrite 阶段，早于 location 匹配）。
+    ///
+    /// 这条断言锁住「deny 是 `if` 而非 `location`」——形态改回去就会红。
+    #[test]
+    fn deny_rules_must_be_server_level_if_not_location() {
+        let out = render_nginx(&spec_routed());
+        assert!(
+            out.contains(r#"if ($uri ~ "/[.](?!well-known/)") { return 403; }"#),
+            "敏感文件拒绝必须是 server 级 if（rewrite 阶段），否则被 ^~ 屏蔽：\n{out}"
+        );
+        // 反向断言：deny **不得**再以正则 location 形态出现
+        assert!(
+            !out.contains("location ~ /[.]") && !out.contains("location ~* /[.]"),
+            "deny 不许用正则 location（^~ 会屏蔽它）：\n{out}"
+        );
+        // 所有 return 403 都必须在 server 块内（缩进 4 空格），不依赖任何 location
+        for line in out.lines().filter(|l| l.trim_start().starts_with("if ($uri")) {
+            assert!(
+                line.starts_with("    if ($uri"),
+                "deny 的 if 必须在 server 块内：{line}\n{out}"
+            );
+        }
+    }
+
+    /// deny 必须覆盖**任意层级**的隐藏文件，不只是顶层。
+    ///
+    /// 实测：`^/[.]`（带锚点）时 `/admin/.env` 与 `/api/.env` 全部漏过——
+    /// 多路由让站点有了子路径，这个漏洞才暴露。去掉 `^` 后 `/[.]` 匹配任意位置，
+    /// 而 `/a.b.c` 这类正常名不受影响（`.` 前面是字母而非 `/`）。
+    ///
+    /// 同时锁住 `.well-known` 的放行不能被这个"放宽"误伤。
+    #[test]
+    fn deny_covers_nested_paths_but_still_exempts_well_known() {
+        let out = render_nginx(&spec_routed());
+        // 不能有 `^` 锚点
+        assert!(
+            !out.contains(r#"if ($uri ~ "^/[.]"#),
+            "隐藏文件规则不能锚定 ^（否则 /admin/.env 漏过）：\n{out}"
+        );
+        assert!(!out.contains(r#"~* "^/[.](git|svn|hg)"#), "版本库规则同样不能锚定 ^：\n{out}");
+        // 但放行 .well-known 的前瞻必须仍在
+        assert!(out.contains(r#"/[.](?!well-known/)"#), "必须保留 .well-known 放行：\n{out}");
+        assert!(
+            out.contains(r#"location ^~ /.well-known/acme-challenge/"#),
+            "挑战路径必须仍在：\n{out}"
+        );
     }
 
     /// deny 放行 `/.well-known` 是硬要求——一刀切会把证书签发/续期打死，
@@ -2805,7 +2876,7 @@ mod tests {
         ] {
             let out = render_nginx(&spec);
             assert!(
-                out.contains("(?!well-known/)"),
+                out.contains(r#"if ($uri ~ "/[.](?!well-known/)") { return 403; }"#),
                 "{name}: 隐藏文件规则必须放行 /.well-known：\n{out}"
             );
             assert!(
