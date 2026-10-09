@@ -20,10 +20,11 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (10, include_str!("../../../migrations/010_cert_auto_renew.sql")),
     (11, include_str!("../../../migrations/011_cert_sweep_state.sql")),
     (12, include_str!("../../../migrations/012_task_idempotency.sql")),
+    (13, include_str!("../../../migrations/013_site_spa_redirect.sql")),
 ];
 
 /// 当前 schema 版本
-pub const LATEST: u32 = 12;
+pub const LATEST: u32 = 13;
 
 pub fn apply(conn: &mut Connection) -> Result<u32> {
     conn.execute_batch(

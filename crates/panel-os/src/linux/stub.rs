@@ -1007,6 +1007,9 @@ fn render_nginx(spec: &SiteSpec) -> String {
     let https_ports: Vec<u16> = spec.listen.iter().copied().filter(|p| *p == 443).collect();
     let mut out = String::new();
 
+    // WebSocket 升级映射变量名（每站唯一，见下方 ReverseProxy 分支的 map 块）
+    let ws_var = format!("${}_ws", upstream_name(&spec.server_names));
+
     out.push_str("# 由 ForkPanel 自动生成，请勿手工修改（下次 apply 会覆盖）。\n");
     out.push_str(&format!("# site: {names}\n\n"));
 
@@ -1022,10 +1025,19 @@ fn render_nginx(spec: &SiteSpec) -> String {
         out.push_str("    return 301 https://$host$request_uri;\n}\n\n");
     }
 
-    // ── 负载均衡 upstream 块 ──
-    // `upstream` 是 **http 级**指令，必须排在 server 之前；塞进 server{} 会直接
-    // 语法错误（而且 nginx -t 会拒绝整份配置，不只是这个站点）。
+    // ── 负载均衡 upstream 块 + WebSocket 连接升级映射 ──
+    // `upstream` / `map` 都是 **http 级**指令，必须排在 server 之前；塞进 server{}
+    // 会直接语法错误（而且 nginx -t 会拒绝整份配置，不只是这个站点）。
     if let SiteKind::ReverseProxy { upstreams } = &spec.kind {
+        // WebSocket 升级映射：用每站唯一的变量名（`upstream_name` 派生），避免多站点
+        // conf 拼进同一 http 上下文时 map 重名导致 nginx 整份拒绝加载。
+        // 用 map 按请求动态决定 Connection（带 Upgrade 头→upgrade，否则→close），
+        // 这样普通请求仍走 keep-alive、WebSocket 握手才能成功——只写死
+        // `Connection "upgrade"` 会让所有请求都带升级头、破坏后端连接复用。
+        out.push_str(&format!("map $http_upgrade {ws_var} {{\n"));
+        out.push_str("    default upgrade;\n");
+        out.push_str("    ''      close;\n");
+        out.push_str("}\n\n");
         if upstreams.len() > 1 {
             out.push_str(&format!("upstream {} {{\n", upstream_name(&spec.server_names)));
             // least_conn：相比轮询，对长连接/慢请求更均衡；单机小集群够用
@@ -1074,8 +1086,11 @@ fn render_nginx(spec: &SiteSpec) -> String {
         out.push_str("    ssl_protocols TLSv1.2 TLSv1.3;\n\n");
     }
 
-    out.push_str(&format!("    root {};\n", spec.root.display()));
-    out.push_str("    index index.html index.htm;\n\n");
+    // 整站重定向不输出 root / index（它只发 return，没有文件服务）
+    if !matches!(spec.kind, SiteKind::Redirect { .. }) {
+        out.push_str(&format!("    root {};\n", spec.root.display()));
+        out.push_str("    index index.html index.htm;\n\n");
+    }
 
     if let Some(al) = &spec.access_log { out.push_str(&format!("    access_log {};\n", al.display())); }
     if let Some(el) = &spec.error_log  { out.push_str(&format!("    error_log {};\n", el.display())); }
@@ -1087,7 +1102,13 @@ fn render_nginx(spec: &SiteSpec) -> String {
 
     match &spec.kind {
         SiteKind::Static => {
-            out.push_str("    location / {\n        try_files $uri $uri/ =404;\n    }\n");
+            // SPA 回退：history 路由的单页应用需要把所有未命中文件的路径交给
+            // /index.html 处理；非 SPA 则 404（避免把未知路径当成 index 引发漏洞）。
+            if spec.spa_fallback {
+                out.push_str("    location / {\n        try_files $uri $uri/ /index.html;\n    }\n");
+            } else {
+                out.push_str("    location / {\n        try_files $uri $uri/ =404;\n    }\n");
+            }
         }
         SiteKind::ReverseProxy { upstreams } => {
             let target = match upstreams.len() {
@@ -1102,7 +1123,15 @@ fn render_nginx(spec: &SiteSpec) -> String {
             out.push_str("        proxy_set_header X-Real-IP $remote_addr;\n");
             out.push_str("        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n");
             out.push_str("        proxy_set_header X-Forwarded-Proto $scheme;\n");
+            // WebSocket：升级连接头 + HTTP/1.1 长连接（详见上方 map 块的说明）
+            out.push_str("        proxy_http_version 1.1;\n");
+            out.push_str("        proxy_set_header Upgrade $http_upgrade;\n");
+            out.push_str(&format!("        proxy_set_header Connection {ws_var};\n"));
             out.push_str("    }\n");
+        }
+        SiteKind::Redirect { target, code } => {
+            // 整站重定向：自动追加 $request_uri 保留原始路径与查询串。
+            out.push_str(&format!("    return {code} {target}$request_uri;\n"));
         }
         SiteKind::Php { fpm } => {
             // `fastcgi_params` 由发行版提供（Debian: /etc/nginx/fastcgi_params）
@@ -1938,6 +1967,7 @@ mod tests {
             tls_cert: None,
             tls_key: None,
             force_https: false,
+            spa_fallback: false,
             waf: None,
         }
     }
@@ -2285,6 +2315,47 @@ mod tests {
         assert!(out.contains("fastcgi_pass unix:/run/php/php8.2-fpm.sock;"), "{out}");
         assert!(out.contains("SCRIPT_FILENAME $document_root$fastcgi_script_name;"), "{out}");
         assert!(out.contains("location ~ \\.php$"), "{out}");
+    }
+
+    #[test]
+    fn render_reverse_proxy_supports_websocket() {
+        let mut s = spec_static();
+        s.kind = SiteKind::ReverseProxy { upstreams: vec!["http://127.0.0.1:3000".into()] };
+        let out = render_nginx(&s);
+        // 升级头 + HTTP/1.1 长连接：WebSocket 握手才能成功
+        assert!(out.contains("proxy_http_version 1.1;"), "{out}");
+        assert!(out.contains("proxy_set_header Upgrade $http_upgrade;"), "{out}");
+        // map 动态决定 Connection（普通请求 keep-alive、WS 升级），变量名每站唯一
+        let ws_var = format!("${}_ws", upstream_name(&s.server_names));
+        assert!(out.contains(&format!("map $http_upgrade {ws_var} {{")), "{out}");
+        assert!(out.contains(&format!("proxy_set_header Connection {ws_var};")), "{out}");
+        // 单后端仍不该建 upstream 块
+        assert!(!out.contains("upstream "), "单后端不应生成 upstream 块: {out}");
+    }
+
+    #[test]
+    fn render_spa_fallback_uses_index_html() {
+        let mut s = spec_static();
+        s.spa_fallback = true;
+        let out = render_nginx(&s);
+        assert!(out.contains("try_files $uri $uri/ /index.html;"), "{out}");
+        assert!(!out.contains("=404"), "SPA 不应回 404: {out}");
+        // 非 SPA 仍是 =404（避免把未知路径当成 index 引发漏洞）
+        let mut plain = spec_static();
+        plain.spa_fallback = false;
+        assert!(render_nginx(&plain).contains("try_files $uri $uri/ =404;"), "{plain:?}");
+    }
+
+    #[test]
+    fn render_redirect_returns_code_and_target() {
+        let mut s = spec_static();
+        s.kind = SiteKind::Redirect { target: "https://new.example.com".into(), code: 301 };
+        let out = render_nginx(&s);
+        // 整站重定向：只发 return，不输出 root / index / location
+        assert!(out.contains("return 301 https://new.example.com$request_uri;"), "{out}");
+        assert!(!out.contains("root "), "重定向不应输出 root: {out}");
+        assert!(!out.contains("location "), "重定向不应输出 location: {out}");
+        assert!(!out.contains("try_files"), "重定向不应输出 try_files: {out}");
     }
 
     #[test]

@@ -333,6 +333,30 @@ pub mod rules {
         if s == "." || s == ".." { return false; }
         s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     }
+
+    /// 站点名称（即 `sites.name`，用户可见的虚拟主机标识）。
+    ///
+    /// 它**不进 nginx 配置**（conf 文件名按域名派生、server_name 即 domains），
+    /// 但会进入两处敏感面：
+    /// ① 落库为 `sites` 表主键（UNIQUE）——空名会让 `INSERT` 直接失败；
+    /// ② 作为站点根目录的默认目录名（未指定 root 时 `resolve_site_root` 用它
+    ///    在 site_root 下建子目录）——`.`/`..`/含 `/` 会越界或建出隐藏/逃逸目录。
+    ///
+    /// 故采用白名单而非黑名单：首字符必须字母数字，后续允许字母数字与 `. _ -`，
+    /// 长度 1~63。明确拒绝：空、空格、`.`、`..`、首字符 `-`、含 `/`、含 shell
+    /// 注入字符（空格 / `;` / `$` / 反引号 / 引号）。返回 400 比"建出一个打不开或
+    /// 跨站泄露的站点"安全得多——此前 name 仅判非空，于是 `a b` 之类能进库、
+    /// `.` 名会把根目录解析成整个 site_root（跨站泄露）。
+    pub fn is_valid_site_name(s: &str) -> bool {
+        // 长度 1~63（与 systemd 单元名上限同源，避免某些文件系统对超长目录名支持不稳）
+        if s.is_empty() || s.len() > 63 { return false; }
+        // 首字符必须字母数字：排除 `-` 被当成 CLI 选项、`.` 建出隐藏/当前目录
+        let mut chars = s.chars();
+        let first = chars.next().unwrap(); // 非空已判过，unwrap 安全
+        if !first.is_ascii_alphanumeric() { return false; }
+        // 其余字符白名单：字母数字 + . _ -（排除 / \ 及任何空白或注入字符）
+        chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    }
 }
 
 #[cfg(test)]
@@ -371,6 +395,25 @@ mod tests {
         assert!(!is_valid_path_segment(".."));
         assert!(!is_valid_path_segment("a/b"));
         assert!(!is_valid_path_segment("a\0b"));
+    }
+
+    /// 站点名共享校验（后端 create / patch 共用）：白名单而非黑名单。
+    /// 这批用例是此前仅判非空时漏掉的危险输入——`.` 会让根目录解析成整个
+    /// site_root（跨站泄露）、空格名会带着注入字符进库。
+    #[test]
+    fn site_name_rules() {
+        // 合法：字母数字开头，后续可含 . _ -
+        for ok in ["web", "my-site", "site1", "a.b", "api_v2", "Blog2026", "x"] {
+            assert!(is_valid_site_name(ok), "should accept {ok:?}");
+        }
+        // 非法：空 / 空格 / 点类 / 越界 / 注入
+        for bad in [
+            "", " ", ".", "..", ".hidden", "-lead", "a/b", "a b",
+            "a;b", "a$(id)", "a`id`", "a\"b", "a\\b",
+            &"x".repeat(64),
+        ] {
+            assert!(!is_valid_site_name(bad), "should reject {bad:?}");
+        }
     }
 
     #[test]

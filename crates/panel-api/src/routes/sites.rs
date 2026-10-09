@@ -57,6 +57,12 @@ struct RawSite {
     upstreams_json: Option<String>,
     /// php-fpm 目标（unix:/path.sock | host:port）；非 php 站点为 NULL
     fpm: Option<String>,
+    /// SPA 回退标志（kind=static 时有效）：1 = 开启
+    spa: i32,
+    /// 整站重定向目标 URL（kind=redirect 时存在）；其余为 NULL
+    redirect_target: Option<String>,
+    /// 整站重定向状态码 301/302/307/308（kind=redirect 时存在）；其余为 NULL
+    redirect_code: Option<i64>,
     /// apply 写入的 nginx 配置路径；**从未成功下发则为 NULL / 空串**。
     /// 这是「配置是否真落到 Web 服务器」的唯一判据——`enabled` 只表示期望状态。
     conf_path: Option<String>,
@@ -108,6 +114,12 @@ pub struct SiteOut {
     pub upstreams: Option<Vec<String>>,
     /// php-fpm 目标（kind=php 时存在）
     pub fpm: Option<String>,
+    /// SPA 回退（kind=static 时有效）：true = 启用 history 路由回退
+    pub spa: bool,
+    /// 整站重定向目标 URL（kind=redirect 时存在）；其余为 null
+    pub redirect_target: Option<String>,
+    /// 整站重定向状态码（kind=redirect 时存在；301/302/307/308）；其余为 null
+    pub redirect_code: Option<u16>,
 }
 
 /// API 口径（`proxy`）→ 库内口径（`reverse_proxy`）。
@@ -120,6 +132,7 @@ fn kind_to_db(k: &panel_os::SiteKind) -> &'static str {
         panel_os::SiteKind::Static => "static",
         panel_os::SiteKind::ReverseProxy { .. } => "reverse_proxy",
         panel_os::SiteKind::Php { .. } => "php",
+        panel_os::SiteKind::Redirect { .. } => "redirect",
     }
 }
 
@@ -129,6 +142,7 @@ fn kind_to_api(k: &str) -> &'static str {
     match k {
         "reverse_proxy" => "proxy",
         "php" => "php",
+        "redirect" => "redirect",
         _ => "static",
     }
 }
@@ -150,6 +164,9 @@ fn to_out(r: &RawSite) -> SiteOut {
         waf_burst: r.waf_burst,
         upstreams: r.upstreams_json.as_deref().and_then(|s| serde_json::from_str(s).ok()),
         fpm: r.fpm.clone(),
+        spa: r.spa != 0,
+        redirect_target: r.redirect_target.clone(),
+        redirect_code: r.redirect_code.map(|n| n as u16),
     }
 }
 
@@ -161,7 +178,7 @@ fn db_err(e: rusqlite::Error) -> PanelError {
 const SITE_SELECT: &str = "s.id, s.name, s.domains, s.root, s.kind, s.enabled, s.created_at,
        (SELECT COUNT(*) FROM ssl_certs c WHERE c.site_id = s.id) AS tls_count,
        s.waf_enabled, s.waf_profile, s.waf_rate, s.waf_burst,
-       s.upstreams_json, s.fpm, s.conf_path";
+       s.upstreams_json, s.fpm, s.spa, s.redirect_target, s.redirect_code, s.conf_path";
 
 /// 站点查询 SQL。
 ///
@@ -196,7 +213,10 @@ async fn fetch_all(state: &Shared) -> Result<Vec<RawSite>> {
                         waf_burst: r.get(11)?,
                     upstreams_json: r.get(12)?,
                     fpm: r.get(13)?,
-                    conf_path: r.get(14)?,
+                    spa: r.get(14)?,
+                    redirect_target: r.get(15)?,
+                    redirect_code: r.get(16)?,
+                    conf_path: r.get(17)?,
                     })
                 })
                 .map_err(db_err)?;
@@ -232,7 +252,10 @@ async fn fetch_one(state: &Shared, id: i64) -> Result<Option<RawSite>> {
                     waf_burst: r.get(11)?,
                     upstreams_json: r.get(12)?,
                     fpm: r.get(13)?,
-                    conf_path: r.get(14)?,
+                    spa: r.get(14)?,
+                    redirect_target: r.get(15)?,
+                    redirect_code: r.get(16)?,
+                    conf_path: r.get(17)?,
                 })
             })
             .map_err(db_err)?;
@@ -265,7 +288,10 @@ async fn fetch_one_by_name(state: &Shared, name: &str) -> Result<Option<RawSite>
                     waf_burst: r.get(11)?,
                     upstreams_json: r.get(12)?,
                     fpm: r.get(13)?,
-                    conf_path: r.get(14)?,
+                    spa: r.get(14)?,
+                    redirect_target: r.get(15)?,
+                    redirect_code: r.get(16)?,
+                    conf_path: r.get(17)?,
                 })
             })
             .map_err(db_err)?;
@@ -398,10 +424,7 @@ pub async fn create(
     {
         return Err(ApiError::unsupported("webserver.manage"));
     }
-    let name = req.name.trim().to_string();
-    if name.is_empty() {
-        return Err(ApiError::bad_request("name", "name required"));
-    }
+    let name = validate_site_name(&req.name)?;
     if req.domains.is_empty() {
         return Err(ApiError::bad_request("domains", "at least one domain required"));
     }
@@ -464,6 +487,9 @@ pub async fn create(
                     waf_burst: None,
                     upstreams: None,
                     fpm: None,
+                    spa: false,
+                    redirect_target: None,
+                    redirect_code: None,
                 });
             Ok(ok(out))
         }
@@ -556,8 +582,14 @@ async fn render_spec_for_row(
         "php" => panel_os::SiteKind::Php {
             fpm: row.fpm.clone().unwrap_or_default(),
         },
+        "redirect" => panel_os::SiteKind::Redirect {
+            target: row.redirect_target.clone().unwrap_or_default(),
+            code: row.redirect_code.map(|n| n as u16).unwrap_or(301),
+        },
         _ => panel_os::SiteKind::Static,
     };
+    // SPA 回退仅对 static 有意义；其余类型忽略
+    let spa = row.kind == "static" && row.spa != 0;
 
     // 证书：沿用 apply 的查找逻辑（证书文件缺失则不启用 TLS）
     let (tls_cert, tls_key) = match cert_domains_for_site(state, row.id).await? {
@@ -583,6 +615,7 @@ async fn render_spec_for_row(
         tls_cert,
         tls_key,
         force_https: has_tls,
+        spa_fallback: spa,
         waf,
     };
 
@@ -642,13 +675,7 @@ pub async fn patch(
     // root 的解析仍传**旧名**：只有 root 传空串时才会按 name 生成默认目录，沿用旧名
     // 可避免"改个名字顺带把站点目录也换了地方"这种隐式漂移。
     let new_name = match req.name.as_deref() {
-        Some(raw) => {
-            let n = raw.trim().to_string();
-            if n.is_empty() {
-                return Err(ApiError::bad_request("name", "name required"));
-            }
-            n
-        }
+        Some(raw) => validate_site_name(raw)?,
         None => cur.name.clone(),
     };
     if new_name != cur.name {
@@ -842,6 +869,16 @@ pub struct ApplyReq {
     /// `kind=php` 的 php-fpm 目标（`unix:/path.sock` 或 `host:port`）
     #[serde(default)]
     pub fpm: Option<String>,
+    /// `kind=static` 的 SPA 回退开关：true 时 `try_files` 末项为 `/index.html`
+    /// （支持 Vue/React 等 history 路由单页应用）。缺省 false。
+    #[serde(default)]
+    pub spa: Option<bool>,
+    /// `kind=redirect` 的目标 URL（必须是 http(s):// 绝对地址）
+    #[serde(default)]
+    pub redirect_target: Option<String>,
+    /// `kind=redirect` 的状态码：301 / 302 / 307 / 308，缺省 301
+    #[serde(default)]
+    pub redirect_code: Option<u16>,
     /// 站点 WAF。**缺省 = 保留库中现有配置**（不是"关闭"）——apply 是按
     /// "期望状态"覆盖的，但静默关掉一层防护比多一次点击危险得多，
     /// 而且调用方未必都知道有 `waf` 这个字段。显式 `{"enabled": false}` 才关闭。
@@ -980,6 +1017,51 @@ fn validate_fpm(v: &str) -> ApiResult<String> {
     Ok(v.to_string())
 }
 
+/// 站点名共享校验（create / patch 共用）。返回 trim 后的合法名，非法则 400。
+///
+/// 规则见 `panel_core::rules::is_valid_site_name`：白名单——首字符字母数字、
+/// 后续允许字母数字与 `. _ -`，长度 1~63。明确拒绝空 / 空格 / 点类（`.`/`..`/
+/// `.hidden`）/ 越界（`/`）/ 注入字符（空格 / `;` / `$` / 反引号 / 引号）。
+/// 此前 name 仅判非空，于是 `a b` 之类能进库、`.` 名会把根目录解析成整个
+/// site_root（跨站泄露）。抽成单一函数是为了让 create 与 patch 两条入口共用
+/// 同一套校验，避免一边收紧另一边还能绕过。
+fn validate_site_name(raw: &str) -> ApiResult<String> {
+    let name = raw.trim();
+    if panel_core::rules::is_valid_site_name(name) {
+        Ok(name.to_string())
+    } else {
+        Err(ApiError::bad_request(
+            "name",
+            "站点名仅允许字母数字开头，后可接字母数字与 . _ -，长度 1~63（不得含空格、/、以点开头或仅为 .）",
+        ))
+    }
+}
+
+/// 整站重定向目标 URL 校验（注入防护 + 结构校验）。
+///
+/// 该值会直接拼进 nginx `return <code> <target>$request_uri;`，必须是一个**绝对**
+/// `http(s)://` URL，且不含空白 / 换行 / 引号 / 分号（否则破坏 return 指令或注入）。
+/// 结构正确性（域名可达性）交给 `nginx -t` 在 render → validate 链路兜底。
+fn validate_redirect_target(raw: &str) -> ApiResult<String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Err(ApiError::bad_request("redirect_target", "重定向目标不能为空"));
+    }
+    if !t.starts_with("http://") && !t.starts_with("https://") {
+        return Err(ApiError::bad_request(
+            "redirect_target",
+            "必须是 http:// 或 https:// 开头的绝对 URL",
+        ));
+    }
+    if t.contains(char::is_whitespace) || t.contains(';') || t.contains('"') || t.contains('\'') {
+        return Err(ApiError::bad_request(
+            "redirect_target",
+            "含非法字符（不得含空白、引号或分号）",
+        ));
+    }
+    Ok(t.to_string())
+}
+
 /// 应用站点配置。**整个流程在写事务之外完成**。
 pub async fn apply(
     State(state): State<Shared>,
@@ -1066,12 +1148,33 @@ pub async fn apply(
             })?;
             panel_os::SiteKind::Php { fpm: validate_fpm(fpm)? }
         }
+        "redirect" => {
+            // 整站重定向：目标必须绝对 http(s) URL（注入防护见 validate_redirect_target），
+            // 状态码仅限 301/302/307/308——其余值 nginx `return` 不接受。
+            let target = req.redirect_target.clone().ok_or_else(|| {
+                ApiError::bad_request("redirect_target", "重定向站点必须指定目标 URL")
+            })?;
+            let target = validate_redirect_target(&target)?;
+            let code = req.redirect_code.unwrap_or(301);
+            if !matches!(code, 301 | 302 | 307 | 308) {
+                return Err(ApiError::bad_request("redirect_code", "仅支持 301 / 302 / 307 / 308"));
+            }
+            panel_os::SiteKind::Redirect { target, code: code as u16 }
+        }
         other => {
             return Err(ApiError::bad_request(
                 "kind",
-                format!("未知站点类型：{other}（可选 static / proxy / php）"),
+                format!("未知站点类型：{other}（可选 static / proxy / php / redirect）"),
             ))
         }
+    };
+    // SPA 回退仅对 static 有意义；其它类型忽略该开关（避免误把静态开关带进反代/重定向）
+    let spa = matches!(req.kind.as_deref(), Some("static")) && req.spa.unwrap_or(false);
+    let spa_i32: i32 = if spa { 1 } else { 0 };
+    // 重定向的目标 / 状态码一并落库（仅 redirect 类型非空）
+    let (redirect_target_db, redirect_code_db): (Option<String>, Option<i64>) = match &kind {
+        panel_os::SiteKind::Redirect { target, code } => (Some(target.clone()), Some(*code as i64)),
+        _ => (None, None),
     };
     // 反代 / PHP 后端配置一并落库（F6）：从已校验的 kind 提前取出，避免被 move 进 SiteSpec 后无法再借
     let (upstreams_json, fpm_str) = match &kind {
@@ -1090,6 +1193,7 @@ pub async fn apply(
         tls_cert,
         tls_key,
         force_https: req.force_https.unwrap_or(true) && has_tls,
+        spa_fallback: spa,
         waf,
     };
     let (target, rendered) = state.os.webserver().render(&spec)?;
@@ -1136,20 +1240,24 @@ pub async fn apply(
         .db
         .exec(move |conn| {
             // ?5 = enabled, ?6 = conf_path；deploy=false 时两者分别为 0 / 空串。
-            // upstreams_json / fpm_str 已在 apply 开头算出（kind 之后被 move 进 SiteSpec）。
+            // upstreams_json / fpm_str / spa / redirect_* 已在 apply 开头算出
+            // （kind 之后被 move 进 SiteSpec）。
             conn.execute(
                 "INSERT INTO sites(name, domains, root, kind, webserver, enabled, conf_path, created_at,
-                                   waf_enabled, waf_profile, waf_rate, waf_burst, upstreams_json, fpm)
-                 VALUES(?1, ?2, ?3, ?4, 'nginx', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                                   waf_enabled, waf_profile, waf_rate, waf_burst, upstreams_json, fpm,
+                                   spa, redirect_target, redirect_code)
+                 VALUES(?1, ?2, ?3, ?4, 'nginx', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
                  ON CONFLICT(name) DO UPDATE SET
                     domains=excluded.domains, root=excluded.root, kind=excluded.kind, enabled=?5,
                     conf_path=?6, webserver='nginx',
                     waf_enabled=excluded.waf_enabled, waf_profile=excluded.waf_profile,
                     waf_rate=excluded.waf_rate, waf_burst=excluded.waf_burst,
-                    upstreams_json=excluded.upstreams_json, fpm=excluded.fpm",
+                    upstreams_json=excluded.upstreams_json, fpm=excluded.fpm,
+                    spa=excluded.spa, redirect_target=excluded.redirect_target,
+                    redirect_code=excluded.redirect_code",
                 rusqlite::params![name, domains_json, root_str, kind_db, enabled_i32, conf_db, now,
                                   waf_on, waf_profile, waf_rate, waf_burst,
-                                  upstreams_json, fpm_str],
+                                  upstreams_json, fpm_str, spa_i32, redirect_target_db, redirect_code_db],
             )
             .map(|_| panel_db::WriteAck { rows_changed: 1 })
             .map_err(|e| PanelError::Database(e.to_string()))
@@ -2089,7 +2197,12 @@ mod kind_tests {
     /// 静态站——反代站被编辑后一点"应用"就被改坏。
     #[test]
     fn kind_maps_round_trip_and_unknown_falls_back_to_static() {
-        for (db, api) in [("static", "static"), ("reverse_proxy", "proxy"), ("php", "php")] {
+        for (db, api) in [
+            ("static", "static"),
+            ("reverse_proxy", "proxy"),
+            ("php", "php"),
+            ("redirect", "redirect"),
+        ] {
             assert_eq!(kind_to_api(db), api, "库口径 {db} 应呈现为 {api}");
         }
         assert_eq!(kind_to_db(&panel_os::SiteKind::Static), "static");
@@ -2098,6 +2211,10 @@ mod kind_tests {
             "reverse_proxy"
         );
         assert_eq!(kind_to_db(&panel_os::SiteKind::Php { fpm: "unix:/run/php.sock".into() }), "php");
+        assert_eq!(
+            kind_to_db(&panel_os::SiteKind::Redirect { target: "https://new.example.com".into(), code: 301 }),
+            "redirect"
+        );
         // 未知值必须降级成 static：认成 proxy 会让人按错误前提去改配置
         assert_eq!(kind_to_api("something_else"), "static");
         assert_eq!(kind_to_api(""), "static");

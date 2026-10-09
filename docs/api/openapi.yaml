@@ -454,7 +454,7 @@ components:
         name:     { type: string }
         domains:  { type: array, items: { type: string } }
         root:     { type: string }
-        kind:     { type: string, enum: [static, proxy, php], description: "站点类型（库内口径为 static | reverse_proxy | php；API 把 reverse_proxy 呈现为 proxy）" }
+        kind:     { type: string, enum: [static, proxy, php, redirect], description: "站点类型（库内口径为 static | reverse_proxy | php | redirect；API 把 reverse_proxy 呈现为 proxy）" }
         enabled:  { type: boolean, description: "期望状态：是否已纳入 Web 服务器配置（新建默认 true）。它**不**代表站点正在对外服务——后者见 deployed" }
         deployed: { type: boolean, description: "配置是否已真实下发到 Web 服务器（apply 成功写入 conf_path 后为 true）。enabled=true 而 deployed=false 即「已登记、未下发」，此时访问域名会连接失败" }
         tls:      { type: boolean }
@@ -464,6 +464,9 @@ components:
         waf_burst:        { type: [integer, "null"], description: "突发桶容量" }
         upstreams:        { type: [array, "null"], items: { type: string }, description: "反代后端列表（kind=proxy 时存在，如 [\"http://127.0.0.1:3000\"]）；其余为 null" }
         fpm:              { type: [string, "null"], description: "php-fpm 目标（kind=php 时存在，unix:/path.sock | host:port）；其余为 null" }
+        spa:              { type: boolean, description: "SPA 回退（kind=static 时有效）：true 时未命中文件的路径交给 /index.html（history 路由单页应用）。缺省 false" }
+        redirect_target:  { type: [string, "null"], description: "整站重定向目标 URL（kind=redirect 时存在，绝对 http(s)://）；其余为 null" }
+        redirect_code:    { type: [integer, "null"], description: "整站重定向状态码（kind=redirect 时存在；301/302/307/308）；其余为 null" }
     SiteWaf:
       type: object
       required: [enabled]
@@ -489,7 +492,7 @@ components:
       type: object
       required: [name, domains]
       properties:
-        name:    { type: string }
+        name:    { type: string, pattern: "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$", description: "站点名称（用户可见的虚拟主机标识）。白名单：字母数字开头，后可接字母数字与 . _ -，长度 1~63；不得含空格、/、以点开头或仅为 .。非法值返回 400" }
         domains: { type: array, items: { type: string } }
         root:    { type: [string, "null"] }
         php:     { type: boolean }
@@ -497,7 +500,7 @@ components:
     SitePatch:
       type: object
       properties:
-        name:    { type: string, description: "站点名称，**支持改名**。nginx 配置按域名派生（conf 文件名取首个域名、server_name 即 domains）、root 建站时已固化为绝对路径、证书按 domain 绑定，三者都与 name 无关，故改名**不需要重新下发配置**；与其它站点同名返回 4090（site name exists）" }
+        name:    { type: string, pattern: "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$", description: "站点名称，**支持改名**。白名单同 SiteCreate（字母数字开头，后可接字母数字与 . _ -，长度 1~63）；非法值返回 400。nginx 配置按域名派生（conf 文件名取首个域名、server_name 即 domains）、root 建站时已固化为绝对路径、证书按 domain 绑定，三者都与 name 无关，故改名**不需要重新下发配置**；与其它站点同名返回 409（site name exists）" }
         domains: { type: array, items: { type: string } }
         root:    { type: string }
         enabled: { type: boolean, description: "启用状态。与当前值**不相同**时会真正同步 Web 服务器：true=按当前设置渲染配置并下发 + reload（此前从未 apply 的站点在此补齐）；false=从 Web 服务器移除该站点配置 + reload，站点停止对外服务。与当前值相同则只写库" }
@@ -510,12 +513,15 @@ components:
         domains:     { type: array, items: { type: string } }
         root:        { type: string }
         force_https: { type: boolean }
-        kind:        { type: string, enum: [static, proxy, php], default: static, description: "站点类型；默认静态" }
+        kind:        { type: string, enum: [static, proxy, php, redirect], default: static, description: "站点类型；默认静态" }
         upstreams:
           type: array
           description: "kind=proxy 的后端（1~16 个）。必须是 http(s)://host[:port]，不得含路径/查询/片段——该值直接进 nginx 配置文本，注入校验在后端（前端校验不可作数）"
           items: { type: string }
         fpm:         { type: string, description: "kind=php 的 php-fpm 目标：unix:/绝对路径.sock 或 host:port" }
+        spa:         { type: boolean, description: "kind=static 的 SPA 回退开关：true 时 try_files 末项为 /index.html（history 路由单页应用）。缺省 false" }
+        redirect_target: { type: string, description: "kind=redirect 的目标 URL（必须是 http:// 或 https:// 开头的绝对地址）；直接进 nginx return 指令，注入校验在后端" }
+        redirect_code:   { type: integer, enum: [301, 302, 307, 308], description: "kind=redirect 的状态码；缺省 301" }
         waf:         { $ref: '#/components/schemas/SiteWaf' }
     Cert:
       type: object

@@ -689,6 +689,9 @@ pub struct SiteSpec {
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
     pub force_https: bool,
+    /// 静态站点 SPA 回退：开启后 `try_files` 末项为 `/index.html`（支持 history 路由的
+    /// 单页应用）。只对 `SiteKind::Static` 生效，其余类型忽略。
+    pub spa_fallback: bool,
     /// WAF 配置；`None` = 不生成任何拦截规则
     pub waf: Option<WafSpec>,
 }
@@ -748,6 +751,10 @@ pub enum SiteKind {
     ReverseProxy { upstreams: Vec<String> },
     /// PHP：`fastcgi_pass` 到 php-fpm（`unix:/path.sock` 或 `host:port`）
     Php { fpm: String },
+    /// 整站重定向：访问本站点域名时返回 `<code>` 跳转到 `target`（自动追加
+    /// `$request_uri` 保留路径）。`code` 仅限 301 / 302 / 307 / 308，`target` 必须是
+    /// 绝对 `http(s)://` URL。`root` / `index` / `location` 一概不输出。
+    Redirect { target: String, code: u16 },
 }
 
 #[async_trait]
