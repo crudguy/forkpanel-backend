@@ -454,7 +454,7 @@ components:
         name:     { type: string }
         domains:  { type: array, items: { type: string } }
         root:     { type: string }
-        kind:     { type: string, enum: [static, proxy, php, redirect], description: "站点类型（库内口径为 static | reverse_proxy | php | redirect；API 把 reverse_proxy 呈现为 proxy）" }
+        kind:     { type: string, enum: [static, proxy, php, redirect, routed], description: "站点类型（库内口径为 static | reverse_proxy | php | redirect | routed；API 把 reverse_proxy 呈现为 proxy）" }
         enabled:  { type: boolean, description: "期望状态：是否已纳入 Web 服务器配置（新建默认 true）。它**不**代表站点正在对外服务——后者见 deployed" }
         deployed: { type: boolean, description: "配置是否已真实下发到 Web 服务器（apply 成功写入 conf_path 后为 true）。enabled=true 而 deployed=false 即「已登记、未下发」，此时访问域名会连接失败" }
         tls:      { type: boolean }
@@ -467,7 +467,18 @@ components:
         spa:              { type: boolean, description: "SPA 回退（kind=static 时有效）：true 时未命中文件的路径交给 /index.html（history 路由单页应用）。缺省 false" }
         redirect_target:  { type: [string, "null"], description: "整站重定向目标 URL（kind=redirect 时存在，绝对 http(s)://）；其余为 null" }
         redirect_code:    { type: [integer, "null"], description: "整站重定向状态码（kind=redirect 时存在；301/302/307/308）；其余为 null" }
-    App:
+        routes:          { type: array, items: { $ref: '#/components/schemas/SiteRoute' }, description: "多路由表（kind=routed 时非空；其余恒为 []，不会返回 null）" }
+        SiteRoute:
+      type: object
+      required: [prefix, kind]
+      properties:
+        prefix: { type: string, pattern: "^/[A-Za-z0-9._~/-]*$", description: "URL 前缀，须以 / 开头；只允许字母数字与 / - _ . ~（该值**直接进 nginx 配置文本**，注入校验在后端）。末尾多余的 / 会被归一化（/api/ ≡ /api）；**必须有一条 prefix=/ 作兜底**，否则漏掉的路径会落到别的站点去" }
+        kind:   { type: string, enum: [proxy, static, php] }
+        upstreams:       { type: array, items: { type: string }, description: "kind=proxy 的后端（至少 1 个）。格式要求同 SiteApply.upstreams" }
+        spa:             { type: boolean, description: "kind=static：未命中是否回退 /index.html（history 路由单页应用）" }
+        fpm:             { type: string, description: "kind=php 的 php-fpm 目标" }
+        front_controller: { type: string, description: "kind=php 的**入口脚本（必填，相对站点根、须以 / 开头）**。多路由下一律用 front controller 形式而非 `location ~ \\.[Pp]hp$`——后者会被 `^~` 前缀屏蔽、PHP 请求将落到静态处理" }
+App:
       type: object
       properties:
         id:            { type: integer }
@@ -567,7 +578,7 @@ components:
         domains:     { type: array, items: { type: string }, description: "站点域名，至少一个。校验规则同 SiteCreate.domains（语法 + 真实 TLD / IPv4 语义）。非法值返回 400" }
         root:        { type: string }
         force_https: { type: boolean }
-        kind:        { type: string, enum: [static, proxy, php, redirect], default: static, description: "站点类型；默认静态" }
+        kind:        { type: string, enum: [static, proxy, php, redirect, routed], default: static, description: "站点类型；默认静态" }
         upstreams:
           type: array
           description: "kind=proxy 的后端（1~16 个）。必须是 http(s)://host[:port]，不得含路径/查询/片段——该值直接进 nginx 配置文本，注入校验在后端（前端校验不可作数）"
@@ -576,6 +587,7 @@ components:
         spa:         { type: boolean, description: "kind=static 的 SPA 回退开关：true 时 try_files 末项为 /index.html（history 路由单页应用）。缺省 false" }
         redirect_target: { type: string, description: "kind=redirect 的目标 URL（必须是 http:// 或 https:// 开头的绝对地址）；直接进 nginx return 指令，注入校验在后端" }
         redirect_code:   { type: integer, enum: [301, 302, 307, 308], description: "kind=redirect 的状态码；缺省 301" }
+        routes:      { type: array, items: { $ref: '#/components/schemas/SiteRoute' }, description: "kind=routed 的路由表（至少一条，且必须含一条 prefix=/ 的兜底）。**省略 = 保留库中现有路由表**（与 waf 同语义，不静默清空）" }
         waf:         { $ref: '#/components/schemas/SiteWaf' }
     Cert:
       type: object

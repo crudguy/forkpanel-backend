@@ -1,0 +1,14 @@
+-- 站点多路由（路由表）：一个站点内按 URL 前缀分派
+--
+-- 动机：「Vue dist + /api 交给 Go/Node 后端」这类混合形态，此前只能拆成两个站点
+-- （两个域名、两份证书、两套 WAF）或手改 nginx。routes_json 让它成为站点一等公民。
+--
+-- 存储格式：[{ "prefix": "/api", "kind": "proxy", "upstreams": ["http://127.0.0.1:3000"] }, …]
+--   kind: proxy | static | php
+--   static: { "prefix": "/", "kind": "static", "spa": true }
+--   php:    { "prefix": "/app", "kind": "php", "fpm": "unix:/run/php/php8.2-fpm.sock",
+--             "front_controller": "/app/public/index.php" }
+--
+-- 非多路由站点存 '[]'（而非 NULL）：读侧统一 serde_json::from_str().unwrap_or_default()，
+-- 避免"NULL 与空数组两种表示"带来的分支。与 domains_json 同风格。
+ALTER TABLE sites ADD COLUMN routes_json TEXT NOT NULL DEFAULT '[]';

@@ -958,6 +958,10 @@ pub struct SiteSpec {
     pub spa_fallback: bool,
     /// WAF 配置；`None` = 不生成任何拦截规则
     pub waf: Option<WafSpec>,
+    /// 路由表。`Some(..)` 时 `kind` 必须是 [`SiteKind::Routed`] 且与之内容一致；
+    /// 保留为独立字段是为了让调用方能「构造 spec 时先算好routes、再决定 kind」，
+    /// 渲染层以 `kind` 为唯一真相源，本字段只作校验对照（不一致即渲染期报错）。
+    pub routes: Option<SiteRoutes>,
 }
 
 /// WAF 规则档位。
@@ -1019,6 +1023,72 @@ pub enum SiteKind {
     /// `$request_uri` 保留路径）。`code` 仅限 301 / 302 / 307 / 308，`target` 必须是
     /// 绝对 `http(s)://` URL。`root` / `index` / `location` 一概不输出。
     Redirect { target: String, code: u16 },
+    /// 多路由：一个站点内按 URL 前缀分派（`/` 兜底 + 任意条 `/api`、`/admin` …）。
+    ///
+    /// 与其它变体的关系：**互斥**（一个站点要么是单一形态、要么是路由表），
+    /// 这样 `spa_fallback` 等旧字段的语义不会在多路由下产生歧义——
+    /// 路由表里每条静态路由自带 `spa`，不受站点级 `spa_fallback` 影响。
+    Routed { routes: SiteRoutes },
+}
+
+/// 一条路由：把某个 URL 前缀交给特定处理方式。
+///
+/// 存在的意义：单 `kind` 的站点只有**一个** `location /`，于是「Vue 静态站 +
+/// `/api` 交给 Go 后端」这种最常见的混合形态必须拆成两个站点（两个域名、两份
+/// 证书、两套 WAF），或者手改 nginx 配置。多路由把它变成站点的一等公民。
+///
+/// ⚠ **渲染一律用 `location ^~ <prefix>`**（不使用正则）：nginx 的 location
+/// 优先级是「精确 `=` > 前缀 `^~` > 正则 > 普通前缀」，**前缀一旦带 `^~`
+/// 就永不再走正则**——这正是我们要的确定性（用户写的 prefix 与任何正则规则
+/// 谁先命中，不再依赖配置里的书写顺序）。反过来说，**多路由模式下不能再依赖
+/// 正则 location**（含本文件自己为单路由 PHP 生成的 `~ \.php$`），故 PHP 路由
+/// 改用「固定 front controller」的 FastCGI 形式（见 [`RouteKind::Php`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SiteRoute {
+    /// URL 前缀。必须以 `/` 开头；`/` 表示兜底（只能有一条）。
+    /// 归一化由调用方负责（去掉末尾多余的 `/`，除根之外）。
+    pub prefix: String,
+    pub kind: RouteKind,
+}
+
+/// 单条路由的处理方式。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteKind {
+    /// 反向代理（可多后端 → 由 `upstream` 块轮询）。
+    Proxy { upstreams: Vec<String> },
+    /// 静态文件。`spa` 开启时未命中回退到 `/index.html`（history 路由）。
+    Static { spa: bool },
+    /// PHP：转发到 php-fpm。
+    ///
+    /// `front_controller` 是入口脚本（相对 `root`，如 `index.php`）。**必填**：
+    /// 多路由下不能用 `location ~ \.php$` 正则（`^~` 会屏蔽它），所以必须
+    /// 显式指定入口，把**整个前缀**都交给它——这也正是现代 PHP 框架
+    /// （Laravel / ThinkPHP / Slim）的标准 front controller 模式。
+    Php { fpm: String, front_controller: String },
+}
+
+/// 多路由站点：`routes` 至少一条，其中**恰好一条** `prefix == "/"` 作兜底。
+///
+/// 渲染时按 prefix 长度**降序**输出（`/api/admin` 先于 `/api` 先于 `/`），
+/// 让最长前缀先匹配——即便 nginx 的前缀匹配本身会挑最长，显式降序也让
+/// 配置文本读起来与实际生效顺序一致，便于人工核对。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SiteRoutes {
+    pub routes: Vec<SiteRoute>,
+}
+
+impl SiteRoutes {
+    /// 按 prefix 长度降序（同级保持原序，稳定）——渲染顺序即生效顺序。
+    pub fn sorted(&self) -> Vec<&SiteRoute> {
+        let mut v: Vec<&SiteRoute> = self.routes.iter().collect();
+        v.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
+        v
+    }
+
+    /// 找出兜底路由（`prefix == "/"`）。
+    pub fn fallback(&self) -> Option<&SiteRoute> {
+        self.routes.iter().find(|r| r.prefix == "/")
+    }
 }
 
 #[async_trait]

@@ -66,6 +66,8 @@ struct RawSite {
     /// apply 写入的 nginx 配置路径；**从未成功下发则为 NULL / 空串**。
     /// 这是「配置是否真落到 Web 服务器」的唯一判据——`enabled` 只表示期望状态。
     conf_path: Option<String>,
+    /// 多路由表 JSON 数组；非多路由站点为 `'[]'`（迁移给了 DEFAULT，不会有 NULL）
+    routes_json: String,
 }
 
 impl RawSite {
@@ -120,6 +122,32 @@ pub struct SiteOut {
     pub redirect_target: Option<String>,
     /// 整站重定向状态码（kind=redirect 时存在；301/302/307/308）；其余为 null
     pub redirect_code: Option<u16>,
+    /// 多路由表（kind=routed 时非空；其余恒为 `[]`——不返回 null，省前端分支）
+    pub routes: Vec<RouteOut>,
+}
+
+/// API 口径的单条路由。
+///
+/// 与 `panel_os::RouteKind` 一一对应，但**枚举值用小写字符串**（而非枚举类型）——
+/// 前端只需原样回传，不该依赖 Rust 侧的枚举形状。
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct RouteOut {
+    /// URL 前缀，必须以 `/` 开头；`/` 为兜底（最多一条）
+    pub prefix: String,
+    /// `proxy` | `static` | `php`
+    pub kind: String,
+    /// kind=proxy：后端列表
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upstreams: Vec<String>,
+    /// kind=static：未命中是否回退 /index.html
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub spa: bool,
+    /// kind=php：php-fpm 目标
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fpm: Option<String>,
+    /// kind=php：入口脚本（相对站点根，须以 `/` 开头）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub front_controller: Option<String>,
 }
 
 /// API 口径（`proxy`）→ 库内口径（`reverse_proxy`）。
@@ -133,6 +161,7 @@ fn kind_to_db(k: &panel_os::SiteKind) -> &'static str {
         panel_os::SiteKind::ReverseProxy { .. } => "reverse_proxy",
         panel_os::SiteKind::Php { .. } => "php",
         panel_os::SiteKind::Redirect { .. } => "redirect",
+        panel_os::SiteKind::Routed { .. } => "routed",
     }
 }
 
@@ -143,8 +172,130 @@ fn kind_to_api(k: &str) -> &'static str {
         "reverse_proxy" => "proxy",
         "php" => "php",
         "redirect" => "redirect",
+        "routed" => "routed",
         _ => "static",
     }
+}
+
+/// 库内 JSON → API 口径的路由列表。
+///
+/// 反向（API → 库内）由 `validate_routes` 负责：它先规范化再落库，
+/// 所以这里读出来的都是**已规范化**的值，可直接回显给前端再提交。
+fn routes_from_json(raw: &str) -> Vec<RouteOut> {
+    serde_json::from_str(raw).unwrap_or_default()
+}
+
+/// 校验并规范化路由表。返回库内形态（`SiteRoutes`）。
+///
+/// 校验点（每条都对应一类真实事故或 nginx 行为）：
+/// - **prefix 必须以 `/` 开头**——否则 nginx 的 `location` 语义不对；
+/// - **prefix 只允许安全字符**（字母数字 / `-` `_` `.` `~` 与 `/`）——它会**直接进
+///   nginx 配置文本**，带 `;`、`{`、`}`、空白、换行就是配置注入（可借此写出任意指令）；
+/// - **不得重复**——两条同 prefix 谁生效取决于书写顺序，用户无法预期；
+/// - **`/` 最多一条**——兜底重复同样无法预期；
+/// - **必须有兜底 `/`**——否则漏掉的路径会落到 nginx 的默认 server（**别的站点**），
+///   表现为「本站点随机串到别的站」，比 404 更难排查；
+/// - 每条路由按 kind 校验必填项（反代至少一个后端 / PHP 必须给 front controller）。
+fn validate_routes(routes: &[RouteOut]) -> ApiResult<panel_os::SiteRoutes> {
+    if routes.is_empty() {
+        return Err(ApiError::bad_request("routes", "至少需要一条路由"));
+    }
+    let mut seen: Vec<&str> = Vec::new();
+    let mut out = Vec::with_capacity(routes.len());
+    let mut has_root = false;
+
+    for (i, r) in routes.iter().enumerate() {
+        let field = "routes";
+        let prefix = r.prefix.trim();
+        if !prefix.starts_with('/') {
+            return Err(ApiError::bad_request(
+                field,
+                format!("第 {} 条路由的前缀「{}」必须以 / 开头", i + 1, r.prefix),
+            ));
+        }
+        if prefix.len() > 128 {
+            return Err(ApiError::bad_request(field, "路由前缀过长（上限 128 字符）"));
+        }
+        // 归一化：去掉末尾多余的 `/`（`/api/` ≡ `/api`），根前缀保持 `/`
+        let prefix = if prefix.len() > 1 { prefix.trim_end_matches('/') } else { "/" };
+        // 注入防线：只放行 URL 路径里合法且无害的字符
+        if !prefix
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.' | '~'))
+        {
+            return Err(ApiError::bad_request(
+                field,
+                format!("路由前缀「{prefix}」含非法字符（只允许字母数字与 / - _ . ~）"),
+            ));
+        }
+        if seen.contains(&prefix) {
+            return Err(ApiError::bad_request(field, format!("路由前缀「{prefix}」重复")));
+        }
+        seen.push(prefix);
+        if prefix == "/" {
+            if has_root {
+                return Err(ApiError::bad_request(field, "兜底路由「/」最多一条"));
+            }
+            has_root = true;
+        }
+
+        let kind = match r.kind.as_str() {
+            "static" => panel_os::RouteKind::Static { spa: r.spa },
+            "proxy" => {
+                let ups: Vec<String> = r.upstreams.iter().map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect();
+                if ups.is_empty() {
+                    return Err(ApiError::bad_request(
+                        field,
+                        format!("第 {} 条路由（前缀 {prefix}）的反代至少需要一个后端", i + 1),
+                    ));
+                }
+                panel_os::RouteKind::Proxy { upstreams: ups }
+            }
+            "php" => {
+                let fpm = r.fpm.as_deref().map(str::trim).filter(|v| !v.is_empty()).ok_or_else(|| {
+                    ApiError::bad_request(field, format!("第 {} 条路由（前缀 {prefix}）缺少 php-fpm 目标", i + 1))
+                })?;
+                // front_controller 必填：`^~` 前缀会屏蔽 `location ~ \.php$`，
+                // 没有它就没有任何入口（详见 panel_os::RouteKind::Php 的说明）
+                let fc = r
+                    .front_controller
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| {
+                        ApiError::bad_request(
+                            field,
+                            format!("第 {} 条路由（前缀 {prefix}）缺少 PHP 入口脚本（front_controller）", i + 1),
+                        )
+                    })?;
+                if !fc.starts_with('/') {
+                    return Err(ApiError::bad_request(
+                        field,
+                        format!("PHP 入口脚本「{fc}」必须以 / 开头（相对站点根）"),
+                    ));
+                }
+                if fc.contains([';', '\n', '\r', '{', '}']) {
+                    return Err(ApiError::bad_request(field, "PHP 入口脚本含非法字符"));
+                }
+                panel_os::RouteKind::Php { fpm: fpm.to_string(), front_controller: fc.to_string() }
+            }
+            other => {
+                return Err(ApiError::bad_request(
+                    field,
+                    format!("第 {} 条路由的 kind「{other}」无效（只支持 proxy / static / php）", i + 1),
+                ))
+            }
+        };
+        out.push(panel_os::SiteRoute { prefix: prefix.to_string(), kind });
+    }
+
+    if !has_root {
+        return Err(ApiError::bad_request(
+            "routes",
+            "必须有一条前缀为 / 的兜底路由（否则漏掉的路径会落到别的站点去）",
+        ));
+    }
+    Ok(panel_os::SiteRoutes { routes: out })
 }
 
 fn to_out(r: &RawSite) -> SiteOut {
@@ -167,6 +318,7 @@ fn to_out(r: &RawSite) -> SiteOut {
         spa: r.spa != 0,
         redirect_target: r.redirect_target.clone(),
         redirect_code: r.redirect_code.map(|n| n as u16),
+        routes: routes_from_json(&r.routes_json),
     }
 }
 
@@ -178,7 +330,11 @@ fn db_err(e: rusqlite::Error) -> PanelError {
 const SITE_SELECT: &str = "s.id, s.name, s.domains, s.root, s.kind, s.enabled, s.created_at,
        (SELECT COUNT(*) FROM ssl_certs c WHERE c.site_id = s.id) AS tls_count,
        s.waf_enabled, s.waf_profile, s.waf_rate, s.waf_burst,
-       s.upstreams_json, s.fpm, s.spa, s.redirect_target, s.redirect_code, s.conf_path";
+       s.upstreams_json, s.fpm, s.spa, s.redirect_target, s.redirect_code, s.conf_path,
+       s.routes_json";
+// ⚠ 列序与下方 `r.get(N)` 一一对应。加列**一律追加到末尾**（本次 routes_json = 18），
+//   这样既有索引全部不变——中途插列会让每个 r.get 静默错位（本项目已踩过一次：
+//   tls_count 子查询列把后续整体后移一位，apply 运行时才报 `Invalid column type`）。
 
 /// 站点查询 SQL。
 ///
@@ -217,6 +373,7 @@ async fn fetch_all(state: &Shared) -> Result<Vec<RawSite>> {
                     redirect_target: r.get(15)?,
                     redirect_code: r.get(16)?,
                     conf_path: r.get(17)?,
+                    routes_json: r.get(18)?,
                     })
                 })
                 .map_err(db_err)?;
@@ -256,6 +413,7 @@ async fn fetch_one(state: &Shared, id: i64) -> Result<Option<RawSite>> {
                     redirect_target: r.get(15)?,
                     redirect_code: r.get(16)?,
                     conf_path: r.get(17)?,
+                    routes_json: r.get(18)?,
                 })
             })
             .map_err(db_err)?;
@@ -292,6 +450,7 @@ async fn fetch_one_by_name(state: &Shared, name: &str) -> Result<Option<RawSite>
                     redirect_target: r.get(15)?,
                     redirect_code: r.get(16)?,
                     conf_path: r.get(17)?,
+                    routes_json: r.get(18)?,
                 })
             })
             .map_err(db_err)?;
@@ -490,6 +649,7 @@ pub async fn create(
                     spa: false,
                     redirect_target: None,
                     redirect_code: None,
+                                    routes: Vec::new(),
                 });
             Ok(ok(out))
         }
@@ -586,6 +746,20 @@ async fn render_spec_for_row(
             target: row.redirect_target.clone().unwrap_or_default(),
             code: row.redirect_code.map(|n| n as u16).unwrap_or(301),
         },
+        // 库里存的是**已校验**的 JSON（写入方validate 过），故这里解析失败即
+        // 降级成静态站——宁可显示成"静态"也不能让整个列表页报错。
+        "routed" => match routes_from_json(&row.routes_json)
+            .iter()
+            .cloned()
+            .collect::<Vec<RouteOut>>()
+            .as_slice()
+        {
+            [] => panel_os::SiteKind::Static,
+            rs => match validate_routes(rs) {
+                Ok(rr) => panel_os::SiteKind::Routed { routes: rr },
+                Err(_) => panel_os::SiteKind::Static,
+            },
+        },
         _ => panel_os::SiteKind::Static,
     };
     // SPA 回退仅对 static 有意义；其余类型忽略
@@ -617,6 +791,8 @@ async fn render_spec_for_row(
         force_https: has_tls,
         spa_fallback: spa,
         waf,
+        // 路由表已在 `kind` 里（Routed 变体），此字段只是对照——渲染以 kind 为准
+        routes: None,
     };
 
     let (target, rendered) = state.os.webserver().render(&spec)?;
@@ -860,9 +1036,14 @@ pub struct ApplyReq {
     pub domains: Vec<String>,
     pub root: String,
     pub force_https: Option<bool>,
-    /// 站点类型：`static`（默认）/ `proxy` / `php`
+    /// 站点类型：`static`（默认）/ `proxy` / `php` / `redirect` / `routed`
     #[serde(default)]
     pub kind: Option<String>,
+    /// `kind=routed` 的路由表（至少一条，且必须含一条前缀为 `/` 的兜底）。
+    /// **缺省 = 保留库中现有路由表**（与 `waf` 同语义：apply 是按期望状态覆盖，
+    /// 但静默清空一整张路由表比多一次点击危险得多）。
+    #[serde(default)]
+    pub routes: Option<Vec<RouteOut>>,
     /// `kind=proxy` 的后端列表（1~16 个）
     #[serde(default)]
     pub upstreams: Option<Vec<String>>,
@@ -1161,10 +1342,16 @@ pub async fn apply(
             }
             panel_os::SiteKind::Redirect { target, code: code as u16 }
         }
+        "routed" => {
+            let rs = req.routes.clone().ok_or_else(|| {
+                ApiError::bad_request("routes", "多路由站点必须提供路由表（routes）")
+            })?;
+            panel_os::SiteKind::Routed { routes: validate_routes(&rs)? }
+        }
         other => {
             return Err(ApiError::bad_request(
                 "kind",
-                format!("未知站点类型：{other}（可选 static / proxy / php / redirect）"),
+                format!("未知站点类型：{other}（可选 static / proxy / php / redirect / routed）"),
             ))
         }
     };
@@ -1175,6 +1362,42 @@ pub async fn apply(
     let (redirect_target_db, redirect_code_db): (Option<String>, Option<i64>) = match &kind {
         panel_os::SiteKind::Redirect { target, code } => (Some(target.clone()), Some(*code as i64)),
         _ => (None, None),
+    };
+    // 路由表落库：存 API 口径的 JSON（读侧 `routes_from_json` + `validate_routes` 复原）。
+    // 非 routed 一律存 '[]' ——不用 NULL，避免「NULL 与空数组两种表示」带来的分支。
+    let routes_json: String = match &kind {
+        panel_os::SiteKind::Routed { routes } => {
+            let api: Vec<RouteOut> = routes
+                .routes
+                .iter()
+                .map(|r| RouteOut {
+                    prefix: r.prefix.clone(),
+                    kind: match &r.kind {
+                        panel_os::RouteKind::Proxy { .. } => "proxy",
+                        panel_os::RouteKind::Static { .. } => "static",
+                        panel_os::RouteKind::Php { .. } => "php",
+                    }
+                    .to_string(),
+                    upstreams: match &r.kind {
+                        panel_os::RouteKind::Proxy { upstreams } => upstreams.clone(),
+                        _ => Vec::new(),
+                    },
+                    spa: matches!(&r.kind, panel_os::RouteKind::Static { spa: true }),
+                    fpm: match &r.kind {
+                        panel_os::RouteKind::Php { fpm, .. } => Some(fpm.clone()),
+                        _ => None,
+                    },
+                    front_controller: match &r.kind {
+                        panel_os::RouteKind::Php { front_controller, .. } => {
+                            Some(front_controller.clone())
+                        }
+                        _ => None,
+                    },
+                })
+                .collect();
+            serde_json::to_string(&api).unwrap_or_else(|_| "[]".into())
+        }
+        _ => "[]".to_string(),
     };
     // 反代 / PHP 后端配置一并落库（F6）：从已校验的 kind 提前取出，避免被 move 进 SiteSpec 后无法再借
     let (upstreams_json, fpm_str) = match &kind {
@@ -1195,6 +1418,8 @@ pub async fn apply(
         force_https: req.force_https.unwrap_or(true) && has_tls,
         spa_fallback: spa,
         waf,
+        // 路由表已在 `kind` 里（Routed 变体），此字段只是对照——渲染以 kind 为准
+        routes: None,
     };
     let (target, rendered) = state.os.webserver().render(&spec)?;
 
@@ -1245,8 +1470,8 @@ pub async fn apply(
             conn.execute(
                 "INSERT INTO sites(name, domains, root, kind, webserver, enabled, conf_path, created_at,
                                    waf_enabled, waf_profile, waf_rate, waf_burst, upstreams_json, fpm,
-                                   spa, redirect_target, redirect_code)
-                 VALUES(?1, ?2, ?3, ?4, 'nginx', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                                   spa, redirect_target, redirect_code, routes_json)
+                 VALUES(?1, ?2, ?3, ?4, 'nginx', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
                  ON CONFLICT(name) DO UPDATE SET
                     domains=excluded.domains, root=excluded.root, kind=excluded.kind, enabled=?5,
                     conf_path=?6, webserver='nginx',
@@ -1254,10 +1479,11 @@ pub async fn apply(
                     waf_rate=excluded.waf_rate, waf_burst=excluded.waf_burst,
                     upstreams_json=excluded.upstreams_json, fpm=excluded.fpm,
                     spa=excluded.spa, redirect_target=excluded.redirect_target,
-                    redirect_code=excluded.redirect_code",
+                    redirect_code=excluded.redirect_code, routes_json=excluded.routes_json",
                 rusqlite::params![name, domains_json, root_str, kind_db, enabled_i32, conf_db, now,
                                   waf_on, waf_profile, waf_rate, waf_burst,
-                                  upstreams_json, fpm_str, spa_i32, redirect_target_db, redirect_code_db],
+                                  upstreams_json, fpm_str, spa_i32, redirect_target_db, redirect_code_db,
+                                  routes_json],
             )
             .map(|_| panel_db::WriteAck { rows_changed: 1 })
             .map_err(|e| PanelError::Database(e.to_string()))
@@ -2202,6 +2428,7 @@ mod kind_tests {
             ("reverse_proxy", "proxy"),
             ("php", "php"),
             ("redirect", "redirect"),
+            ("routed", "routed"),
         ] {
             assert_eq!(kind_to_api(db), api, "库口径 {db} 应呈现为 {api}");
         }
@@ -2218,6 +2445,113 @@ mod kind_tests {
         // 未知值必须降级成 static：认成 proxy 会让人按错误前提去改配置
         assert_eq!(kind_to_api("something_else"), "static");
         assert_eq!(kind_to_api(""), "static");
+    }
+
+    fn route(prefix: &str, kind: &str) -> RouteOut {
+        RouteOut {
+            prefix: prefix.to_string(),
+            kind: kind.to_string(),
+            upstreams: Vec::new(),
+            spa: false,
+            fpm: None,
+            front_controller: None,
+        }
+    }
+
+    #[test]
+    fn routes_validation_normalizes_and_accepts() {
+        let mut rs = vec![route("/", "static"), route("/api/", "proxy")];
+        rs[1].upstreams = vec!["  http://127.0.0.1:3000  ".into()];
+        let out = validate_routes(&rs).expect("合法路由表应通过");
+        // 末尾多余的 / 必须被归一化（/api/ ≡ /api），否则同一前缀能存成两条
+        assert_eq!(out.routes[1].prefix, "/api");
+        assert_eq!(out.routes[1].kind, panel_os::RouteKind::Proxy {
+            upstreams: vec!["http://127.0.0.1:3000".into()],
+        });
+        // 归一化后两条不再重复（若不归一化，第二条就与首条同前缀而报重复）
+        assert_eq!(out.routes.len(), 2);
+        assert!(out.fallback().is_some());
+    }
+
+    /// `prefix` 会**直接进 nginx 配置文本**，带 `;` / `{` / 换行就是配置注入
+    /// （可借此写出任意指令，如 `location / { } return 200 "ok"; }`）。
+    /// 这类输入必须在校验层挡住——渲染层不设防。
+    #[test]
+    fn routes_validation_blocks_config_injection() {
+        for bad in [
+            "/api; return 200 'pwned'",
+            "/api { }",
+            "/api\n    }\n    location / { deny all;",
+            "/api /api2",   // 空白
+            "/api/$(id)",
+            "/api`id`",
+            "/api\u{0}",
+        ] {
+            let rs = vec![route("/", "static"), route(bad, "static")];
+            assert!(
+                validate_routes(&rs).is_err(),
+                "必须拒绝含注入字符的前缀：{bad:?}"
+            );
+        }
+        // 合法但需归一化的边界
+        let rs = vec![route("/", "static"), route("/api/v1.0~beta-2_x", "static")];
+        assert!(validate_routes(&rs).is_ok(), "点/波浪/下划线/连字符应放行");
+    }
+
+    #[test]
+    fn routes_validation_requires_exactly_one_fallback() {
+        // 没有兜底 → 必须报错（漏掉的路径会落到别的站点去）
+        let rs = vec![route("/api", "static")];
+        let e = validate_routes(&rs).expect_err("缺兜底必须报错");
+        assert!(format!("{e:?}").contains("兜底"), "{e:?}");
+        // 两个兜底 → 必须报错（谁生效取决于书写顺序）
+        let rs = vec![route("/", "static"), route("/", "proxy")];
+        assert!(validate_routes(&rs).is_err(), "重复的 / 必须报错");
+        // 空表
+        assert!(validate_routes(&[]).is_err(), "空路由表必须报错");
+    }
+
+    #[test]
+    fn routes_validation_rejects_duplicate_prefix() {
+        let rs = vec![route("/", "static"), route("/api", "static"), route("/api", "static")];
+        let e = validate_routes(&rs).expect_err("重复前缀必须报错");
+        assert!(format!("{e:?}").contains("重复"), "{e:?}");
+    }
+
+    #[test]
+    fn routes_validation_checks_per_kind_required_fields() {
+        // 反代缺后端
+        let mut proxy = route("/api", "proxy");
+        proxy.upstreams = vec!["   ".into()];
+        let rs = vec![route("/", "static"), proxy];
+        assert!(validate_routes(&rs).is_err(), "反代必须有后端");
+
+        // PHP 缺 fpm / 缺 front_controller
+        let rs = vec![route("/", "static"), route("/app", "php")];
+        assert!(validate_routes(&rs).is_err(), "PHP 缺 fpm 必须报错");
+        let mut php = route("/app", "php");
+        php.fpm = Some("unix:/run/php.sock".into());
+        let rs = vec![route("/", "static"), php.clone()];
+        assert!(validate_routes(&rs).is_err(), "PHP 缺 front_controller 必须报错");
+        // 补齐后应通过
+        let mut ok = php.clone();
+        ok.front_controller = Some("/app/public/index.php".into());
+        let rs = vec![route("/", "static"), ok];
+        assert!(validate_routes(&rs).is_ok());
+
+        // front_controller 必须以 / 开头且不含注入字符
+        let mut bad = php.clone();
+        bad.front_controller = Some("app/index.php".into());
+        let rs = vec![route("/", "static"), bad];
+        assert!(validate_routes(&rs).is_err(), "front_controller 须以 / 开头");
+
+        // 未知 kind
+        let rs = vec![route("/", "static"), route("/x", "cobol")];
+        assert!(validate_routes(&rs).is_err(), "未知 kind 必须报错");
+
+        // 非 / 前缀
+        let rs = vec![route("/", "static"), route("api", "static")];
+        assert!(validate_routes(&rs).is_err(), "前缀须以 / 开头");
     }
 }
 

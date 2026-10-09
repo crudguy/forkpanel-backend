@@ -1028,26 +1028,37 @@ fn render_nginx(spec: &SiteSpec) -> String {
     // ── 负载均衡 upstream 块 + WebSocket 连接升级映射 ──
     // `upstream` / `map` 都是 **http 级**指令，必须排在 server 之前；塞进 server{}
     // 会直接语法错误（而且 nginx -t 会拒绝整份配置，不只是这个站点）。
-    if let SiteKind::ReverseProxy { upstreams } = &spec.kind {
+    if let SiteKind::Routed { routes } = &spec.kind {
+        // 多路由：**每条反代路由都要自己的 map 变量名**。若沿用站点级的名字，
+        // 两条 `/api` 与 `/admin` 路由会共用一个 `$panel_x_ws`——map 变量
+        // 本身可复用，但 upstream **块名**会撞车（nginx 直接 `duplicate upstream`
+        // 拒绝加载整份配置）。故按 prefix 派生，见 route_upstream_name。
+        for r in &routes.routes {
+            if let RouteKind::Proxy { upstreams } = &r.kind {
+                if !upstreams.is_empty() {
+                    out.push_str(&render_ws_map(&route_ws_var(&spec.server_names, &r.prefix)));
+                }
+                if upstreams.len() > 1 {
+                    out.push_str(&render_upstream_block(
+                        &route_upstream_name(&spec.server_names, &r.prefix),
+                        upstreams,
+                    ));
+                }
+            }
+        }
+        out.push('\n');
+    } else if let SiteKind::ReverseProxy { upstreams } = &spec.kind {
         // WebSocket 升级映射：用每站唯一的变量名（`upstream_name` 派生），避免多站点
         // conf 拼进同一 http 上下文时 map 重名导致 nginx 整份拒绝加载。
         // 用 map 按请求动态决定 Connection（带 Upgrade 头→upgrade，否则→close），
         // 这样普通请求仍走 keep-alive、WebSocket 握手才能成功——只写死
         // `Connection "upgrade"` 会让所有请求都带升级头、破坏后端连接复用。
-        out.push_str(&format!("map $http_upgrade {ws_var} {{\n"));
-        out.push_str("    default upgrade;\n");
-        out.push_str("    ''      close;\n");
-        out.push_str("}\n\n");
+        out.push_str(&render_ws_map(&ws_var));
         if upstreams.len() > 1 {
-            out.push_str(&format!("upstream {} {{\n", upstream_name(&spec.server_names)));
-            // least_conn：相比轮询，对长连接/慢请求更均衡；单机小集群够用
-            out.push_str("    least_conn;\n");
-            for u in upstreams {
-                // upstream 的 server 指令只接受 host:port，不接受 scheme
-                let hp = u.split_once("://").map(|(_, r)| r).unwrap_or(u.as_str());
-                out.push_str(&format!("    server {hp};\n"));
-            }
-            out.push_str("}\n\n");
+            out.push_str(&render_upstream_block(
+                &upstream_name(&spec.server_names),
+                upstreams,
+            ));
         }
     }
 
@@ -1144,6 +1155,9 @@ fn render_nginx(spec: &SiteSpec) -> String {
             // 整站重定向：自动追加 $request_uri 保留原始路径与查询串。
             out.push_str(&format!("    return {code} {target}$request_uri;\n"));
         }
+        SiteKind::Routed { routes } => {
+            out.push_str(&render_routed_server(routes, spec));
+        }
         SiteKind::Php { fpm } => {
             // `fastcgi_params` 由发行版提供（Debian: /etc/nginx/fastcgi_params）
             out.push_str("    location ~ \\.php$ {\n");
@@ -1158,7 +1172,105 @@ fn render_nginx(spec: &SiteSpec) -> String {
     out
 }
 
+/// WebSocket 升级映射块（http 级，必须排在 server 之前）。
+///
+/// 用 map 按请求动态决定 Connection（带 Upgrade 头→upgrade，否则→close），
+/// 这样普通请求仍走 keep-alive、WebSocket 握手才能成功——只写死
+/// `Connection "upgrade"` 会让所有请求都带升级头、破坏后端连接复用。
+fn render_ws_map(ws_var: &str) -> String {
+    let mut o = String::new();
+    o.push_str(&format!("map $http_upgrade {ws_var} {{\n"));
+    o.push_str("    default upgrade;\n");
+    o.push_str("    ''      close;\n");
+    o.push_str("}\n\n");
+    o
+}
+
+/// `upstream` 块（http 级）。`upstreams` 已是 `host:port` 或带 scheme 的完整 URL。
+fn render_upstream_block(name: &str, upstreams: &[String]) -> String {
+    let mut o = String::new();
+    o.push_str(&format!("upstream {name} {{\n"));
+    // least_conn：相比轮询，对长连接/慢请求更均衡；单机小集群够用
+    o.push_str("    least_conn;\n");
+    for u in upstreams {
+        // upstream 的 server 指令只接受 host:port，不接受 scheme
+        let hp = u.split_once("://").map(|(_, r)| r).unwrap_or(u.as_str());
+        o.push_str(&format!("    server {hp};\n"));
+    }
+    o.push_str("}\n\n");
+    o
+}
+
+/// 多路由的反代目标解析：单后端直连、多后端指向 upstream 块名。
+fn route_proxy_target(server_names: &[String], prefix: &str, upstreams: &[String]) -> String {
+    match upstreams.len() {
+        1 => upstreams[0].clone(),
+        _ => format!("http://{}", route_upstream_name(server_names, prefix)),
+    }
+}
+
+/// 多路由渲染：按 prefix 长度降序输出 `location ^~ <prefix>`。
+///
+/// 全部用 `^~`（**不用正则**）：带 `^~` 的前缀一旦命中就**不再走正则**，
+/// 于是「用户写的 prefix」与「deny/WAF 里的正则 location」的优先级变得确定，
+/// 不再取决于配置里的书写顺序——这正是引入多路由时必须一并锁掉的东西。
+fn render_routed_server(routes: &SiteRoutes, spec: &SiteSpec) -> String {
+    let mut o = String::new();
+    o.push_str("\n    # ── 多路由（按前缀长度降序；`^~` 保证不被正则抢走）──\n");
+    for r in routes.sorted() {
+        o.push_str(&format!("\n    # {} → {:?}\n", r.prefix, r.kind));
+        match &r.kind {
+            RouteKind::Static { spa } => {
+                o.push_str(&format!("    location ^~ {} {{\n", r.prefix));
+                if *spa {
+                    o.push_str("        try_files $uri $uri/ /index.html;\n");
+                } else {
+                    o.push_str("        try_files $uri $uri/ =404;\n");
+                }
+                o.push_str("    }\n");
+            }
+            RouteKind::Proxy { upstreams } => {
+                let target = route_proxy_target(&spec.server_names, &r.prefix, upstreams);
+                o.push_str(&format!("    location ^~ {} {{\n", r.prefix));
+                o.push_str(&format!("        proxy_pass {target};\n"));
+                o.push_str("        proxy_set_header Host $host;\n");
+                o.push_str("        proxy_set_header X-Real-IP $remote_addr;\n");
+                o.push_str("        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n");
+                o.push_str("        proxy_set_header X-Forwarded-Proto $scheme;\n");
+                o.push_str("        proxy_http_version 1.1;\n");
+                o.push_str("        proxy_set_header Upgrade $http_upgrade;\n");
+                o.push_str(&format!(
+                    "        proxy_set_header Connection {};\n",
+                    route_ws_var(&spec.server_names, &r.prefix)
+                ));
+                o.push_str("    }\n");
+            }
+            RouteKind::Php { fpm, front_controller } => {
+                // ⚠ 多路由下**不能**用 `location ~ \\.[Pp]hp$`：`^~` 前缀会屏蔽
+                // 同级正则，那条正则永不执行 → PHP 请求落到静态处理（源码当文本下载，
+                // 或404）。故改成现代框架的 front controller 形式：整个前缀交给
+                // 入口脚本，由框架自己路由。这也是 Laravel/ThinkPHP 的标准部署法。
+                o.push_str(&format!("    location ^~ {} {{\n", r.prefix));
+                o.push_str("        include fastcgi_params;\n");
+                o.push_str(&format!("        fastcgi_pass {fpm};\n"));
+                o.push_str(&format!(
+                    "        fastcgi_param SCRIPT_FILENAME $document_root{front_controller};\n"
+                ));
+                o.push_str(&format!(
+                    "        fastcgi_param SCRIPT_NAME {front_controller};\n"
+                ));
+                o.push_str("    }\n");
+            }
+        }
+    }
+    o
+}
+
 /// upstream 块名：由首个 server_name 派生并净化（非字母数字 → `_`）。
+///
+/// 必须稳定且唯一——同一台机器上多站点的 upstream 名一旦撞车，
+/// nginx 会拒绝加载整份配置（`duplicate upstream`）。
+/// 多路由追加 `prefix` 成分，否则同一站点的两条反代路由会撞车。
 /// 必须稳定且唯一——同一台机器上多站点的 upstream 名一旦撞车，
 /// nginx 会拒绝加载整份配置（`duplicate upstream`）。
 fn upstream_name(server_names: &[String]) -> String {
@@ -1220,6 +1332,25 @@ fn waf_trav(p: WafProfile) -> String { waf_rules(WAF_TRAV_BASIC, WAF_TRAV_STRICT
 /// WAF 变量 / zone 名：复用 upstream 的净化规则（同一站点稳定且唯一）。
 /// 多站点 zone 名撞车会让 nginx 拒绝加载**整份**配置，不只是这个站点。
 fn waf_token(server_names: &[String]) -> String { upstream_name(server_names) }
+
+/// 多路由的 upstream 块名 / map 变量名：站点名 + prefix 派生。
+///
+/// prefix 的 `/` 与非字母数字统一替成 `_`，保证与 `upstream_name` 的净化规则一致；
+/// 带上 prefix 是**必须的**——同一站点的 `/api` 与 `/admin` 各有多后端时，
+/// 块名撞车会让 nginx 以 `duplicate upstream` 拒绝整份配置。
+fn route_upstream_name(server_names: &[String], prefix: &str) -> String {
+    let base = upstream_name(server_names);
+    let mut out = String::from(&base);
+    for c in prefix.chars() {
+        if c.is_ascii_alphanumeric() { out.push(c); } else { out.push('_'); }
+    }
+    out
+}
+
+/// 多路由的 WebSocket map 变量名（`$panel_x_api_ws` 形式）。
+fn route_ws_var(server_names: &[String], prefix: &str) -> String {
+    format!("${}_ws", route_upstream_name(server_names, prefix))
+}
 
 /// WAF 的 **http 级**片段（`map` / `limit_req_zone` / `limit_req_status`）。
 ///
@@ -2021,7 +2152,28 @@ mod tests {
             force_https: false,
             spa_fallback: false,
             waf: None,
+            routes: None,
         }
+    }
+
+    /// 多路由测试用的 spec：`/` 静态兜底 + `/api` 反代。
+    fn spec_routed() -> SiteSpec {
+        let mut s = spec_static();
+        s.kind = SiteKind::Routed {
+            routes: SiteRoutes {
+                routes: vec![
+                    SiteRoute { prefix: "/".into(), kind: RouteKind::Static { spa: true } },
+                    SiteRoute {
+                        prefix: "/api".into(),
+                        kind: RouteKind::Proxy {
+                            upstreams: vec!["http://127.0.0.1:3000".into()],
+                        },
+                    },
+                ],
+            },
+        };
+        s.routes = match &s.kind { SiteKind::Routed { routes } => Some(routes.clone()), _ => None };
+        s
     }
 
     fn spec_waf(profile: WafProfile, rate: Option<u32>, burst: u32) -> SiteSpec {
@@ -2420,6 +2572,152 @@ mod tests {
         let mut plain = spec_static();
         plain.spa_fallback = false;
         assert!(render_nginx(&plain).contains("try_files $uri $uri/ =404;"), "{plain:?}");
+    }
+
+    /// 多路由核心：`/` 静态 + `/api` 反代，各生成一条 `location ^~`。
+    ///
+    /// 这正是「Vue dist + Go/Node API」这一最高频形态——此前必须拆成两个站点。
+    #[test]
+    fn routed_site_renders_one_caret_prefix_location_per_route() {
+        let out = render_nginx(&spec_routed());
+        assert!(out.contains("location ^~ / {"), "缺兜底路由：\n{out}");
+        assert!(out.contains("location ^~ /api {"), "缺 /api 路由：\n{out}");
+        assert!(out.contains("proxy_pass http://127.0.0.1:3000;"), "反代目标错：\n{out}");
+        // / 是 SPA 静态 → 回退 index.html
+        assert!(out.contains("try_files $uri $uri/ /index.html;"), "/ 应为 SPA 静态：\n{out}");
+    }
+
+    /// #2 的核心约束：**多路由下必须全部用 `^~` 前缀，一条正则都不用**。
+    ///
+    /// 理由：nginx 里`^~` 前缀命中后**永不再走正则**，这让「用户写的 prefix」
+    /// 与「deny/WAF 的正则 location」的优先级变得确定。反之若用普通前缀，
+    /// 谁先命中就取决于配置里的书写顺序——多站点 conf 拼进同一 http 上下文时
+    /// 这种顺序依赖极难排查。
+    #[test]
+    fn routed_sites_use_no_regex_locations() {
+        let out = render_nginx(&spec_routed());
+        // ⚠ 断言只针对**路由表段**（`# ── 多路由` 到下一个段标/结尾）。
+        // deny 与 ACME 那几条**必须仍是正则**——它们要拦的是「任意路径下的
+        // 敏感文件」（`/api/.env`、`/admin/.git/config`），换成前缀就漏了。
+        // 「路由表不用正则」与「防护规则用正则」是两件事，别混为一谈。
+        let routed_section = out
+            .split("── 多路由")
+            .nth(1)
+            .expect("应有多路由段");
+        for line in routed_section.lines().filter(|l| l.contains("location ")) {
+            assert!(
+                line.contains("location ^~ "),
+                "路由表只允许 ^~ 前缀（禁正则），发现：{line}\n{routed_section}"
+            );
+        }
+        // 反向确认：防护规则确实还在（且是正则形态）
+        assert!(out.contains("location ~ /[.](?!well-known/) { deny all; }"), "{out}");
+        // 反代请求头一行不能少（Host/真实 IP 是反代的 basics）
+        assert!(out.contains("proxy_set_header Host $host;"), "{out}");
+        assert!(out.contains("proxy_set_header X-Real-IP $remote_addr;"), "{out}");
+    }
+
+    /// 排序必须按前缀长度降序——`/api/admin` 要先于 `/api` 先于 `/`。
+    /// 即便 nginx 前缀匹配本身挑最长，显式降序也让「配置文本顺序 = 生效顺序」。
+    #[test]
+    fn routed_routes_render_in_longest_prefix_first_order() {
+        let mut s = spec_static();
+        let routes = SiteRoutes {
+            routes: vec![
+                SiteRoute { prefix: "/".into(), kind: RouteKind::Static { spa: false } },
+                SiteRoute { prefix: "/api".into(), kind: RouteKind::Static { spa: false } },
+                SiteRoute {
+                    prefix: "/api/admin".into(),
+                    kind: RouteKind::Proxy { upstreams: vec!["http://127.0.0.1:9000".into()] },
+                },
+            ],
+        };
+        s.kind = SiteKind::Routed { routes: routes.clone() };
+        let out = render_nginx(&s);
+        let admin = out.find("location ^~ /api/admin {").expect("应有 /api/admin");
+        let api = out.find("location ^~ /api {").expect("应有 /api");
+        let root = out.find("location ^~ / {").expect("应有 /");
+        assert!(admin < api && api < root, "顺序应按前缀长度降序：\n{out}");
+        // 顺带验证 sorted() 与 fallback()
+        assert_eq!(routes.fallback().map(|r| r.prefix.as_str()), Some("/"));
+    }
+
+    /// 多路由下两条反代路由各有多个后端 → upstream 块名**必须不同**。
+    /// 撞名会让 nginx 以 `duplicate upstream` 拒绝加载**整份配置**
+    /// （不止这个站点，全机 nginx 起不来）。
+    #[test]
+    fn routed_multi_upstream_blocks_have_unique_names() {
+        let mut s = spec_static();
+        s.kind = SiteKind::Routed {
+            routes: SiteRoutes {
+                routes: vec![
+                    SiteRoute { prefix: "/".into(), kind: RouteKind::Static { spa: false } },
+                    SiteRoute {
+                        prefix: "/api".into(),
+                        kind: RouteKind::Proxy {
+                            upstreams: vec!["http://127.0.0.1:3000".into(), "http://127.0.0.1:3001".into()],
+                        },
+                    },
+                    SiteRoute {
+                        prefix: "/ws".into(),
+                        kind: RouteKind::Proxy {
+                            upstreams: vec!["http://127.0.0.1:4000".into(), "http://127.0.0.1:4001".into()],
+                        },
+                    },
+                ],
+            },
+        };
+        let out = render_nginx(&s);
+        assert!(out.contains("upstream panel_example_com_api {"), "{out}");
+        assert!(out.contains("upstream panel_example_com_ws {"), "{out}");
+        // 两个 map 变量也不能重名
+        assert!(out.contains("map $http_upgrade $panel_example_com_api_ws {"), "{out}");
+        assert!(out.contains("map $http_upgrade $panel_example_com_ws_ws {"), "{out}");
+        // 单后端路由不该建 upstream 块（少一层间接）
+        let single = render_nginx(&spec_routed());
+        assert!(!single.contains("upstream "), "单后端不该建 upstream 块：\n{single}");
+    }
+
+    /// 多路由的 PHP 必须用 front controller 形式，**不能**用 `location ~ \.php$`。
+    ///
+    /// 这是 #2+#4 必须一起做的原因：`^~` 会屏蔽同级正则，若沿用单路由那套正则写法，
+    /// PHP 请求会落到静态处理（源码被当文本下载，或直接 404）——一个更隐蔽的坏法。
+    #[test]
+    fn routed_php_uses_front_controller_not_regex() {
+        let mut s = spec_static();
+        s.kind = SiteKind::Routed {
+            routes: SiteRoutes {
+                routes: vec![
+                    SiteRoute { prefix: "/".into(), kind: RouteKind::Static { spa: false } },
+                    SiteRoute {
+                        prefix: "/app".into(),
+                        kind: RouteKind::Php {
+                            fpm: "unix:/run/php/php8.2-fpm.sock".into(),
+                            front_controller: "/app/public/index.php".into(),
+                        },
+                    },
+                ],
+            },
+        };
+        let out = render_nginx(&s);
+        assert!(out.contains("location ^~ /app {"), "{out}");
+        assert!(out.contains("fastcgi_pass unix:/run/php/php8.2-fpm.sock;"), "{out}");
+        assert!(
+            out.contains("fastcgi_param SCRIPT_FILENAME $document_root/app/public/index.php;"),
+            "应把 SCRIPT_FILENAME 固定到 front controller：\n{out}"
+        );
+        // 关键：**路由表段内**不得出现正则 location（deny/ACME 的正则不在此段）
+        let routed_section = out.split("── 多路由").nth(1).expect("应有多路由段");
+        assert!(!routed_section.contains("location ~"), "路由表不得用正则 location：\n{routed_section}");
+    }
+
+    /// 多路由站点的 ACME 挑战路径与敏感文件 deny **仍然生效**——
+    /// 它们是 server 级的，与路由表共存（这也是把两件事分开实现的原因）。
+    #[test]
+    fn routed_site_keeps_acme_and_deny_guards() {
+        let out = render_nginx(&spec_routed());
+        assert!(out.contains("location ^~ /.well-known/acme-challenge/"), "{out}");
+        assert!(out.contains("(?!well-known/) { deny all; }"), "{out}");
     }
 
     /// 修复 #1：反代站点的 ACME http-01 挑战路径。

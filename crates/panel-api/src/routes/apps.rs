@@ -481,6 +481,9 @@ async fn apply_site(state: &Shared, session: &Session, app: &RawApp) -> ApiResul
         spa: None,
         redirect_target: None,
         redirect_code: None,
+        // 应用托管只建**单一反代站**；多路由是用户在「网站」页自己编排的事，
+        // 这里不代填（传 None = 保留库中现有路由表，与 apply 的缺省语义一致）。
+        routes: None,
         waf: None,
     };
     // 直接 `?`：apply 失败必须让本次保存失败——否则 DB 说已建站、nginx 却没配置，
