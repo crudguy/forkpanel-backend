@@ -1012,7 +1012,10 @@ fn render_nginx(spec: &SiteSpec) -> String {
     // WebSocket 升级映射变量名（每站唯一，见下方 ReverseProxy 分支的 map 块）
     let ws_var = format!("${}_ws", upstream_name(&spec.server_names));
 
-    out.push_str("# 由 ForkPanel 自动生成，请勿手工修改（下次 apply 会覆盖）。\n");
+    // 文件头两句：旧文案「请勿手工修改」与「手动维护」功能矛盾（用户其实可以自改，
+    // 只是要走面板入口）——第一句说清托管态会覆盖，第二句给出正确的自改路径。
+    out.push_str("# 由 ForkPanel 自动生成（面板托管中：保存并应用会覆盖）。\n");
+    out.push_str("# 如需自改：在面板「站点配置」区编辑并保存，将转为手动维护、不再被覆盖。\n");
     out.push_str(&format!("# site: {names}\n\n"));
 
     // ── force_https 且具备证书：80 端口整域 301 → https（独立 server 块）──
