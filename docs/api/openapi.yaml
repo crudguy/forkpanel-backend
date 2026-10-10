@@ -477,6 +477,16 @@ components:
         manual_conf:     { type: boolean, description: "手动维护：true = 磁盘上的配置文件由用户原始编辑维护，表单「保存并应用」不再覆盖它；可经「恢复面板托管」清零（停用/重新启用路径也会清零）" }
         conf_stale:      { type: boolean, description: "**未同步**（仅 manual_conf=true 且站点启用时有意义）：表单的部署相关字段与「配置文件最后一次落盘时的指纹」不一致——即面板里看到的规格 ≠ 线上文件（表单改过、文件没跟上）。由「重新生成配置」（conf/restore 或 apply 带 regen_conf）清零" }
         custom_conf:     { type: [string, "null"], description: "自定义配置片段（owner 维护）：插在主 server 块尾部，随表单「保存并应用」重新渲染；null = 无。与「手动维护」互补——片段属托管态（随保存重渲染），整文件手动维护则不被覆盖" }
+        www_redirect:    { type: string, enum: [off, to_www, to_bare], description: "www ↔ 非 www 跳转（020，**只对主域名 domains[0] 生效**，子域不参与）：off = 不处理；to_www = 裸域跳到 www.<主域名>；to_bare = www.<主域名> 跳回裸域。渲染为独立 server 块 + return 301（刻意不用 if）" }
+        tls_profile:     { type: string, enum: [compat, modern, strict], description: "加密套件档位（020）：compat = 兼容老客户端（含弱套件）、modern = 默认（TLSv1.2+ 主流套件）、strict = 仅 TLSv1.3 + 前向保密" }
+        tls_min:         { type: string, enum: [TLSv1, TLSv1.1, TLSv1.2, TLSv1.3], description: "TLS 版本下限（020），渲染时展开为「下限及以上」的 ssl_protocols 列表（如 TLSv1.2 → `TLSv1.2 TLSv1.3`）；默认 TLSv1.2" }
+        hsts:            { type: boolean, description: "HSTS 开关（020）：开启后 HTTPS 响应带 Strict-Transport-Security。⚠ 浏览器在 max-age 期间强制 HTTPS、服务端**无法撤回**——故默认关闭，UI 开启需二次确认" }
+        hsts_max_age:    { type: integer, description: "HSTS max-age（秒，0 ~ 63072000）。默认 300：先小步验证、确认无误再调大" }
+        hsts_include_sub: { type: boolean, description: "HSTS includeSubDomains（020）：一并约束子域。误用代价高，故独立开关、不随 hsts 一起开" }
+        hsts_preload:    { type: boolean, description: "HSTS preload（020）：申请进浏览器内置列表，**几乎不可逆**，独立开关" }
+        rewrite_preset:  { type: string, enum: [none, wordpress, laravel, thinkphp, typecho, discuz, custom], description: "伪静态预置模板（020，仅 php 类型有意义）：预置值替换默认的 try_files 兜底；custom 时使用 rewrite_custom；none = 不做伪静态" }
+        rewrite_custom:  { type: [string, "null"], description: "rewrite_preset=custom 时的原始 rewrite 文本（020）：原样进 `location /`，上限 64 KiB；其余为 null" }
+        conf_external:   { type: boolean, description: "外部修改（020）：磁盘上的配置文件与「最后一次落盘的内容」不一致——文件在面板之外被改动过。面板**不会**静默覆盖它（无从判断是人工有意、脚本误写还是攻击），由用户决定「重新生成覆盖 / 改为自定义片段 / 手动接管」" }
     SiteRoute:
       type: object
       required: [prefix, kind]
@@ -601,6 +611,15 @@ components:
         waf:         { $ref: '#/components/schemas/SiteWaf' }
         regen_conf:  { type: boolean, default: false, description: "手动维护站点的「重新生成配置」开关：true = 忽略手动维护保护，按本次表单**重新渲染并覆盖**磁盘配置（覆盖前自动备份到 <data_dir>/conf-backups/），成功后清零 manual_conf（回到面板托管）。缺省 false = 保持保护语义（跳过渲染/下发、表单仅入库）——此后若两边不一致，Site.conf_stale 会亮起" }
         custom_conf: { type: [string, "null"], description: "自定义配置片段：插在主 server 块尾部（所有 location 之后）。null = 清除、省略 = 保留库中现值（与 routes/waf 同「不静默清空」语义）；仅 owner 可改（非 owner 提交即 403）；上限 64 KiB；内容随部署指纹，改动会触发「未同步」判定" }
+        www_redirect: { type: string, enum: [off, to_www, to_bare], description: "www ↔ 非 www 跳转（020），省略 = 保留库中现值。见 Site.www_redirect" }
+        tls_profile: { type: string, enum: [compat, modern, strict], description: "加密套件档位（020），省略 = 保留现值。见 Site.tls_profile" }
+        tls_min: { type: string, enum: [TLSv1, TLSv1.1, TLSv1.2, TLSv1.3], description: "TLS 版本下限（020），省略 = 保留现值。见 Site.tls_min" }
+        hsts: { type: boolean, description: "HSTS 开关（020），省略 = 保留现值。⚠ 不可撤回，UI 需二次确认" }
+        hsts_max_age: { type: integer, description: "HSTS max-age（020），秒；0 ~ 63072000，省略 = 保留现值" }
+        hsts_sub: { type: boolean, description: "HSTS includeSubDomains（020），省略 = 保留现值" }
+        hsts_preload: { type: boolean, description: "HSTS preload（020），省略 = 保留现值" }
+        rewrite_preset: { type: string, enum: [none, wordpress, laravel, thinkphp, typecho, discuz, custom], description: "伪静态预置模板（020），省略 = 保留现值；仅 php 类型有意义" }
+        rewrite_custom: { type: [string, "null"], description: "rewrite_preset=custom 时的原始 rewrite 文本（020）：null/空白 = 清除、省略 = 保留现值；上限 64 KiB" }
     Cert:
       type: object
       properties:
@@ -1690,14 +1709,15 @@ paths:
       description: |
         路径唯一来源是落库的 conf_path（由 apply/patch 写入），避免「读任意文件」的越权面。
         从未下发、或文件已被外部删除时 content=null（不报 404——弹窗按「暂无内容」展示）。
-        成功响应 data：path（落盘路径，可为 null）、content（文件原文，可为 null）、manual（是否手动维护）、stale（表单与文件是否已分叉，见 Site.conf_stale）。
+        成功响应 data：path（落盘路径，可为 null）、content（文件原文，可为 null）、manual（是否手动维护）、
+        stale（表单与文件是否已分叉，见 Site.conf_stale）、external（磁盘内容 vs 最后留档版本：文件在面板之外被改过）。
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       responses:
         '200':
           description: ok
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { path: { type: [string, "null"] }, content: { type: [string, "null"] }, manual: { type: boolean }, stale: { type: boolean } } } } }
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { path: { type: [string, "null"] }, content: { type: [string, "null"] }, manual: { type: boolean }, stale: { type: boolean }, external: { type: boolean, description: "外部修改（020）：磁盘内容与最后一次留档的版本不一致——文件在面板之外被改过" } } } } }
         '404': { description: 站点不存在 }
     put:
       tags: [sites]

@@ -604,6 +604,17 @@ async fn apply_site(state: &Shared, session: &Session, app: &RawApp) -> ApiResul
         regen_conf: None,
         // 应用托管不暴露「自定义片段」编辑（那是「网站」页的高级功能）——恒 None = 保留库中现值。
         custom_conf: None,
+        // 高级配置（020）同理由面板自己维护，应用侧不开放：www 跳转关、TLS 取默认档、
+        // HSTS 不开、无伪静态（应用多为反代站，伪静态对它无意义）。
+        www_redirect: Some("off".to_string()),
+        tls_profile: Some("modern".to_string()),
+        tls_min: Some("TLSv1.2".to_string()),
+        hsts: Some(false),
+        hsts_max_age: Some(300),
+        hsts_sub: Some(false),
+        hsts_preload: Some(false),
+        rewrite_preset: Some("none".to_string()),
+        rewrite_custom: None,
     };
     // 直接 `?`：apply 失败必须让本次保存失败——否则 DB 说已建站、nginx 却没配置，
     // 用户下次排查会面对「应用在、站点不在」的错觉。

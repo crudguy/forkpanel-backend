@@ -82,6 +82,22 @@ struct RawSite {
     /// 自定义配置片段（019 迁移）：渲染时插在主 server 块尾部（托管态随表单
     /// 重渲染；纳入部署指纹——改动会自动触发未同步检测）。NULL / 空串 = 无。
     custom_conf: Option<String>,
+    /// www ↔ 非 www 跳转（020）：off | to_www | to_bare
+    www_redirect: String,
+    /// 加密套件档位（020）：compat | modern | strict
+    tls_profile: String,
+    /// TLS 版本下限（020）：TLSv1 | TLSv1.1 | TLSv1.2 | TLSv1.3
+    tls_min: String,
+    hsts: i32,
+    hsts_max_age: i64,
+    hsts_sub: i32,
+    hsts_preload: i32,
+    /// 伪静态模板（020）：none | wordpress | laravel | thinkphp | typecho | discuz | custom
+    rewrite_preset: String,
+    rewrite_custom: Option<String>,
+    /// **派生列**（非 sites 表的列）：最新留档版本的内容 hash，用于「外部修改检测」。
+    /// NULL = 该站尚无留档，此时无从判定，一律按「无外部修改」处理（不谎报）。
+    last_ver_hash: Option<String>,
 }
 
 impl RawSite {
@@ -148,6 +164,25 @@ pub struct SiteOut {
     /// 自定义配置片段（019）：插在主 server 块尾部；null = 无。owner 可编辑，
     /// 随「保存并应用」重渲染生效（托管态语义）。
     pub custom_conf: Option<String>,
+    /// www ↔ 非 www 跳转（020）：off | to_www | to_bare
+    pub www_redirect: String,
+    /// 加密套件档位（020）：compat | modern | strict
+    pub tls_profile: String,
+    /// TLS 版本下限（020）：TLSv1 | TLSv1.1 | TLSv1.2 | TLSv1.3
+    pub tls_min: String,
+    /// HSTS（020）：开启后响应带 Strict-Transport-Security
+    pub hsts: bool,
+    pub hsts_max_age: i64,
+    pub hsts_include_sub: bool,
+    pub hsts_preload: bool,
+    /// 伪静态模板（020）：none | wordpress | laravel | thinkphp | typecho | discuz | custom
+    pub rewrite_preset: String,
+    /// preset=custom 时的原始 rewrite 文本；其余为 null
+    pub rewrite_custom: Option<String>,
+    /// 外部修改（020）：磁盘上的配置文件与「最后一次落盘的内容」**不一致**——
+    /// 文件在面板之外被改动过。面板**不会**静默覆盖它（无从判断是人工有意、
+    /// 脚本误写还是攻击），由用户决定「重新生成覆盖」或「改成自定义片段」。
+    pub conf_external: bool,
 }
 
 /// API 口径的单条路由。
@@ -367,6 +402,9 @@ fn deploy_fingerprint(
     waf_burst: Option<i64>,
     routes_json: &str,
     custom_conf: Option<&str>,
+    // 高级配置（020）打包成的 JSON：9 个字段合成一段，避免参数表继续膨胀；
+    // serde_json 键序固定（字典序），指纹可复现。
+    advanced_json: &str,
 ) -> String {
     let mut s = String::with_capacity(256);
     let push = |s: &mut String, v: &str| { s.push_str(v); s.push('\u{1f}'); };
@@ -386,7 +424,26 @@ fn deploy_fingerprint(
     push(&mut s, routes_json);
     // 自定义片段（019）参与渲染 → 必须进指纹：否则改了它「未同步」不会亮。
     push(&mut s, custom_conf.unwrap_or(""));
+    // 高级配置（020）同样影响渲染输出（跳转块 / TLS 指令 / 伪静态）
+    push(&mut s, advanced_json);
     s
+}
+
+/// 高级配置（020）的指纹片段。**读侧**（库值）与**写侧**（apply 解析后的值）
+/// 必须用同一组键——两边键名或顺序不同就会误报「未同步」。
+fn advanced_json_of(r: &RawSite) -> String {
+    serde_json::json!({
+        "hsts": r.hsts,
+        "hsts_max_age": r.hsts_max_age,
+        "hsts_preload": r.hsts_preload,
+        "hsts_sub": r.hsts_sub,
+        "rewrite_custom": r.rewrite_custom,
+        "rewrite_preset": r.rewrite_preset,
+        "tls_min": r.tls_min,
+        "tls_profile": r.tls_profile,
+        "www": r.www_redirect,
+    })
+    .to_string()
 }
 
 /// 当前库值的部署指纹（读侧口径：全部取**落库原样**——与 apply 写入口径同源）。
@@ -407,6 +464,7 @@ fn fingerprint_of(r: &RawSite) -> String {
         r.waf_burst,
         &r.routes_json,
         r.custom_conf.as_deref(),
+        &advanced_json_of(r),
     )
 }
 
@@ -442,6 +500,18 @@ fn to_out(r: &RawSite) -> SiteOut {
         manual_conf: r.manual_conf != 0,
         conf_stale: conf_stale_of(r),
         custom_conf: r.custom_conf.clone(),
+        www_redirect: r.www_redirect.clone(),
+        tls_profile: r.tls_profile.clone(),
+        tls_min: r.tls_min.clone(),
+        hsts: r.hsts != 0,
+        hsts_max_age: r.hsts_max_age,
+        hsts_include_sub: r.hsts_sub != 0,
+        hsts_preload: r.hsts_preload != 0,
+        rewrite_preset: r.rewrite_preset.clone(),
+        rewrite_custom: r.rewrite_custom.clone(),
+        // 外部修改需要读磁盘比对 hash（异步），to_out 是纯映射 → 由 list() 侧
+        // 逐条补算（见 `list` 内的 external_of 循环）。
+        conf_external: false,
     }
 }
 
@@ -454,12 +524,16 @@ const SITE_SELECT: &str = "s.id, s.name, s.domains, s.root, s.kind, s.enabled, s
        (SELECT COUNT(*) FROM ssl_certs c WHERE c.site_id = s.id) AS tls_count,
        s.waf_enabled, s.waf_profile, s.waf_rate, s.waf_burst,
        s.upstreams_json, s.fpm, s.spa, s.redirect_target, s.redirect_code, s.conf_path,
-       s.routes_json, s.manual_conf, s.conf_snapshot, s.custom_conf";
+       s.routes_json, s.manual_conf, s.conf_snapshot, s.custom_conf,
+       s.www_redirect, s.tls_profile, s.tls_min, s.hsts, s.hsts_max_age,
+       s.hsts_sub, s.hsts_preload, s.rewrite_preset, s.rewrite_custom,
+       (SELECT v.hash FROM site_conf_versions v WHERE v.site_id = s.id ORDER BY v.id DESC LIMIT 1) AS last_ver_hash";
 // ⚠ 列序与下方 `r.get(N)` 一一对应。加列**一律追加到末尾**（routes_json = 18、
-//   manual_conf = 19、conf_snapshot = 20、custom_conf = 21），这样既有索引全部不变——
+//   manual_conf = 19、conf_snapshot = 20、custom_conf = 21、www_redirect = 22 …
+//   rewrite_custom = 29、last_ver_hash = 30），这样既有索引全部不变——
 //   中途插列会让每个 r.get 静默错位（本项目已踩过一次：tls_count 子查询列把后续
 //   整体后移一位，apply 运行时才报 `Invalid column type`）。
-//   三个 fetch 函数中的 get(18/19/20/21) 必须同步。
+//   三个 fetch 函数中的 get(18…30) 必须同步（last_ver_hash 是子查询派生列）。
 
 /// 站点查询 SQL。
 ///
@@ -502,6 +576,16 @@ async fn fetch_all(state: &Shared) -> Result<Vec<RawSite>> {
                     manual_conf: r.get(19)?,
                     conf_snapshot: r.get(20)?,
                     custom_conf: r.get(21)?,
+                    www_redirect: r.get(22)?,
+                    tls_profile: r.get(23)?,
+                    tls_min: r.get(24)?,
+                    hsts: r.get(25)?,
+                    hsts_max_age: r.get(26)?,
+                    hsts_sub: r.get(27)?,
+                    hsts_preload: r.get(28)?,
+                    rewrite_preset: r.get(29)?,
+                    rewrite_custom: r.get(30)?,
+                    last_ver_hash: r.get(31)?,
                     })
                 })
                 .map_err(db_err)?;
@@ -545,6 +629,16 @@ async fn fetch_one(state: &Shared, id: i64) -> Result<Option<RawSite>> {
                     manual_conf: r.get(19)?,
                     conf_snapshot: r.get(20)?,
                     custom_conf: r.get(21)?,
+                    www_redirect: r.get(22)?,
+                    tls_profile: r.get(23)?,
+                    tls_min: r.get(24)?,
+                    hsts: r.get(25)?,
+                    hsts_max_age: r.get(26)?,
+                    hsts_sub: r.get(27)?,
+                    hsts_preload: r.get(28)?,
+                    rewrite_preset: r.get(29)?,
+                    rewrite_custom: r.get(30)?,
+                    last_ver_hash: r.get(31)?,
                 })
             })
             .map_err(db_err)?;
@@ -585,6 +679,16 @@ async fn fetch_one_by_name(state: &Shared, name: &str) -> Result<Option<RawSite>
                     manual_conf: r.get(19)?,
                     conf_snapshot: r.get(20)?,
                     custom_conf: r.get(21)?,
+                    www_redirect: r.get(22)?,
+                    tls_profile: r.get(23)?,
+                    tls_min: r.get(24)?,
+                    hsts: r.get(25)?,
+                    hsts_max_age: r.get(26)?,
+                    hsts_sub: r.get(27)?,
+                    hsts_preload: r.get(28)?,
+                    rewrite_preset: r.get(29)?,
+                    rewrite_custom: r.get(30)?,
+                    last_ver_hash: r.get(31)?,
                 })
             })
             .map_err(db_err)?;
@@ -662,7 +766,13 @@ pub async fn list(
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SITE_VIEW)?;
     let rows = fetch_all(&state).await?;
-    let dtos: Vec<SiteOut> = rows.iter().map(to_out).collect();
+    let mut dtos: Vec<SiteOut> = rows.iter().map(to_out).collect();
+    // 外部修改检测（020）：`to_out` 是纯映射不做 IO，故在这里逐条补算——比对
+    // 「磁盘内容 hash」与「最新留档版本 hash」，不等 = 文件在面板之外被改过。
+    // 站点数量级很小（读 N 个配置文件），不必为此再引入缓存层。
+    for (dto, r) in dtos.iter_mut().zip(rows.iter()) {
+        dto.conf_external = external_of(r).await;
+    }
     Ok(ok(dtos))
 }
 
@@ -789,6 +899,16 @@ pub async fn create(
                     // 非手动维护恒无「未同步」（指纹判据要求 manual_conf=1）
                     conf_stale: false,
                     custom_conf: None,
+                    www_redirect: "off".to_string(),
+                    tls_profile: "modern".to_string(),
+                    tls_min: "TLSv1.2".to_string(),
+                    hsts: false,
+                    hsts_max_age: 300,
+                    hsts_include_sub: false,
+                    hsts_preload: false,
+                    rewrite_preset: "none".to_string(),
+                    rewrite_custom: None,
+                    conf_external: false,
                 });
             Ok(ok(out))
         }
@@ -934,6 +1054,16 @@ async fn render_spec_for_row(
         routes: None,
         // 自定义片段（019）：从落库值重建（与 apply 落库口径一致）
         custom_conf: row.custom_conf.clone(),
+        // 高级配置（020）：同上，全部取落库值
+        www_redirect: Some(row.www_redirect.clone()),
+        tls_profile: Some(row.tls_profile.clone()),
+        tls_min: Some(row.tls_min.clone()),
+        hsts: row.hsts != 0,
+        hsts_max_age: row.hsts_max_age,
+        hsts_include_sub: row.hsts_sub != 0,
+        hsts_preload: row.hsts_preload != 0,
+        rewrite_preset: Some(row.rewrite_preset.clone()),
+        rewrite_custom: row.rewrite_custom.clone(),
     };
 
     let (target, rendered) = state.os.webserver().render(&spec)?;
@@ -1130,6 +1260,7 @@ pub async fn patch(
                 cur.waf_burst,
                 &cur.routes_json,
                 cur.custom_conf.as_deref(),
+                &advanced_json_of(&cur),
             ))
         } else {
             None
@@ -1260,6 +1391,31 @@ pub struct ApplyReq {
     /// 缺省 = 保留库中现值；显式空串/空白 = 清空。上限 64 KiB。
     #[serde(default)]
     pub custom_conf: Option<String>,
+    /// www ↔ 非 www 跳转（020）：off | to_www | to_bare；缺省 = 保留现值
+    #[serde(default)]
+    pub www_redirect: Option<String>,
+    /// 加密套件档位（020）：compat | modern | strict
+    #[serde(default)]
+    pub tls_profile: Option<String>,
+    /// TLS 版本下限（020）：TLSv1 | TLSv1.1 | TLSv1.2 | TLSv1.3
+    #[serde(default)]
+    pub tls_min: Option<String>,
+    /// HSTS 开关（020）
+    #[serde(default)]
+    pub hsts: Option<bool>,
+    /// HSTS max-age（秒，0 ~ 63072000）
+    #[serde(default)]
+    pub hsts_max_age: Option<i64>,
+    #[serde(default)]
+    pub hsts_sub: Option<bool>,
+    #[serde(default)]
+    pub hsts_preload: Option<bool>,
+    /// 伪静态模板（020）：none | wordpress | laravel | thinkphp | typecho | discuz | custom
+    #[serde(default)]
+    pub rewrite_preset: Option<String>,
+    /// preset=custom 时的原始 rewrite 文本（上限 64 KiB）
+    #[serde(default)]
+    pub rewrite_custom: Option<String>,
 }
 
 /// WAF 请求体。
@@ -1490,6 +1646,89 @@ pub async fn apply(
             if v.trim().is_empty() { None } else { Some(v.clone()) }
         }
     };
+    // 高级配置（020）：与 custom_conf 同语义——缺省 = 保留库中现值，显式值才校验。
+    // 全部走白名单/区间：这些字段的非法值要么让 nginx -t 失败（还好），要么让
+    // 老客户端**静默**连不上（更坏），所以必须在入口拦掉而不是交给渲染器。
+    let www_db: String = match req.www_redirect.as_deref() {
+        None => cur_row.as_ref().map(|r| r.www_redirect.clone()).unwrap_or_else(|| "off".to_string()),
+        Some(v) => {
+            if !matches!(v, "off" | "to_www" | "to_bare") {
+                return Err(ApiError::bad_request("www_redirect", "跳转方式只能是 off / to_www / to_bare"));
+            }
+            v.to_string()
+        }
+    };
+    let tls_profile_db: String = match req.tls_profile.as_deref() {
+        None => cur_row.as_ref().map(|r| r.tls_profile.clone()).unwrap_or_else(|| "modern".to_string()),
+        Some(v) => {
+            if !matches!(v, "compat" | "modern" | "strict") {
+                return Err(ApiError::bad_request("tls_profile", "加密套件档位只能是 compat / modern / strict"));
+            }
+            v.to_string()
+        }
+    };
+    let tls_min_db: String = match req.tls_min.as_deref() {
+        None => cur_row.as_ref().map(|r| r.tls_min.clone()).unwrap_or_else(|| "TLSv1.2".to_string()),
+        Some(v) => {
+            if !matches!(v, "TLSv1" | "TLSv1.1" | "TLSv1.2" | "TLSv1.3") {
+                return Err(ApiError::bad_request("tls_min", "TLS 版本下限只能是 TLSv1 / TLSv1.1 / TLSv1.2 / TLSv1.3"));
+            }
+            v.to_string()
+        }
+    };
+    let hsts_db: i32 = match req.hsts {
+        None => cur_row.as_ref().map(|r| r.hsts).unwrap_or(0),
+        Some(b) => if b { 1 } else { 0 },
+    };
+    let hsts_max_age_db: i64 = match req.hsts_max_age {
+        None => cur_row.as_ref().map(|r| r.hsts_max_age).unwrap_or(300),
+        Some(n) => {
+            // 上限取 2 年（RFC 6797 的建议值 31536000 之上再放宽一档）；0 = 立即失效
+            if n < 0 || n > 63_072_000 {
+                return Err(ApiError::bad_request("hsts_max_age", "max-age 需在 0 ~ 63072000 秒之间"));
+            }
+            n
+        }
+    };
+    let hsts_sub_db: i32 = match req.hsts_sub {
+        None => cur_row.as_ref().map(|r| r.hsts_sub).unwrap_or(0),
+        Some(b) => if b { 1 } else { 0 },
+    };
+    let hsts_preload_db: i32 = match req.hsts_preload {
+        None => cur_row.as_ref().map(|r| r.hsts_preload).unwrap_or(0),
+        Some(b) => if b { 1 } else { 0 },
+    };
+    let rewrite_preset_db: String = match req.rewrite_preset.as_deref() {
+        None => cur_row.as_ref().map(|r| r.rewrite_preset.clone()).unwrap_or_else(|| "none".to_string()),
+        Some(v) => {
+            if !matches!(v, "none" | "wordpress" | "laravel" | "thinkphp" | "typecho" | "discuz" | "custom") {
+                return Err(ApiError::bad_request("rewrite_preset", "伪静态模板取值不合法"));
+            }
+            v.to_string()
+        }
+    };
+    let rewrite_custom_db: Option<String> = match req.rewrite_custom.as_ref() {
+        None => cur_row.as_ref().and_then(|r| r.rewrite_custom.clone()),
+        Some(v) => {
+            if v.len() > 64 * 1024 {
+                return Err(ApiError::bad_request("rewrite_custom", "自定义 rewrite 超过 64 KiB 上限"));
+            }
+            if v.trim().is_empty() { None } else { Some(v.clone()) }
+        }
+    };
+    // 写侧指纹片段：**键名与顺序**必须和读侧 `advanced_json_of` 完全一致
+    let advanced_json = serde_json::json!({
+        "hsts": hsts_db,
+        "hsts_max_age": hsts_max_age_db,
+        "hsts_preload": hsts_preload_db,
+        "hsts_sub": hsts_sub_db,
+        "rewrite_custom": rewrite_custom_db,
+        "rewrite_preset": rewrite_preset_db,
+        "tls_min": tls_min_db,
+        "tls_profile": tls_profile_db,
+        "www": www_db,
+    })
+    .to_string();
     // 停用态守恒：站点已停用则只更新配置、不下发 Web 服务器（conf_path 留空），
     // 与 `patch` 的「真停用」语义一致——避免「点一次应用就把刚停用的站点又拉起来」。
     // 新建站点（无 cur_row）按默认启用对待，照常部署。
@@ -1661,6 +1900,15 @@ pub async fn apply(
         routes: None,
         // 自定义片段（019）：落库值同时进 spec 与指纹（clone 一份后面还要写库）
         custom_conf: custom_conf_db.clone(),
+        www_redirect: Some(www_db.clone()),
+        tls_profile: Some(tls_profile_db.clone()),
+        tls_min: Some(tls_min_db.clone()),
+        hsts: hsts_db != 0,
+        hsts_max_age: hsts_max_age_db,
+        hsts_include_sub: hsts_sub_db != 0,
+        hsts_preload: hsts_preload_db != 0,
+        rewrite_preset: Some(rewrite_preset_db.clone()),
+        rewrite_custom: rewrite_custom_db.clone(),
     };
     // 覆盖前备份：本次要写/换掉的磁盘文件里是**用户手改的内容**（manual_conf=1；
     // 由 manual_skip 的定义可知，只有显式 regen 才会走到这里）→ 先把旧文件备份。
@@ -1750,6 +1998,7 @@ pub async fn apply(
         waf_burst,
         &routes_json,
         custom_conf_db.as_deref(),
+        &advanced_json,
     );
     // 指纹只在「文件确实被写/删」时更新：
     // - 手动维护跳过下发：文件未动 → 保持旧值（更新它等于谎报「已同步」）
@@ -1774,8 +2023,11 @@ pub async fn apply(
             conn.execute(
                 "INSERT INTO sites(name, domains, root, kind, webserver, enabled, conf_path, created_at,
                                    waf_enabled, waf_profile, waf_rate, waf_burst, upstreams_json, fpm,
-                                   spa, redirect_target, redirect_code, routes_json, conf_snapshot, custom_conf)
-                 VALUES(?1, ?2, ?3, ?4, 'nginx', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?20)
+                                   spa, redirect_target, redirect_code, routes_json, conf_snapshot, custom_conf,
+                                   www_redirect, tls_profile, tls_min, hsts, hsts_max_age, hsts_sub,
+                                   hsts_preload, rewrite_preset, rewrite_custom)
+                 VALUES(?1, ?2, ?3, ?4, 'nginx', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?20,
+                        ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)
                  ON CONFLICT(name) DO UPDATE SET
                     domains=excluded.domains, root=excluded.root, kind=excluded.kind, enabled=?5,
                     conf_path=?6, webserver='nginx',
@@ -1786,11 +2038,17 @@ pub async fn apply(
                     redirect_code=excluded.redirect_code, routes_json=excluded.routes_json,
                     conf_snapshot=excluded.conf_snapshot,
                     custom_conf=excluded.custom_conf,
+                    www_redirect=excluded.www_redirect, tls_profile=excluded.tls_profile,
+                    tls_min=excluded.tls_min, hsts=excluded.hsts, hsts_max_age=excluded.hsts_max_age,
+                    hsts_sub=excluded.hsts_sub, hsts_preload=excluded.hsts_preload,
+                    rewrite_preset=excluded.rewrite_preset, rewrite_custom=excluded.rewrite_custom,
                     manual_conf=COALESCE(?19, manual_conf)",
                 rusqlite::params![name, domains_json, root_str, kind_db, enabled_i32, conf_db, now,
                                   waf_on, waf_profile, waf_rate, waf_burst,
                                   upstreams_json, fpm_str, spa_i32, redirect_target_db, redirect_code_db,
-                                  routes_json, snap_db, clear_manual, custom_conf_db],
+                                  routes_json, snap_db, clear_manual, custom_conf_db,
+                                  www_db, tls_profile_db, tls_min_db, hsts_db, hsts_max_age_db,
+                                  hsts_sub_db, hsts_preload_db, rewrite_preset_db, rewrite_custom_db],
             )
             .map(|_| panel_db::WriteAck { rows_changed: 1 })
             .map_err(|e| PanelError::Database(e.to_string()))
@@ -2037,6 +2295,8 @@ pub async fn conf_get(
         // 未同步（017）：表单部署相关字段与「文件上次落盘时的指纹」不一致。
         // 配置区据此显示警示条 + 一键「重新生成配置」。
         "stale": conf_stale_of(&row),
+        // 外部修改（020）：磁盘内容与最后一次留档不一致 ⇒ 文件在面板之外被改过
+        "external": external_of(&row).await,
     })))
 }
 
@@ -2239,6 +2499,24 @@ pub async fn conf_restore(
 // 「当前文件」：nginx -t 校验 → 原子替换 → reload；被恢复的内容与被你替换掉的
 // 现场都会进版本链。回滚后自动定态：版本指纹 == 当前表单指纹 ⇒ 内容正是表单
 // 产物 → 回「面板托管」；否则转「手动维护」（表单再分叉时「未同步」照常亮）。
+
+/// 外部修改检测（020）：磁盘内容与「最后一次留档的版本」不一致 ⇒ 文件在面板之外
+/// 被改动过。
+///
+/// **不静默覆盖**是刻意的：面板无从判断一次外部改动是用户有意、脚本误写还是攻击，
+/// 所以只如实标记，把决策交回用户（重新生成覆盖 / 改成自定义片段 / 手动接管）。
+/// 无留档（`last_ver_hash` 为 NULL）时无从判定，返回 false——宁可不报，也不谎报。
+async fn external_of(r: &RawSite) -> bool {
+    let Some(p) = r.conf_path.as_deref().map(str::trim).filter(|p| !p.is_empty()) else {
+        return false;
+    };
+    let Some(last) = r.last_ver_hash.as_deref() else { return false };
+    match tokio::fs::read_to_string(p).await {
+        Ok(c) => conf_hash(&c) != last,
+        // 文件被删 / 读不了：交给「未下发 / 缺失」那套语义处理，不算外部修改
+        Err(_) => false,
+    }
+}
 
 /// 版本历史列表：倒序返回最近 20 版**元数据**（不含正文——正文按需单取，
 /// 避免一次拉 20 份全文）。每项附 `current`：该版内容 == 磁盘当前内容。
@@ -3650,6 +3928,16 @@ mod tests {
             manual_conf: 1,
             conf_snapshot: None,
             custom_conf: None,
+            www_redirect: "off".into(),
+            tls_profile: "modern".into(),
+            tls_min: "TLSv1.2".into(),
+            hsts: 0,
+            hsts_max_age: 300,
+            hsts_sub: 0,
+            hsts_preload: 0,
+            rewrite_preset: "none".into(),
+            rewrite_custom: None,
+            last_ver_hash: None,
         }
     }
 
@@ -3716,15 +4004,19 @@ mod tests {
     #[test]
     fn fingerprint_is_separator_safe() {
         // 分隔符回归：没有 \u{1f} 时 ("a","bc") 与 ("ab","c") 会撞同一指纹 → 漏报
-        let a = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None, false, None, None, None, "[]", None);
-        let b = deploy_fingerprint("ab", "c", "/r", "static", false, None, None, None, None, false, None, None, None, "[]", None);
+        let a = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None, false, None, None, None, "[]", None, "");
+        let b = deploy_fingerprint("ab", "c", "/r", "static", false, None, None, None, None, false, None, None, None, "[]", None, "");
         assert_ne!(a, b, "字段边界必须由分隔符保护");
         // 自定义片段（019）参与指纹：只差它一处也必须产生不同指纹
         // ——否则改了 custom_conf「未同步」不会亮，等于坏了 017 的核心承诺。
-        let c = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None, false, None, None, None, "[]", Some("add_header X-A 1;"));
+        let c = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None, false, None, None, None, "[]", Some("add_header X-A 1;"), "");
         assert_ne!(a, c, "custom_conf 必须进入指纹");
-        let d = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None, false, None, None, None, "[]", Some("add_header X-A 2;"));
+        let d = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None, false, None, None, None, "[]", Some("add_header X-A 2;"), "");
         assert_ne!(c, d, "custom_conf 内容变化必须反映到指纹");
+        // 高级配置（020）同理：www 跳转 / TLS 档位 / 伪静态都会改变渲染结果，
+        // 漏进指纹 = 改了它们「未同步」不亮（与 custom_conf 同款静默分叉）。
+        let e = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None, false, None, None, None, "[]", None, r#"{"www":"to_www"}"#);
+        assert_ne!(a, e, "高级配置必须进入指纹");
     }
 
     #[test]

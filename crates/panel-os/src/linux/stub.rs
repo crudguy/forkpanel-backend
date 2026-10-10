@@ -1002,8 +1002,87 @@ fn nginx_test_argv(base: &std::path::Path) -> Vec<String> {
 }
 
 /// 渲染 nginx `server{}` 块（纯函数，可黄金单测）。
+/// www ↔ 非 www 的跳转对 `(来源域名, 目标域名)`；无需跳转（off / 条件不满足）为 None。
+///
+/// 只对**主域名**生效：`api.example.com` 被 to_www 改写成 `www.api.example.com`
+/// 几乎不会是用户想要的，宁可少做。
+fn www_pair(names: &[String], mode: Option<&str>) -> Option<(String, String)> {
+    let primary = names.first()?.trim();
+    if primary.is_empty() { return None }
+    let base = primary.strip_prefix("www.").unwrap_or(primary).to_string();
+    match mode.unwrap_or("off") {
+        // www → 裸域：域名表里得真有 `www.<base>` 才成立（否则无从可跳）
+        "to_bare" => {
+            let from = format!("www.{base}");
+            if from == base || !names.iter().any(|n| n == &from) { return None }
+            Some((from, base))
+        }
+        // 裸域 → www：主域名本身已带 www 前缀则无事可做
+        "to_www" => {
+            if primary.starts_with("www.") { return None }
+            Some((base.clone(), format!("www.{base}")))
+        }
+        _ => None,
+    }
+}
+
+/// TLS 版本下限 → nginx `ssl_protocols`（下限及以上）。未知/缺失按 `TLSv1.2`，
+/// 与 020 迁移的默认值同口径。
+fn tls_protocols(min: Option<&str>) -> &'static str {
+    match min.unwrap_or("TLSv1.2") {
+        "TLSv1" => "TLSv1 TLSv1.1 TLSv1.2 TLSv1.3",
+        "TLSv1.1" => "TLSv1.1 TLSv1.2 TLSv1.3",
+        "TLSv1.3" => "TLSv1.3",
+        _ => "TLSv1.2 TLSv1.3",
+    }
+}
+
+/// 加密套件档位 → nginx `ssl_ciphers`。三档预设——**不开放自由输入**：抄错
+/// 要么让老客户端直接连不上、要么安全性不升反降，代价远大于收益。未知值按 modern。
+fn tls_ciphers(profile: Option<&str>) -> &'static str {
+    match profile.unwrap_or("modern") {
+        "compat" => "ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-SHA:AES128-SHA:AES256-SHA:HIGH:!aNULL:!MD5",
+        // 严格：只留 ECDHE + AES-GCM / CHACHA20（前向保密、无弱套件）。
+        // ⚠ **不能**把 TLSv1.3 的套件名（TLS_AES_128_GCM_SHA256 等）填进 ssl_ciphers：
+        // 那条指令只认 TLSv1.2 及以下的 OpenSSL 套件名，填了会让 nginx 以
+        // `no cipher match` 直接 emerg 拒绝**整份**配置（实机验证踩到——单测只能
+        // 比对字符串，看不出 nginx 是否接受）。「仅 TLSv1.3」由 `ssl_protocols
+        // TLSv1.3` 表达，TLSv1.3 的套件由 nginx 自行协商，不需要（也不能）列举。
+        "strict" => "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305",
+        _ => "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:HIGH:!aNULL:!MD5",
+    }
+}
+
+/// 伪静态预置模板 → `location /` 内的 try_files 行（编译期常量）。
+///
+/// 这些框架的「正确 rewrite」长得几乎一样却极易写错（`$args` 与 `$query_string`
+/// 之别、是否带 PATH_INFO），手写是新手最大的坑，故做成预置。`custom` 由调用方
+/// 原样输出用户文本；返回 None = 不做伪静态（默认 `=404` 兜底）。
+fn php_try_files(preset: Option<&str>) -> Option<&'static str> {
+    match preset.unwrap_or("none") {
+        // ⚠ 常量**不带**结尾分号：由调用方统一拼（`;` 重复会让 nginx 直接 emerg
+        // `unexpected ";"` ——实机验证踩到，单测的 `contains("...;")` 看不出来）。
+        "wordpress" | "typecho" | "discuz" => Some("try_files $uri $uri/ /index.php?$args"),
+        // ThinkPHP / Laravel 的差别不在这一行，而在 php location 里是否拆 PATH_INFO
+        "laravel" | "thinkphp" => Some("try_files $uri $uri/ /index.php?$query_string"),
+        _ => None,
+    }
+}
+
 fn render_nginx(spec: &SiteSpec) -> String {
     let names = spec.server_names.join(" ");
+    // www ↔ 非 www 跳转（020）：命中时把「跳转来源域名」从主块 / 强制 HTTPS 块的
+    // server_name 里**剔除**——两块同名会让 nginx 报 `conflicting server name`
+    // 并按先声明者命中，跳转直接失效；再把「目标域名」补进主块。
+    let www = www_pair(&spec.server_names, spec.www_redirect.as_deref());
+    let main_names: String = match &www {
+        Some((from, to)) => {
+            let mut v: Vec<String> = spec.server_names.iter().filter(|n| *n != from).cloned().collect();
+            if !v.iter().any(|n| n == to) { v.push(to.clone()); }
+            v.join(" ")
+        }
+        None => names.clone(),
+    };
     let has_tls = spec.tls_cert.is_some() && spec.tls_key.is_some();
     let http_ports: Vec<u16> = spec.listen.iter().copied().filter(|p| *p != 443).collect();
     let https_ports: Vec<u16> = spec.listen.iter().copied().filter(|p| *p == 443).collect();
@@ -1026,7 +1105,7 @@ fn render_nginx(spec: &SiteSpec) -> String {
         } else {
             for p in &http_ports { out.push_str(&format!("    listen {p};\n")); }
         }
-        out.push_str(&format!("    server_name {names};\n"));
+        out.push_str(&format!("    server_name {main_names};\n"));
         out.push_str("    return 301 https://$host$request_uri;\n}\n\n");
     }
 
@@ -1072,6 +1151,31 @@ fn render_nginx(spec: &SiteSpec) -> String {
         out.push_str(&render_waf_http(&spec.server_names, w));
     }
 
+    // ── www ↔ 非 www 跳转（020）：独立 server 块 + return 301 ──
+    // 刻意**不用** `if ($host = ...)`：if 在 server 级虽可用，但与 location 内
+    // rewrite 交互有已知陷阱；独立块语义直白，nginx 对精确 server_name 也更快。
+    if let Some((from, to)) = &www {
+        out.push_str("server {\n");
+        if http_ports.is_empty() {
+            out.push_str("    listen 80;\n");
+        } else {
+            for p in &http_ports { out.push_str(&format!("    listen {p};\n")); }
+        }
+        if has_tls {
+            for p in &https_ports { out.push_str(&format!("    listen {p} ssl;\n")); }
+            if let (Some(cert), Some(key)) = (&spec.tls_cert, &spec.tls_key) {
+                out.push_str(&format!("    ssl_certificate     {};\n", cert.display()));
+                out.push_str(&format!("    ssl_certificate_key {};\n", key.display()));
+                out.push_str(&format!("    ssl_protocols {};\n", tls_protocols(spec.tls_min.as_deref())));
+            }
+        }
+        // 有证书时直接跳 https（省掉「先跳 http 再被 force_https 跳 https」的二次
+        // 跳转）；无证书则保持 $scheme，不把明文访问硬拗成 https。
+        let scheme = if has_tls { "https" } else { "$scheme" };
+        out.push_str(&format!("    server_name {from};\n"));
+        out.push_str(&format!("    return 301 {scheme}://{to}$request_uri;\n}}\n\n"));
+    }
+
     // ── 主 server 块 ──
     out.push_str("server {\n");
     // force_https+tls 时主块只留 443（80 已交给重定向块）
@@ -1094,12 +1198,26 @@ fn render_nginx(spec: &SiteSpec) -> String {
     if !wrote_listen {
         out.push_str("    listen 80;\n");   // 兜底：一个 listen 都没写时不生成无监听的 server
     }
-    out.push_str(&format!("    server_name {names};\n\n"));
+    out.push_str(&format!("    server_name {main_names};\n\n"));
 
     if let (Some(cert), Some(key)) = (&spec.tls_cert, &spec.tls_key) {
         out.push_str(&format!("    ssl_certificate     {};\n", cert.display()));
         out.push_str(&format!("    ssl_certificate_key {};\n", key.display()));
-        out.push_str("    ssl_protocols TLSv1.2 TLSv1.3;\n\n");
+        out.push_str(&format!("    ssl_protocols {};\n", tls_protocols(spec.tls_min.as_deref())));
+        out.push_str(&format!("    ssl_ciphers {};\n", tls_ciphers(spec.tls_profile.as_deref())));
+        out.push_str("    ssl_prefer_server_ciphers on;\n");
+        // 会话复用：减少重复握手。zone 名按站点派生，避免多站共用一个共享内存区
+        out.push_str(&format!(
+            "    ssl_session_cache shared:SSL_{}:10m;\n",
+            upstream_name(&spec.server_names)));
+        out.push_str("    ssl_session_timeout 1d;\n");
+        if spec.hsts {
+            let mut v = format!("max-age={}", spec.hsts_max_age.max(0));
+            if spec.hsts_include_sub { v.push_str("; includeSubDomains"); }
+            if spec.hsts_preload { v.push_str("; preload"); }
+            out.push_str(&format!("    add_header Strict-Transport-Security \"{}\" always;\n", v));
+        }
+        out.push('\n');
     }
 
     // 整站重定向不输出 root / index（它只发 return，没有文件服务）
@@ -1168,9 +1286,28 @@ fn render_nginx(spec: &SiteSpec) -> String {
             out.push_str("    location ~ \\.php$ {\n");
             out.push_str("        include fastcgi_params;\n");
             out.push_str(&format!("        fastcgi_pass {fpm};\n"));
+            // ThinkPHP 走 PATH_INFO：把 `/index.php/a/b` 拆成脚本名 + PATH_INFO 交给框架
+            if spec.rewrite_preset.as_deref() == Some("thinkphp") {
+                out.push_str("        fastcgi_split_path_info ^(.+\\.php)(.*)$;\n");
+                out.push_str("        fastcgi_param PATH_INFO $fastcgi_path_info;\n");
+            }
             out.push_str("        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;\n");
             out.push_str("    }\n");
-            out.push_str("    location / {\n        try_files $uri $uri/ =404;\n    }\n");
+            // 伪静态（020）：预置模板替换默认 `=404` 兜底；custom 时原样输出用户文本
+            out.push_str("    location / {\n");
+            match (spec.rewrite_preset.as_deref().unwrap_or("none"), spec.rewrite_custom.as_deref()) {
+                ("custom", Some(c)) if !c.trim().is_empty() => {
+                    for line in c.trim_end().lines() {
+                        out.push_str("        ");
+                        out.push_str(line.trim());
+                        out.push('\n');
+                    }
+                }
+                (p, _) => out.push_str(&format!(
+                    "        {};\n",
+                    php_try_files(Some(p)).unwrap_or("try_files $uri $uri/ =404"))),
+            }
+            out.push_str("    }\n");
         }
     }
 
@@ -2315,6 +2452,15 @@ mod tests {
             waf: None,
             routes: None,
             custom_conf: None,
+            www_redirect: None,
+            tls_profile: None,
+            tls_min: None,
+            hsts: false,
+            hsts_max_age: 0,
+            hsts_include_sub: false,
+            hsts_preload: false,
+            rewrite_preset: None,
+            rewrite_custom: None,
         }
     }
 
@@ -2866,6 +3012,72 @@ mod tests {
         );
         s.custom_conf = None;
         assert!(!render_nginx(&s).contains("自定义配置片段"), "{out}");
+    }
+
+    /// www ↔ 非 www 跳转（020）：独立 server 块 + return 301，且**主块必须剔除来源
+    /// 域名**——两块同名会让 nginx 报 conflicting server name 并按先声明者命中，
+    /// 跳转直接失效（这是独立块方案唯一容易写错的地方，故用断言钉住）。
+    #[test]
+    fn www_redirect_emits_standalone_server_and_drops_source_name() {
+        // server_names = [example.com, www.example.com]
+        let mut s = spec_static();
+        s.www_redirect = Some("to_bare".into());
+        let out = render_nginx(&s);
+        assert!(out.contains("return 301 $scheme://example.com$request_uri;"), "{out}");
+        assert!(out.contains("    server_name www.example.com;\n"), "跳转块只命中来源域名：{out}");
+        assert!(out.contains("    server_name example.com;\n"), "主块保留目标域名：{out}");
+        assert_eq!(out.matches("    server_name ").count(), 2, "跳转块与主块各一条：{out}");
+        // 反向：裸域 → www
+        s.www_redirect = Some("to_www".into());
+        assert!(render_nginx(&s).contains("return 301 $scheme://www.example.com$request_uri;"), "{s:?}");
+        // off（默认）不生成任何跳转块
+        s.www_redirect = Some("off".into());
+        assert!(!render_nginx(&s).contains("$scheme://"), "off 不应生成跳转：{s:?}");
+    }
+
+    /// TLS 强化（020）：协议下限按档位**展开**、套件取预设、HSTS 仅在开启时输出。
+    #[test]
+    fn tls_hardening_emits_protocols_ciphers_and_hsts_only_when_enabled() {
+        let mut s = spec_static();
+        s.tls_cert = Some(PathBuf::from("/etc/panel/ssl/example.com.crt"));
+        s.tls_key = Some(PathBuf::from("/etc/panel/ssl/example.com.key"));
+        s.tls_min = Some("TLSv1.3".into());
+        s.tls_profile = Some("strict".into());
+        let out = render_nginx(&s);
+        assert!(out.contains("ssl_protocols TLSv1.3;"), "{out}");
+        // strict 档仍必须是 OpenSSL 套件名（TLSv1.3 套件名会让 nginx emerg，见 tls_ciphers）
+        assert!(out.contains("ssl_ciphers ECDHE-ECDSA-AES256-GCM-SHA384"), "{out}");
+        assert!(out.contains("ssl_session_cache shared:"), "{out}");
+        assert!(!out.contains("Strict-Transport-Security"), "HSTS 默认不开：{out}");
+        // 开启后按 max-age / includeSubDomains / preload 逐项拼装
+        s.hsts = true;
+        s.hsts_max_age = 300;
+        s.hsts_include_sub = true;
+        let out2 = render_nginx(&s);
+        assert!(out2.contains("Strict-Transport-Security \"max-age=300; includeSubDomains\" always;"), "{out2}");
+        s.hsts_preload = true;
+        assert!(render_nginx(&s).contains("max-age=300; includeSubDomains; preload"), "{s:?}");
+        // 下限展开：TLSv1.2 → `TLSv1.2 TLSv1.3`
+        s.tls_min = Some("TLSv1.2".into());
+        assert!(render_nginx(&s).contains("ssl_protocols TLSv1.2 TLSv1.3;"), "{s:?}");
+    }
+
+    /// 伪静态（020）：预置模板替换默认 `=404` 兜底；custom 时原样输出用户文本。
+    #[test]
+    fn php_rewrite_preset_replaces_try_files() {
+        let mut s = spec_static();
+        s.kind = SiteKind::Php { fpm: "unix:/run/php/php8.2-fpm.sock".into() };
+        assert!(render_nginx(&s).contains("try_files $uri $uri/ =404;"), "默认无伪静态：{s:?}");
+        s.rewrite_preset = Some("wordpress".into());
+        assert!(render_nginx(&s).contains("try_files $uri $uri/ /index.php?$args;"), "{s:?}");
+        s.rewrite_preset = Some("laravel".into());
+        assert!(render_nginx(&s).contains("try_files $uri $uri/ /index.php?$query_string;"), "{s:?}");
+        // ThinkPHP 的差别在 php location 里拆 PATH_INFO
+        s.rewrite_preset = Some("thinkphp".into());
+        assert!(render_nginx(&s).contains("fastcgi_split_path_info"), "ThinkPHP 需拆 PATH_INFO：{s:?}");
+        s.rewrite_preset = Some("custom".into());
+        s.rewrite_custom = Some("try_files $uri $uri/ /custom.php?$args;".into());
+        assert!(render_nginx(&s).contains("try_files $uri $uri/ /custom.php?$args;"), "{s:?}");
     }
 
     /// 多路由的 PHP 必须用 front controller 形式，**不能**用 `location ~ \.php$`。

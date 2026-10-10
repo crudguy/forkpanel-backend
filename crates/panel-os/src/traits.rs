@@ -993,6 +993,30 @@ pub struct SiteSpec {
     /// 其它 server 级指令。为原始 nginx 文本——语法由下发前的 `nginx -t`
     /// 兜底，写入方（panel-api）负责权限（仅 owner）与长度上限。
     pub custom_conf: Option<String>,
+    /// www ↔ 非 www 跳转（020）：`off` | `to_www`（裸域→www）| `to_bare`（www→裸域）。
+    /// **只对主域名**（server_names[0]）生效——子域被一起改写几乎不是用户想要的。
+    /// 渲染为独立 server 块 + `return 301`，不用 `if ($host …)`（有已知陷阱）。
+    pub www_redirect: Option<String>,
+    /// 加密套件档位（020）：`compat`（老客户端，含弱套件）| `modern`（默认）|
+    /// `strict`（仅 TLSv1.3 + 前向保密）。未知值按 `modern` 处理。
+    pub tls_profile: Option<String>,
+    /// TLS 版本下限（020）：`TLSv1` | `TLSv1.1` | `TLSv1.2` | `TLSv1.3`；
+    /// 渲染时展开为「下限及以上」的协议列表（TLSv1.2 → `TLSv1.2 TLSv1.3`）。
+    pub tls_min: Option<String>,
+    /// HSTS（020）：开启后输出 `Strict-Transport-Security` 响应头。
+    /// ⚠ 浏览器在 max-age 期间强制 HTTPS、服务端**无法撤回**——故默认关闭，
+    /// 默认 max-age 只给 300 秒（验证通过后再调大），两个附加项各自独立开关。
+    pub hsts: bool,
+    pub hsts_max_age: i64,
+    /// `includeSubDomains`：一并约束子域（误用代价高，故独立开关）
+    pub hsts_include_sub: bool,
+    /// `preload`：申请进浏览器内置列表（**几乎不可逆**，独立开关）
+    pub hsts_preload: bool,
+    /// 伪静态预置模板（020）：`none` | `wordpress` | `laravel` | `thinkphp` |
+    /// `typecho` | `discuz` | `custom`；仅 php 类型有意义（其余类型渲染时忽略）。
+    pub rewrite_preset: Option<String>,
+    /// preset=custom 时的原始 rewrite 文本（渲染时原样进 `location /`）。
+    pub rewrite_custom: Option<String>,
 }
 
 /// WAF 规则档位。
