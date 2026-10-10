@@ -475,6 +475,7 @@ components:
         redirect_code:    { type: [integer, "null"], description: "整站重定向状态码（kind=redirect 时存在；301/302/307/308）；其余为 null" }
         routes:          { type: array, items: { $ref: '#/components/schemas/SiteRoute' }, description: "多路由表（kind=routed 时非空；其余恒为 []，不会返回 null）" }
         manual_conf:     { type: boolean, description: "手动维护：true = 磁盘上的配置文件由用户原始编辑维护，表单「保存并应用」不再覆盖它；可经「恢复面板托管」清零（停用/重新启用路径也会清零）" }
+        conf_stale:      { type: boolean, description: "**未同步**（仅 manual_conf=true 且站点启用时有意义）：表单的部署相关字段与「配置文件最后一次落盘时的指纹」不一致——即面板里看到的规格 ≠ 线上文件（表单改过、文件没跟上）。由「重新生成配置」（conf/restore 或 apply 带 regen_conf）清零" }
     SiteRoute:
       type: object
       required: [prefix, kind]
@@ -597,6 +598,7 @@ components:
         redirect_code:   { type: integer, enum: [301, 302, 307, 308], description: "kind=redirect 的状态码；缺省 301" }
         routes:      { type: array, items: { $ref: '#/components/schemas/SiteRoute' }, description: "kind=routed 的路由表（至少一条，且必须含一条 prefix=/ 的兜底）。**省略 = 保留库中现有路由表**（与 waf 同语义，不静默清空）" }
         waf:         { $ref: '#/components/schemas/SiteWaf' }
+        regen_conf:  { type: boolean, default: false, description: "手动维护站点的「重新生成配置」开关：true = 忽略手动维护保护，按本次表单**重新渲染并覆盖**磁盘配置（覆盖前自动备份到 <data_dir>/conf-backups/），成功后清零 manual_conf（回到面板托管）。缺省 false = 保持保护语义（跳过渲染/下发、表单仅入库）——此后若两边不一致，Site.conf_stale 会亮起" }
     Cert:
       type: object
       properties:
@@ -1567,6 +1569,11 @@ paths:
     post:
       tags: [sites]
       summary: 应用站点配置（配置闭环：render→validate→deploy→reload→落库）
+      description: |
+        手动维护（manual_conf=1）的站点缺省**整段跳过渲染/下发**（保护手改内容，表单仅入库）；
+        显式 regen_conf=true 才按本次表单重新渲染覆盖（覆盖前自动备份到 <data_dir>/conf-backups/），
+        成功后清零 manual 标记。成功响应 data 含：manual（是否走了跳过路径）、regenerated（本次是否
+        重新生成）、backup（覆盖前备份路径，可为 null）、deployed / reloaded。
       security: [cookieAuth, csrfHeader]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SiteApply' } } } }
       responses:
@@ -1680,14 +1687,14 @@ paths:
       description: |
         路径唯一来源是落库的 conf_path（由 apply/patch 写入），避免「读任意文件」的越权面。
         从未下发、或文件已被外部删除时 content=null（不报 404——弹窗按「暂无内容」展示）。
-        成功响应 data：path（落盘路径，可为 null）、content（文件原文，可为 null）、manual（是否手动维护）。
+        成功响应 data：path（落盘路径，可为 null）、content（文件原文，可为 null）、manual（是否手动维护）、stale（表单与文件是否已分叉，见 Site.conf_stale）。
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       responses:
         '200':
           description: ok
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { path: { type: [string, "null"] }, content: { type: [string, "null"] }, manual: { type: boolean } } } } }
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { path: { type: [string, "null"] }, content: { type: [string, "null"] }, manual: { type: boolean }, stale: { type: boolean } } } } }
         '404': { description: 站点不存在 }
     put:
       tags: [sites]
@@ -1696,7 +1703,7 @@ paths:
         顺序与 apply 一致：先 nginx -t 校验（独立 wrapper，不触碰线上配置）——失败返回 40002 并带
         原始 stderr，旧文件纹丝不动；通过才原子替换并 reload。成功后站点置 manual_conf=1，表单
         「保存并应用」不再覆盖该文件（可经 conf/restore 恢复面板托管）。站点停用（配置未下发）时拒绝编辑。
-        成功响应 data：path、manual（true）、reloaded（true）。
+        成功响应 data：path、manual（true）、stale（false——此刻文件已对齐表单）、reloaded（true）。
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       requestBody:
@@ -1721,7 +1728,7 @@ paths:
       description: |
         与 patch 的「重新启用下发」同一渲染路径（render_spec_for_row，自带 nginx -t 校验），
         丢弃手工内容。停用站点没有配置文件可恢复——仅清零标记（下次启用按表单渲染）。
-        成功响应 data：path、manual（false）、deployed、reloaded。
+        成功响应 data：path、manual（false）、stale（false）、deployed、reloaded、backup（覆盖前的手改备份路径，可为 null）。
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       responses:

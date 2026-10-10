@@ -74,6 +74,10 @@ struct RawSite {
     routes_json: String,
     /// 手动维护标记（016 迁移）：1 = 磁盘配置由用户原始编辑维护，表单保存不覆盖
     manual_conf: i32,
+    /// 部署指纹（017 迁移）：「配置文件最后一次落盘时表单部署相关字段的指纹」。
+    /// 与当前表单指纹（`fingerprint_of`）不等 ⇒ 手动维护期间两边已分叉（conf_stale）。
+    /// NULL = 无记录（旧行）——对手动维护站点按「未同步」对待。
+    conf_snapshot: Option<String>,
 }
 
 impl RawSite {
@@ -133,6 +137,10 @@ pub struct SiteOut {
     /// 手动维护：true = 磁盘上的配置文件由用户原始编辑维护，表单保存不再覆盖它
     /// （可用「恢复面板托管」清零；停用/重新启用路径同样清零）
     pub manual_conf: bool,
+    /// 未同步（仅 manual_conf=true 且站点启用时有意义）：表单的部署相关字段与
+    /// 「配置文件最后一次落盘时的指纹」不一致——即面板里看到的规格 ≠ 线上文件。
+    /// 由「重新生成配置」（conf/restore）或重新下发（apply）清零。
+    pub conf_stale: bool,
 }
 
 /// API 口径的单条路由。
@@ -325,6 +333,80 @@ fn validate_routes(routes: &[RouteOut]) -> ApiResult<panel_os::SiteRoutes> {
     Ok(panel_os::SiteRoutes { routes: out })
 }
 
+/// 部署指纹：影响「渲染结果 / 磁盘配置内容」的字段快照（017 迁移）。
+///
+/// ⚠ **单一事实源**：apply 落库、conf PUT、conf restore、`to_out` 判定四处
+/// 必须走同一个函数——本项目的高发 bug 就是「同一约束两条路径漏配」，指纹
+/// 一旦两处口径不同，就会误报/漏报「未同步」。
+///
+/// 拼接用不可见分隔符 `\u{1f}`：这些值都可能含任意字符（域名 JSON、路由 JSON、
+/// 路径），没有分隔符就可能出现 `("a", "bc")` 与 `("ab", "c")` 撞同一指纹。
+///
+/// ⚠ 新增「部署相关」字段（会影响 render 输出的）必须同时加进这里，
+///   否则改该字段不会触发「未同步」提示（静默分叉复发）。
+fn deploy_fingerprint(
+    name: &str,
+    domains_json: &str,
+    root: &str,
+    kind: &str,
+    spa: bool,
+    upstreams_json: Option<&str>,
+    fpm: Option<&str>,
+    redirect_target: Option<&str>,
+    redirect_code: Option<i64>,
+    waf_enabled: bool,
+    waf_profile: Option<&str>,
+    waf_rate: Option<i64>,
+    waf_burst: Option<i64>,
+    routes_json: &str,
+) -> String {
+    let mut s = String::with_capacity(256);
+    let push = |s: &mut String, v: &str| { s.push_str(v); s.push('\u{1f}'); };
+    push(&mut s, name);
+    push(&mut s, domains_json);
+    push(&mut s, root);
+    push(&mut s, kind);
+    push(&mut s, if spa { "1" } else { "0" });
+    push(&mut s, upstreams_json.unwrap_or(""));
+    push(&mut s, fpm.unwrap_or(""));
+    push(&mut s, redirect_target.unwrap_or(""));
+    push(&mut s, &redirect_code.map(|c| c.to_string()).unwrap_or_default());
+    push(&mut s, if waf_enabled { "1" } else { "0" });
+    push(&mut s, waf_profile.unwrap_or(""));
+    push(&mut s, &waf_rate.map(|c| c.to_string()).unwrap_or_default());
+    push(&mut s, &waf_burst.map(|c| c.to_string()).unwrap_or_default());
+    push(&mut s, routes_json);
+    s
+}
+
+/// 当前库值的部署指纹（读侧口径：全部取**落库原样**——与 apply 写入口径同源）。
+fn fingerprint_of(r: &RawSite) -> String {
+    deploy_fingerprint(
+        &r.name,
+        &r.domains,
+        &r.root,
+        &r.kind,
+        r.spa != 0,
+        r.upstreams_json.as_deref(),
+        r.fpm.as_deref(),
+        r.redirect_target.as_deref(),
+        r.redirect_code,
+        r.waf_enabled != 0,
+        r.waf_profile.as_deref(),
+        r.waf_rate,
+        r.waf_burst,
+        &r.routes_json,
+    )
+}
+
+/// 「未同步」判据：手动维护 + 启用 + 指纹缺失或与当前表单指纹不一致。
+/// 指纹缺失（NULL，旧行）按未同步对待——有疑问时向「提示」倾斜，而不是假装同步。
+fn conf_stale_of(r: &RawSite) -> bool {
+    r.enabled != 0
+        && r.manual_conf != 0
+        && r.conf_snapshot.as_deref() != Some(fingerprint_of(r).as_str())
+}
+
 fn to_out(r: &RawSite) -> SiteOut {
     SiteOut {
         id: r.id,
@@ -347,6 +429,7 @@ fn to_out(r: &RawSite) -> SiteOut {
         redirect_code: r.redirect_code.map(|n| n as u16),
         routes: routes_from_json(&r.routes_json),
         manual_conf: r.manual_conf != 0,
+        conf_stale: conf_stale_of(r),
     }
 }
 
@@ -359,11 +442,11 @@ const SITE_SELECT: &str = "s.id, s.name, s.domains, s.root, s.kind, s.enabled, s
        (SELECT COUNT(*) FROM ssl_certs c WHERE c.site_id = s.id) AS tls_count,
        s.waf_enabled, s.waf_profile, s.waf_rate, s.waf_burst,
        s.upstreams_json, s.fpm, s.spa, s.redirect_target, s.redirect_code, s.conf_path,
-       s.routes_json, s.manual_conf";
+       s.routes_json, s.manual_conf, s.conf_snapshot";
 // ⚠ 列序与下方 `r.get(N)` 一一对应。加列**一律追加到末尾**（routes_json = 18、
-//   manual_conf = 19），这样既有索引全部不变——中途插列会让每个 r.get 静默错位
-//   （本项目已踩过一次：tls_count 子查询列把后续整体后移一位，apply 运行时才报
-//   `Invalid column type`）。三个 fetch 函数中的 get(18/19) 必须同步。
+//   manual_conf = 19、conf_snapshot = 20），这样既有索引全部不变——中途插列会让
+//   每个 r.get 静默错位（本项目已踩过一次：tls_count 子查询列把后续整体后移一位，
+//   apply 运行时才报 `Invalid column type`）。三个 fetch 函数中的 get(18/19/20) 必须同步。
 
 /// 站点查询 SQL。
 ///
@@ -404,6 +487,7 @@ async fn fetch_all(state: &Shared) -> Result<Vec<RawSite>> {
                     conf_path: r.get(17)?,
                     routes_json: r.get(18)?,
                     manual_conf: r.get(19)?,
+                    conf_snapshot: r.get(20)?,
                     })
                 })
                 .map_err(db_err)?;
@@ -445,6 +529,7 @@ async fn fetch_one(state: &Shared, id: i64) -> Result<Option<RawSite>> {
                     conf_path: r.get(17)?,
                     routes_json: r.get(18)?,
                     manual_conf: r.get(19)?,
+                    conf_snapshot: r.get(20)?,
                 })
             })
             .map_err(db_err)?;
@@ -483,6 +568,7 @@ async fn fetch_one_by_name(state: &Shared, name: &str) -> Result<Option<RawSite>
                     conf_path: r.get(17)?,
                     routes_json: r.get(18)?,
                     manual_conf: r.get(19)?,
+                    conf_snapshot: r.get(20)?,
                 })
             })
             .map_err(db_err)?;
@@ -684,6 +770,8 @@ pub async fn create(
                     routes: Vec::new(),
                     // 兜底分支：新建站点必非手动维护（manual_conf 默认 0）
                     manual_conf: false,
+                    // 非手动维护恒无「未同步」（指纹判据要求 manual_conf=1）
+                    conf_stale: false,
                 });
             Ok(ok(out))
         }
@@ -977,6 +1065,12 @@ pub async fn patch(
         } else {
             // 真→假：移除配置，使站点真正下线（`remove` 内部含 reload）。
             if let Some(c) = conf_path.as_deref().filter(|c| !c.is_empty()) {
+                // 手改内容不该静默消失：停用前先备份（与 apply「重新生成」同一安全网）。
+                if cur.manual_conf != 0
+                    && backup_manual_conf(&state, Path::new(c)).await.is_some()
+                {
+                    audit(&state, &s, "site.conf.backup", &id.to_string(), "ok").await;
+                }
                 state
                     .os
                     .webserver()
@@ -994,13 +1088,43 @@ pub async fn patch(
     // 未翻转则原样保留（COALESCE(NULL, manual_conf)）。
     let clear_manual: Option<i32> = if old_enabled != enabled { Some(0) } else { None };
 
+    // 部署指纹（017）随翻转同步：
+    // - 假→真：文件按「本次提交的 name/domains/root + 行内其余字段」重新渲染 → 指纹=新值
+    // - 真→假：文件已移除 → NULL
+    // - 未翻转：文件未动 → 保持旧值（这样表单改名/改域名/改根目录后，
+    //   手动维护站点的「未同步」提示会自然亮起，而不是静默分叉）
+    let snap_patch: Option<String> = if old_enabled != enabled {
+        if enabled {
+            Some(deploy_fingerprint(
+                &new_name,
+                &domains_json,
+                &root,
+                &cur.kind,
+                cur.spa != 0,
+                cur.upstreams_json.as_deref(),
+                cur.fpm.as_deref(),
+                cur.redirect_target.as_deref(),
+                cur.redirect_code,
+                cur.waf_enabled != 0,
+                cur.waf_profile.as_deref(),
+                cur.waf_rate,
+                cur.waf_burst,
+                &cur.routes_json,
+            ))
+        } else {
+            None
+        }
+    } else {
+        cur.conf_snapshot.clone()
+    };
+
     state
         .db
         .exec(move |conn| {
             conn.execute(
                 "UPDATE sites SET name = ?6, domains = ?1, root = ?2, enabled = ?3, conf_path = ?4,
-                                  manual_conf = COALESCE(?7, manual_conf) WHERE id = ?5",
-                rusqlite::params![domains_json, root, enabled as i32, conf_path, id, new_name, clear_manual],
+                                  manual_conf = COALESCE(?7, manual_conf), conf_snapshot = ?8 WHERE id = ?5",
+                rusqlite::params![domains_json, root, enabled as i32, conf_path, id, new_name, clear_manual, snap_patch],
             )
             .map(|n| panel_db::WriteAck { rows_changed: n })
             .map_err(|e| PanelError::Database(e.to_string()))
@@ -1105,6 +1229,12 @@ pub struct ApplyReq {
     /// 而且调用方未必都知道有 `waf` 这个字段。显式 `{"enabled": false}` 才关闭。
     #[serde(default)]
     pub waf: Option<WafReq>,
+    /// 手动维护站点的「重新生成配置」开关：true = 忽略手动维护保护，按本次表单
+    /// **重新渲染并覆盖**磁盘配置（覆盖前自动备份旧文件到 conf-backups/），
+    /// 成功后清零 manual 标记（站点回到面板托管）。缺省 false = 保持既有保护语义
+    /// （跳过渲染/下发，表单仅入库——此刻两边若不一致，列表会标「未同步」）。
+    #[serde(default)]
+    pub regen_conf: Option<bool>,
 }
 
 /// WAF 请求体。
@@ -1323,10 +1453,15 @@ pub async fn apply(
     let deploy = cur_row.as_ref().map(|r| r.enabled != 0).unwrap_or(true);
     // 手动维护站点（enabled 且 manual_conf=1）：整段跳过渲染/校验/下发——磁盘上的
     // 手工配置是唯一事实源，表单保存只更新库内规格（语义见 016 迁移）。
+    // `regen_conf=true` 是唯一例外：用户显式选了「重新生成配置」，按本次表单覆盖
+    // 手改内容（覆盖前自动备份到 conf-backups/），并结束手动维护。
+    let regen = req.regen_conf.unwrap_or(false);
+    let was_manual = cur_row.as_ref().map(|r| r.manual_conf != 0).unwrap_or(false);
     let manual_skip = cur_row
         .as_ref()
         .map(|r| r.enabled != 0 && r.manual_conf != 0)
-        .unwrap_or(false);
+        .unwrap_or(false)
+        && !regen;
     // 落库四元组在这里就算好：`waf` 随即被 move 进 SiteSpec。
     // 关掉 WAF 时一并清空——留着旧数值会让"下次重新打开"意外带上几年前的参数，
     // 而用户早就不记得了。
@@ -1482,6 +1617,24 @@ pub async fn apply(
         // 路由表已在 `kind` 里（Routed 变体），此字段只是对照——渲染以 kind 为准
         routes: None,
     };
+    // 覆盖前备份：本次要写/换掉的磁盘文件里是**用户手改的内容**（manual_conf=1；
+    // 由 manual_skip 的定义可知，只有显式 regen 才会走到这里）→ 先把旧文件备份。
+    // 备份失败不阻断主流程（它是安全网，不是校验步骤）：响应里 backup=null，前端文案据实。
+    let mut backup_path: Option<String> = None;
+    if !manual_skip && was_manual {
+        if let Some(cp) = cur_row
+            .as_ref()
+            .and_then(|r| r.conf_path.as_deref())
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        {
+            if let Some(b) = backup_manual_conf(&state, Path::new(cp)).await {
+                audit(&state, &s, "site.conf.backup", &req.name, "ok").await;
+                backup_path = Some(b.display().to_string());
+            }
+        }
+    }
+
     // 4) 渲染 + 校验 + 下发（手动维护站点整段跳过：不重渲染、不覆盖、不 reload，
     //    conf_path 保持落库现值——那正是用户正在维护的那个文件）。
     let conf = if manual_skip {
@@ -1528,6 +1681,39 @@ pub async fn apply(
     // 停用态：conf_path 留空（配置未下发），enabled 保持 0；启用态 / 新建 / 手动维护：正常写入。
     let conf_db = if deploy { conf.clone() } else { String::new() };
     let enabled_i32: i32 = if deploy { 1 } else { 0 };
+
+    // 部署指纹（017）：与下面要写入的字段**完全同源**——写入口径必须与读侧
+    // `fingerprint_of` 逐字节一致，否则「未同步」会误报/漏报。
+    let fingerprint_new = deploy_fingerprint(
+        &name,
+        &domains_json,
+        &root_str,
+        kind_db,
+        spa_i32 != 0,
+        upstreams_json.as_deref(),
+        fpm_str.as_deref(),
+        redirect_target_db.as_deref(),
+        redirect_code_db,
+        waf_on != 0,
+        waf_profile.as_deref(),
+        waf_rate,
+        waf_burst,
+        &routes_json,
+    );
+    // 指纹只在「文件确实被写/删」时更新：
+    // - 手动维护跳过下发：文件未动 → 保持旧值（更新它等于谎报「已同步」）
+    // - 停用：无文件 → NULL
+    // - 正常下发 / 重新生成：= 当前表单指纹
+    let snap_db: Option<String> = if manual_skip {
+        cur_row.as_ref().and_then(|r| r.conf_snapshot.clone())
+    } else if deploy {
+        Some(fingerprint_new)
+    } else {
+        None
+    };
+    // 只有「重新生成」才结束手动维护；普通 apply 对手动站点是整段跳过（manual 保持 1）。
+    let clear_manual: Option<i32> = if !manual_skip && was_manual { Some(0) } else { None };
+
     state
         .db
         .exec(move |conn| {
@@ -1537,8 +1723,8 @@ pub async fn apply(
             conn.execute(
                 "INSERT INTO sites(name, domains, root, kind, webserver, enabled, conf_path, created_at,
                                    waf_enabled, waf_profile, waf_rate, waf_burst, upstreams_json, fpm,
-                                   spa, redirect_target, redirect_code, routes_json)
-                 VALUES(?1, ?2, ?3, ?4, 'nginx', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                                   spa, redirect_target, redirect_code, routes_json, conf_snapshot)
+                 VALUES(?1, ?2, ?3, ?4, 'nginx', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
                  ON CONFLICT(name) DO UPDATE SET
                     domains=excluded.domains, root=excluded.root, kind=excluded.kind, enabled=?5,
                     conf_path=?6, webserver='nginx',
@@ -1546,11 +1732,13 @@ pub async fn apply(
                     waf_rate=excluded.waf_rate, waf_burst=excluded.waf_burst,
                     upstreams_json=excluded.upstreams_json, fpm=excluded.fpm,
                     spa=excluded.spa, redirect_target=excluded.redirect_target,
-                    redirect_code=excluded.redirect_code, routes_json=excluded.routes_json",
+                    redirect_code=excluded.redirect_code, routes_json=excluded.routes_json,
+                    conf_snapshot=excluded.conf_snapshot,
+                    manual_conf=COALESCE(?19, manual_conf)",
                 rusqlite::params![name, domains_json, root_str, kind_db, enabled_i32, conf_db, now,
                                   waf_on, waf_profile, waf_rate, waf_burst,
                                   upstreams_json, fpm_str, spa_i32, redirect_target_db, redirect_code_db,
-                                  routes_json],
+                                  routes_json, snap_db, clear_manual],
             )
             .map(|_| panel_db::WriteAck { rows_changed: 1 })
             .map_err(|e| PanelError::Database(e.to_string()))
@@ -1566,6 +1754,10 @@ pub async fn apply(
         "reloaded": deploy && !manual_skip,
         "enabled": deploy,
         "manual": manual_skip,
+        // 「重新生成」：本次把手动维护的文件按表单覆盖了（manual 已清零）
+        "regenerated": !manual_skip && was_manual,
+        // 覆盖前的手改备份路径（<data_dir>/conf-backups/…）；无需备份 / 失败为 null
+        "backup": backup_path,
     })))
 }
 
@@ -1601,6 +1793,42 @@ pub async fn reload(
 // - GET  conf：读取落盘内容（路径取**落库 conf_path**，绝不接受前端传路径）
 // - PUT  conf：原始写入 → 此后表单保存不再覆盖（仅 owner；写入前必过 nginx -t）
 // - POST conf/restore：恢复面板托管（按表单重新渲染覆盖，清零 manual_conf）
+//
+// 017 迁移再补一拍：conf_snapshot 指纹让「表单已改、文件没跟上」的**静默**分叉
+// 变成可见状态（conf_stale / 「未同步」），并在覆盖手改内容前自动备份。
+
+/// 覆盖手动配置前的备份：复制到 `<data_dir>/conf-backups/<文件名>.<unix>.bak`，
+/// 同前缀仅保留最近 10 份（`prune_keep_newest` 按 mtime 判新旧）。
+///
+/// 返回备份路径；文件不存在 / 任何步骤失败返回 None——备份是安全网而非校验步骤，
+/// 失败**不阻断**「重新生成 / 恢复托管 / 停用」主流程（响应 backup=null，前端文案据实）。
+/// 放在业务层而不是 provider：provider 抽象的是「渲染/下发」，备份是面板的策略
+/// （保留几份、放哪、怎么命名），与具体 Web 服务器无关。
+async fn backup_manual_conf(state: &Shared, conf_path: &Path) -> Option<PathBuf> {
+    let file_name = conf_path.file_name()?.to_str()?.to_string();
+    if tokio::fs::metadata(conf_path).await.is_err() {
+        return None; // 文件不存在（或不可读）——无事可备
+    }
+    let dir = state.os.paths().data_dir().join("conf-backups");
+    tokio::fs::create_dir_all(&dir).await.ok()?;
+    // 同一秒内多次备份会撞名：撞了顺延序号，绝不覆盖既有备份
+    let ts = crate::now_unix();
+    let mut dest = dir.join(format!("{file_name}.{ts}.bak"));
+    let mut n = 1u32;
+    while tokio::fs::metadata(&dest).await.is_ok() {
+        dest = dir.join(format!("{file_name}.{ts}.{n}.bak"));
+        n += 1;
+    }
+    tokio::fs::copy(conf_path, &dest).await.ok()?;
+    // 清理放在副本写好**之后**：先保新、再清旧（反过来会在复制失败时白删旧备份）
+    let dir2 = dir.clone();
+    let prefix = format!("{file_name}.");
+    let _ = tokio::task::spawn_blocking(move || {
+        panel_os::fs::prune_keep_newest(&dir2, &prefix, 10)
+    })
+    .await;
+    Some(dest)
+}
 
 /// 读取站点当前的 Web 服务器配置文件内容。
 ///
@@ -1633,6 +1861,9 @@ pub async fn conf_get(
         "path": path,
         "content": content,
         "manual": row.manual_conf != 0,
+        // 未同步（017）：表单部署相关字段与「文件上次落盘时的指纹」不一致。
+        // 配置区据此显示警示条 + 一键「重新生成配置」。
+        "stale": conf_stale_of(&row),
     })))
 }
 
@@ -1729,12 +1960,15 @@ pub async fn conf_put(
 
     let path_str = target.display().to_string();
     let path_db = path_str.clone();
+    // 指纹 = 当前表单值：此刻「文件已对齐表单」（文件=用户文本 + 表单=库值）。
+    // 未来表单再改时，与这份文件分叉 → 未同步提示由此成立（017 迁移）。
+    let snap_db = fingerprint_of(&row);
     state
         .db
         .exec(move |conn| {
             conn.execute(
-                "UPDATE sites SET manual_conf = 1, conf_path = ?1 WHERE id = ?2",
-                rusqlite::params![path_db, id],
+                "UPDATE sites SET manual_conf = 1, conf_path = ?1, conf_snapshot = ?3 WHERE id = ?2",
+                rusqlite::params![path_db, id, snap_db],
             )
             .map(|n| panel_db::WriteAck { rows_changed: n })
             .map_err(|e| PanelError::Database(e.to_string()))
@@ -1742,7 +1976,7 @@ pub async fn conf_put(
         .await?;
 
     audit(&state, &s, "site.conf.edit", &id.to_string(), "ok").await;
-    Ok(ok(serde_json::json!({ "path": path_str, "manual": true, "reloaded": true })))
+    Ok(ok(serde_json::json!({ "path": path_str, "manual": true, "stale": false, "reloaded": true })))
 }
 
 /// 恢复面板托管：按表单规格重新渲染覆盖（丢弃手工内容），清零 `manual_conf`。
@@ -1776,7 +2010,7 @@ pub async fn conf_restore(
             .db
             .exec(move |conn| {
                 conn.execute(
-                    "UPDATE sites SET manual_conf = 0 WHERE id = ?1",
+                    "UPDATE sites SET manual_conf = 0, conf_snapshot = NULL WHERE id = ?1",
                     [id],
                 )
                 .map(|n| panel_db::WriteAck { rows_changed: n })
@@ -1796,6 +2030,17 @@ pub async fn conf_restore(
     if domains.is_empty() {
         return Err(ApiError::bad_request("domains", "站点缺少域名，无法重新渲染配置"));
     }
+    // 覆盖前备份手改内容：在渲染**之前**做——无论新文件同名覆盖、还是改名后清孤儿，
+    // 旧内容都已经进了备份（安全网，失败不阻断）。
+    let mut backup_path: Option<String> = None;
+    if row.manual_conf != 0 {
+        if let Some(cp) = row.conf_path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+            if let Some(b) = backup_manual_conf(&state, Path::new(cp)).await {
+                audit(&state, &s, "site.conf.backup", &id.to_string(), "ok").await;
+                backup_path = Some(b.display().to_string());
+            }
+        }
+    }
     let (target, rendered) = render_spec_for_row(&state, &row, &domains, &row.root).await?;
     state.os.webserver().deploy(&target, &rendered).await?;
     let pruned = prune_stale_conf(&state, row.conf_path.as_deref(), &target).await?;
@@ -1810,12 +2055,14 @@ pub async fn conf_restore(
 
     let path_str = target.display().to_string();
     let path_db = path_str.clone();
+    // 指纹 = 当前表单值（渲染正是按它做的）→ 恢复托管后天然「已同步」
+    let snap_db = fingerprint_of(&row);
     state
         .db
         .exec(move |conn| {
             conn.execute(
-                "UPDATE sites SET manual_conf = 0, conf_path = ?1 WHERE id = ?2",
-                rusqlite::params![path_db, id],
+                "UPDATE sites SET manual_conf = 0, conf_path = ?1, conf_snapshot = ?3 WHERE id = ?2",
+                rusqlite::params![path_db, id, snap_db],
             )
             .map(|n| panel_db::WriteAck { rows_changed: n })
             .map_err(|e| PanelError::Database(e.to_string()))
@@ -1826,8 +2073,10 @@ pub async fn conf_restore(
     Ok(ok(serde_json::json!({
         "path": path_str,
         "manual": false,
+        "stale": false,
         "deployed": true,
         "reloaded": true,
+        "backup": backup_path,
     })))
 }
 
@@ -2992,5 +3241,102 @@ mod tests {
         assert_eq!(site_root_rel(Path::new("/var/www"), "", "my-site"), "my-site");
         // 相对路径原样透传（含子目录与 .. 语义拦截交给沙箱）
         assert_eq!(site_root_rel(Path::new("/var/www"), "my-site/blog", "fb"), "my-site/blog");
+    }
+
+    // ── 部署指纹 / 未同步（017）：判据、边界、分隔符安全 ──
+
+    /// 一个「手动维护 + 已同步」的基线行（指纹在用例里按需设置）。
+    fn raw_site() -> RawSite {
+        RawSite {
+            id: 1,
+            name: "my-site".into(),
+            domains: r#"["example.com"]"#.into(),
+            root: "/var/www/my-site".into(),
+            kind: "static".into(),
+            enabled: 1,
+            created_at: 0,
+            tls: false,
+            waf_enabled: 1,
+            waf_profile: Some("basic".into()),
+            waf_rate: None,
+            waf_burst: Some(0),
+            upstreams_json: None,
+            fpm: None,
+            spa: 0,
+            redirect_target: None,
+            redirect_code: None,
+            conf_path: Some("/etc/nginx/conf.d/panel-example.com.conf".into()),
+            routes_json: "[]".into(),
+            manual_conf: 1,
+            conf_snapshot: None,
+        }
+    }
+
+    #[test]
+    fn conf_stale_true_when_manual_and_snapshot_missing() {
+        // 旧行（017 之前转入手动维护，如 as11）：无指纹记录 → 按「未同步」对待。
+        // 有疑问时向"提示"倾斜，而不是假装同步。
+        assert!(conf_stale_of(&raw_site()));
+    }
+
+    #[test]
+    fn conf_stale_false_when_fingerprint_matches() {
+        let mut r = raw_site();
+        r.conf_snapshot = Some(fingerprint_of(&r));
+        assert!(!conf_stale_of(&r), "指纹一致 = 已同步");
+    }
+
+    #[test]
+    fn conf_stale_true_when_any_deploy_field_changed() {
+        // 核心回归（真实事故）：手动维护后只改表单（如 WAF 档位 strict）、文件没动
+        // → 必须报未同步。面板显示 strict、nginx 里是 basic 且界面毫无提示，正是要修的 bug。
+        let mk = || {
+            let mut r = raw_site();
+            r.conf_snapshot = Some(fingerprint_of(&r));
+            r
+        };
+        macro_rules! changed {
+            ($label:expr, $m:expr) => {{
+                let mut r = mk();
+                let f: fn(&mut RawSite) = $m;
+                f(&mut r);
+                assert!(conf_stale_of(&r), "{}：字段变更必须触发未同步", $label);
+            }};
+        }
+        changed!("waf_profile", |r| r.waf_profile = Some("strict".into()));
+        changed!("name", |r| r.name = "renamed".into());
+        changed!("domains", |r| r.domains = r#"["example.com","www.example.com"]"#.into());
+        changed!("root", |r| r.root = "/var/www/other".into());
+        changed!("kind", |r| r.kind = "redirect".into());
+        changed!("spa", |r| r.spa = 1);
+        changed!("upstreams", |r| r.upstreams_json = Some(r#"["http://127.0.0.1:3000"]"#.into()));
+        changed!("fpm", |r| r.fpm = Some("unix:/run/php.sock".into()));
+        changed!("redirect_target", |r| r.redirect_target = Some("https://x.example".into()));
+        changed!("redirect_code", |r| r.redirect_code = Some(302));
+        changed!("waf_enabled", |r| r.waf_enabled = 0);
+        changed!("waf_rate", |r| r.waf_rate = Some(50));
+        changed!("waf_burst", |r| r.waf_burst = Some(99));
+        changed!("routes", |r| r.routes_json = r#"[{"prefix":"/","kind":"static"}]"#.into());
+    }
+
+    #[test]
+    fn conf_stale_false_for_panel_managed_or_disabled() {
+        // 非手动维护：apply 每次重渲染 → 不存在分叉概念（指纹值随便给）
+        let mut r = raw_site();
+        r.manual_conf = 0;
+        r.conf_snapshot = Some("whatever".into());
+        assert!(!conf_stale_of(&r));
+        // 停用：文件已被移除 → 无从「未同步」
+        let mut r2 = raw_site();
+        r2.enabled = 0;
+        assert!(!conf_stale_of(&r2));
+    }
+
+    #[test]
+    fn fingerprint_is_separator_safe() {
+        // 分隔符回归：没有 \u{1f} 时 ("a","bc") 与 ("ab","c") 会撞同一指纹 → 漏报
+        let a = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None, false, None, None, None, "[]");
+        let b = deploy_fingerprint("ab", "c", "/r", "static", false, None, None, None, None, false, None, None, None, "[]");
+        assert_ne!(a, b, "字段边界必须由分隔符保护");
     }
 }

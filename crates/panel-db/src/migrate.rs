@@ -24,10 +24,11 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (14, include_str!("../../../migrations/014_apps.sql")),
     (15, include_str!("../../../migrations/015_site_routes.sql")),
     (16, include_str!("../../../migrations/016_site_manual_conf.sql")),
+    (17, include_str!("../../../migrations/017_site_conf_snapshot.sql")),
 ];
 
 /// 当前 schema 版本
-pub const LATEST: u32 = 16;
+pub const LATEST: u32 = 17;
 
 pub fn apply(conn: &mut Connection) -> Result<u32> {
     conn.execute_batch(
