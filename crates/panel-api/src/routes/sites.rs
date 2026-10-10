@@ -2488,6 +2488,7 @@ mod kind_tests {
             spa: false,
             fpm: None,
             front_controller: None,
+            root: None,
         }
     }
 
