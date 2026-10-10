@@ -1220,8 +1220,13 @@ fn render_routed_server(routes: &SiteRoutes, spec: &SiteSpec) -> String {
     for r in routes.sorted() {
         o.push_str(&format!("\n    # {} → {:?}\n", r.prefix, r.kind));
         match &r.kind {
-            RouteKind::Static { spa } => {
+            RouteKind::Static { spa, root } => {
                 o.push_str(&format!("    location ^~ {} {{\n", r.prefix));
+                // 路由级 root：覆盖 server 级站点 root（须为空或经 apply 约束到 site_root 内）。
+                // 不填则继承 server root——最常见：整站一个根目录，各静态子路径共用。
+                if let Some(rv) = root {
+                    o.push_str(&format!("        root {};\n", rv));
+                }
                 if *spa {
                     o.push_str("        try_files $uri $uri/ /index.html;\n");
                 } else {
@@ -2203,6 +2208,33 @@ impl UserProvider for LinuxUsers {
             .ok_or_else(|| PanelError::Validation { field: "user", reason: format!("找不到用户 {name} 的组") })?;
         Ok((uid, gid))
     }
+
+    /// 枚举本机全部账户。**只读**：直接解析 `/etc/passwd`（零子进程）。
+    ///
+    /// 过滤掉破损行（字段不足 7 列 / uid·gid 非数字 / 空名），不让脏数据污染下拉。
+    /// 结果按 uid 升序，便于 UI 稳定展示。
+    async fn list(&self) -> Result<Vec<SystemUser>> {
+        const NOLOGIN: &[&str] = &[
+            "/usr/sbin/nologin", "/sbin/nologin",
+            "/bin/false", "/usr/bin/false", "/dev/null",
+        ];
+        let s = tokio::fs::read_to_string("/etc/passwd").await
+            .map_err(|e| PanelError::Internal(e.to_string()))?;
+        let mut users = Vec::new();
+        for line in s.lines() {
+            let f: Vec<&str> = line.split(':').collect();
+            if f.len() < 7 { continue; }
+            let name = f[0];
+            if name.is_empty() { continue; }
+            let uid: u32 = match f[2].parse() { Ok(u) => u, Err(_) => continue };
+            let gid: u32 = match f[3].parse() { Ok(g) => g, Err(_) => continue };
+            let shell = f[6].to_string();
+            let login_allowed = !NOLOGIN.contains(&shell.as_str());
+            users.push(SystemUser { name: name.to_string(), uid, gid, shell, login_allowed });
+        }
+        users.sort_by(|a, b| a.uid.cmp(&b.uid));
+        Ok(users)
+    }
 }
 
 // 未在 stub 中使用的导入显式标记，避免 dead_code 警告干扰评审
@@ -2261,7 +2293,7 @@ mod tests {
         s.kind = SiteKind::Routed {
             routes: SiteRoutes {
                 routes: vec![
-                    SiteRoute { prefix: "/".into(), kind: RouteKind::Static { spa: true } },
+                    SiteRoute { prefix: "/".into(), kind: RouteKind::Static { spa: true, root: None } },
                     SiteRoute {
                         prefix: "/api".into(),
                         kind: RouteKind::Proxy {
@@ -2723,8 +2755,8 @@ mod tests {
         let mut s = spec_static();
         let routes = SiteRoutes {
             routes: vec![
-                SiteRoute { prefix: "/".into(), kind: RouteKind::Static { spa: false } },
-                SiteRoute { prefix: "/api".into(), kind: RouteKind::Static { spa: false } },
+                SiteRoute { prefix: "/".into(), kind: RouteKind::Static { spa: false, root: None } },
+                SiteRoute { prefix: "/api".into(), kind: RouteKind::Static { spa: false, root: None } },
                 SiteRoute {
                     prefix: "/api/admin".into(),
                     kind: RouteKind::Proxy { upstreams: vec!["http://127.0.0.1:9000".into()] },
@@ -2750,7 +2782,7 @@ mod tests {
         s.kind = SiteKind::Routed {
             routes: SiteRoutes {
                 routes: vec![
-                    SiteRoute { prefix: "/".into(), kind: RouteKind::Static { spa: false } },
+                    SiteRoute { prefix: "/".into(), kind: RouteKind::Static { spa: false, root: None } },
                     SiteRoute {
                         prefix: "/api".into(),
                         kind: RouteKind::Proxy {
@@ -2787,7 +2819,7 @@ mod tests {
         s.kind = SiteKind::Routed {
             routes: SiteRoutes {
                 routes: vec![
-                    SiteRoute { prefix: "/".into(), kind: RouteKind::Static { spa: false } },
+                    SiteRoute { prefix: "/".into(), kind: RouteKind::Static { spa: false, root: None } },
                     SiteRoute {
                         prefix: "/app".into(),
                         kind: RouteKind::Php {
@@ -3259,4 +3291,36 @@ redis-server:
             Some(("1.0".to_string(), "2.0".to_string())),
             "Candidate 被 pin 压低时仍应据版本表报出更新（旧口径漏报的场景）"
         );
-    }}
+    }
+}
+
+#[cfg(test)]
+mod user_provider_tests {
+    use super::*;
+
+    /// 枚举本机账户：读真实 /etc/passwd（测试数据 = 线上形态），验证解析与 login_allowed 判定。
+    #[tokio::test]
+    async fn linux_users_list_parses_passwd() {
+        let users = LinuxUsers::default().list().await.expect("list 不应失败");
+        assert!(!users.is_empty(), "本机应至少枚举到 root 等账户");
+
+        let root = users.iter().find(|u| u.name == "root").expect("应有 root 账户");
+        assert_eq!(root.uid, 0);
+        assert!(root.login_allowed, "root 属可登录 shell，login_allowed 应为 true");
+
+        // 服务账号（如 www-data）应为 nologin/false，login_allowed 必须 false
+        if let Some(www) = users.iter().find(|u| u.name == "www-data") {
+            assert!(!www.login_allowed, "www-data 是服务账号，login_allowed 应为 false");
+        }
+
+        // 结果按 uid 升序，UI 展示稳定
+        for w in users.windows(2) {
+            assert!(w[0].uid <= w[1].uid, "应按 uid 升序");
+        }
+
+        // 每个条目字段都该填满，不存在空名
+        for u in &users {
+            assert!(!u.name.is_empty(), "账户名不应为空");
+        }
+    }
+}

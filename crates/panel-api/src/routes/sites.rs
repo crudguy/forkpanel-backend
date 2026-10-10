@@ -148,6 +148,11 @@ pub struct RouteOut {
     /// kind=php：入口脚本（相对站点根，须以 `/` 开头）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub front_controller: Option<String>,
+    /// kind=static：该路由自己的根目录（可选，覆盖站点级 root）。留空继承站点级
+    /// root；填了则这条静态路由从它自己的目录读文件。须落在 site_root 之内
+    /// （apply 阶段经 resolve_site_root 约束，防路径穿越）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
 }
 
 /// API 口径（`proxy`）→ 库内口径（`reverse_proxy`）。
@@ -240,7 +245,20 @@ fn validate_routes(routes: &[RouteOut]) -> ApiResult<panel_os::SiteRoutes> {
         }
 
         let kind = match r.kind.as_str() {
-            "static" => panel_os::RouteKind::Static { spa: r.spa },
+            "static" => {
+                // 路由级 root：可选。只做轻量语法校验（注入字符），实际约束到 site_root
+                // 在 apply 阶段做（那里有 state，与站点级 root 同一条 resolve_site_root）。
+                let root = r.root.as_deref().map(str::trim).filter(|v| !v.is_empty());
+                if let Some(rv) = root {
+                    if rv.contains([';', '\n', '\r', '{', '}']) {
+                        return Err(ApiError::bad_request(
+                            field,
+                            format!("第 {} 条路由（前缀 {prefix}）的根目录含非法字符", i + 1),
+                        ));
+                    }
+                }
+                panel_os::RouteKind::Static { spa: r.spa, root: root.map(|s| s.to_string()) }
+            }
             "proxy" => {
                 let ups: Vec<String> = r.upstreams.iter().map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect();
                 if ups.is_empty() {
@@ -1346,7 +1364,18 @@ pub async fn apply(
             let rs = req.routes.clone().ok_or_else(|| {
                 ApiError::bad_request("routes", "多路由站点必须提供路由表（routes）")
             })?;
-            panel_os::SiteKind::Routed { routes: validate_routes(&rs)? }
+            let mut routes = validate_routes(&rs)?;
+            // 路由级 root 约束到 site_root 之内（防路径穿越）：与站点级 root 复用同一条
+            // resolve_site_root。空 root 不变（继承 server 级站点 root）。
+            for r in routes.routes.iter_mut() {
+                if let panel_os::RouteKind::Static { spa: _, root } = &mut r.kind {
+                    if let Some(rv) = root {
+                        let safe = resolve_site_root(&state, rv, &req.name)?;
+                        *rv = safe.as_path().display().to_string();
+                    }
+                }
+            }
+            panel_os::SiteKind::Routed { routes }
         }
         other => {
             return Err(ApiError::bad_request(
@@ -1382,7 +1411,7 @@ pub async fn apply(
                         panel_os::RouteKind::Proxy { upstreams } => upstreams.clone(),
                         _ => Vec::new(),
                     },
-                    spa: matches!(&r.kind, panel_os::RouteKind::Static { spa: true }),
+                    spa: matches!(&r.kind, panel_os::RouteKind::Static { spa: true, .. }),
                     fpm: match &r.kind {
                         panel_os::RouteKind::Php { fpm, .. } => Some(fpm.clone()),
                         _ => None,
@@ -1391,6 +1420,10 @@ pub async fn apply(
                         panel_os::RouteKind::Php { front_controller, .. } => {
                             Some(front_controller.clone())
                         }
+                        _ => None,
+                    },
+                    root: match &r.kind {
+                        panel_os::RouteKind::Static { root, .. } => root.clone(),
                         _ => None,
                     },
                 })

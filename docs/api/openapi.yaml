@@ -478,6 +478,7 @@ components:
         spa:             { type: boolean, description: "kind=static：未命中是否回退 /index.html（history 路由单页应用）" }
         fpm:             { type: string, description: "kind=php 的 php-fpm 目标" }
         front_controller: { type: string, description: "kind=php 的**入口脚本（必填，相对站点根、须以 / 开头）**。多路由下一律用 front controller 形式而非 `location ~ \\.[Pp]hp$`——后者会被 `^~` 前缀屏蔽、PHP 请求将落到静态处理" }
+        root:            { type: [string, "null"], description: "kind=static 的**路由级根目录（可选，覆盖站点级 root）**。留空继承站点根目录；填了则这条静态路由从它自己的目录读文件（如 `/` 前端产物 + `/blog` 另一套静态站）。后端经 resolve_site_root 约束到 site_root 之内，防路径穿越；其余为 null" }
 App:
       type: object
       properties:
@@ -1197,6 +1198,17 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/Overview' } } }
+
+  /api/v1/system/users:
+    get:
+      tags: [system]
+      summary: 枚举本机系统账户（运行用户下拉数据源）
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { type: object, properties: { name: { type: string }, uid: { type: integer }, gid: { type: integer }, shell: { type: string }, login_allowed: { type: boolean } } } } } } }
 
   /api/v1/metrics/realtime:
     get:

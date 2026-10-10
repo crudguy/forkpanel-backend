@@ -13,6 +13,7 @@ use panel_core::{
     Capability, FirewallBackend, InitSystem, LogBackend, PlatformInfo, Result, SafePath,
     UnitName,
 };
+use std::collections::HashMap;
 use std::{cmp::Ordering, path::PathBuf, time::Duration};
 use tokio::sync::mpsc::Receiver;
 
@@ -206,6 +207,12 @@ pub trait ServiceProvider: Send + Sync {
     fn init_system(&self) -> InitSystem;
     async fn list(&self, filter: ServiceFilter) -> Result<Vec<ServiceUnit>>;
     async fn status(&self, name: &UnitName) -> Result<ServiceState>;
+    /// 批量状态快照：一次 `systemctl is-active` 取多个单元状态，供应用/站点列表避免「每单元各起一次进程」。
+    ///
+    /// systemd 下 `is-active` 接受多个单元名、按入参顺序逐行输出，dead/unknown 也照常返回
+    /// （不依赖 `list-units` 的已加载集合，因此 dead 但仍存在的单元也能拿到 `inactive` 而非被漏掉）。
+    /// 返回 `单元名字符串 → 状态` 的映射；非 systemd 实现退化为逐次调用 `status`。
+    async fn statuses(&self, names: &[UnitName]) -> Result<HashMap<String, ServiceState>>;
     /// 按单元名直接查单个服务，绕开 `list` 的 `list-units --all` 全量枚举。
     ///
     /// 为什么需要：systemd 的 `list-units` 只列出**已加载进运行时**的单元，
@@ -589,11 +596,30 @@ pub trait NetworkProvider: Send + Sync {
 
 // ═══════════════════════════ 系统用户 ═══════════════════════════
 
+/// 系统账户（解析 `/etc/passwd` 得到）。
+///
+/// 用于「运行用户」下拉等选择入口：列出本机全部账户并标注登录 shell 是否可交互登录
+/// （服务账号多为 nologin/false，UI 应提示其不可 SSH 登录）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SystemUser {
+    pub name: String,
+    pub uid: u32,
+    pub gid: u32,
+    /// 登录 shell 绝对路径（/etc/passwd 第 7 列）
+    pub shell: String,
+    /// 是否允许交互登录：shell 既不是 nologin 也不是 false 类禁用壳
+    pub login_allowed: bool,
+}
+
 #[async_trait]
 pub trait UserProvider: Send + Sync {
     async fn exists(&self, name: &str) -> Result<bool>;
     async fn ensure(&self, name: &str, system: bool, shell_nologin: bool) -> Result<()>;
     async fn uid_gid(&self, name: &str) -> Result<(u32, u32)>;
+    /// 枚举本机全部系统账户（只读 `/etc/passwd`）。
+    ///
+    /// 仅暴露「存在且可列举」的事实，不做任何写操作；前端用于「运行用户」下拉。
+    async fn list(&self) -> Result<Vec<SystemUser>>;
 }
 
 // ═══════════════════════════ 存储与权限 ═══════════════════════════
@@ -1057,7 +1083,14 @@ pub enum RouteKind {
     /// 反向代理（可多后端 → 由 `upstream` 块轮询）。
     Proxy { upstreams: Vec<String> },
     /// 静态文件。`spa` 开启时未命中回退到 `/index.html`（history 路由）。
-    Static { spa: bool },
+    ///
+    /// `root` 可选：填了则这条静态路由从**它自己的目录**读文件（覆盖 server 级站点
+    /// root），不填则继承 server 级 root。用于「同一站点下多套纯静态子目录各自独立」
+    /// 的场景（如 `/` 给前端构建产物、`/blog` 给另一套静态站）。
+    ///
+    /// ⚠ 安全：该值由后端在 apply 阶段经 `resolve_site_root` 约束到 `site_root` 之内，
+    /// 绝不允许越界到任意文件系统位置（否则可用 `/api` 指向 `/etc` 读敏感文件）。
+    Static { spa: bool, root: Option<String> },
     /// PHP：转发到 php-fpm。
     ///
     /// `front_controller` 是入口脚本（相对 `root`，如 `index.php`）。**必填**：
