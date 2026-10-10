@@ -474,6 +474,7 @@ components:
         redirect_target:  { type: [string, "null"], description: "整站重定向目标 URL（kind=redirect 时存在，绝对 http(s)://）；其余为 null" }
         redirect_code:    { type: [integer, "null"], description: "整站重定向状态码（kind=redirect 时存在；301/302/307/308）；其余为 null" }
         routes:          { type: array, items: { $ref: '#/components/schemas/SiteRoute' }, description: "多路由表（kind=routed 时非空；其余恒为 []，不会返回 null）" }
+        manual_conf:     { type: boolean, description: "手动维护：true = 磁盘上的配置文件由用户原始编辑维护，表单「保存并应用」不再覆盖它；可经「恢复面板托管」清零（停用/重新启用路径也会清零）" }
     SiteRoute:
       type: object
       required: [prefix, kind]
@@ -1672,6 +1673,62 @@ paths:
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       responses: { '204': { description: ok } }
+  /api/v1/sites/{id}/conf:
+    get:
+      tags: [sites]
+      summary: 读取站点当前的 Web 服务器配置文件（路径取落库 conf_path，不接受前端指定路径）
+      description: |
+        路径唯一来源是落库的 conf_path（由 apply/patch 写入），避免「读任意文件」的越权面。
+        从未下发、或文件已被外部删除时 content=null（不报 404——弹窗按「暂无内容」展示）。
+        成功响应 data：path（落盘路径，可为 null）、content（文件原文，可为 null）、manual（是否手动维护）。
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { path: { type: [string, "null"] }, content: { type: [string, "null"] }, manual: { type: boolean } } } } }
+        '404': { description: 站点不存在 }
+    put:
+      tags: [sites]
+      summary: 保存站点原始配置（nginx -t 校验 → 原子替换 → reload；成功后置「手动维护」；仅 owner）
+      description: |
+        顺序与 apply 一致：先 nginx -t 校验（独立 wrapper，不触碰线上配置）——失败返回 40002 并带
+        原始 stderr，旧文件纹丝不动；通过才原子替换并 reload。成功后站点置 manual_conf=1，表单
+        「保存并应用」不再覆盖该文件（可经 conf/restore 恢复面板托管）。站点停用（配置未下发）时拒绝编辑。
+        成功响应 data：path、manual（true）、reloaded（true）。
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content: { type: string, description: "完整配置片段（与落盘文件同构，含 server / map 等 http 上下文）；非空且不超过 1 MiB" }
+      responses:
+        '200': { description: ok }
+        '400': { description: 校验失败（返回 nginx -t 原始 stderr）或内容为空/超限或站点已停用 }
+        '403': { description: 仅 owner 可编辑原始配置 }
+        '404': { description: 站点不存在 }
+        '501': { description: 无 Web 服务器底座（webserver.manage） }
+  /api/v1/sites/{id}/conf/restore:
+    post:
+      tags: [sites]
+      summary: 恢复面板托管（按表单规格重新渲染覆盖手动内容，清零 manual_conf；仅 owner）
+      description: |
+        与 patch 的「重新启用下发」同一渲染路径（render_spec_for_row，自带 nginx -t 校验），
+        丢弃手工内容。停用站点没有配置文件可恢复——仅清零标记（下次启用按表单渲染）。
+        成功响应 data：path、manual（false）、deployed、reloaded。
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: ok }
+        '403': { description: 仅 owner }
+        '404': { description: 站点不存在 }
+        '501': { description: 无 Web 服务器底座（webserver.manage） }
   /api/v1/sites/{id}/logs:
     get:
       tags: [sites]

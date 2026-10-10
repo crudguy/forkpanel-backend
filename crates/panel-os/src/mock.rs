@@ -366,9 +366,12 @@ impl SchedulerProvider for MockScheduler {
 #[async_trait]
 impl WebServerProvider for MockWebServer {
     fn name(&self) -> &'static str { "mock" }
+    fn conf_path(&self, server_names: &[String]) -> PathBuf {
+        PathBuf::from("/etc/mock/conf.d")
+            .join(format!("{}.conf", server_names.first().unwrap_or(&"site".into())))
+    }
     fn render(&self, spec: &SiteSpec) -> Result<(PathBuf, String)> {
-        Ok((PathBuf::from("/etc/mock/conf.d").join(format!("{}.conf", spec.server_names.first().unwrap_or(&"site".into()))),
-            "server { listen 80; }".into()))
+        Ok((self.conf_path(&spec.server_names), "server { listen 80; }".into()))
     }
     async fn validate(&self, _r: &str) -> Result<()> { Ok(()) }
     async fn deploy(&self, _t: &std::path::Path, _c: &str) -> Result<()> { Ok(()) }

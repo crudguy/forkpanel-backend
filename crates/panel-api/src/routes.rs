@@ -143,6 +143,9 @@ pub fn build_router(state: Shared) -> Router {
         )
         .route("/api/v1/apps/{id}/act", post(apps::act))
         .route("/api/v1/sites/{id}/reload", post(sites::reload))
+        // 站点配置原始读写：GET 查看（site.manage）、PUT 编辑（仅 owner）、restore 恢复托管
+        .route("/api/v1/sites/{id}/conf", get(sites::conf_get).put(sites::conf_put))
+        .route("/api/v1/sites/{id}/conf/restore", post(sites::conf_restore))
         .route("/api/v1/sites/{id}/logs", get(sites::logs))
         .route("/api/v1/sites/{id}/ssl/apply", post(sites::ssl_apply))
         .route("/api/v1/ssl/ca", get(sites::ssl_ca_download))

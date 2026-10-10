@@ -19,6 +19,10 @@
 //!   能力位为 `no`（本机未装 nginx/caddy），这两个动作诚实返回 501，绝不伪造成功。
 //! - SSL 的 ACME 签发/续期同理：能力位 `ssl.acme` 为 `no` 时诚实 501；
 //!   证书「删除」是纯 DB 操作，始终可用。
+//! - `conf_get` / `conf_put` / `conf_restore`：站点已落盘配置的**原始读写**。
+//!   GET 按落库 `conf_path` 读（不接受前端路径）；PUT 仅 owner、写入前必过
+//!   `nginx -t`，成功后站点转「手动维护」（表单保存不再覆盖，见 016 迁移）；
+//!   `conf_restore` 按表单重新渲染，恢复面板托管。
 
 use crate::{
     auth::perm,
@@ -68,6 +72,8 @@ struct RawSite {
     conf_path: Option<String>,
     /// 多路由表 JSON 数组；非多路由站点为 `'[]'`（迁移给了 DEFAULT，不会有 NULL）
     routes_json: String,
+    /// 手动维护标记（016 迁移）：1 = 磁盘配置由用户原始编辑维护，表单保存不覆盖
+    manual_conf: i32,
 }
 
 impl RawSite {
@@ -124,6 +130,9 @@ pub struct SiteOut {
     pub redirect_code: Option<u16>,
     /// 多路由表（kind=routed 时非空；其余恒为 `[]`——不返回 null，省前端分支）
     pub routes: Vec<RouteOut>,
+    /// 手动维护：true = 磁盘上的配置文件由用户原始编辑维护，表单保存不再覆盖它
+    /// （可用「恢复面板托管」清零；停用/重新启用路径同样清零）
+    pub manual_conf: bool,
 }
 
 /// API 口径的单条路由。
@@ -337,6 +346,7 @@ fn to_out(r: &RawSite) -> SiteOut {
         redirect_target: r.redirect_target.clone(),
         redirect_code: r.redirect_code.map(|n| n as u16),
         routes: routes_from_json(&r.routes_json),
+        manual_conf: r.manual_conf != 0,
     }
 }
 
@@ -349,10 +359,11 @@ const SITE_SELECT: &str = "s.id, s.name, s.domains, s.root, s.kind, s.enabled, s
        (SELECT COUNT(*) FROM ssl_certs c WHERE c.site_id = s.id) AS tls_count,
        s.waf_enabled, s.waf_profile, s.waf_rate, s.waf_burst,
        s.upstreams_json, s.fpm, s.spa, s.redirect_target, s.redirect_code, s.conf_path,
-       s.routes_json";
-// ⚠ 列序与下方 `r.get(N)` 一一对应。加列**一律追加到末尾**（本次 routes_json = 18），
-//   这样既有索引全部不变——中途插列会让每个 r.get 静默错位（本项目已踩过一次：
-//   tls_count 子查询列把后续整体后移一位，apply 运行时才报 `Invalid column type`）。
+       s.routes_json, s.manual_conf";
+// ⚠ 列序与下方 `r.get(N)` 一一对应。加列**一律追加到末尾**（routes_json = 18、
+//   manual_conf = 19），这样既有索引全部不变——中途插列会让每个 r.get 静默错位
+//   （本项目已踩过一次：tls_count 子查询列把后续整体后移一位，apply 运行时才报
+//   `Invalid column type`）。三个 fetch 函数中的 get(18/19) 必须同步。
 
 /// 站点查询 SQL。
 ///
@@ -392,6 +403,7 @@ async fn fetch_all(state: &Shared) -> Result<Vec<RawSite>> {
                     redirect_code: r.get(16)?,
                     conf_path: r.get(17)?,
                     routes_json: r.get(18)?,
+                    manual_conf: r.get(19)?,
                     })
                 })
                 .map_err(db_err)?;
@@ -432,6 +444,7 @@ async fn fetch_one(state: &Shared, id: i64) -> Result<Option<RawSite>> {
                     redirect_code: r.get(16)?,
                     conf_path: r.get(17)?,
                     routes_json: r.get(18)?,
+                    manual_conf: r.get(19)?,
                 })
             })
             .map_err(db_err)?;
@@ -469,6 +482,7 @@ async fn fetch_one_by_name(state: &Shared, name: &str) -> Result<Option<RawSite>
                     redirect_code: r.get(16)?,
                     conf_path: r.get(17)?,
                     routes_json: r.get(18)?,
+                    manual_conf: r.get(19)?,
                 })
             })
             .map_err(db_err)?;
@@ -667,7 +681,9 @@ pub async fn create(
                     spa: false,
                     redirect_target: None,
                     redirect_code: None,
-                                    routes: Vec::new(),
+                    routes: Vec::new(),
+                    // 兜底分支：新建站点必非手动维护（manual_conf 默认 0）
+                    manual_conf: false,
                 });
             Ok(ok(out))
         }
@@ -973,12 +989,18 @@ pub async fn patch(
         }
     }
 
+    // 开关翻转会重新渲染（启用）或移除（停用）配置文件——手动维护状态随之结束：
+    // 停用 = 文件已移除（无内容可护）；重新启用 = 按表单重新生成（不保留手改）。
+    // 未翻转则原样保留（COALESCE(NULL, manual_conf)）。
+    let clear_manual: Option<i32> = if old_enabled != enabled { Some(0) } else { None };
+
     state
         .db
         .exec(move |conn| {
             conn.execute(
-                "UPDATE sites SET name = ?6, domains = ?1, root = ?2, enabled = ?3, conf_path = ?4 WHERE id = ?5",
-                rusqlite::params![domains_json, root, enabled as i32, conf_path, id, new_name],
+                "UPDATE sites SET name = ?6, domains = ?1, root = ?2, enabled = ?3, conf_path = ?4,
+                                  manual_conf = COALESCE(?7, manual_conf) WHERE id = ?5",
+                rusqlite::params![domains_json, root, enabled as i32, conf_path, id, new_name, clear_manual],
             )
             .map(|n| panel_db::WriteAck { rows_changed: n })
             .map_err(|e| PanelError::Database(e.to_string()))
@@ -1299,6 +1321,12 @@ pub async fn apply(
     // 与 `patch` 的「真停用」语义一致——避免「点一次应用就把刚停用的站点又拉起来」。
     // 新建站点（无 cur_row）按默认启用对待，照常部署。
     let deploy = cur_row.as_ref().map(|r| r.enabled != 0).unwrap_or(true);
+    // 手动维护站点（enabled 且 manual_conf=1）：整段跳过渲染/校验/下发——磁盘上的
+    // 手工配置是唯一事实源，表单保存只更新库内规格（语义见 016 迁移）。
+    let manual_skip = cur_row
+        .as_ref()
+        .map(|r| r.enabled != 0 && r.manual_conf != 0)
+        .unwrap_or(false);
     // 落库四元组在这里就算好：`waf` 随即被 move 进 SiteSpec。
     // 关掉 WAF 时一并清空——留着旧数值会让"下次重新打开"意外带上几年前的参数，
     // 而用户早就不记得了。
@@ -1454,44 +1482,50 @@ pub async fn apply(
         // 路由表已在 `kind` 里（Routed 变体），此字段只是对照——渲染以 kind 为准
         routes: None,
     };
-    let (target, rendered) = state.os.webserver().render(&spec)?;
+    // 4) 渲染 + 校验 + 下发（手动维护站点整段跳过：不重渲染、不覆盖、不 reload，
+    //    conf_path 保持落库现值——那正是用户正在维护的那个文件）。
+    let conf = if manual_skip {
+        cur_row.as_ref().and_then(|r| r.conf_path.clone()).unwrap_or_default()
+    } else {
+        let (target, rendered) = state.os.webserver().render(&spec)?;
 
-    // 4) ⚠️ 校验在写事务之外。失败直接返回 40002，旧配置原封不动
-    state
-        .os
-        .webserver()
-        .validate(&rendered)
-        .await
-        .map_err(|e| ApiError::from(PanelError::ConfigInvalid { detail: e.to_string() }))?;
+        // 4) ⚠️ 校验在写事务之外。失败直接返回 40002，旧配置原封不动
+        state
+            .os
+            .webserver()
+            .validate(&rendered)
+            .await
+            .map_err(|e| ApiError::from(PanelError::ConfigInvalid { detail: e.to_string() }))?;
 
-    // 5) 部署（仅启用态）。停用态：上面已渲染+校验通过配置，但**不**下发到 Web 服务器，
-    //    配置不会进 nginx，与「真停用」一致；用户启用站点后再应用才会真正生效。
-    if deploy {
-        state.os.webserver().deploy(&target, &rendered).await?;
+        // 5) 部署（仅启用态）。停用态：上面已渲染+校验通过配置，但**不**下发到 Web 服务器，
+        //    配置不会进 nginx，与「真停用」一致；用户启用站点后再应用才会真正生效。
+        if deploy {
+            state.os.webserver().deploy(&target, &rendered).await?;
 
-        // 5.5) 域名改过则旧文件名成了孤儿：新配置已就位，**此刻**才轮到删旧配置。
-        //      `remove` 自带 reload —— 删过就等于重载过了，不再重复 reload。
-        let stale_conf = cur_row.as_ref().and_then(|r| r.conf_path.as_deref());
-        let pruned = prune_stale_conf(&state, stale_conf, &target).await?;
+            // 5.5) 域名改过则旧文件名成了孤儿：新配置已就位，**此刻**才轮到删旧配置。
+            //      `remove` 自带 reload —— 删过就等于重载过了，不再重复 reload。
+            let stale_conf = cur_row.as_ref().and_then(|r| r.conf_path.as_deref());
+            let pruned = prune_stale_conf(&state, stale_conf, &target).await?;
 
-        // 6) reload。失败时配置已写入但服务未加载 —— 这是可恢复的（配置语法已校验过）
-        if !pruned {
-            if let Err(e) = state.os.webserver().reload().await {
-                return Err(ApiError::from(PanelError::Command {
-                    bin: "reload".to_string(),
-                    detail: format!("配置已写入但 reload 失败：{e}"),
-                }));
+            // 6) reload。失败时配置已写入但服务未加载 —— 这是可恢复的（配置语法已校验过）
+            if !pruned {
+                if let Err(e) = state.os.webserver().reload().await {
+                    return Err(ApiError::from(PanelError::Command {
+                        bin: "reload".to_string(),
+                        detail: format!("配置已写入但 reload 失败：{e}"),
+                    }));
+                }
             }
         }
-    }
+        target.display().to_string()
+    };
 
     // 7) 落库：此时系统已处于期望状态（按 name upsert，与 create 不冲突）
     let name = req.name.clone();
     let domains_json = serde_json::to_string(&domains).unwrap_or_else(|_| "[]".into());
     let root_str = root.as_path().display().to_string();
-    let conf = target.display().to_string();
     let now = crate::now_unix();
-    // 停用态：conf_path 留空（配置未下发），enabled 保持 0；启用态 / 新建：正常写入。
+    // 停用态：conf_path 留空（配置未下发），enabled 保持 0；启用态 / 新建 / 手动维护：正常写入。
     let conf_db = if deploy { conf.clone() } else { String::new() };
     let enabled_i32: i32 = if deploy { 1 } else { 0 };
     state
@@ -1528,8 +1562,10 @@ pub async fn apply(
         "name": req.name,
         "config": conf,
         "deployed": deploy,
-        "reloaded": deploy,
+        // 手动维护：配置保持原样（未重渲染），如实报 reloaded=false + manual=true
+        "reloaded": deploy && !manual_skip,
         "enabled": deploy,
+        "manual": manual_skip,
     })))
 }
 
@@ -1556,6 +1592,243 @@ pub async fn reload(
         .map_err(ApiError::from)?;
     audit(&state, &s, "site.reload", &id.to_string(), "ok").await;
     Ok(ok(serde_json::json!({ "reloaded": true })))
+}
+
+// ─────────────── 站点配置：查看 / 原始编辑（手动维护） ───────────────
+//
+// 背景：面板托管的配置是「表单 → render → validate → 下发」的产物。手动维护
+// （016 迁移的 manual_conf）让用户直接改这份产物成为一等状态：
+// - GET  conf：读取落盘内容（路径取**落库 conf_path**，绝不接受前端传路径）
+// - PUT  conf：原始写入 → 此后表单保存不再覆盖（仅 owner；写入前必过 nginx -t）
+// - POST conf/restore：恢复面板托管（按表单重新渲染覆盖，清零 manual_conf）
+
+/// 读取站点当前的 Web 服务器配置文件内容。
+///
+/// 路径唯一来源是**落库的 `conf_path`**（由 apply/patch 写入，不接受前端输入——
+/// 否则就成了「读任意文件」的越权面）。尚未下发 / 文件缺失时如实返回 `content: null`。
+pub async fn conf_get(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    AxPath(id): AxPath<i64>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::SITE_MANAGE)?;
+    let row = fetch_one(&state, id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("site"))?;
+    let path = row
+        .conf_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
+    let content = match path {
+        Some(p) => match tokio::fs::read_to_string(p).await {
+            Ok(c) => Some(c),
+            // 文件被外部删除：如实返回「无内容」，而不是 404 把弹窗打成错误态
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(ApiError::from(PanelError::Io(format!("read {p}: {e}")))),
+        },
+        None => None,
+    };
+    Ok(ok(serde_json::json!({
+        "path": path,
+        "content": content,
+        "manual": row.manual_conf != 0,
+    })))
+}
+
+/// `PUT` 的请求体：完整配置片段（与落盘文件同构——server / map 等 http 上下文片段）。
+#[derive(Debug, Deserialize)]
+pub struct ConfPutReq {
+    pub content: String,
+}
+
+/// 保存站点原始配置（进入 / 保持「手动维护」）。
+///
+/// ⚠ 写入面等价于「一台 root 改 nginx」——仅 **owner** 可调用，且校验失败尝试也留审计。
+/// 顺序与 apply 完全一致：**先 `nginx -t` 校验 → 原子替换 → reload**；校验不过旧文件纹丝不动。
+/// 成功后站点置 `manual_conf=1`：此后表单「保存并应用」不再覆盖该文件（见 016 迁移）。
+pub async fn conf_put(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    AxPath(id): AxPath<i64>,
+    Json(req): Json<ConfPutReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::SITE_MANAGE)?;
+    if s.role != "owner" {
+        return Err(ApiError::forbidden("owner"));
+    }
+    if !state
+        .capabilities
+        .get(cap_keys::WEBSERVER_MANAGE)
+        .map(|c| c.supported)
+        .unwrap_or(false)
+    {
+        return Err(ApiError::unsupported("webserver.manage"));
+    }
+    let row = fetch_one(&state, id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("site"))?;
+    if row.enabled == 0 {
+        return Err(ApiError::bad_request(
+            "enabled",
+            "站点已停用（配置已从 Web 服务器移除）；请先启用后再编辑原始配置",
+        ));
+    }
+    if req.content.trim().is_empty() {
+        return Err(ApiError::bad_request("content", "配置内容不能为空"));
+    }
+    if req.content.len() > 1_048_576 {
+        return Err(ApiError::bad_request("content", "配置内容超过 1 MiB 上限"));
+    }
+
+    // 目标路径：优先落库 conf_path（曾下发过，可能带着旧域名文件名）；从未下发则按
+    // provider 的命名规则推导——与 render 同源（绝不由前端指定路径）。
+    let target: PathBuf = match row
+        .conf_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        Some(p) => PathBuf::from(p),
+        None => {
+            let domains: Vec<String> = serde_json::from_str(&row.domains).unwrap_or_default();
+            if domains.is_empty() {
+                return Err(ApiError::bad_request("conf", "站点缺少域名，无法推导配置文件路径"));
+            }
+            state.os.webserver().conf_path(&domains)
+        }
+    };
+    // 纵深防御：conf_path 理论上只由面板写入，但写盘操作值得再验一次「父目录就是
+    // Web 配置目录」——防止被篡改的库值把 root 写入引到别处（lexical 检查已足够：
+    // 带 `..` 的伪造路径其 parent 必然不相等）。
+    let conf_dir = state.os.paths().web_conf_dir();
+    let parent_ok = target.parent().map(|p| p == conf_dir).unwrap_or(false)
+        && !target
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir));
+    if !parent_ok {
+        return Err(ApiError::bad_request(
+            "conf_path",
+            "落库配置路径不在 Web 配置目录内，拒绝写入",
+        ));
+    }
+
+    // 校验（独立 wrapper 跑 nginx -t，不触碰线上配置）→ 失败 40002 + 原始 stderr
+    if let Err(e) = state.os.webserver().validate(&req.content).await {
+        audit(&state, &s, "site.conf.edit", &id.to_string(), "fail").await;
+        return Err(ApiError::from(PanelError::ConfigInvalid { detail: e.to_string() }));
+    }
+    // 原子替换 + reload；reload 失败时配置已写入（语法已验过，可恢复）——与 apply 同口径
+    state.os.webserver().deploy(&target, &req.content).await?;
+    if let Err(e) = state.os.webserver().reload().await {
+        return Err(ApiError::from(PanelError::Command {
+            bin: "reload".to_string(),
+            detail: format!("配置已写入但 reload 失败：{e}"),
+        }));
+    }
+
+    let path_str = target.display().to_string();
+    let path_db = path_str.clone();
+    state
+        .db
+        .exec(move |conn| {
+            conn.execute(
+                "UPDATE sites SET manual_conf = 1, conf_path = ?1 WHERE id = ?2",
+                rusqlite::params![path_db, id],
+            )
+            .map(|n| panel_db::WriteAck { rows_changed: n })
+            .map_err(|e| PanelError::Database(e.to_string()))
+        })
+        .await?;
+
+    audit(&state, &s, "site.conf.edit", &id.to_string(), "ok").await;
+    Ok(ok(serde_json::json!({ "path": path_str, "manual": true, "reloaded": true })))
+}
+
+/// 恢复面板托管：按表单规格重新渲染覆盖（丢弃手工内容），清零 `manual_conf`。
+///
+/// 与 `patch` 的「重新启用下发」同一条渲染路径（`render_spec_for_row`，自带校验）。
+/// 停用站点没有配置文件可恢复——只清零标记（下次启用按表单渲染）。
+pub async fn conf_restore(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    AxPath(id): AxPath<i64>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::SITE_MANAGE)?;
+    if s.role != "owner" {
+        return Err(ApiError::forbidden("owner"));
+    }
+    if !state
+        .capabilities
+        .get(cap_keys::WEBSERVER_MANAGE)
+        .map(|c| c.supported)
+        .unwrap_or(false)
+    {
+        return Err(ApiError::unsupported("webserver.manage"));
+    }
+    let row = fetch_one(&state, id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("site"))?;
+
+    // 停用站点：无文件可恢复，仅清零标记（启用路径会按表单重新渲染）
+    if row.enabled == 0 {
+        state
+            .db
+            .exec(move |conn| {
+                conn.execute(
+                    "UPDATE sites SET manual_conf = 0 WHERE id = ?1",
+                    [id],
+                )
+                .map(|n| panel_db::WriteAck { rows_changed: n })
+                .map_err(|e| PanelError::Database(e.to_string()))
+            })
+            .await?;
+        audit(&state, &s, "site.conf.restore", &id.to_string(), "ok").await;
+        return Ok(ok(serde_json::json!({
+            "path": serde_json::Value::Null,
+            "manual": false,
+            "deployed": false,
+            "reloaded": false,
+        })));
+    }
+
+    let domains: Vec<String> = serde_json::from_str(&row.domains).unwrap_or_default();
+    if domains.is_empty() {
+        return Err(ApiError::bad_request("domains", "站点缺少域名，无法重新渲染配置"));
+    }
+    let (target, rendered) = render_spec_for_row(&state, &row, &domains, &row.root).await?;
+    state.os.webserver().deploy(&target, &rendered).await?;
+    let pruned = prune_stale_conf(&state, row.conf_path.as_deref(), &target).await?;
+    if !pruned {
+        if let Err(e) = state.os.webserver().reload().await {
+            return Err(ApiError::from(PanelError::Command {
+                bin: "reload".to_string(),
+                detail: format!("配置已写入但 reload 失败：{e}"),
+            }));
+        }
+    }
+
+    let path_str = target.display().to_string();
+    let path_db = path_str.clone();
+    state
+        .db
+        .exec(move |conn| {
+            conn.execute(
+                "UPDATE sites SET manual_conf = 0, conf_path = ?1 WHERE id = ?2",
+                rusqlite::params![path_db, id],
+            )
+            .map(|n| panel_db::WriteAck { rows_changed: n })
+            .map_err(|e| PanelError::Database(e.to_string()))
+        })
+        .await?;
+
+    audit(&state, &s, "site.conf.restore", &id.to_string(), "ok").await;
+    Ok(ok(serde_json::json!({
+        "path": path_str,
+        "manual": false,
+        "deployed": true,
+        "reloaded": true,
+    })))
 }
 
 /// 站点日志（SSE）：`kind=access|error`，跟随该站点的 nginx 日志文件。

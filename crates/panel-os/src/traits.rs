@@ -1127,6 +1127,12 @@ impl SiteRoutes {
 #[async_trait]
 pub trait WebServerProvider: Send + Sync {
     fn name(&self) -> &'static str;                       // nginx / caddy / iis
+    /// 站点配置文件的目标路径（**纯路径计算**，不落盘、不校验）。
+    ///
+    /// 与 [`Self::render`] 返回的路径**必须同源**（nginx 实现里 render 就是调它）。
+    /// 用途：`PUT /sites/{id}/conf` 在站点尚未下发（落库 conf_path 为空）时据此
+    /// 决定写到哪里——路径只能由 provider 推导，绝不由前端指定。
+    fn conf_path(&self, server_names: &[String]) -> std::path::PathBuf;
     /// 渲染配置（纯字符串生成，不落盘）
     fn render(&self, spec: &SiteSpec) -> Result<(PathBuf, String)>;
     /// 写入前必须校验；失败时业务层回滚（设计方案 §2.4-4）

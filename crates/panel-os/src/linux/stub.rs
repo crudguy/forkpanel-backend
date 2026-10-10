@@ -846,7 +846,9 @@ impl LinuxWebServer {
     }
 
     /// 站点配置文件路径：`<web_conf_dir>/panel-<slug>.conf`
-    fn conf_path(&self, server_names: &[String]) -> PathBuf {
+    /// （`pub` 是为了让 `WebServerProvider::conf_path` 对外暴露同一份计算——
+    ///  trait 里同名方法委托到它，调用方经 `dyn` 也能拿到与 render 同源的路径）
+    pub fn conf_path(&self, server_names: &[String]) -> PathBuf {
         let stem = server_names.first().map(|s| slug(s)).unwrap_or_else(|| "site".into());
         self.paths.web_conf_dir().join(format!("panel-{stem}.conf"))
     }
@@ -1493,6 +1495,12 @@ fn render_acme_challenge_location(root: &std::path::Path) -> String {
 #[async_trait]
 impl WebServerProvider for LinuxWebServer {
     fn name(&self) -> &'static str { self.name.unwrap_or("none") }
+
+    /// 委托给同名**固有方法**（`LinuxWebServer::conf_path`，类型限定调用消歧义）——
+    /// 路径计算只有一份，render 与 PUT conf 拿到的目标必然一致。
+    fn conf_path(&self, server_names: &[String]) -> PathBuf {
+        LinuxWebServer::conf_path(self, server_names)
+    }
 
     fn render(&self, spec: &SiteSpec) -> Result<(PathBuf, String)> {
         match self.name {
