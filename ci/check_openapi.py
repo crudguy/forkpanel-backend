@@ -12,16 +12,24 @@
 - flow mapping 的多行条目之间漏写逗号，同样使文件不可解析。
 - 前后端两份副本手改不同步，契约一致性静默失效。
 
-以上三类都不会让 `cargo build` / `vue-tsc` 报错，也不会被 grep 类门禁
+以上各类都不会让 `cargo build` / `vue-tsc` 报错，也不会被 grep 类门禁
 （只看路径字符串）发现，直到有人拿 YAML 解析器去读才炸——而项目里当时
-并没有这样的读取方，属于**完全没有守卫**。
+并没有这样的读取方，属于**完全没有守卫**。结构错位（第 4 项）更隐蔽：
+PyYAML 都能"解析成功"，只有按语义消费契约的读取方才拿得到错误结构。
 
-本脚本做三件事（都不依赖 PyYAML，避免 CI 环境装依赖）：
+本脚本做五件事（都不依赖 PyYAML，避免 CI 环境装依赖）：
 1. flow mapping 语法体检：未加引号的 plain scalar 里出现 `{`/`[`/`}`/`]`
    即报错（附行号与出错片段）。
 2. 冒烟解析：若运行环境恰好有 PyYAML，则真解析一次兜住逗号等其它错法；
    没有则跳过并说明（不算失败）。
 3. 两份副本逐字节比对：后端事实源 vs 前端副本，不一致即失败。
+4. 结构体检（[E4]，零依赖）：同级重复键 / `$ref` 目标存在性 / schemas
+   直系缩进——缩进错位的定义块（曾真实发生：`SiteRoute:` 多缩进 4 格、
+   `App:` 顶格）不会让第 1/2 项报错，只在语义上把 schema 顶替或丢失。
+5. 行级括号平衡（[E5]，零依赖）：行尾多/少一个 `}`（曾真实发生：
+   system/users 响应 schema 行 10 开 11 闭，整份文件从该行起不可解析）
+   ——第 1 项只看非法位置的开括号，PyYAML 缺席时第 2 项跳过，第 3/4 项
+   不依赖括号闭合，全靠本项兜住。
 
 用法：
     python3 ci/check_openapi.py [后端仓根目录]
@@ -86,6 +94,81 @@ def scan_flow_scalars(path):
     return problems
 
 
+def scan_bracket_balance(path):
+    """逐行检查 `{}` / `[]` 括号平衡（引号感知，跳过注释与块标量内容）。
+
+    为什么需要
+    ----------
+    [E1] 只查「标量里多了结构字符」（非法位置的开括号），查不出**行尾多一个
+    闭括号**：`... login_allowed: { type: boolean } } } } } } }`（10 开 11 闭）
+    里每一段流映射单看都合法，只有数总账才发现多一个 `}`——而它让整份文件
+    **从该行起无法被任何 YAML 解析器读取**。PyYAML 缺席时 [E2] 跳过，[E3]
+    副本比对、[E4] 结构体检（它们不依赖括号闭合）也都会报绿，属于治理盲区。
+    曾真实发生：该行横跨 3 个提交未被发现，本次手工数括号才定位。
+
+    与书写风格的耦合：flow 结构不跨行（本文件约定）——若未来出现跨行 flow，
+    本函数需按「括号计数跨行结转」升级。
+
+    返回 (problems, stats)：
+    - problems: [(行号, 类型, 净深度, 行文本)]，类型 ∈ extra-close /
+      unbalanced / unterminated-quote；
+    - stats: {'lines': 总行数, 'brace_lines': 含括号的行数}（供前提断言）。
+    """
+    problems = []
+    lines = open(path, encoding='utf-8').read().splitlines()
+    brace_lines = 0
+    skip_to = -1
+    for i, line in enumerate(lines):
+        lineno = i + 1
+        if i < skip_to or line.lstrip().startswith('#'):
+            continue
+        ind = len(line) - len(line.lstrip())
+        if re.search(r':\s*[|>][-+0-9]*\s*$', line):
+            j = i + 1
+            while j < len(lines) and (not lines[j].strip()
+                                      or (len(lines[j]) - len(lines[j].lstrip())) > ind):
+                j += 1
+            skip_to = j
+            continue
+        if not any(c in line for c in '{[}]'):
+            continue
+        brace_lines += 1
+        depth = 0
+        quote = None
+        k = 0
+        problem = None
+        while k < len(line):
+            ch = line[k]
+            if quote:
+                if quote == '"' and ch == '\\':
+                    k += 2
+                    continue
+                if quote == "'" and ch == "'" and k + 1 < len(line) and line[k + 1] == "'":
+                    k += 2          # YAML 单引号内两个 '' 表示一个字面 '
+                    continue
+                if ch == quote:
+                    quote = None
+            elif ch in "'\"":
+                quote = ch
+            elif ch == '#' and (k == 0 or line[k - 1] in ' \t'):
+                break               # 行内注释：其后不再计入
+            elif ch in '{[':
+                depth += 1
+            elif ch in '}]':
+                depth -= 1
+                if depth < 0:
+                    problem = ('extra-close', depth)
+                    break
+            k += 1
+        if problem is None and quote:
+            problem = ('unterminated-quote', depth)
+        if problem is None and depth != 0:
+            problem = ('unbalanced', depth)
+        if problem:
+            problems.append((lineno, problem[0], problem[1], line))
+    return problems, {'lines': len(lines), 'brace_lines': brace_lines}
+
+
 def smoke_parse(path):
     """若环境有 PyYAML 就真解析一次；没有则返回 None（跳过，不算失败）。"""
     try:
@@ -99,10 +182,105 @@ def smoke_parse(path):
     return ''
 
 
+def scan_structure(path):
+    """按缩进解析键路径，做三项结构体检（零依赖，不用 YAML 解析器）。
+
+    为什么需要
+    ----------
+    缩进错位的定义块不会让 [E1] 报错：把 `    SiteRoute:` 误写成 8 空格后，它成了
+    上层 properties 下的「空值键」，后面跟着的 `type/properties` 与上层重名——PyYAML
+    对重复键「取后者」，解析**成功**但语义已坏（Site 的 properties 被顶替、
+    SiteRoute 从 components.schemas 里消失）。曾真实发生：`SiteRoute:` 多缩进 4 格 +
+    `App:` 顶格，横跨 3 个提交无人发现——唯一可靠信号就是这份结构体检。
+
+    返回 (dups, paths, bad_schema_children)：
+    - dups: [(行号, 键, 容器路径)] 同级重复键——YAML 语义上不允许，出现即结构错位；
+    - paths: 所有键的完整路径集合（供 $ref 目标存在性检查）；
+    - bad_schema_children: components/schemas 直系子级中缩进非 4 空格的行。
+
+    与书写风格的耦合（改风格须同步升级本函数）：
+    - 块标量（`|` / `>`）内容按缩进跳过，否则描述文本里的 `xx:` 会被当成键；
+    - 列表项行 `- `：块状项（`- key: v`）自建唯一容器 `#item@行号` 隔离同级重复
+      （servers 这类「多项各带续行」写法因此不误报）；flow 项（`- {…}` / `- $ref`）
+      视为不透明；
+    - 描述值均单行内联、flow 不跨行——若未来出现跨行 flow，需扩展本解析。
+    """
+    lines = open(path, encoding='utf-8').read().splitlines()
+    dups, paths, bad = [], set(), []
+    stack = []              # [(indent, path)] 键路径栈
+    seen = {}               # (container_path, indent) -> set(keys) 同级键去重表
+    skip_to = -1            # 块标量内容的跳过终止行
+    i, n = 0, len(lines)
+    while i < n:
+        l = lines[i]
+        if i < skip_to or not l.strip() or l.lstrip().startswith('#'):
+            i += 1
+            continue
+        s = l.lstrip()
+        m_item = re.match(r'^(\s*)- (.*)$', l)
+        if m_item:
+            ind = len(m_item.group(1))
+            rest = m_item.group(2)
+            while stack and stack[-1][0] >= ind:
+                stack.pop()
+            container = stack[-1][1] if stack else ''
+            item_id = f'{container}/#item@{i + 1}'
+            if rest.startswith(('{', '[')):
+                stack.append((ind, item_id))
+            else:
+                m_k = re.match(r'^([^\s#][^:]*):(\s|$)', rest)
+                if m_k:
+                    key = m_k.group(1).strip()
+                    full = item_id + '/' + key
+                    paths.add(full)
+                    bucket = seen.setdefault((item_id, ind + 2), set())
+                    if key in bucket:
+                        dups.append((i + 1, key, item_id))
+                    bucket.add(key)
+                    stack.append((ind, item_id))
+                    stack.append((ind + 2, full))
+                else:
+                    stack.append((ind, item_id))
+            i += 1
+            continue
+        m = re.match(r'^([^\s#][^:]*):(\s|$)', s)
+        if not m:
+            i += 1
+            continue
+        key = m.group(1).strip()
+        ind = len(l) - len(s)
+        while stack and stack[-1][0] >= ind:
+            stack.pop()
+        container = stack[-1][1] if stack else ''
+        full = (container + '/' + key) if container else key
+        paths.add(full)
+        bucket = seen.setdefault((container, ind), set())
+        if key in bucket:
+            dups.append((i + 1, key, container or '<root>'))
+        bucket.add(key)
+        if container == 'components/schemas' and ind != 4:
+            bad.append((i + 1, ind, s))
+        stack.append((ind, full))
+        if re.search(r':\s*[|>][-+0-9]*\s*$', l):
+            j = i + 1
+            while j < n and (not lines[j].strip()
+                             or (len(lines[j]) - len(lines[j].lstrip())) > ind):
+                j += 1
+            skip_to = j
+        i += 1
+    return dups, paths, bad
+
+
+def collect_refs(text):
+    """抽取全部 `$ref: '#/components/…'` 目标路径（兼容两种引号）。"""
+    return (set(re.findall(r"\$ref:\s*'#/([^']+)'", text))
+            | set(re.findall(r'\$ref:\s*"#/([^"]+)"', text)))
+
+
 def main():
     root = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_ROOT
     backend = os.path.join(root, BACKEND_REL)
-    frontend = os.argv[2] if len(sys.argv) > 2 else os.path.join(root, FRONTEND_REL)
+    frontend = sys.argv[2] if len(sys.argv) > 2 else os.path.join(root, FRONTEND_REL)
 
     fails = []
 
@@ -155,6 +333,63 @@ def main():
             print(f"  ✗ 两份契约不一致，共 {len(diffs)} 行不同（行号：{head}）")
             print(f"      后端 {BACKEND_REL} 是事实源，改完请同步到 {os.path.relpath(frontend, root)}")
             fails.append("前后端契约副本不一致")
+
+    # ── 4. 结构体检：同级重复键 / $ref 目标存在 / schemas 直系缩进 ──
+    print("== [E4] 契约结构（同级重复键 / $ref 目标存在）==")
+    dups, paths, bad_children = scan_structure(backend)
+    refs = collect_refs(open(backend, encoding='utf-8').read())
+    # 前提断言：提取结果异常少 = 解析器自己失效（或文件被大改）。
+    # 绝不能因为「没扫到东西」而报绿——恒绿的门禁比没有门禁更危险。
+    if len(paths) < 100 or len(refs) < 5:
+        print(f"  ✗ 提取异常：键路径 {len(paths)} 个、$ref {len(refs)} 个——解析前提不成立")
+        print("      修法：先确认契约文件未被截断/换书写风格；若是风格变化，需同步升级 scan_structure")
+        fails.append("结构解析前提不成立（检查器需维护）")
+    else:
+        if dups:
+            for lineno, key, container in dups[:10]:
+                print(f"  ✗ {BACKEND_REL}:{lineno} 同级重复键 '{key}'"
+                      f"（容器：{container}）")
+            print("      修法：YAML 不允许同级重复键；多为缩进错位——把该块挪回正确层级"
+                  "（典型：schema 名多缩进而把上一个块的尾部写成了重复键）")
+            fails.append(f"{len(dups)} 处同级重复键")
+        else:
+            print("  ✓ 无同级重复键")
+        missing = sorted(r for r in refs if r not in paths)
+        if missing:
+            for r in missing[:10]:
+                print(f"  ✗ $ref 目标不存在：#/{r}")
+            print("      修法：补上缺失的 schema/parameter 定义，或修正其缩进"
+                  "（定义写错层级时，按引用路径找不到它）")
+            fails.append(f"{len(missing)} 个 $ref 目标缺失")
+        else:
+            print(f"  ✓ {len(refs)} 个 $ref 目标全部存在")
+        if bad_children:
+            for lineno, ind, text in bad_children[:10]:
+                print(f"  ✗ {BACKEND_REL}:{lineno} schemas 直系子级缩进 {ind}"
+                      f"（应为 4）：{text.strip()[:60]}")
+            fails.append(f"{len(bad_children)} 处 schemas 子级缩进异常")
+
+    # ── 5. 行内括号平衡（零依赖，兜住「行尾多/少一个闭括号」）──
+    print("== [E5] flow 括号平衡（行级）==")
+    problems, stats = scan_bracket_balance(backend)
+    # 前提断言：本文件应含大量流式括号行；扫到的太少 = 检查器失效，绝不报绿
+    if stats['brace_lines'] < 50:
+        print(f"  ✗ 提取异常：仅 {stats['brace_lines']} 行含括号（共 {stats['lines']} 行）"
+              "——解析前提不成立")
+        fails.append("括号检查前提不成立（检查器需维护）")
+    elif problems:
+        kinds = {'extra-close': '多一个闭括号',
+                 'unbalanced': '括号未闭合（开多于闭）',
+                 'unterminated-quote': '引号未闭合'}
+        for lineno, kind, depth, text in problems[:10]:
+            extra = f"（净深度 {depth}）" if kind == 'unbalanced' else ''
+            print(f"  ✗ {BACKEND_REL}:{lineno} {kinds.get(kind, kind)}{extra}："
+                  f"{text.strip()[:90]}")
+        print("      修法：flow 结构不跨行；数该行 {} [] 开闭总数是否相等"
+              "（引号内与注释里的不计）")
+        fails.append(f"{len(problems)} 处括号不平衡")
+    else:
+        print(f"  ✓ {stats['brace_lines']} 个括号行全部平衡（共 {stats['lines']} 行）")
 
     print()
     if fails:

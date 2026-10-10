@@ -81,6 +81,12 @@ components:
       in: query
       schema: { type: string }
       description: 关键字过滤。
+    LogId:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer }
+      description: 日志源 id
 
   schemas:
     Envelope:
@@ -468,7 +474,7 @@ components:
         redirect_target:  { type: [string, "null"], description: "整站重定向目标 URL（kind=redirect 时存在，绝对 http(s)://）；其余为 null" }
         redirect_code:    { type: [integer, "null"], description: "整站重定向状态码（kind=redirect 时存在；301/302/307/308）；其余为 null" }
         routes:          { type: array, items: { $ref: '#/components/schemas/SiteRoute' }, description: "多路由表（kind=routed 时非空；其余恒为 []，不会返回 null）" }
-        SiteRoute:
+    SiteRoute:
       type: object
       required: [prefix, kind]
       properties:
@@ -479,7 +485,7 @@ components:
         fpm:             { type: string, description: "kind=php 的 php-fpm 目标" }
         front_controller: { type: string, description: "kind=php 的**入口脚本（必填，相对站点根、须以 / 开头）**。多路由下一律用 front controller 形式而非 `location ~ \\.[Pp]hp$`——后者会被 `^~` 前缀屏蔽、PHP 请求将落到静态处理" }
         root:            { type: [string, "null"], description: "kind=static 的**路由级根目录（可选，覆盖站点级 root）**。留空继承站点根目录；填了则这条静态路由从它自己的目录读文件（如 `/` 前端产物 + `/blog` 另一套静态站）。后端经 resolve_site_root 约束到 site_root 之内，防路径穿越；其余为 null" }
-App:
+    App:
       type: object
       properties:
         id:            { type: integer }
@@ -1208,7 +1214,7 @@ paths:
           description: ok
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { type: object, properties: { name: { type: string }, uid: { type: integer }, gid: { type: integer }, shell: { type: string }, login_allowed: { type: boolean } } } } } } }
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { type: object, properties: { name: { type: string }, uid: { type: integer }, gid: { type: integer }, shell: { type: string }, login_allowed: { type: boolean } } } } } }
 
   /api/v1/metrics/realtime:
     get:
