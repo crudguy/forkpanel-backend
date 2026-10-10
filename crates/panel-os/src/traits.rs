@@ -988,6 +988,11 @@ pub struct SiteSpec {
     /// 保留为独立字段是为了让调用方能「构造 spec 时先算好routes、再决定 kind」，
     /// 渲染层以 `kind` 为唯一真相源，本字段只作校验对照（不一致即渲染期报错）。
     pub routes: Option<SiteRoutes>,
+    /// 自定义配置片段（可选）：渲染时原样插入**主 server 块尾部**（在各类
+    /// location / WAF 段之后、闭合 `}` 之前），可放 add_header / location /
+    /// 其它 server 级指令。为原始 nginx 文本——语法由下发前的 `nginx -t`
+    /// 兜底，写入方（panel-api）负责权限（仅 owner）与长度上限。
+    pub custom_conf: Option<String>,
 }
 
 /// WAF 规则档位。

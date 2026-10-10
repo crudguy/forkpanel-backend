@@ -1173,6 +1173,25 @@ fn render_nginx(spec: &SiteSpec) -> String {
             out.push_str("    location / {\n        try_files $uri $uri/ =404;\n    }\n");
         }
     }
+
+    // ── 自定义配置片段（owner 维护；可选）──
+    // 插在主 server 块**尾部**（各类 location / WAF 段之后、闭合 `}` 之前），
+    // 可补 add_header / location / 其它 server 级指令——与整文件手动维护互补：
+    // 那种是「接管、不重渲」，这段始终随表单「保存并应用」重新渲染。
+    // 内容原样透传（不重排缩进）：写坏由下发前的 `nginx -t` 拦截，不会带病上线。
+    if let Some(cc) = spec
+        .custom_conf
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+    {
+        out.push_str("\n    # ── 自定义配置片段（owner 维护；随表单保存重新渲染）──\n");
+        for line in cc.lines() {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+
     out.push_str("}\n");
     out
 }
@@ -2295,6 +2314,7 @@ mod tests {
             spa_fallback: false,
             waf: None,
             routes: None,
+            custom_conf: None,
         }
     }
 
@@ -2818,6 +2838,34 @@ mod tests {
         // 单后端路由不该建 upstream 块（少一层间接）
         let single = render_nginx(&spec_routed());
         assert!(!single.contains("upstream "), "单后端不该建 upstream 块：\n{single}");
+    }
+
+    /// 自定义配置片段：原样插入主 server 块**尾部**（闭合 `}` 之前）。
+    /// 三个必须保住的语义：① 内容逐行原样（不重排缩进——写坏由 nginx -t 拦）；
+    /// ② 空/仅空白片段不产生任何输出；③ 片段在 server 块内（`}` 之前）。
+    #[test]
+    fn custom_conf_inserted_before_server_close_brace() {
+        let mut s = spec_static();
+        s.custom_conf = Some("add_header X-Custom \"1\";\nlocation = /health { return 200; }".into());
+        let out = render_nginx(&s);
+        // ① 内容逐行原样
+        assert!(out.contains("add_header X-Custom \"1\";"), "{out}");
+        assert!(out.contains("location = /health { return 200; }"), "{out}");
+        // ③ 片段位于 server 块的闭合 `}` 之前（不能掉到块外——那会改变指令作用域）
+        let seg = out.find("add_header X-Custom").expect("片段应在输出中");
+        let tail = &out[seg..];
+        assert!(
+            tail.contains("\n}\n"),
+            "片段之后必须有 server 块的闭合花括号：\n{tail}"
+        );
+        // ② 空片段（None / 空白）不产生片段段标
+        s.custom_conf = Some("   \n\t\n".into());
+        assert!(
+            !render_nginx(&s).contains("自定义配置片段"),
+            "空白片段不应渲染任何内容"
+        );
+        s.custom_conf = None;
+        assert!(!render_nginx(&s).contains("自定义配置片段"), "{out}");
     }
 
     /// 多路由的 PHP 必须用 front controller 形式，**不能**用 `location ~ \.php$`。

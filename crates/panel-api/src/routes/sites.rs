@@ -37,6 +37,7 @@ use axum::{
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use panel_core::{cap_keys, domain, PanelError, Result, SafePath};
 use panel_os::{paths::slug, tls};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -78,6 +79,9 @@ struct RawSite {
     /// 与当前表单指纹（`fingerprint_of`）不等 ⇒ 手动维护期间两边已分叉（conf_stale）。
     /// NULL = 无记录（旧行）——对手动维护站点按「未同步」对待。
     conf_snapshot: Option<String>,
+    /// 自定义配置片段（019 迁移）：渲染时插在主 server 块尾部（托管态随表单
+    /// 重渲染；纳入部署指纹——改动会自动触发未同步检测）。NULL / 空串 = 无。
+    custom_conf: Option<String>,
 }
 
 impl RawSite {
@@ -141,6 +145,9 @@ pub struct SiteOut {
     /// 「配置文件最后一次落盘时的指纹」不一致——即面板里看到的规格 ≠ 线上文件。
     /// 由「重新生成配置」（conf/restore）或重新下发（apply）清零。
     pub conf_stale: bool,
+    /// 自定义配置片段（019）：插在主 server 块尾部；null = 无。owner 可编辑，
+    /// 随「保存并应用」重渲染生效（托管态语义）。
+    pub custom_conf: Option<String>,
 }
 
 /// API 口径的单条路由。
@@ -359,6 +366,7 @@ fn deploy_fingerprint(
     waf_rate: Option<i64>,
     waf_burst: Option<i64>,
     routes_json: &str,
+    custom_conf: Option<&str>,
 ) -> String {
     let mut s = String::with_capacity(256);
     let push = |s: &mut String, v: &str| { s.push_str(v); s.push('\u{1f}'); };
@@ -376,6 +384,8 @@ fn deploy_fingerprint(
     push(&mut s, &waf_rate.map(|c| c.to_string()).unwrap_or_default());
     push(&mut s, &waf_burst.map(|c| c.to_string()).unwrap_or_default());
     push(&mut s, routes_json);
+    // 自定义片段（019）参与渲染 → 必须进指纹：否则改了它「未同步」不会亮。
+    push(&mut s, custom_conf.unwrap_or(""));
     s
 }
 
@@ -396,6 +406,7 @@ fn fingerprint_of(r: &RawSite) -> String {
         r.waf_rate,
         r.waf_burst,
         &r.routes_json,
+        r.custom_conf.as_deref(),
     )
 }
 
@@ -430,6 +441,7 @@ fn to_out(r: &RawSite) -> SiteOut {
         routes: routes_from_json(&r.routes_json),
         manual_conf: r.manual_conf != 0,
         conf_stale: conf_stale_of(r),
+        custom_conf: r.custom_conf.clone(),
     }
 }
 
@@ -442,11 +454,12 @@ const SITE_SELECT: &str = "s.id, s.name, s.domains, s.root, s.kind, s.enabled, s
        (SELECT COUNT(*) FROM ssl_certs c WHERE c.site_id = s.id) AS tls_count,
        s.waf_enabled, s.waf_profile, s.waf_rate, s.waf_burst,
        s.upstreams_json, s.fpm, s.spa, s.redirect_target, s.redirect_code, s.conf_path,
-       s.routes_json, s.manual_conf, s.conf_snapshot";
+       s.routes_json, s.manual_conf, s.conf_snapshot, s.custom_conf";
 // ⚠ 列序与下方 `r.get(N)` 一一对应。加列**一律追加到末尾**（routes_json = 18、
-//   manual_conf = 19、conf_snapshot = 20），这样既有索引全部不变——中途插列会让
-//   每个 r.get 静默错位（本项目已踩过一次：tls_count 子查询列把后续整体后移一位，
-//   apply 运行时才报 `Invalid column type`）。三个 fetch 函数中的 get(18/19/20) 必须同步。
+//   manual_conf = 19、conf_snapshot = 20、custom_conf = 21），这样既有索引全部不变——
+//   中途插列会让每个 r.get 静默错位（本项目已踩过一次：tls_count 子查询列把后续
+//   整体后移一位，apply 运行时才报 `Invalid column type`）。
+//   三个 fetch 函数中的 get(18/19/20/21) 必须同步。
 
 /// 站点查询 SQL。
 ///
@@ -488,6 +501,7 @@ async fn fetch_all(state: &Shared) -> Result<Vec<RawSite>> {
                     routes_json: r.get(18)?,
                     manual_conf: r.get(19)?,
                     conf_snapshot: r.get(20)?,
+                    custom_conf: r.get(21)?,
                     })
                 })
                 .map_err(db_err)?;
@@ -530,6 +544,7 @@ async fn fetch_one(state: &Shared, id: i64) -> Result<Option<RawSite>> {
                     routes_json: r.get(18)?,
                     manual_conf: r.get(19)?,
                     conf_snapshot: r.get(20)?,
+                    custom_conf: r.get(21)?,
                 })
             })
             .map_err(db_err)?;
@@ -569,6 +584,7 @@ async fn fetch_one_by_name(state: &Shared, name: &str) -> Result<Option<RawSite>
                     routes_json: r.get(18)?,
                     manual_conf: r.get(19)?,
                     conf_snapshot: r.get(20)?,
+                    custom_conf: r.get(21)?,
                 })
             })
             .map_err(db_err)?;
@@ -772,6 +788,7 @@ pub async fn create(
                     manual_conf: false,
                     // 非手动维护恒无「未同步」（指纹判据要求 manual_conf=1）
                     conf_stale: false,
+                    custom_conf: None,
                 });
             Ok(ok(out))
         }
@@ -915,6 +932,8 @@ async fn render_spec_for_row(
         waf,
         // 路由表已在 `kind` 里（Routed 变体），此字段只是对照——渲染以 kind 为准
         routes: None,
+        // 自定义片段（019）：从落库值重建（与 apply 落库口径一致）
+        custom_conf: row.custom_conf.clone(),
     };
 
     let (target, rendered) = state.os.webserver().render(&spec)?;
@@ -1110,6 +1129,7 @@ pub async fn patch(
                 cur.waf_rate,
                 cur.waf_burst,
                 &cur.routes_json,
+                cur.custom_conf.as_deref(),
             ))
         } else {
             None
@@ -1235,6 +1255,11 @@ pub struct ApplyReq {
     /// （跳过渲染/下发，表单仅入库——此刻两边若不一致，列表会标「未同步」）。
     #[serde(default)]
     pub regen_conf: Option<bool>,
+    /// 自定义配置片段（019；**仅 owner 可改**）：插在主 server 块尾部，随本次
+    /// apply 重新渲染生效（托管态语义——与整文件手动维护互补）。
+    /// 缺省 = 保留库中现值；显式空串/空白 = 清空。上限 64 KiB。
+    #[serde(default)]
+    pub custom_conf: Option<String>,
 }
 
 /// WAF 请求体。
@@ -1447,6 +1472,24 @@ pub async fn apply(
     // 取一次现运行配置：TLS 与 WAF 都要基于"当前状态"做缺省合并
     let cur_row = fetch_one_by_name(&state, &req.name).await?;
     let waf = build_waf(req.waf.as_ref(), cur_row.as_ref().and_then(|r| r.waf()).as_ref())?;
+    // 自定义配置片段（019）：原始 nginx 文本（写坏≈root 级事故）→ **仅 owner 可改**，
+    // 64 KiB 上限。缺省 = 保留库中现值（与 waf 同语义：不传 ≠ 清空）；
+    // 显式空串/全空白 = 清空。语法由下方渲染后的 `nginx -t` 兜底，写坏不会上线。
+    let custom_conf_db: Option<String> = match req.custom_conf.as_ref() {
+        None => cur_row.as_ref().and_then(|r| r.custom_conf.clone()),
+        Some(v) => {
+            if s.role != "owner" {
+                return Err(ApiError::forbidden("owner"));
+            }
+            if v.len() > 64 * 1024 {
+                return Err(ApiError::bad_request(
+                    "custom_conf",
+                    "自定义片段超过 64 KiB 上限",
+                ));
+            }
+            if v.trim().is_empty() { None } else { Some(v.clone()) }
+        }
+    };
     // 停用态守恒：站点已停用则只更新配置、不下发 Web 服务器（conf_path 留空），
     // 与 `patch` 的「真停用」语义一致——避免「点一次应用就把刚停用的站点又拉起来」。
     // 新建站点（无 cur_row）按默认启用对待，照常部署。
@@ -1616,6 +1659,8 @@ pub async fn apply(
         waf,
         // 路由表已在 `kind` 里（Routed 变体），此字段只是对照——渲染以 kind 为准
         routes: None,
+        // 自定义片段（019）：落库值同时进 spec 与指纹（clone 一份后面还要写库）
+        custom_conf: custom_conf_db.clone(),
     };
     // 覆盖前备份：本次要写/换掉的磁盘文件里是**用户手改的内容**（manual_conf=1；
     // 由 manual_skip 的定义可知，只有显式 regen 才会走到这里）→ 先把旧文件备份。
@@ -1637,6 +1682,9 @@ pub async fn apply(
 
     // 4) 渲染 + 校验 + 下发（手动维护站点整段跳过：不重渲染、不覆盖、不 reload，
     //    conf_path 保持落库现值——那正是用户正在维护的那个文件）。
+    // 版本留档（018）：真正落盘的内容在下面留存，落库成功后再进版本链
+    // （落库失败不留档——版本链记录的必须是「已生效」的历史）。
+    let mut archived_render: Option<String> = None;
     let conf = if manual_skip {
         cur_row.as_ref().and_then(|r| r.conf_path.clone()).unwrap_or_default()
     } else {
@@ -1654,6 +1702,8 @@ pub async fn apply(
         //    配置不会进 nginx，与「真停用」一致；用户启用站点后再应用才会真正生效。
         if deploy {
             state.os.webserver().deploy(&target, &rendered).await?;
+            // 文件已真实落盘 → 留存待版本链（落库成功后入库；见下方 archive 调用）
+            archived_render = Some(rendered.clone());
 
             // 5.5) 域名改过则旧文件名成了孤儿：新配置已就位，**此刻**才轮到删旧配置。
             //      `remove` 自带 reload —— 删过就等于重载过了，不再重复 reload。
@@ -1699,6 +1749,7 @@ pub async fn apply(
         waf_rate,
         waf_burst,
         &routes_json,
+        custom_conf_db.as_deref(),
     );
     // 指纹只在「文件确实被写/删」时更新：
     // - 手动维护跳过下发：文件未动 → 保持旧值（更新它等于谎报「已同步」）
@@ -1707,7 +1758,7 @@ pub async fn apply(
     let snap_db: Option<String> = if manual_skip {
         cur_row.as_ref().and_then(|r| r.conf_snapshot.clone())
     } else if deploy {
-        Some(fingerprint_new)
+        Some(fingerprint_new.clone())
     } else {
         None
     };
@@ -1723,8 +1774,8 @@ pub async fn apply(
             conn.execute(
                 "INSERT INTO sites(name, domains, root, kind, webserver, enabled, conf_path, created_at,
                                    waf_enabled, waf_profile, waf_rate, waf_burst, upstreams_json, fpm,
-                                   spa, redirect_target, redirect_code, routes_json, conf_snapshot)
-                 VALUES(?1, ?2, ?3, ?4, 'nginx', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                                   spa, redirect_target, redirect_code, routes_json, conf_snapshot, custom_conf)
+                 VALUES(?1, ?2, ?3, ?4, 'nginx', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?20)
                  ON CONFLICT(name) DO UPDATE SET
                     domains=excluded.domains, root=excluded.root, kind=excluded.kind, enabled=?5,
                     conf_path=?6, webserver='nginx',
@@ -1734,16 +1785,27 @@ pub async fn apply(
                     spa=excluded.spa, redirect_target=excluded.redirect_target,
                     redirect_code=excluded.redirect_code, routes_json=excluded.routes_json,
                     conf_snapshot=excluded.conf_snapshot,
+                    custom_conf=excluded.custom_conf,
                     manual_conf=COALESCE(?19, manual_conf)",
                 rusqlite::params![name, domains_json, root_str, kind_db, enabled_i32, conf_db, now,
                                   waf_on, waf_profile, waf_rate, waf_burst,
                                   upstreams_json, fpm_str, spa_i32, redirect_target_db, redirect_code_db,
-                                  routes_json, snap_db, clear_manual],
+                                  routes_json, snap_db, clear_manual, custom_conf_db],
             )
             .map(|_| panel_db::WriteAck { rows_changed: 1 })
             .map_err(|e| PanelError::Database(e.to_string()))
         })
         .await?;
+
+    // 版本留档（018）：真实落盘 + 落库成功 → 进版本链（「重新生成」与普通下发作区分）。
+    // 站点 id 回读——apply 按 name upsert，新建站点的 id 由本次落库才生成。
+    if let Some(content) = archived_render {
+        if let Some(row) = fetch_one_by_name(&state, &req.name).await? {
+            let source = if was_manual { "regen" } else { "apply" };
+            archive_conf_version(&state, row.id, &content, Some(fingerprint_new), source, &s.username)
+                .await;
+        }
+    }
 
     audit(&state, &s, "site.apply", &req.name, "ok").await;
     Ok(ok(serde_json::json!({
@@ -1797,6 +1859,42 @@ pub async fn reload(
 // 017 迁移再补一拍：conf_snapshot 指纹让「表单已改、文件没跟上」的**静默**分叉
 // 变成可见状态（conf_stale / 「未同步」），并在覆盖手改内容前自动备份。
 
+/// 解析站点配置的写盘目标路径并做纵深校验（`conf_put` / `conf_rollback` 共用——
+/// 同一约束两条路径必须同源，历史上「两路漏配」是本项目最高发 bug 之一）。
+///
+/// 规则：优先落库 `conf_path`（曾下发过，可能带着旧域名文件名）；从未下发则按
+/// provider 的命名规则推导（与 render 同源，**绝不由前端指定路径**）。
+/// 父目录必须就是 Web 配置目录且路径不含 `..`——防被篡改的库值把写操作引到别处。
+fn resolve_conf_target(state: &Shared, row: &RawSite) -> ApiResult<PathBuf> {
+    let target: PathBuf = match row
+        .conf_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        Some(p) => PathBuf::from(p),
+        None => {
+            let domains: Vec<String> = serde_json::from_str(&row.domains).unwrap_or_default();
+            if domains.is_empty() {
+                return Err(ApiError::bad_request("conf", "站点缺少域名，无法推导配置文件路径"));
+            }
+            state.os.webserver().conf_path(&domains)
+        }
+    };
+    let conf_dir = state.os.paths().web_conf_dir();
+    let parent_ok = target.parent().map(|p| p == conf_dir).unwrap_or(false)
+        && !target
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir));
+    if !parent_ok {
+        return Err(ApiError::bad_request(
+            "conf_path",
+            "落库配置路径不在 Web 配置目录内，拒绝写入",
+        ));
+    }
+    Ok(target)
+}
+
 /// 覆盖手动配置前的备份：复制到 `<data_dir>/conf-backups/<文件名>.<unix>.bak`，
 /// 同前缀仅保留最近 10 份（`prune_keep_newest` 按 mtime 判新旧）。
 ///
@@ -1828,6 +1926,81 @@ async fn backup_manual_conf(state: &Shared, conf_path: &Path) -> Option<PathBuf>
     })
     .await;
     Some(dest)
+}
+
+/// 配置内容指纹（SHA-256 十六进制）——版本去重与「当前版本」标记用。
+fn conf_hash(content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    const T: &[u8; 16] = b"0123456789abcdef";
+    let d = Sha256::digest(content.as_bytes());
+    let mut s = String::with_capacity(64);
+    for &x in d.iter() {
+        s.push(T[(x >> 4) as usize] as char);
+        s.push(T[(x & 0xf) as usize] as char);
+    }
+    s
+}
+
+/// 给站点配置留档一版（去重 + 每站保留最新 20 版）。
+///
+/// 调用点 = 全部写入口：apply 正常下发 / conf_restore 重新渲染 / conf_put 手动
+/// 保存 / conf_rollback 回滚（回滚前先把现场留档）。与**最新版**内容相同（hash
+/// 相等）不重复入库——反复「保存并应用」不会堆出一串一模一样的版本。
+///
+/// `fingerprint` 记录「这版内容对应的部署指纹」（可空）：回滚时若某版的指纹恰好
+/// 等于当前表单指纹，说明那份内容正是表单产物 → 回滚后站点可回「面板托管」；
+/// 否则按手动维护处理（快照=版本指纹，表单再分叉时「未同步」照常亮）。
+///
+/// 失败不阻断主流程（版本链是安全网，与 `backup_manual_conf` 同哲学）——
+/// 但必须出声：静默丢版本链比报错更危险。
+async fn archive_conf_version(
+    state: &Shared,
+    site_id: i64,
+    content: &str,
+    fingerprint: Option<String>,
+    source: &str,
+    operator: &str,
+) {
+    let hash = conf_hash(content);
+    let content = content.to_string();
+    // 闭包要 move 走一个 String；原 `source`（&str）留着给收尾日志用，
+    // 否则日志会借用已 move 的值（E0382）。
+    let source_in = source.to_string();
+    let operator = operator.to_string();
+    let res = state
+        .db
+        .exec(move |conn| {
+            // 去重：与最新版相同则跳过（避免反复 apply 堆同内容版本）
+            let last: Option<String> = conn
+                .query_row(
+                    "SELECT hash FROM site_conf_versions WHERE site_id = ?1 ORDER BY id DESC LIMIT 1",
+                    [site_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| PanelError::Database(e.to_string()))?;
+            if last.as_deref() == Some(hash.as_str()) {
+                return Ok(panel_db::WriteAck { rows_changed: 0 });
+            }
+            conn.execute(
+                "INSERT INTO site_conf_versions(site_id, content, hash, fingerprint, source, operator, created_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![site_id, content, hash, fingerprint, source_in, operator, crate::now_unix()],
+            )
+            .map_err(|e| PanelError::Database(e.to_string()))?;
+            // 每站保留最新 20 版（写入后立即裁剪，防无限增长）
+            conn.execute(
+                "DELETE FROM site_conf_versions WHERE site_id = ?1 AND id NOT IN (
+                     SELECT id FROM site_conf_versions WHERE site_id = ?1 ORDER BY id DESC LIMIT 20)",
+                [site_id],
+            )
+            .map_err(|e| PanelError::Database(e.to_string()))?;
+            Ok(panel_db::WriteAck { rows_changed: 1 })
+        })
+        .await;
+    if let Err(e) = res {
+        eprintln!("[sites] archive_conf_version(site={site_id}, source={source}) 失败: {e}");
+    }
 }
 
 /// 读取站点当前的 Web 服务器配置文件内容。
@@ -1912,37 +2085,8 @@ pub async fn conf_put(
         return Err(ApiError::bad_request("content", "配置内容超过 1 MiB 上限"));
     }
 
-    // 目标路径：优先落库 conf_path（曾下发过，可能带着旧域名文件名）；从未下发则按
-    // provider 的命名规则推导——与 render 同源（绝不由前端指定路径）。
-    let target: PathBuf = match row
-        .conf_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-    {
-        Some(p) => PathBuf::from(p),
-        None => {
-            let domains: Vec<String> = serde_json::from_str(&row.domains).unwrap_or_default();
-            if domains.is_empty() {
-                return Err(ApiError::bad_request("conf", "站点缺少域名，无法推导配置文件路径"));
-            }
-            state.os.webserver().conf_path(&domains)
-        }
-    };
-    // 纵深防御：conf_path 理论上只由面板写入，但写盘操作值得再验一次「父目录就是
-    // Web 配置目录」——防止被篡改的库值把 root 写入引到别处（lexical 检查已足够：
-    // 带 `..` 的伪造路径其 parent 必然不相等）。
-    let conf_dir = state.os.paths().web_conf_dir();
-    let parent_ok = target.parent().map(|p| p == conf_dir).unwrap_or(false)
-        && !target
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir));
-    if !parent_ok {
-        return Err(ApiError::bad_request(
-            "conf_path",
-            "落库配置路径不在 Web 配置目录内，拒绝写入",
-        ));
-    }
+    // 目标路径 + 纵深校验：与 conf_rollback 共用同一函数（两路同源）
+    let target = resolve_conf_target(&state, &row)?;
 
     // 校验（独立 wrapper 跑 nginx -t，不触碰线上配置）→ 失败 40002 + 原始 stderr
     if let Err(e) = state.os.webserver().validate(&req.content).await {
@@ -1976,6 +2120,11 @@ pub async fn conf_put(
         .await?;
 
     audit(&state, &s, "site.conf.edit", &id.to_string(), "ok").await;
+    // 版本留档（018）：手动保存 = 一条新的「已生效历史」（source=manual）。
+    // 指纹与上面 conf_snapshot 同源（保存后：文件=用户文本、快照=当前表单——
+    // 两者此刻配对；未来表单再改，「未同步」照常亮起）。
+    archive_conf_version(&state, id, &req.content, Some(fingerprint_of(&row)), "manual", &s.username)
+        .await;
     Ok(ok(serde_json::json!({ "path": path_str, "manual": true, "stale": false, "reloaded": true })))
 }
 
@@ -2070,6 +2219,9 @@ pub async fn conf_restore(
         .await?;
 
     audit(&state, &s, "site.conf.restore", &id.to_string(), "ok").await;
+    // 版本留档（018）：重新生成 = 按表单渲染的产物（source=regen）
+    archive_conf_version(&state, id, &rendered, Some(fingerprint_of(&row)), "regen", &s.username)
+        .await;
     Ok(ok(serde_json::json!({
         "path": path_str,
         "manual": false,
@@ -2077,6 +2229,234 @@ pub async fn conf_restore(
         "deployed": true,
         "reloaded": true,
         "backup": backup_path,
+    })))
+}
+
+// ─────────────── 站点配置：版本历史 / 回滚（018 迁移） ───────────────
+//
+// 版本链是配置生命周期的另一半：写入口（apply/regen/manual/rollback）每次都把
+// 生效内容留档（同 hash 去重、每站保留 20 版）。回滚 = 选任一天历史版本作为新的
+// 「当前文件」：nginx -t 校验 → 原子替换 → reload；被恢复的内容与被你替换掉的
+// 现场都会进版本链。回滚后自动定态：版本指纹 == 当前表单指纹 ⇒ 内容正是表单
+// 产物 → 回「面板托管」；否则转「手动维护」（表单再分叉时「未同步」照常亮）。
+
+/// 版本历史列表：倒序返回最近 20 版**元数据**（不含正文——正文按需单取，
+/// 避免一次拉 20 份全文）。每项附 `current`：该版内容 == 磁盘当前内容。
+pub async fn conf_versions(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    AxPath(id): AxPath<i64>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::SITE_MANAGE)?;
+    let row = fetch_one(&state, id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("site"))?;
+    // 磁盘当前内容 hash（文件缺失 → None：所有版本 current=false，如实呈现）
+    let cur_hash: Option<String> = match row
+        .conf_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        Some(p) => tokio::fs::read_to_string(p)
+            .await
+            .ok()
+            .map(|c| conf_hash(&c)),
+        None => None,
+    };
+    let items: Vec<serde_json::Value> = state
+        .pool
+        .with(move |conn| {
+            let mut st = conn
+                .prepare(
+                    "SELECT id, hash, source, operator, created_at, LENGTH(content)
+                     FROM site_conf_versions WHERE site_id = ?1 ORDER BY id DESC LIMIT 20",
+                )
+                .map_err(db_err)?;
+            let rows = st
+                .query_map([id], |r| {
+                    let hash: String = r.get(1)?;
+                    Ok(serde_json::json!({
+                        "id": r.get::<_, i64>(0)?,
+                        "hash": hash,
+                        "source": r.get::<_, String>(2)?,
+                        "operator": r.get::<_, String>(3)?,
+                        "created_at": r.get::<_, i64>(4)?,
+                        "size": r.get::<_, i64>(5)?,
+                        "current": cur_hash.as_deref() == Some(hash.as_str()),
+                    }))
+                })
+                .map_err(db_err)?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(db_err)?);
+            }
+            Ok(out)
+        })
+        .await?;
+    Ok(ok(serde_json::json!({ "items": items })))
+}
+
+/// 单个历史版本的正文（回滚前预览用）。版本必须属于本站点（`AND site_id = ?2`，
+/// 防跨站读取——版本 id 是全局自增，不校验归属就成越权面）。
+pub async fn conf_version_get(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    AxPath((id, vid)): AxPath<(i64, i64)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::SITE_MANAGE)?;
+    fetch_one(&state, id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("site"))?;
+    let v = state
+        .pool
+        .with(move |conn| {
+            conn.query_row(
+                "SELECT id, content, hash, source, operator, created_at
+                 FROM site_conf_versions WHERE id = ?1 AND site_id = ?2",
+                rusqlite::params![vid, id],
+                |r| {
+                    Ok(serde_json::json!({
+                        "id": r.get::<_, i64>(0)?,
+                        "content": r.get::<_, String>(1)?,
+                        "hash": r.get::<_, String>(2)?,
+                        "source": r.get::<_, String>(3)?,
+                        "operator": r.get::<_, String>(4)?,
+                        "created_at": r.get::<_, i64>(5)?,
+                    }))
+                },
+            )
+            .optional()
+            .map_err(db_err)
+        })
+        .await?;
+    let Some(v) = v else {
+        return Err(ApiError::not_found("version"));
+    };
+    Ok(ok(v))
+}
+
+/// 回滚定态：决定回滚后站点归「面板托管」还是「手动维护」。
+///
+/// 判据 = 版本留档时记录的部署指纹 vs **当前**表单指纹：
+/// - 相等 ⇒ 这版内容正是当前表单的产物（例如先改了表单没下发、又想退回上一版
+///   渲染结果）→ 回「面板托管」，快照=表单指纹（天然已同步）。
+/// - 否则 ⇒ 转「手动维护」，快照=版本指纹；版本无指纹（旧行/外部来源）则留
+///   NULL——「未同步」照常亮起，向提示的一侧倾斜（与 017 同哲学）。
+fn rollback_state(ver_fp: Option<&str>, form_fp: &str) -> (i32, Option<String>) {
+    if ver_fp == Some(form_fp) {
+        (0, Some(form_fp.to_string()))
+    } else {
+        (1, ver_fp.map(str::to_string))
+    }
+}
+
+/// 回滚请求体。
+#[derive(Debug, Deserialize)]
+pub struct ConfRollbackReq {
+    /// 目标版本 id（`site_conf_versions.id`）
+    pub version_id: i64,
+}
+
+/// 回滚到指定历史版本。⚠ 与 `conf_put` 同为「root 级写入面」，仅 owner。
+///
+/// 顺序：nginx -t 校验（失败 40002 + 原始 stderr，旧文件纹丝不动）→ 现场留档
+/// （磁盘当前内容进版本链，源=rollback）→ 原子替换 → reload → 自动定态 + 留档。
+pub async fn conf_rollback(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    AxPath(id): AxPath<i64>,
+    Json(req): Json<ConfRollbackReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::SITE_MANAGE)?;
+    if s.role != "owner" {
+        return Err(ApiError::forbidden("owner"));
+    }
+    if !state
+        .capabilities
+        .get(cap_keys::WEBSERVER_MANAGE)
+        .map(|c| c.supported)
+        .unwrap_or(false)
+    {
+        return Err(ApiError::unsupported("webserver.manage"));
+    }
+    let row = fetch_one(&state, id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("site"))?;
+    if row.enabled == 0 {
+        return Err(ApiError::bad_request(
+            "enabled",
+            "站点已停用（配置已从 Web 服务器移除）；请先启用后再回滚配置",
+        ));
+    }
+    // 目标版本（必须属于本站点）
+    let vid = req.version_id;
+    let ver = state
+        .pool
+        .with(move |conn| {
+            conn.query_row(
+                "SELECT content, fingerprint FROM site_conf_versions WHERE id = ?1 AND site_id = ?2",
+                rusqlite::params![vid, id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .optional()
+            .map_err(db_err)
+        })
+        .await?;
+    let Some((content, ver_fp)) = ver else {
+        return Err(ApiError::not_found("version"));
+    };
+    // 校验（独立 wrapper 跑 nginx -t，不触碰线上）→ 失败 40002 + 原始 stderr
+    if let Err(e) = state.os.webserver().validate(&content).await {
+        audit(&state, &s, "site.conf.rollback", &id.to_string(), "fail").await;
+        return Err(ApiError::from(PanelError::ConfigInvalid {
+            detail: e.to_string(),
+        }));
+    }
+    let target = resolve_conf_target(&state, &row)?;
+    // 现场留档：磁盘当前内容进版本链（source=rollback；与最新版相同则自动去重）。
+    // 外部手改（面板不知情）的内容也由此获得一条可回溯记录。指纹沿用站点快照
+    // ——它记录的正是「这版文件对应的部署指纹」。
+    if let Ok(cur) = tokio::fs::read_to_string(&target).await {
+        archive_conf_version(&state, id, &cur, row.conf_snapshot.clone(), "rollback", &s.username)
+            .await;
+    }
+    // 原子替换 + reload（reload 失败时配置已写入、语法已验过，可恢复——与 apply 同口径）
+    state.os.webserver().deploy(&target, &content).await?;
+    if let Err(e) = state.os.webserver().reload().await {
+        return Err(ApiError::from(PanelError::Command {
+            bin: "reload".to_string(),
+            detail: format!("配置已写入但 reload 失败：{e}"),
+        }));
+    }
+    // 自动定态（判据见 `rollback_state` 与其单测）
+    let form_fp = fingerprint_of(&row);
+    let (manual_new, snap_new) = rollback_state(ver_fp.as_deref(), &form_fp);
+    let path_str = target.display().to_string();
+    let path_db = path_str.clone();
+    state
+        .db
+        .exec(move |conn| {
+            conn.execute(
+                "UPDATE sites SET manual_conf = ?3, conf_path = ?1, conf_snapshot = ?4 WHERE id = ?2",
+                rusqlite::params![path_db, id, manual_new, snap_new],
+            )
+            .map(|n| panel_db::WriteAck { rows_changed: n })
+            .map_err(|e| PanelError::Database(e.to_string()))
+        })
+        .await?;
+
+    audit(&state, &s, "site.conf.rollback", &id.to_string(), "ok").await;
+    // 被恢复的内容也进版本链（指纹继承版本）：列表最新 = 当前磁盘事实
+    archive_conf_version(&state, id, &content, ver_fp, "rollback", &s.username).await;
+    Ok(ok(serde_json::json!({
+        "path": path_str,
+        "manual": manual_new != 0,
+        // 定态后 manual=1 时快照（版本指纹）≠ 当前表单指纹，恒「未同步」——如实报告
+        "stale": manual_new != 0,
+        "deployed": true,
+        "reloaded": true,
+        "restored_from": req.version_id,
     })))
 }
 
@@ -3269,6 +3649,7 @@ mod tests {
             routes_json: "[]".into(),
             manual_conf: 1,
             conf_snapshot: None,
+            custom_conf: None,
         }
     }
 
@@ -3335,8 +3716,40 @@ mod tests {
     #[test]
     fn fingerprint_is_separator_safe() {
         // 分隔符回归：没有 \u{1f} 时 ("a","bc") 与 ("ab","c") 会撞同一指纹 → 漏报
-        let a = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None, false, None, None, None, "[]");
-        let b = deploy_fingerprint("ab", "c", "/r", "static", false, None, None, None, None, false, None, None, None, "[]");
+        let a = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None, false, None, None, None, "[]", None);
+        let b = deploy_fingerprint("ab", "c", "/r", "static", false, None, None, None, None, false, None, None, None, "[]", None);
         assert_ne!(a, b, "字段边界必须由分隔符保护");
+        // 自定义片段（019）参与指纹：只差它一处也必须产生不同指纹
+        // ——否则改了 custom_conf「未同步」不会亮，等于坏了 017 的核心承诺。
+        let c = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None, false, None, None, None, "[]", Some("add_header X-A 1;"));
+        assert_ne!(a, c, "custom_conf 必须进入指纹");
+        let d = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None, false, None, None, None, "[]", Some("add_header X-A 2;"));
+        assert_ne!(c, d, "custom_conf 内容变化必须反映到指纹");
+    }
+
+    #[test]
+    fn conf_hash_stable_distinct_and_hex() {
+        // SHA-256 hex（64 字符）：版本去重与「当前版本」标记的比较基准
+        let a = conf_hash("server { listen 80; }\n");
+        assert_eq!(a.len(), 64);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(a, conf_hash("server { listen 80; }\n"), "同内容必须同 hash");
+        assert_ne!(a, conf_hash("server { listen 81; }\n"), "一字节之差必须不同");
+    }
+
+    #[test]
+    fn rollback_state_managed_iff_fingerprint_matches_form() {
+        // 版本指纹 == 当前表单指纹 → 回托管、快照=表单指纹（天然已同步）
+        let (m, snap) = rollback_state(Some("FP"), "FP");
+        assert_eq!(m, 0);
+        assert_eq!(snap.as_deref(), Some("FP"));
+        // 不等 → 手动维护、快照=版本指纹
+        let (m, snap) = rollback_state(Some("OLD"), "FP");
+        assert_eq!(m, 1);
+        assert_eq!(snap.as_deref(), Some("OLD"));
+        // 版本无指纹（旧行）→ 手动维护 + NULL 快照（conf_stale_of 判「未同步」）
+        let (m, snap) = rollback_state(None, "FP");
+        assert_eq!(m, 1);
+        assert!(snap.is_none());
     }
 }

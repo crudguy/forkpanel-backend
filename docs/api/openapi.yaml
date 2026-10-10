@@ -476,6 +476,7 @@ components:
         routes:          { type: array, items: { $ref: '#/components/schemas/SiteRoute' }, description: "多路由表（kind=routed 时非空；其余恒为 []，不会返回 null）" }
         manual_conf:     { type: boolean, description: "手动维护：true = 磁盘上的配置文件由用户原始编辑维护，表单「保存并应用」不再覆盖它；可经「恢复面板托管」清零（停用/重新启用路径也会清零）" }
         conf_stale:      { type: boolean, description: "**未同步**（仅 manual_conf=true 且站点启用时有意义）：表单的部署相关字段与「配置文件最后一次落盘时的指纹」不一致——即面板里看到的规格 ≠ 线上文件（表单改过、文件没跟上）。由「重新生成配置」（conf/restore 或 apply 带 regen_conf）清零" }
+        custom_conf:     { type: [string, "null"], description: "自定义配置片段（owner 维护）：插在主 server 块尾部，随表单「保存并应用」重新渲染；null = 无。与「手动维护」互补——片段属托管态（随保存重渲染），整文件手动维护则不被覆盖" }
     SiteRoute:
       type: object
       required: [prefix, kind]
@@ -599,6 +600,7 @@ components:
         routes:      { type: array, items: { $ref: '#/components/schemas/SiteRoute' }, description: "kind=routed 的路由表（至少一条，且必须含一条 prefix=/ 的兜底）。**省略 = 保留库中现有路由表**（与 waf 同语义，不静默清空）" }
         waf:         { $ref: '#/components/schemas/SiteWaf' }
         regen_conf:  { type: boolean, default: false, description: "手动维护站点的「重新生成配置」开关：true = 忽略手动维护保护，按本次表单**重新渲染并覆盖**磁盘配置（覆盖前自动备份到 <data_dir>/conf-backups/），成功后清零 manual_conf（回到面板托管）。缺省 false = 保持保护语义（跳过渲染/下发、表单仅入库）——此后若两边不一致，Site.conf_stale 会亮起" }
+        custom_conf: { type: [string, "null"], description: "自定义配置片段：插在主 server 块尾部（所有 location 之后）。null = 清除、省略 = 保留库中现值（与 routes/waf 同「不静默清空」语义）；仅 owner 可改（非 owner 提交即 403）；上限 64 KiB；内容随部署指纹，改动会触发「未同步」判定" }
     Cert:
       type: object
       properties:
@@ -1572,8 +1574,9 @@ paths:
       description: |
         手动维护（manual_conf=1）的站点缺省**整段跳过渲染/下发**（保护手改内容，表单仅入库）；
         显式 regen_conf=true 才按本次表单重新渲染覆盖（覆盖前自动备份到 <data_dir>/conf-backups/），
-        成功后清零 manual 标记。成功响应 data 含：manual（是否走了跳过路径）、regenerated（本次是否
-        重新生成）、backup（覆盖前备份路径，可为 null）、deployed / reloaded。
+        成功后清零 manual 标记。custom_conf 仅 owner 可改（非 owner 提交即 403）。下发的配置内容
+        自动进入历史版本链（source=apply，与最新版相同则去重）。成功响应 data 含：manual（是否走了
+        跳过路径）、regenerated（本次是否重新生成）、backup（覆盖前备份路径，可为 null）、deployed / reloaded。
       security: [cookieAuth, csrfHeader]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SiteApply' } } } }
       responses:
@@ -1703,6 +1706,7 @@ paths:
         顺序与 apply 一致：先 nginx -t 校验（独立 wrapper，不触碰线上配置）——失败返回 40002 并带
         原始 stderr，旧文件纹丝不动；通过才原子替换并 reload。成功后站点置 manual_conf=1，表单
         「保存并应用」不再覆盖该文件（可经 conf/restore 恢复面板托管）。站点停用（配置未下发）时拒绝编辑。
+        写入内容自动进入历史版本链（source=manual；与最新版相同则去重）。
         成功响应 data：path、manual（true）、stale（false——此刻文件已对齐表单）、reloaded（true）。
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
@@ -1735,6 +1739,59 @@ paths:
         '200': { description: ok }
         '403': { description: 仅 owner }
         '404': { description: 站点不存在 }
+        '501': { description: 无 Web 服务器底座（webserver.manage） }
+  /api/v1/sites/{id}/conf/versions:
+    get:
+      tags: [sites]
+      summary: 配置历史版本列表（最新在前，每站保留 20 版）
+      description: |
+        四个写入口自动留档：apply（表单下发）/ regen（按表单重新生成）/ manual（手动保存）/ rollback（回滚）。
+        与最新版内容相同（hash 相等）的写入不重复留档；写入后立即裁剪到最新 20 版。
+        current = 该版本内容是否与磁盘当前文件一致（文件缺失/未下发时全部 false）。
+        成功响应 data：items（数组，元素为 {id, hash, source, operator, created_at, size, current}）。
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: ok }
+        '404': { description: 站点不存在 }
+  /api/v1/sites/{id}/conf/versions/{vid}:
+    get:
+      tags: [sites]
+      summary: 单个历史版本的正文（回滚前预览）
+      description: 版本必须属于该站点（`AND site_id` 校验；跨站读取返回 404）。成功响应 data：id、content、hash、source、operator、created_at。
+      security: [cookieAuth, csrfHeader]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+        - { name: vid, in: path, required: true, schema: { type: integer } }
+      responses:
+        '200': { description: ok }
+        '404': { description: 站点或版本不存在 }
+  /api/v1/sites/{id}/conf/rollback:
+    post:
+      tags: [sites]
+      summary: 回滚到指定历史版本（nginx -t 校验 → 现场留档 → 原子替换 → reload；仅 owner）
+      description: |
+        顺序与 conf PUT 相同：先 nginx -t 校验（失败返回 40002 + 原始 stderr，旧文件纹丝不动），
+        通过才把磁盘当前内容留档（source=rollback，外部手改也由此获得可回溯记录）→ 原子替换 → reload。
+        自动定态：版本指纹 == 当前表单指纹 ⇒ 回「面板托管」（stale=false）；否则转「手动维护」
+        （stale=true，如实报告）。站点停用（配置未下发）时拒绝。
+        成功响应 data：path、manual、stale、deployed、reloaded、restored_from（本轮恢复的版本 id）。
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [version_id]
+              properties:
+                version_id: { type: integer, description: 目标版本 id（site_conf_versions.id，必须属于该站点） }
+      responses:
+        '200': { description: ok }
+        '400': { description: 校验失败（返回 nginx -t 原始 stderr）或站点已停用 }
+        '403': { description: 仅 owner }
+        '404': { description: 站点或版本不存在 }
         '501': { description: 无 Web 服务器底座（webserver.manage） }
   /api/v1/sites/{id}/logs:
     get:

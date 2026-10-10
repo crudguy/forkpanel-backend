@@ -602,6 +602,8 @@ async fn apply_site(state: &Shared, session: &Session, app: &RawApp) -> ApiResul
         waf: None,
         // 应用托管是**面板自己**在维护配置，从不涉及"手动维护重新生成"——恒 None。
         regen_conf: None,
+        // 应用托管不暴露「自定义片段」编辑（那是「网站」页的高级功能）——恒 None = 保留库中现值。
+        custom_conf: None,
     };
     // 直接 `?`：apply 失败必须让本次保存失败——否则 DB 说已建站、nginx 却没配置，
     // 用户下次排查会面对「应用在、站点不在」的错觉。
