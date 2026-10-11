@@ -22,6 +22,31 @@ fn acme_live_dir(domain: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("/etc/letsencrypt/live/{domain}"))
 }
 
+/// 生成 HTTP Basic Auth 的口令行（`user:apr1摘要`，与 `htpasswd -m` 同款）。
+///
+/// 与自签证书同走 `cmd.rs` 受控外呼（argv 直传、不经 shell、强制超时）。口令只在
+/// 这一刻出现：**不落库、不入日志、不出现在任何响应里**。返回整行文本，由调用方写
+/// 进 htpasswd 文件（nginx 的 `auth_basic_user_file` 读它）。
+pub async fn htpasswd_line(user: &str, pass: &str) -> Result<String> {
+    let r = crate::cmd::run(
+        Bin::OpenSsl,
+        &["passwd", "-apr1", pass],
+        CmdOpt { timeout: Duration::from_secs(10), ..Default::default() },
+    )
+    .await;
+    match r {
+        Ok(o) if o.code == Some(0) => {
+            let h = o.stdout.trim().to_string();
+            if h.is_empty() {
+                return Err(PanelError::Command { bin: "openssl".into(), detail: "passwd 返回空摘要".into() });
+            }
+            Ok(format!("{user}:{h}"))
+        }
+        Ok(o) => Err(PanelError::Command { bin: "openssl".into(), detail: truncate(&o.stderr, 500) }),
+        Err(e) => Err(e),
+    }
+}
+
 /// 以 **http-01 webroot** 方式用 certbot 签发证书。
 ///
 /// 走 `cmd::run`（唯一子进程出口，argv 直传不经 shell）；域名与邮箱由调用方校验。

@@ -487,6 +487,18 @@ components:
         rewrite_preset:  { type: string, enum: [none, wordpress, laravel, thinkphp, typecho, discuz, custom], description: "伪静态预置模板（020，仅 php 类型有意义）：预置值替换默认的 try_files 兜底；custom 时使用 rewrite_custom；none = 不做伪静态" }
         rewrite_custom:  { type: [string, "null"], description: "rewrite_preset=custom 时的原始 rewrite 文本（020）：原样进 `location /`，上限 64 KiB；其余为 null" }
         conf_external:   { type: boolean, description: "外部修改（020）：磁盘上的配置文件与「最后一次落盘的内容」不一致——文件在面板之外被改动过。面板**不会**静默覆盖它（无从判断是人工有意、脚本误写还是攻击），由用户决定「重新生成覆盖 / 改为自定义片段 / 手动接管」" }
+        # ── 021：访问控制 / 反代增强 / 站点日志 ──
+        ip_allow:       { type: [array, "null"], items: { type: string }, description: "IP 白名单（单 IP 或 CIDR，IPv4）。非空即进入白名单模式：只放行名单内、其余 deny all，此时 ip_deny 被忽略（UI 二者互斥置灰）" }
+        ip_deny:        { type: [array, "null"], items: { type: string }, description: "IP 黑名单（单 IP 或 CIDR，IPv4）。ip_allow 非空时被忽略" }
+        auth_basic:     { type: boolean, description: "HTTP Basic Auth 开关（口令不落库，仅在其设置时经 openssl 生成 apr1 摘要写入 htpasswd 文件）" }
+        auth_user:      { type: [string, "null"], description: "Basic Auth 用户名（auth_basic=true 时必填）" }
+        lb_policy:      { type: string, enum: [least_conn, ip_hash], description: "多后端负载均衡策略（021）：least_conn = 最小连接（默认）、ip_hash = 同客户端落同后端。单后端时 upstream 块不存在、策略不生效" }
+        proxy_connect_timeout: { type: integer, description: "反代建连超时（秒，1~3600），默认 60" }
+        proxy_send_timeout:    { type: integer, description: "反代发送超时（秒，1~3600），默认 60" }
+        proxy_read_timeout:    { type: integer, description: "反代读取超时（秒，1~3600），默认 60" }
+        log_access:     { type: boolean, description: "站点独立访问日志开关（021）：开启后由面板指定路径，可下载/清空" }
+        log_error:      { type: boolean, description: "站点独立错误日志开关（021）" }
+        log_error_level: { type: string, enum: [debug, info, notice, warn, error, crit, alert, emerg], description: "错误日志级别（021），默认 error" }
     SiteRoute:
       type: object
       required: [prefix, kind]
@@ -620,6 +632,19 @@ components:
         hsts_preload: { type: boolean, description: "HSTS preload（020），省略 = 保留现值" }
         rewrite_preset: { type: string, enum: [none, wordpress, laravel, thinkphp, typecho, discuz, custom], description: "伪静态预置模板（020），省略 = 保留现值；仅 php 类型有意义" }
         rewrite_custom: { type: [string, "null"], description: "rewrite_preset=custom 时的原始 rewrite 文本（020）：null/空白 = 清除、省略 = 保留现值；上限 64 KiB" }
+        # ── 021：访问控制 / 反代增强 / 站点日志 ──
+        ip_allow:       { type: array, items: { type: string }, description: "IP 白名单（单 IP 或 CIDR，IPv4）；空串 = 清除，省略 = 保留现值" }
+        ip_deny:        { type: array, items: { type: string }, description: "IP 黑名单（单 IP 或 CIDR，IPv4）；ip_allow 非空时被忽略；省略 = 保留现值" }
+        auth_basic:     { type: boolean, description: "Basic Auth 开关；省略 = 保留现值" }
+        auth_user:      { type: [string, "null"], description: "Basic Auth 用户名（auth_basic=true 时必填）；省略 = 保留现值" }
+        auth_pass:      { type: [string, "null"], description: "Basic Auth 口令（021，只写不读）：提交后经 openssl 生成 apr1 摘要写入 htpasswd 文件，口令本身不落库、不回显；省略 = 保留现值" }
+        lb_policy:      { type: string, enum: [least_conn, ip_hash], description: "负载均衡策略；省略 = 保留现值" }
+        proxy_connect_timeout: { type: integer, description: "建连超时（秒，1~3600）；省略 = 保留现值" }
+        proxy_send_timeout:    { type: integer, description: "发送超时（秒，1~3600）；省略 = 保留现值" }
+        proxy_read_timeout:    { type: integer, description: "读取超时（秒，1~3600）；省略 = 保留现值" }
+        log_access:     { type: boolean, description: "独立访问日志开关；省略 = 保留现值" }
+        log_error:      { type: boolean, description: "独立错误日志开关；省略 = 保留现值" }
+        log_error_level: { type: string, enum: [debug, info, notice, warn, error, crit, alert, emerg], description: "错误日志级别；省略 = 保留现值" }
     Cert:
       type: object
       properties:
@@ -1823,6 +1848,47 @@ paths:
         - { name: filter, in: query, schema: { type: string }, description: 关键词过滤 }
         - { name: limit, in: query, schema: { type: integer }, description: 回溯行数上限 }
       responses: { '200': { description: text/event-stream } }
+  /api/v1/sites/{id}/log/download:
+    get:
+      tags: [sites]
+      summary: 下载站点独立日志（021，kind=access|error）
+      description: |
+        cookie 认证（无需 CSRF，与根证书下载同范式）。站点未开启对应独立日志时返回 400 并说明原因；
+        已开启但日志文件尚未生成（站点还没有请求）返回 400 提示先产生访问。
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+        - { name: kind, in: query, schema: { type: string, enum: [access, error] }, description: 日志类型，默认 access }
+      responses:
+        '200':
+          description: 日志文本（text/plain; charset=utf-8，附件名 <站点名>-<access|error>.log）
+          content: { text/plain: { schema: { type: string, format: binary } } }
+        '400': { description: 站点未开启独立日志 / 日志文件尚未生成 }
+        '401': { description: 未登录 }
+        '404': { description: 站点不存在 }
+  /api/v1/sites/{id}/log/clear:
+    post:
+      tags: [sites]
+      summary: 清空站点独立日志（021，kind=access|error）
+      description: |
+        截断而非删除：删除会让正在写入的 nginx worker 继续往已 unlink 的 inode 写（磁盘不释放、文件"失踪"），
+        截断才是运维上的正确做法。写操作需要 CSRF。
+      security: [cookieAuth, csrfHeader]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                kind: { type: string, enum: [access, error], description: 日志类型，默认 access }
+      responses:
+        '200': { description: 已截断（返回 path） }
+        '400': { description: 站点未开启独立日志 }
+        '401': { description: 未登录 }
+        '403': { description: 缺少 CSRF 令牌 }
+        '404': { description: 站点不存在 }
   /api/v1/sites/{id}/ssl/apply:
     post:
       tags: [sites]

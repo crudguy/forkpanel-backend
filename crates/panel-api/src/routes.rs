@@ -98,6 +98,7 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/system/overview", get(system::overview))
         .route("/api/v1/metrics/realtime", get(system::realtime))
         .route("/api/v1/metrics/history", get(system::history))
+        .route("/api/v1/system/users", get(system::users))
         .route("/api/v1/metrics/snapshot", get(system::snapshot));
 
     // ── 进程（M2） ──
@@ -151,6 +152,9 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/sites/{id}/conf/versions/{vid}", get(sites::conf_version_get))
         .route("/api/v1/sites/{id}/conf/rollback", post(sites::conf_rollback))
         .route("/api/v1/sites/{id}/logs", get(sites::logs))
+        // 站点独立日志（021）：下载 / 清空（查看走下载——浏览器直接渲染文本）
+        .route("/api/v1/sites/{id}/log/download", get(sites::log_download))
+        .route("/api/v1/sites/{id}/log/clear", post(sites::log_clear))
         .route("/api/v1/sites/{id}/ssl/apply", post(sites::ssl_apply))
         .route("/api/v1/ssl/ca", get(sites::ssl_ca_download))
         .route("/api/v1/certs", get(sites::certs))

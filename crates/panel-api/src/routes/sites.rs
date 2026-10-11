@@ -98,6 +98,23 @@ struct RawSite {
     /// **派生列**（非 sites 表的列）：最新留档版本的内容 hash，用于「外部修改检测」。
     /// NULL = 该站尚无留档，此时无从判定，一律按「无外部修改」处理（不谎报）。
     last_ver_hash: Option<String>,
+    /// IP 白名单（021，逗号分隔）；NULL/空 = 不限制
+    ip_allow: Option<String>,
+    /// IP 黑名单（021，逗号分隔）；ip_allow 非空时被忽略
+    ip_deny: Option<String>,
+    auth_basic: i32,
+    /// Basic Auth 用户名（口令不落库）
+    auth_user: Option<String>,
+    /// 负载均衡策略（021）：round_robin | least_conn | ip_hash
+    lb_policy: String,
+    proxy_connect_timeout: i64,
+    proxy_send_timeout: i64,
+    proxy_read_timeout: i64,
+    /// 站点独立访问日志（021）：1 = 渲染 access_log 指令
+    log_access: i32,
+    log_error: i32,
+    /// 错误日志级别（021）
+    log_error_level: String,
 }
 
 impl RawSite {
@@ -182,7 +199,29 @@ pub struct SiteOut {
     /// 外部修改（020）：磁盘上的配置文件与「最后一次落盘的内容」**不一致**——
     /// 文件在面板之外被改动过。面板**不会**静默覆盖它（无从判断是人工有意、
     /// 脚本误写还是攻击），由用户决定「重新生成覆盖」或「改成自定义片段」。
+    /// 外部修改（020）：磁盘上的配置文件与「最后一次落盘的内容」**不一致**——
+    /// 文件在面板之外被改动过。面板**不会**静默覆盖它（无从判断是人工有意、
+    /// 脚本误写还是攻击），由用户决定「重新生成覆盖」或「改为自定义片段」。
     pub conf_external: bool,
+    /// IP 白名单（021）：为空数组 = 不限制
+    pub ip_allow: Vec<String>,
+    /// IP 黑名单（021）：ip_allow 非空时前端应把它置灰（二者互斥）
+    pub ip_deny: Vec<String>,
+    /// HTTP Basic Auth 是否开启（021）
+    pub auth_basic: bool,
+    /// Basic Auth 用户名；未设置为 null（**口令永不返回**）
+    pub auth_user: Option<String>,
+    /// 负载均衡策略（021，多后端生效）：round_robin | least_conn | ip_hash
+    pub lb_policy: String,
+    /// 代理超时三项（021，秒）
+    pub proxy_connect_timeout: i64,
+    pub proxy_send_timeout: i64,
+    pub proxy_read_timeout: i64,
+    /// 是否写站点独立访问日志（021）
+    pub log_access: bool,
+    pub log_error: bool,
+    /// 错误日志级别（021）
+    pub log_error_level: String,
 }
 
 /// API 口径的单条路由。
@@ -429,6 +468,108 @@ fn deploy_fingerprint(
     s
 }
 
+/// 空列表 → None（渲染器据此整段跳过，不输出空注释块）。
+fn nonempty(v: Vec<String>) -> Option<Vec<String>> {
+    if v.is_empty() { None } else { Some(v) }
+}
+
+/// 逗号 / 空白分隔的列表字符串 → Vec（空 → 空数组：前端不必判断 null）。
+fn split_list(v: &Option<String>) -> Vec<String> {
+    v.as_deref()
+        .map(|raw| {
+            raw.split(|c: char| c == ',' || c.is_whitespace())
+                .map(str::trim)
+                .filter(|x| !x.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 站点独立日志目录（021）：面板数据目录下的 `log/`。
+fn site_log_dir(state: &Shared) -> std::path::PathBuf {
+    state.os.paths().data_dir().join("log")
+}
+
+/// 该站点的 access / error 日志路径；未开启对应开关则为 None（沿用 nginx 全局日志）。
+fn site_log_paths(
+    state: &Shared,
+    domains: &[String],
+    access: bool,
+    error: bool,
+) -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
+    let stem = slug(domains.first().map(|x| x.as_str()).unwrap_or("site"));
+    let d = site_log_dir(state);
+    (
+        if access { Some(d.join(format!("{stem}.access.log"))) } else { None },
+        if error { Some(d.join(format!("{stem}.error.log"))) } else { None },
+    )
+}
+
+/// 代理超时归一（021）：1~3600 秒；缺省取库中现值（缺省再缺省为 60）。
+fn timeout_db(
+    req: Option<i64>,
+    cur: Option<i64>,
+    field: &'static str,
+) -> std::result::Result<i64, ApiError> {
+    match req {
+        None => Ok(cur.unwrap_or(60)),
+        Some(n) if (1..=3600).contains(&n) => Ok(n),
+        Some(_) => Err(ApiError::bad_request(field, "超时需在 1 ~ 3600 秒之间")),
+    }
+}
+
+/// 解析并校验 IP / CIDR 列表（这些值**直接进 nginx 配置文本**，必须白名单校验）。
+/// 只接受 IPv4 与可选的前缀长度（0~32）——IPv6 暂不支持，宁可拒也不猜。
+fn parse_ip_list(raw: &str) -> std::result::Result<Vec<String>, ApiError> {
+    let mut out = Vec::new();
+    for part in raw.split(|c: char| c == ',' || c.is_whitespace()) {
+        let t = part.trim();
+        if t.is_empty() { continue }
+        if !is_ipv4_or_cidr(t) {
+            return Err(ApiError::bad_request(
+                "ip_allow",
+                format!("IP 地址「{t}」不合法（仅支持 IPv4 或 IPv4/前缀）"),
+            ));
+        }
+        out.push(t.to_string());
+    }
+    Ok(out)
+}
+
+/// IPv4（点分十进制，每段 0~255）或 `IPv4/0~32`。
+fn is_ipv4_or_cidr(s: &str) -> bool {
+    let (ip, mask) = match s.split_once('/') {
+        Some((a, b)) => (a, Some(b)),
+        None => (s, None),
+    };
+    let octets: Vec<&str> = ip.split('.').collect();
+    if octets.len() != 4 { return false }
+    for o in &octets {
+        if o.is_empty() || o.len() > 3 || !o.bytes().all(|b| b.is_ascii_digit()) { return false }
+        if o.parse::<u16>().map(|n| n > 255).unwrap_or(true) { return false }
+    }
+    match mask {
+        None => true,
+        Some(m) => {
+            !m.is_empty()
+                && m.bytes().all(|b| b.is_ascii_digit())
+                && m.parse::<u8>().map(|n| n <= 32).unwrap_or(false)
+        }
+    }
+}
+
+/// Basic Auth 的 htpasswd 文件落盘路径（021）。
+fn htpasswd_path(state: &Shared, domains: &[String]) -> std::path::PathBuf {
+    let stem = slug(domains.first().map(|x| x.as_str()).unwrap_or("site"));
+    state
+        .os
+        .paths()
+        .data_dir()
+        .join("htpasswd")
+        .join(format!("panel-{stem}.htpasswd"))
+}
+
 /// 高级配置（020）的指纹片段。**读侧**（库值）与**写侧**（apply 解析后的值）
 /// 必须用同一组键——两边键名或顺序不同就会误报「未同步」。
 fn advanced_json_of(r: &RawSite) -> String {
@@ -441,7 +582,20 @@ fn advanced_json_of(r: &RawSite) -> String {
         "rewrite_preset": r.rewrite_preset,
         "tls_min": r.tls_min,
         "tls_profile": r.tls_profile,
+        "rewrite_preset": r.rewrite_preset,
         "www": r.www_redirect,
+        // 021：访问控制 / Basic Auth / 反代 / 日志同样影响渲染输出
+        "ip_allow": r.ip_allow,
+        "ip_deny": r.ip_deny,
+        "auth_basic": r.auth_basic,
+        "auth_user": r.auth_user,
+        "lb_policy": r.lb_policy,
+        "pct": r.proxy_connect_timeout,
+        "pst": r.proxy_send_timeout,
+        "prt": r.proxy_read_timeout,
+        "log_access": r.log_access,
+        "log_error": r.log_error,
+        "log_level": r.log_error_level,
     })
     .to_string()
 }
@@ -512,6 +666,17 @@ fn to_out(r: &RawSite) -> SiteOut {
         // 外部修改需要读磁盘比对 hash（异步），to_out 是纯映射 → 由 list() 侧
         // 逐条补算（见 `list` 内的 external_of 循环）。
         conf_external: false,
+        ip_allow: split_list(&r.ip_allow),
+        ip_deny: split_list(&r.ip_deny),
+        auth_basic: r.auth_basic != 0,
+        auth_user: r.auth_user.clone(),
+        lb_policy: r.lb_policy.clone(),
+        proxy_connect_timeout: r.proxy_connect_timeout,
+        proxy_send_timeout: r.proxy_send_timeout,
+        proxy_read_timeout: r.proxy_read_timeout,
+        log_access: r.log_access != 0,
+        log_error: r.log_error != 0,
+        log_error_level: r.log_error_level.clone(),
     }
 }
 
@@ -527,10 +692,13 @@ const SITE_SELECT: &str = "s.id, s.name, s.domains, s.root, s.kind, s.enabled, s
        s.routes_json, s.manual_conf, s.conf_snapshot, s.custom_conf,
        s.www_redirect, s.tls_profile, s.tls_min, s.hsts, s.hsts_max_age,
        s.hsts_sub, s.hsts_preload, s.rewrite_preset, s.rewrite_custom,
-       (SELECT v.hash FROM site_conf_versions v WHERE v.site_id = s.id ORDER BY v.id DESC LIMIT 1) AS last_ver_hash";
+       (SELECT v.hash FROM site_conf_versions v WHERE v.site_id = s.id ORDER BY v.id DESC LIMIT 1) AS last_ver_hash,
+       s.ip_allow, s.ip_deny, s.auth_basic, s.auth_user, s.lb_policy,
+       s.proxy_connect_timeout, s.proxy_send_timeout, s.proxy_read_timeout,
+       s.log_access, s.log_error, s.log_error_level";
 // ⚠ 列序与下方 `r.get(N)` 一一对应。加列**一律追加到末尾**（routes_json = 18、
 //   manual_conf = 19、conf_snapshot = 20、custom_conf = 21、www_redirect = 22 …
-//   rewrite_custom = 29、last_ver_hash = 30），这样既有索引全部不变——
+//   rewrite_custom = 29、last_ver_hash = 30、ip_allow = 31 … log_error_level = 41），这样既有索引全部不变——
 //   中途插列会让每个 r.get 静默错位（本项目已踩过一次：tls_count 子查询列把后续
 //   整体后移一位，apply 运行时才报 `Invalid column type`）。
 //   三个 fetch 函数中的 get(18…30) 必须同步（last_ver_hash 是子查询派生列）。
@@ -586,6 +754,17 @@ async fn fetch_all(state: &Shared) -> Result<Vec<RawSite>> {
                     rewrite_preset: r.get(29)?,
                     rewrite_custom: r.get(30)?,
                     last_ver_hash: r.get(31)?,
+                    ip_allow: r.get(32)?,
+                    ip_deny: r.get(33)?,
+                    auth_basic: r.get(34)?,
+                    auth_user: r.get(35)?,
+                    lb_policy: r.get(36)?,
+                    proxy_connect_timeout: r.get(37)?,
+                    proxy_send_timeout: r.get(38)?,
+                    proxy_read_timeout: r.get(39)?,
+                    log_access: r.get(40)?,
+                    log_error: r.get(41)?,
+                    log_error_level: r.get(42)?,
                     })
                 })
                 .map_err(db_err)?;
@@ -639,6 +818,17 @@ async fn fetch_one(state: &Shared, id: i64) -> Result<Option<RawSite>> {
                     rewrite_preset: r.get(29)?,
                     rewrite_custom: r.get(30)?,
                     last_ver_hash: r.get(31)?,
+                    ip_allow: r.get(32)?,
+                    ip_deny: r.get(33)?,
+                    auth_basic: r.get(34)?,
+                    auth_user: r.get(35)?,
+                    lb_policy: r.get(36)?,
+                    proxy_connect_timeout: r.get(37)?,
+                    proxy_send_timeout: r.get(38)?,
+                    proxy_read_timeout: r.get(39)?,
+                    log_access: r.get(40)?,
+                    log_error: r.get(41)?,
+                    log_error_level: r.get(42)?,
                 })
             })
             .map_err(db_err)?;
@@ -689,6 +879,17 @@ async fn fetch_one_by_name(state: &Shared, name: &str) -> Result<Option<RawSite>
                     rewrite_preset: r.get(29)?,
                     rewrite_custom: r.get(30)?,
                     last_ver_hash: r.get(31)?,
+                    ip_allow: r.get(32)?,
+                    ip_deny: r.get(33)?,
+                    auth_basic: r.get(34)?,
+                    auth_user: r.get(35)?,
+                    lb_policy: r.get(36)?,
+                    proxy_connect_timeout: r.get(37)?,
+                    proxy_send_timeout: r.get(38)?,
+                    proxy_read_timeout: r.get(39)?,
+                    log_access: r.get(40)?,
+                    log_error: r.get(41)?,
+                    log_error_level: r.get(42)?,
                 })
             })
             .map_err(db_err)?;
@@ -909,6 +1110,17 @@ pub async fn create(
                     rewrite_preset: "none".to_string(),
                     rewrite_custom: None,
                     conf_external: false,
+                    ip_allow: Vec::new(),
+                    ip_deny: Vec::new(),
+                    auth_basic: false,
+                    auth_user: None,
+                    lb_policy: "least_conn".to_string(),
+                    proxy_connect_timeout: 60,
+                    proxy_send_timeout: 60,
+                    proxy_read_timeout: 60,
+                    log_access: false,
+                    log_error: false,
+                    log_error_level: "error".to_string(),
                 });
             Ok(ok(out))
         }
@@ -1038,13 +1250,19 @@ async fn render_spec_for_row(
     };
     let has_tls = tls_cert.is_some() && tls_key.is_some();
 
+    // 站点独立日志（021）：开启后指向面板自己的日志目录——它也是「下载 / 清空」的目标
+    let (access_log_p, error_log_p) = site_log_paths(state, &domains, row.log_access != 0, row.log_error != 0);
+    // 站点独立日志（021）：同上，nginx -t 前确保日志目录存在
+    if access_log_p.is_some() || error_log_p.is_some() {
+        let _ = std::fs::create_dir_all(site_log_dir(state));
+    }
     let spec = panel_os::SiteSpec {
         server_names: domains.to_vec(),
         root,
         listen: vec![80, 443],
         kind,
-        access_log: None,
-        error_log: None,
+        access_log: access_log_p,
+        error_log: error_log_p,
         tls_cert,
         tls_key,
         force_https: has_tls,
@@ -1064,6 +1282,16 @@ async fn render_spec_for_row(
         hsts_preload: row.hsts_preload != 0,
         rewrite_preset: Some(row.rewrite_preset.clone()),
         rewrite_custom: row.rewrite_custom.clone(),
+        ip_allow: nonempty(split_list(&row.ip_allow)),
+        ip_deny: nonempty(split_list(&row.ip_deny)),
+        auth_basic: row.auth_basic != 0,
+        auth_user: row.auth_user.clone(),
+        auth_file: Some(htpasswd_path(state, &domains)).filter(|p| p.is_file()),
+        lb_policy: Some(row.lb_policy.clone()),
+        proxy_connect_timeout: row.proxy_connect_timeout,
+        proxy_send_timeout: row.proxy_send_timeout,
+        proxy_read_timeout: row.proxy_read_timeout,
+        error_log_level: Some(row.log_error_level.clone()),
     };
 
     let (target, rendered) = state.os.webserver().render(&spec)?;
@@ -1416,6 +1644,39 @@ pub struct ApplyReq {
     /// preset=custom 时的原始 rewrite 文本（上限 64 KiB）
     #[serde(default)]
     pub rewrite_custom: Option<String>,
+    /// IP 白名单（021，逗号分隔的 IP / CIDR）；空串 = 清除，省略 = 保留现值
+    #[serde(default)]
+    pub ip_allow: Option<String>,
+    /// IP 黑名单（021）；ip_allow 非空时后端忽略该字段
+    #[serde(default)]
+    pub ip_deny: Option<String>,
+    /// HTTP Basic Auth 开关（021）
+    #[serde(default)]
+    pub auth_basic: Option<bool>,
+    #[serde(default)]
+    pub auth_user: Option<String>,
+    /// Basic Auth 口令（021，**只写不读**）：提交后经 openssl 生成 apr1 摘要写进
+    /// htpasswd 文件，口令本身不落库、不出现在任何响应里
+    #[serde(default)]
+    pub auth_pass: Option<String>,
+    /// 负载均衡策略（021）：round_robin | least_conn | ip_hash
+    #[serde(default)]
+    pub lb_policy: Option<String>,
+    /// 代理超时三项（021，秒，1~3600）
+    #[serde(default)]
+    pub proxy_connect_timeout: Option<i64>,
+    #[serde(default)]
+    pub proxy_send_timeout: Option<i64>,
+    #[serde(default)]
+    pub proxy_read_timeout: Option<i64>,
+    /// 站点独立日志（021）：开启后按面板指定路径写 access / error 日志
+    #[serde(default)]
+    pub log_access: Option<bool>,
+    #[serde(default)]
+    pub log_error: Option<bool>,
+    /// 错误日志级别（021）：debug|info|notice|warn|error|crit|alert|emerg
+    #[serde(default)]
+    pub log_error_level: Option<String>,
 }
 
 /// WAF 请求体。
@@ -1716,6 +1977,103 @@ pub async fn apply(
             if v.trim().is_empty() { None } else { Some(v.clone()) }
         }
     };
+    // ── 访问控制 / Basic Auth / 反代增强 / 日志（021）──
+    // 与前面同语义：缺省 = 保留库中现值，显式值才校验。会进配置文本的字段（IP 列表、
+    // 用户名、策略、日志级别）一律走白名单，超时走区间——抄错不是报 400 就是让
+    // 老客户端静默连不上，必须在入口拦住。
+    let ip_allow_db: Option<String> = match req.ip_allow.as_deref() {
+        None => cur_row.as_ref().and_then(|r| r.ip_allow.clone()),
+        Some(v) => {
+            let list = parse_ip_list(v)?;
+            if list.is_empty() { None } else { Some(list.join(",")) }
+        }
+    };
+    let ip_deny_db: Option<String> = match req.ip_deny.as_deref() {
+        None => cur_row.as_ref().and_then(|r| r.ip_deny.clone()),
+        Some(v) => {
+            let list = parse_ip_list(v)?;
+            if list.is_empty() { None } else { Some(list.join(",")) }
+        }
+    };
+    let auth_basic_db: i32 = match req.auth_basic {
+        None => cur_row.as_ref().map(|r| r.auth_basic).unwrap_or(0),
+        Some(b) => if b { 1 } else { 0 },
+    };
+    let auth_user_db: Option<String> = match req.auth_user.as_deref() {
+        None => cur_row.as_ref().and_then(|r| r.auth_user.clone()),
+        Some(v) => {
+            let u = v.trim();
+            if u.is_empty() {
+                None
+            } else if u.contains(':') || u.chars().any(char::is_whitespace) {
+                return Err(ApiError::bad_request("auth_user", "用户名不能含冒号或空白"));
+            } else {
+                Some(u.to_string())
+            }
+        }
+    };
+    let lb_policy_db: String = match req.lb_policy.as_deref() {
+        None => cur_row
+            .as_ref()
+            .map(|r| r.lb_policy.clone())
+            .unwrap_or_else(|| "least_conn".to_string()),
+        Some(v) => {
+            if !matches!(v, "round_robin" | "least_conn" | "ip_hash") {
+                return Err(ApiError::bad_request(
+                    "lb_policy",
+                    "负载均衡策略只能是 round_robin / least_conn / ip_hash",
+                ));
+            }
+            v.to_string()
+        }
+    };
+    let pct_db = timeout_db(req.proxy_connect_timeout, cur_row.as_ref().map(|r| r.proxy_connect_timeout), "proxy_connect_timeout")?;
+    let pst_db = timeout_db(req.proxy_send_timeout, cur_row.as_ref().map(|r| r.proxy_send_timeout), "proxy_send_timeout")?;
+    let prt_db = timeout_db(req.proxy_read_timeout, cur_row.as_ref().map(|r| r.proxy_read_timeout), "proxy_read_timeout")?;
+    let log_access_db: i32 = match req.log_access {
+        None => cur_row.as_ref().map(|r| r.log_access).unwrap_or(0),
+        Some(b) => if b { 1 } else { 0 },
+    };
+    let log_error_db: i32 = match req.log_error {
+        None => cur_row.as_ref().map(|r| r.log_error).unwrap_or(0),
+        Some(b) => if b { 1 } else { 0 },
+    };
+    let log_level_db: String = match req.log_error_level.as_deref() {
+        None => cur_row
+            .as_ref()
+            .map(|r| r.log_error_level.clone())
+            .unwrap_or_else(|| "error".to_string()),
+        Some(v) => {
+            if !matches!(v, "debug" | "info" | "notice" | "warn" | "error" | "crit" | "alert" | "emerg") {
+                return Err(ApiError::bad_request("log_error_level", "日志级别取值不合法"));
+            }
+            v.to_string()
+        }
+    };
+    // Basic Auth（021）：口令只在本次提交出现一次——经 openssl 生成 apr1 摘要写进
+    // htpasswd 文件，**不落库**；此后任何响应（含站点列表）都只回用户名，不再回显口令。
+    let auth_file_db: Option<std::path::PathBuf> = if auth_basic_db != 0 {
+        match &auth_user_db {
+            Some(u) => {
+                let f = htpasswd_path(&state, &domains);
+                if let Some(p) = req.auth_pass.as_deref().filter(|p| !p.is_empty()) {
+                    let line = panel_os::tls::htpasswd_line(u, p)
+                        .await
+                        .map_err(ApiError::from)?;
+                    if let Some(dir) = f.parent() {
+                        std::fs::create_dir_all(dir).map_err(|e| PanelError::Internal(e.to_string()))?;
+                    }
+                    std::fs::write(&f, format!("{line}\n"))
+                        .map_err(|e| PanelError::Internal(e.to_string()))?;
+                }
+                if f.is_file() { Some(f) } else { None }
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
     // 写侧指纹片段：**键名与顺序**必须和读侧 `advanced_json_of` 完全一致
     let advanced_json = serde_json::json!({
         "hsts": hsts_db,
@@ -1727,6 +2085,17 @@ pub async fn apply(
         "tls_min": tls_min_db,
         "tls_profile": tls_profile_db,
         "www": www_db,
+        "ip_allow": ip_allow_db,
+        "ip_deny": ip_deny_db,
+        "auth_basic": auth_basic_db,
+        "auth_user": auth_user_db,
+        "lb_policy": lb_policy_db,
+        "pct": pct_db,
+        "pst": pst_db,
+        "prt": prt_db,
+        "log_access": log_access_db,
+        "log_error": log_error_db,
+        "log_level": log_level_db,
     })
     .to_string();
     // 停用态守恒：站点已停用则只更新配置、不下发 Web 服务器（conf_path 留空），
@@ -1884,13 +2253,21 @@ pub async fn apply(
         _ => (None, None),
     };
     let kind_db = kind_to_db(&kind);
+    // 站点独立日志（021）：路径由面板指定——它同时是「下载 / 清空」的目标文件
+    let (access_log_p, error_log_p) =
+        site_log_paths(&state, &domains, log_access_db != 0, log_error_db != 0);
+    // 站点独立日志（021）：nginx -t 会打开日志文件路径验证可写，目录须先存在，
+    // 否则报 `open() .../xxx.access.log failed (No such file or directory)` 而整次 apply 失败。
+    if access_log_p.is_some() || error_log_p.is_some() {
+        let _ = std::fs::create_dir_all(site_log_dir(&state));
+    }
     let spec = panel_os::SiteSpec {
         server_names: domains.iter().map(|d| d.clone()).collect(),
         root: root.as_path().to_path_buf(),
         listen: vec![80, 443],
         kind,
-        access_log: None,
-        error_log: None,
+        access_log: access_log_p,
+        error_log: error_log_p,
         tls_cert,
         tls_key,
         force_https: req.force_https.unwrap_or(true) && has_tls,
@@ -1909,6 +2286,16 @@ pub async fn apply(
         hsts_preload: hsts_preload_db != 0,
         rewrite_preset: Some(rewrite_preset_db.clone()),
         rewrite_custom: rewrite_custom_db.clone(),
+        ip_allow: nonempty(split_list(&ip_allow_db)),
+        ip_deny: nonempty(split_list(&ip_deny_db)),
+        auth_basic: auth_basic_db != 0,
+        auth_user: auth_user_db.clone(),
+        auth_file: auth_file_db.clone(),
+        lb_policy: Some(lb_policy_db.clone()),
+        proxy_connect_timeout: pct_db,
+        proxy_send_timeout: pst_db,
+        proxy_read_timeout: prt_db,
+        error_log_level: Some(log_level_db.clone()),
     };
     // 覆盖前备份：本次要写/换掉的磁盘文件里是**用户手改的内容**（manual_conf=1；
     // 由 manual_skip 的定义可知，只有显式 regen 才会走到这里）→ 先把旧文件备份。
@@ -2025,9 +2412,13 @@ pub async fn apply(
                                    waf_enabled, waf_profile, waf_rate, waf_burst, upstreams_json, fpm,
                                    spa, redirect_target, redirect_code, routes_json, conf_snapshot, custom_conf,
                                    www_redirect, tls_profile, tls_min, hsts, hsts_max_age, hsts_sub,
-                                   hsts_preload, rewrite_preset, rewrite_custom)
+                                   hsts_preload, rewrite_preset, rewrite_custom,
+                                   ip_allow, ip_deny, auth_basic, auth_user, lb_policy,
+                                   proxy_connect_timeout, proxy_send_timeout, proxy_read_timeout,
+                                   log_access, log_error, log_error_level)
                  VALUES(?1, ?2, ?3, ?4, 'nginx', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?20,
-                        ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)
+                        ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
+                        ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40)
                  ON CONFLICT(name) DO UPDATE SET
                     domains=excluded.domains, root=excluded.root, kind=excluded.kind, enabled=?5,
                     conf_path=?6, webserver='nginx',
@@ -2042,13 +2433,23 @@ pub async fn apply(
                     tls_min=excluded.tls_min, hsts=excluded.hsts, hsts_max_age=excluded.hsts_max_age,
                     hsts_sub=excluded.hsts_sub, hsts_preload=excluded.hsts_preload,
                     rewrite_preset=excluded.rewrite_preset, rewrite_custom=excluded.rewrite_custom,
+                    ip_allow=excluded.ip_allow, ip_deny=excluded.ip_deny,
+                    auth_basic=excluded.auth_basic, auth_user=excluded.auth_user,
+                    lb_policy=excluded.lb_policy,
+                    proxy_connect_timeout=excluded.proxy_connect_timeout,
+                    proxy_send_timeout=excluded.proxy_send_timeout,
+                    proxy_read_timeout=excluded.proxy_read_timeout,
+                    log_access=excluded.log_access, log_error=excluded.log_error,
+                    log_error_level=excluded.log_error_level,
                     manual_conf=COALESCE(?19, manual_conf)",
                 rusqlite::params![name, domains_json, root_str, kind_db, enabled_i32, conf_db, now,
                                   waf_on, waf_profile, waf_rate, waf_burst,
                                   upstreams_json, fpm_str, spa_i32, redirect_target_db, redirect_code_db,
                                   routes_json, snap_db, clear_manual, custom_conf_db,
                                   www_db, tls_profile_db, tls_min_db, hsts_db, hsts_max_age_db,
-                                  hsts_sub_db, hsts_preload_db, rewrite_preset_db, rewrite_custom_db],
+                                  hsts_sub_db, hsts_preload_db, rewrite_preset_db, rewrite_custom_db,
+                                  ip_allow_db, ip_deny_db, auth_basic_db, auth_user_db, lb_policy_db,
+                                  pct_db, pst_db, prt_db, log_access_db, log_error_db, log_level_db],
             )
             .map(|_| panel_db::WriteAck { rows_changed: 1 })
             .map_err(|e| PanelError::Database(e.to_string()))
@@ -2265,6 +2666,90 @@ async fn archive_conf_version(
 ///
 /// 路径唯一来源是**落库的 `conf_path`**（由 apply/patch 写入，不接受前端输入——
 /// 否则就成了「读任意文件」的越权面）。尚未下发 / 文件缺失时如实返回 `content: null`。
+/// 站点日志类型参数：`access` | `error`。
+#[derive(Debug, Deserialize)]
+pub struct SiteLogKindQ {
+    #[serde(default)]
+    pub kind: Option<String>,
+}
+
+/// 该站点的日志文件路径（未开启独立日志 → None）。
+fn site_log_file(row: &RawSite, state: &Shared, kind: &str) -> Option<std::path::PathBuf> {
+    let domains: Vec<String> = serde_json::from_str(&row.domains).unwrap_or_default();
+    let (a, e) = site_log_paths(state, &domains, row.log_access != 0, row.log_error != 0);
+    if kind == "error" { e } else { a }
+}
+
+/// 下载站点日志（021）。走 `location` 直下即可（cookie 认证，无需 CSRF），
+/// 与根证书下载同范式；未开启独立日志时 404 并给出原因。
+pub async fn log_download(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    AxPath(id): AxPath<i64>,
+    Query(q): Query<SiteLogKindQ>,
+) -> ApiResult<axum::response::Response> {
+    crate::auth::require(&s, perm::SITE_MANAGE)?;
+    let row = fetch_one(&state, id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("site"))?;
+    let kind = q.kind.as_deref().unwrap_or("access");
+    let p = site_log_file(&row, &state, kind)
+        .ok_or_else(|| ApiError::bad_request("kind", "该站点未开启独立日志（先在编辑弹窗里开启）"))?;
+    let body = match tokio::fs::read(&p).await {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ApiError::bad_request("kind", "日志文件尚未生成（站点还没有请求）"))
+        }
+        Err(e) => return Err(ApiError::from(PanelError::Io(e.to_string()))),
+    };
+    let name = format!(
+        "{}-{}.log",
+        row.name,
+        if kind == "error" { "error" } else { "access" }
+    );
+    Ok(axum::response::Response::builder()
+        .status(200)
+        .header("content-type", "text/plain; charset=utf-8")
+        .header(
+            "content-disposition",
+            format!("attachment; filename=\"{name}\""),
+        )
+        .body(axum::body::Body::from(body))
+        .map_err(|e| ApiError::from(PanelError::Internal(e.to_string())))?)
+}
+
+/// 清空站点日志（021）：截断而非删除——删除会让正在写入的 nginx worker 继续往
+/// 已 unlink 的 inode 写（磁盘不释放、文件"失踪"），截断才是运维上的正确做法。
+pub async fn log_clear(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    AxPath(id): AxPath<i64>,
+    Json(req): Json<SiteLogClearReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::SITE_MANAGE)?;
+    let row = fetch_one(&state, id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("site"))?;
+    let kind = req.kind.clone().unwrap_or_else(|| "access".to_string());
+    let p = site_log_file(&row, &state, &kind)
+        .ok_or_else(|| ApiError::bad_request("kind", "该站点未开启独立日志（先在编辑弹窗里开启）"))?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&p)
+        .map_err(|e| ApiError::from(PanelError::Io(e.to_string())))?;
+    let kref: &'static str = if kind == "error" { "error" } else { "access" };
+    audit(&state, &s, "site.log.clear", &id.to_string(), kref).await;
+    Ok(ok(serde_json::json!({ "path": p.display().to_string() })))
+}
+
+/// 清空日志的请求体。
+#[derive(Debug, Deserialize)]
+pub struct SiteLogClearReq {
+    pub kind: Option<String>,
+}
+
 pub async fn conf_get(
     State(state): State<Shared>,
     Auth(s): Auth,
@@ -3938,6 +4423,17 @@ mod tests {
             rewrite_preset: "none".into(),
             rewrite_custom: None,
             last_ver_hash: None,
+            ip_allow: None,
+            ip_deny: None,
+            auth_basic: 0,
+            auth_user: None,
+            lb_policy: "least_conn".into(),
+            proxy_connect_timeout: 60,
+            proxy_send_timeout: 60,
+            proxy_read_timeout: 60,
+            log_access: 0,
+            log_error: 0,
+            log_error_level: "error".into(),
         }
     }
 

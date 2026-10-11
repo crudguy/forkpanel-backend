@@ -1017,6 +1017,25 @@ pub struct SiteSpec {
     pub rewrite_preset: Option<String>,
     /// preset=custom 时的原始 rewrite 文本（渲染时原样进 `location /`）。
     pub rewrite_custom: Option<String>,
+    /// IP 白名单（021）：非空即进入**白名单模式**——只放行名单内、其余 `deny all`；
+    /// 此时 `ip_deny` 被忽略（`allow/deny` 按顺序匹配，混用极易写错，故二者互斥）。
+    pub ip_allow: Option<Vec<String>>,
+    /// IP 黑名单（021）：仅在 `ip_allow` 为空时生效。
+    pub ip_deny: Option<Vec<String>>,
+    /// HTTP Basic Auth 开关（021）
+    pub auth_basic: bool,
+    /// Basic Auth 用户名（口令**不进这里**——只在提交时经 openssl 生成 apr1 摘要写文件）
+    pub auth_user: Option<String>,
+    /// Basic Auth 的 htpasswd 文件路径（由 panel-api 落盘后传入，不随请求体进来）
+    pub auth_file: Option<PathBuf>,
+    /// 负载均衡策略（021，多后端时生效）：`round_robin` | `least_conn` | `ip_hash`
+    pub lb_policy: Option<String>,
+    /// 代理超时三项（021，秒）：连接 / 发送 / 读取
+    pub proxy_connect_timeout: i64,
+    pub proxy_send_timeout: i64,
+    pub proxy_read_timeout: i64,
+    /// 错误日志级别（021）：debug|info|notice|warn|error|crit|alert|emerg
+    pub error_log_level: Option<String>,
 }
 
 /// WAF 规则档位。

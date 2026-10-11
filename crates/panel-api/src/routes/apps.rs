@@ -615,6 +615,19 @@ async fn apply_site(state: &Shared, session: &Session, app: &RawApp) -> ApiResul
         hsts_preload: Some(false),
         rewrite_preset: Some("none".to_string()),
         rewrite_custom: None,
+        // 访问控制 / Basic Auth / 反代 / 日志（021）同理由面板自己维护，应用侧不开放
+        ip_allow: None,
+        ip_deny: None,
+        auth_basic: Some(false),
+        auth_user: None,
+        auth_pass: None,
+        lb_policy: Some("least_conn".to_string()),
+        proxy_connect_timeout: Some(60),
+        proxy_send_timeout: Some(60),
+        proxy_read_timeout: Some(60),
+        log_access: Some(false),
+        log_error: Some(false),
+        log_error_level: Some("error".to_string()),
     };
     // 直接 `?`：apply 失败必须让本次保存失败——否则 DB 说已建站、nginx 却没配置，
     // 用户下次排查会面对「应用在、站点不在」的错觉。

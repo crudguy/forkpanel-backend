@@ -1126,6 +1126,7 @@ fn render_nginx(spec: &SiteSpec) -> String {
                     out.push_str(&render_upstream_block(
                         &route_upstream_name(&spec.server_names, &r.prefix),
                         upstreams,
+                        spec.lb_policy.as_deref(),
                     ));
                 }
             }
@@ -1142,6 +1143,7 @@ fn render_nginx(spec: &SiteSpec) -> String {
             out.push_str(&render_upstream_block(
                 &upstream_name(&spec.server_names),
                 upstreams,
+                spec.lb_policy.as_deref(),
             ));
         }
     }
@@ -1227,8 +1229,37 @@ fn render_nginx(spec: &SiteSpec) -> String {
     }
 
     if let Some(al) = &spec.access_log { out.push_str(&format!("    access_log {};\n", al.display())); }
-    if let Some(el) = &spec.error_log  { out.push_str(&format!("    error_log {};\n", el.display())); }
+    if let Some(el) = &spec.error_log {
+        // 级别（021）：错误日志不写级别也能跑，但默认的 error 之外常常要看 warn
+        let lvl = spec.error_log_level.as_deref().unwrap_or("error");
+        out.push_str(&format!("    error_log {} {lvl};\n", el.display()));
+    }
     if spec.access_log.is_some() || spec.error_log.is_some() { out.push('\n'); }
+
+    // ── 访问控制（021）：IP 白/黑名单 + HTTP Basic Auth ──
+    // 白名单优先：ip_allow 非空即「只放行名单内、其余 deny all」，此时 ip_deny 忽略
+    // ——`allow/deny` 是按顺序匹配的，两者混用极易写出与预期相反的规则。
+    if let Some(list) = &spec.ip_allow {
+        if !list.is_empty() {
+            out.push_str("    # ── 访问控制：白名单（名单外一律拒绝）──\n");
+            for ip in list { out.push_str(&format!("    allow {ip};\n")); }
+            out.push_str("    deny all;\n\n");
+        }
+    } else if let Some(list) = &spec.ip_deny {
+        if !list.is_empty() {
+            out.push_str("    # ── 访问控制：黑名单 ──\n");
+            for ip in list { out.push_str(&format!("    deny {ip};\n")); }
+            out.push('\n');
+        }
+    }
+    if spec.auth_basic {
+        if let (Some(u), Some(f)) = (&spec.auth_user, &spec.auth_file) {
+            out.push_str(&format!(
+                "    auth_basic \"{u} 的受限区域\";\n    auth_basic_user_file {};\n\n",
+                f.display()
+            ));
+        }
+    }
 
     // ACME 挑战路径 + 敏感文件拒绝：**所有站点类型都发**，与 WAF 无关。
     //
@@ -1264,6 +1295,10 @@ fn render_nginx(spec: &SiteSpec) -> String {
             };
             out.push_str("    location / {\n");
             out.push_str(&format!("        proxy_pass {target};\n"));
+            // 超时三项（021）：默认各 60s；慢接口（导出/大模型）常常要调大读取超时
+            out.push_str(&format!("        proxy_connect_timeout {}s;\n", spec.proxy_connect_timeout.max(1)));
+            out.push_str(&format!("        proxy_send_timeout {}s;\n", spec.proxy_send_timeout.max(1)));
+            out.push_str(&format!("        proxy_read_timeout {}s;\n", spec.proxy_read_timeout.max(1)));
             out.push_str("        proxy_set_header Host $host;\n");
             out.push_str("        proxy_set_header X-Real-IP $remote_addr;\n");
             out.push_str("        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n");
@@ -1348,11 +1383,17 @@ fn render_ws_map(ws_var: &str) -> String {
 }
 
 /// `upstream` 块（http 级）。`upstreams` 已是 `host:port` 或带 scheme 的完整 URL。
-fn render_upstream_block(name: &str, upstreams: &[String]) -> String {
+fn render_upstream_block(name: &str, upstreams: &[String], policy: Option<&str>) -> String {
     let mut o = String::new();
     o.push_str(&format!("upstream {name} {{\n"));
-    // least_conn：相比轮询，对长连接/慢请求更均衡；单机小集群够用
-    o.push_str("    least_conn;\n");
+    // 负载均衡策略（021）：只给三种互不冲突的取值——轮询不写指令（nginx 默认），
+    // least_conn 对长连接/慢请求更均衡（默认），ip_hash 保证同一客户端落到同一后端。
+    // 未知值回落 least_conn，不把坏值带进配置。
+    match policy.unwrap_or("least_conn") {
+        "round_robin" => {}
+        "ip_hash" => o.push_str("    ip_hash;\n"),
+        _ => o.push_str("    least_conn;\n"),
+    }
     for u in upstreams {
         // upstream 的 server 指令只接受 host:port，不接受 scheme
         let hp = u.split_once("://").map(|(_, r)| r).unwrap_or(u.as_str());
@@ -1399,6 +1440,9 @@ fn render_routed_server(routes: &SiteRoutes, spec: &SiteSpec) -> String {
                 let target = route_proxy_target(&spec.server_names, &r.prefix, upstreams);
                 o.push_str(&format!("    location ^~ {} {{\n", r.prefix));
                 o.push_str(&format!("        proxy_pass {target};\n"));
+                o.push_str(&format!("        proxy_connect_timeout {}s;\n", spec.proxy_connect_timeout.max(1)));
+                o.push_str(&format!("        proxy_send_timeout {}s;\n", spec.proxy_send_timeout.max(1)));
+                o.push_str(&format!("        proxy_read_timeout {}s;\n", spec.proxy_read_timeout.max(1)));
                 o.push_str("        proxy_set_header Host $host;\n");
                 o.push_str("        proxy_set_header X-Real-IP $remote_addr;\n");
                 o.push_str("        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n");
@@ -2461,6 +2505,16 @@ mod tests {
             hsts_preload: false,
             rewrite_preset: None,
             rewrite_custom: None,
+            ip_allow: None,
+            ip_deny: None,
+            auth_basic: false,
+            auth_user: None,
+            auth_file: None,
+            lb_policy: None,
+            proxy_connect_timeout: 60,
+            proxy_send_timeout: 60,
+            proxy_read_timeout: 60,
+            error_log_level: None,
         }
     }
 
