@@ -24,6 +24,7 @@ pub mod system;
 pub mod tasks;
 pub mod processes;
 pub mod security;
+pub mod dashboard;
 pub mod settings;
 pub mod users;
 pub mod audit;
@@ -304,6 +305,7 @@ pub fn build_router(state: Shared) -> Router {
     // ── 设置 / 用户 / 审计 ──
     let cfg_r = Router::new()
         .route("/api/v1/settings", get(settings::get).patch(settings::patch))
+        .route("/api/v1/settings/dashboard", get(dashboard::get).put(dashboard::put))
         .route("/api/v1/users", get(users::list).post(users::create))
         .route("/api/v1/users/{id}", patch(users::patch).delete(users::delete))
         .route("/api/v1/roles", get(roles::list).post(roles::create))

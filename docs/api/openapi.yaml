@@ -1069,6 +1069,22 @@ components:
           type: object
           description: 键值对；白名单=assistant.llm_endpoint/llm_model/llm_api_key；值 null=清除该键
           additionalProperties: { type: [string, "null"] }
+    DashboardCardPref:
+      type: object
+      required: [id, visible]
+      properties:
+        id:      { type: string, enum: [cpu, mem, disk, load, net], description: 卡片标识（与前端 ovCards 对应） }
+        visible: { type: boolean }
+    DashboardLayout:
+      type: object
+      required: [cards]
+      description: 概览页指标卡布局；数组顺序即展示顺序，至少一张 visible
+      properties:
+        cards:
+          type: array
+          minItems: 1
+          maxItems: 5
+          items: { $ref: '#/components/schemas/DashboardCardPref' }
     User:
       type: object
       properties:
@@ -3049,6 +3065,24 @@ paths:
       security: [cookieAuth, csrfHeader]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SettingsPatch' } } } }
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/SettingsReport' } } } } } } }
+  /api/v1/settings/dashboard:
+    get:
+      tags: [settings]
+      summary: 概览页卡片布局（指标卡顺序与显隐）
+      description: |
+        读取概览页指标卡的展示顺序与显隐（个性化偏好，面板级共享）。
+        缺失 / 损坏时回落默认布局（全部可见、默认顺序）。仅需登录。
+      security: [cookieAuth]
+      responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/DashboardLayout' } } } } } } }
+    put:
+      tags: [settings]
+      summary: 保存概览页卡片布局（整体替换，需 settings.manage）
+      description: |
+        `cards` 为 1..=5 的数组；id ∈ {cpu, mem, disk, load, net} 且不重复，
+        数组顺序即展示顺序；至少一张 visible。任一不满足 → 400（不部分写入）。
+      security: [cookieAuth, csrfHeader]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/DashboardLayout' } } } }
+      responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/DashboardLayout' } } } } } } }
   /api/v1/roles:
     get:
       tags: [users]
