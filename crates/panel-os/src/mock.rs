@@ -302,6 +302,28 @@ impl PackageProvider for MockPackages {
         // mock 不跑 apt；返回空列表=「无可升级项」，调用方应隐藏入口而非报错
         Ok(Vec::new())
     }
+
+    async fn holds(&self) -> Result<Vec<String>> {
+        // 进程内状态：mock 没有 apt-mark，用静态集合模拟「钉住全集」，
+        // 使预览模式下 UI 的 hold 读写闭环（列徽标 + 切换后回读）可联调。
+        let set = mock_holds().lock().unwrap();
+        Ok(set.iter().cloned().collect())
+    }
+
+    async fn set_hold(&self, name: &str, held: bool) -> Result<()> {
+        let mut set = mock_holds().lock().unwrap();
+        if held { set.insert(name.to_string()); } else { set.remove(name); }
+        Ok(())
+    }
+}
+
+/// mock 的 hold 全集（进程级）。预览模式无真实包管理器，这组状态就是
+/// 「本进程内被钉住的包」——刷新页面不丢（后端进程活着），重启即清空，
+/// 与「mock 不改真实系统」的定位一致。
+fn mock_holds() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    use std::sync::{Mutex, OnceLock};
+    static HOLDS: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    HOLDS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 
 #[async_trait]

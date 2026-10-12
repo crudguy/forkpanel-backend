@@ -124,6 +124,10 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/packages/install", post(services::install))
         // 版本列表按需查询（安装弹窗打开时），刻意不放进 packages_list 全量拉取
         .route("/api/v1/packages/{name}/versions", get(services::package_versions))
+        // hold/unhold 切换（apt-mark）。路径含子段 `/{name}/hold`，与 `{name}` 单段
+        // 路由不冲突；⚠️ 若日后加 `/packages/{name}` 的 PATCH 等同级方法，仍须保持
+        // `upgradable`/`upgrade` 排在 `{name}` 前的顺序纪律。
+        .route("/api/v1/packages/{name}/hold", post(services::package_hold))
         // ⚠️ 顺序纪律：`/packages/upgradable` 必须排在 `/packages/{name}` **之前**，
         // 否则 axum 的 `{name}` 通配会把它当成 name="upgradable" 吞掉（GET/DELETE 方法还不匹配，
         // 表现为 405/404 而不是可用端点）。同理 upgrade 放在 {name} 系列之后独立成条。

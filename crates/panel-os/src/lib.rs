@@ -257,4 +257,25 @@ mod tests {
         assert!(!os.paths().site_root().as_os_str().is_empty());
         assert!(!os.paths().default_web_user().is_empty());
     }
+
+    /// mock 的 hold 读写必须闭环（幂等 + 全集语义）：预览模式下 UI 的
+    /// 「钉住/取消」切换靠这组进程内状态回读——闭环断一条，用户侧表现
+    /// 就是「点了没反应」或「刷新后钉住状态丢了」，而构建全绿。
+    #[tokio::test]
+    async fn mock_package_hold_roundtrip_is_idempotent() {
+        let os = mock::MockOsAdapter::new();
+        let p = os.packages();
+        p.set_hold("nginx", true).await.unwrap();
+        p.set_hold("redis-server", true).await.unwrap();
+        // 重复 hold 同一包：幂等——不报错，也不产生重复项
+        p.set_hold("nginx", true).await.unwrap();
+        let mut held = p.holds().await.unwrap();
+        held.sort();
+        assert_eq!(held, vec!["nginx".to_string(), "redis-server".to_string()]);
+        // 取消后从全集消失（不是标记为"取消的 hold"——集合语义）
+        p.set_hold("nginx", false).await.unwrap();
+        assert_eq!(p.holds().await.unwrap(), vec!["redis-server".to_string()]);
+        // 对未 hold 的包再 unhold：同样幂等成功
+        p.set_hold("never-held", false).await.unwrap();
+    }
 }

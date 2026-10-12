@@ -434,6 +434,7 @@ components:
         version: { type: [string, "null"] }
         manager: { type: [string, "null"], example: apt }
         path:    { type: [string, "null"] }
+        held:    { type: boolean, description: 是否被 apt-mark hold 钉住（仅已安装包有意义）：挡 apt-get upgrade 的自动升级，不挡显式指定版本安装；非 apt 管理器恒 false }
         unit:
           type: object
           nullable: true
@@ -1598,6 +1599,26 @@ paths:
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: name, in: path, required: true, schema: { type: string } }]
       responses: { '202': { description: 已入队 } }
+  /api/v1/packages/{name}/hold:
+    post:
+      tags: [packages]
+      summary: 设置/取消升级钉住（apt-mark hold/unhold；非 apt 管理器 501）
+      description: |
+        只挡 `apt-get upgrade`/`full-upgrade` 的**自动**升级，不挡显式
+        `apt-get install <pkg>=<version>`——防误升，不是安全边界，前端文案须同步说清。
+        幂等：重复 hold/unhold 同一包返回成功，不报错。
+        包名限白名单（面板以 root 运行）；非 apt 管理器（dnf versionlock 是插件、
+        apk 无对应概念）返回 501(10009) 而不是伪造成功。
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: name, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [held], properties: { held: { type: boolean, description: true=钉住；false=取消 } } }
+      responses:
+        '200': { description: ok, content: { application/json: { schema: { type: object, properties: { name: { type: string, description: 逻辑包名 }, held: { type: boolean, description: 操作后的状态（回显请求值） } } } } } }
+        '10009': { description: 当前包管理器不支持 hold（非 apt） }
 
   # ───────── 站点 / SSL ─────────
   /api/v1/sites:

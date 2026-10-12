@@ -194,8 +194,20 @@ fn service_unit_from_dpkg_list(out: &str, pkg: &str) -> Option<String> {
     Some(candidates[0].to_string())
 }
 
-#[async_trait]
+/// dpkg Status-Abbrev 是否表示「文件在盘上」——**当前状态位（第二位）== 'i'**。
+///
+/// 三位 = `<期望动作><当前状态><错误标记>`。期望动作在 `apt-mark hold` 后会从
+/// `i` 变 `h`：被钉住的包是 `hi ` 而非 `ii `，仍然实打实装着。早期实现只认
+/// `ii`，导致 hold 功能上线时被钉住的包**整条从面板消失**（实机回归：
+/// hold nginx →「已安装软件」少了 nginx，hold 徽标也无处显示）。
+///
+/// 其余形态：`rc ` 删剩配置（要）、`un ` 未安装（本就要排除）、
+/// `iF`/`iU` 半装半配（坏了，不算可用）。空串/短串保守判 false。
+pub(super) fn dpkg_status_installed(status: &str) -> bool {
+    status.as_bytes().get(1) == Some(&b'i')
+}
 
+#[async_trait]
 impl PackageProvider for LinuxPackages {
     fn manager(&self) -> Option<&'static str> { self.manager }
 
@@ -209,8 +221,12 @@ impl PackageProvider for LinuxPackages {
                 // 为什么要 `${db:Status-Abbrev}`：dpkg-query 对**未安装**的包名也会输出一行
                 // （名字 + 空版本），此前只按"有输出行"判定 → 没装过的 apache2 被列进
                 // "已安装软件"（本机实测 apache2 状态 unknown ok not-installed）。
-                // Status-Abbrev 形如 "ii "（已安装）/ "rc "（删剩配置）/ "un "（未知），
-                // 只认 "ii"。不能改用"版本非空"判断——那只是绕开同一个问题的表面现象。
+                // Status-Abbrev 三位 = <期望动作><当前状态><错误标记>：`ii ` 已安装、
+                // `rc ` 删剩配置、`un ` 未安装。判据取**第二位**（当前状态）== 'i'：
+                // 第一位（期望动作）在 `apt-mark hold` 后会从 i 变 h——被钉住的包是
+                // `hi ` 而非 `ii `，只认 "ii" 会让钉住的包整条从面板消失
+                // （实机：hold nginx 后「已安装软件」少了 nginx，且 hold 徽标无处显示）。
+                // 不能改用"版本非空"判断——那只是绕开同一个问题的表面现象。
                 let fmt = "${Package}\t${Version}\t${db:Status-Abbrev}\n";
                 let mut args: Vec<&str> = vec!["-W", "-f", fmt];
                 args.extend_from_slice(names);
@@ -221,7 +237,9 @@ impl PackageProvider for LinuxPackages {
                     let n = it.next()?.trim();
                     let v = it.next()?.trim();
                     let status = it.next()?.trim();
-                    if !status.starts_with("ii") { return None }
+                    // 第二位 == 'i'（installed）：同时接纳 `ii `（普通已装）与
+                    // `hi `（apt-mark hold 钉住的已装）；排除 `rc `/`un `/半装态。
+                    if !dpkg_status_installed(status) { return None }
                     Some(PackageInfo {
                         name: n.to_string(),
                         version: Some(v.to_string()).filter(|s| !s.is_empty()),
@@ -460,6 +478,36 @@ impl PackageProvider for LinuxPackages {
             res.push(UpgradablePkg { name, current, candidate, major });
         }
         Ok(res)
+    }
+
+    async fn holds(&self) -> Result<Vec<String>> {
+        // 非 apt 一律空集：语义是「此系统无 hold 概念」，不是错误。
+        if self.manager != Some("apt") { return Ok(Vec::new()); }
+        // showhold 一次输出全部被钉包名（每行一个）；无任何 hold 时退出码 0、
+        // 输出为空。用 run_checked：apt-mark 缺失（极少数精简镜像）应如实报错，
+        // 而不是把「查询失败」伪装成「没有 hold」——后者会让 UI 隐藏入口，
+        // 用户以为自己的包没被钉，实则状态未知。
+        let out = crate::cmd::run_checked(
+            Bin::AptMark, &["showhold"],
+            CmdOpt { timeout: Duration::from_secs(15), ..Default::default() },
+        ).await?;
+        Ok(out.stdout.lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    async fn set_hold(&self, name: &str, held: bool) -> Result<()> {
+        let m = self.manager.ok_or(PanelError::Unsupported("package.manager"))?;
+        if m != "apt" { return Err(PanelError::Unsupported("package.hold")); }
+        // 子命令编译期二选一；包名由调用方白名单校验后作为单个 argv 传入。
+        let sub = if held { "hold" } else { "unhold" };
+        crate::cmd::run_checked(
+            Bin::AptMark, &[sub, name],
+            CmdOpt { timeout: Duration::from_secs(30), ..Default::default() },
+        ).await?;
+        Ok(())
     }
 }
 
@@ -2475,6 +2523,23 @@ mod tests {
         assert_eq!(service_unit_from_dpkg_list(pg, "postgresql"), None);
         // 包装里没有 .service（certbot/ufw 之类）→ 不关联
         assert_eq!(service_unit_from_dpkg_list("no service file here\n", "certbot"), None);
+    }
+
+    /// dpkg 状态判据：第二位（当前状态）== 'i' 即算已安装。
+    ///
+    /// `hi `（apt-mark hold 钉住）是本测试的核心——hold 功能上线时的实机回归：
+    /// 旧判据只认 `ii`，hold nginx 后该包从「已安装软件」整条消失。
+    #[test]
+    fn dpkg_status_installed_accepts_hold_variant() {
+        assert!(dpkg_status_installed("ii "), "普通已安装");
+        assert!(dpkg_status_installed("hi "), "hold 钉住的已安装（期望动作 h，文件在盘上）");
+        assert!(dpkg_status_installed("ii"), "无尾随空格的紧凑输出");
+        assert!(!dpkg_status_installed("rc "), "删剩配置：文件已不在");
+        assert!(!dpkg_status_installed("un "), "未安装（dpkg-query 对没装过的包也输出一行）");
+        assert!(!dpkg_status_installed("iF"), "半配置：坏了，不算可用");
+        assert!(!dpkg_status_installed("iU"), "半解包：坏了，不算可用");
+        assert!(!dpkg_status_installed(""), "空串保守排除");
+        assert!(!dpkg_status_installed("i"), "只有一位：无当前状态位，保守排除");
     }
 
     fn nginx_server() -> LinuxWebServer {

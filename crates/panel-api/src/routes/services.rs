@@ -711,6 +711,17 @@ pub async fn packages_list(
     let probe: Vec<String> = ALLOWED_PACKAGES.iter().map(|d| real_pkg_name(manager, d.name)).collect();
     let probe: Vec<&str> = probe.iter().map(|s| s.as_str()).collect();
     let pkgs = state.os.packages().detect_installed(&probe).await?;
+    // hold 全集一次性查（apt-mark showhold 一次输出全部被钉包名），本地与已装包
+    // 求交集——按名逐个查既慢又把「全量集」语义拆散，理由见 PackageProvider::holds。
+    // 失败降级为空集 + eprintln：hold 徽标是锦上添花，不该让整页软件列表挂掉
+    // （与 packages_upgradable 探测失败同口径）；apt-mark 缺失只影响徽标显示。
+    let held_set: std::collections::HashSet<String> = match state.os.packages().holds().await {
+        Ok(v) => v.into_iter().collect(),
+        Err(e) => {
+            eprintln!("[panel] 查询 apt-mark hold 失败（hold 徽标将不显示）：{e}");
+            Default::default()
+        }
+    };
     // 软件卡片的「服务管理」入口：用 `dpkg -L` 直接问"这个包装了哪些 .service"，
     // 绕过 systemctl list-units 对 enabled-but-dead 单元的遗漏（详见 PackageProvider::service_unit）。
     // 状态取自 systemd（is-active 口径，与 /services 同源），故 dead 的服务也能正确显示入口与状态。
@@ -735,6 +746,9 @@ pub async fn packages_list(
         items.push(serde_json::json!({
             "name": name, "label": label, "version": p.version,
             "manager": p.manager, "unit": unit,
+            // 按**真实包名**比对：apt-mark 只认真名（Debian 上 redis 的 hold 落在
+            // redis-server 上），拿逻辑名去比会永远不命中，UI 显示「未钉住」的谎状态。
+            "held": held_set.contains(&p.name),
         }));
     }
     // 完整白名单（name+label）随清单一起下发：前端据此给「已装」和「可装」两类都渲染
@@ -955,6 +969,53 @@ pub async fn package_remove(
     Ok(ok(serde_json::json!({ "task_id": id, "created": created })))
 }
 
+/// 设置/取消某个白名单包的「升级钉住」（apt-mark hold/unhold）请求体。
+#[derive(Debug, Deserialize)]
+pub struct HoldReq {
+    /// true = 钉住（阻止自动升级）；false = 取消钉住。
+    pub held: bool,
+}
+
+/// 设置/取消某个已安装白名单包的 hold 状态。
+///
+/// 为什么单独端点而不并进 install/remove：hold 改的是**升级通道**而非安装状态，
+/// 语义独立——装卸走任务队列、有流式输出；hold 是秒级同步操作，且需要独立的
+/// 「仅 apt 支持」能力判定（dnf 的 versionlock 是插件、apk 无对应概念）。
+///
+/// **幂等**：对已 hold 的包再 hold、对未 hold 的包再 unhold 都返回成功——
+/// apt-mark 自身幂等，端点层不额外查现状，省一次子进程往返。
+///
+/// 语义边界（前端文案必须同步说清）：hold 只挡 `apt-get upgrade` 的**自动**升级，
+/// 不挡显式 `apt-get install <pkg>=<version>`——防误升，不是安全边界。
+pub async fn package_hold(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    AxPath(name): AxPath<String>,
+    Json(req): Json<HoldReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::PACKAGE_MANAGE)?;
+    if !state.capabilities.get(cap_keys::PACKAGE_INSTALL).map(|c| c.supported).unwrap_or(false) {
+        return Err(ApiError::unsupported("package.install"));
+    }
+    // 与 install/remove 同一道围栏：面板以 root 运行，只允许动白名单内的包。
+    if !ALLOWED_PACKAGES.iter().any(|p| p.name == name.as_str()) {
+        return Err(ApiError::bad_request("name",
+            "package not in the allowed list (panel runs as root; arbitrary holds are refused)"));
+    }
+    // 能力诚实：非 apt 管理器没有 hold 概念，如实 501 而不是伪造成功——
+    // 能力位不能撒谎（`Capable` 对「实际能不能跑」负责）。
+    if state.os.packages().manager() != Some("apt") {
+        return Err(ApiError::unsupported("package.hold"));
+    }
+    // 钉的是**真实包名**（Debian 上 redis → redis-server）：apt-mark 只认真名，
+    // 拿逻辑名去 hold 会钉到一个不存在的包（退出码 0 但不生效，静默假成功）。
+    let real = real_pkg_name(state.os.packages().manager(), &name);
+    state.os.packages().set_hold(&real, req.held).await?;
+    audit(&state, &s, "package.hold",
+        &format!("{name}:{}", if req.held { "hold" } else { "unhold" }), "ok").await;
+    Ok(ok(serde_json::json!({ "name": name, "held": req.held })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -964,6 +1025,20 @@ mod tests {
         for n in ["nginx", "php8.2-fpm", "mysql", "redis-server", "docker"] {
             assert!(is_managed(n), "{n} 应被识别为托管服务");
         }
+    }
+
+    /// hold 端点按**真实包名**落钉的映射不变量：Debian 上逻辑名 redis 的真名是
+    /// redis-server，若哪天端点直接拿逻辑名去 set_hold，apt-mark 会钉到一个不存在
+    /// 的包（退出码 0 但不生效）——UI 显示「已钉住」而升级照旧发生的假状态。
+    /// 这条测试钉住映射本身；端点接线由实机（dev 实例 curl）覆盖。
+    #[test]
+    fn hold_uses_real_pkg_name_on_apt() {
+        assert_eq!(real_pkg_name(Some("apt"), "redis"), "redis-server");
+        assert_eq!(real_pkg_name(Some("apt"), "nginx"), "nginx");
+        // 非 apt：别名表第二列（dnf 口径）；mock 管理器同样不得误用 apt 列
+        assert_ne!(real_pkg_name(Some("mock"), "redis"), "redis-server");
+        // 回填方向：探测/回读拿到真名必须能还原逻辑名（列表徽标据此匹配卡片）
+        assert_eq!(logical_pkg_name("redis-server"), Some("redis"));
     }
 
     #[test]

@@ -474,6 +474,23 @@ pub trait PackageProvider: Send + Sync {
     /// 查不到（无包管理器 / 非 apt）同样返回空列表，调用方据此隐藏入口而不是报错
     /// ——探测失败不该让整页软件列表挂掉。
     async fn upgradable(&self, names: &[&str]) -> Result<Vec<UpgradablePkg>>;
+    /// 查询**当前被钉住（hold）的包名全集**（一次性查全量，不按名查）。
+    ///
+    /// 为什么不按名查（`apt-mark showhold <pkg>`）：调用方要把 hold 状态合并进
+    /// **白名单包的列表**，每刷新一次就得对二十来个包逐一问一遍——既慢，又把
+    /// 「全量集」这个天然语义拆成 N 次往返。`showhold` 一次输出全部被钉包名，
+    /// 调用方本地做交集即可。
+    ///
+    /// 非 apt 管理器（dnf 的 versionlock 是插件、apk 无对应概念）返回**空集**——
+    /// 语义是「此系统无 hold 概念」，调用方据此隐藏入口而不是报错。
+    async fn holds(&self) -> Result<Vec<String>>;
+    /// 设置/取消某个包的 hold 状态。**幂等**：对已 hold 的包再 hold 不报错。
+    ///
+    /// 语义边界（必须对用户说清）：hold 只影响 `apt-get upgrade`/`full-upgrade`
+    /// 的**自动**升级，不影响显式 `apt-get install <pkg>=<version>`——钉住是
+    /// 防误升，**不是安全边界**。包名校验在调用方白名单完成，本方法只做
+    /// 包管理器参数（argv 直传，不经 shell）。
+    async fn set_hold(&self, name: &str, held: bool) -> Result<()>;
 }
 
 // ═══════════════════════════ 防火墙（声明式） ═══════════════════════════

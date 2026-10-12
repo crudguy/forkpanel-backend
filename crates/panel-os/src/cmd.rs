@@ -33,6 +33,11 @@ pub enum Bin {
     /// 只读查询软件源元数据（apt-cache policy 列可用版本）。与 Apt(apt-get) 分开：
     /// 能力不同（只读 vs 写入），便于在审计与白名单层面区别对待。
     AptCache,
+    /// apt-mark hold/unhold/showhold：包级升级钉住（防「顺手升级把生产依赖升炸」）。
+    /// 安全评估：① 子命令由 provider 侧**编译期写死**（showhold/hold/unhold），
+    /// 不存在用户可控子命令；② 包名经调用方白名单校验后作为**单个 argv** 传入，
+    /// 不经 shell；③ hold 只影响自动升级，不是安全边界——边界仍在端点权限。
+    AptMark,
     Journalctl,                         // 日志
     Crontab,                            // 计划任务（用户 crontab）
     /// 计划任务重叠保护（P2-3）：包裹 cron 命令实现互斥锁。
@@ -89,6 +94,7 @@ impl Bin {
             Apt => "apt-get", Dnf => "dnf", Yum => "yum", Apk => "apk", Zypper => "zypper", Dpkg => "dpkg-query",
             AptList => "apt",
             AptCache => "apt-cache",
+            AptMark => "apt-mark",
             Journalctl => "journalctl", Crontab => "crontab", Flock => "flock", Curl => "curl",
             Nginx => "nginx", Caddy => "caddy",
             Docker => "docker",
