@@ -425,6 +425,14 @@ components:
       type: object
       properties: { enabled: { type: boolean } }
 
+    # ───────────── 本机便签（025） ─────────────
+    ServerNote:
+      type: object
+      properties:
+        id:         { type: integer, description: 便签 id（迁移 025 迁入的旧单例内容恒为 1） }
+        content:    { type: string, description: 便签内容（trim 后非空，≤500 字） }
+        updated_at: { type: integer, description: 最近更新时间（unix 秒） }
+
     # ───────────── 软件包 ─────────────
     Package:
       type: object
@@ -1259,17 +1267,29 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/Overview' } } }
 
-  /api/v1/server/note:
+  /api/v1/server/notes:
     get:
       tags: [system]
-      summary: 读取本机说明（022，单例 server_note；全部登录用户可读）
-      responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { content: { type: string } } } } } } } } }
+      summary: 本机便签列表（025，多条；全部登录用户可读）
+      responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/ServerNote' } } } } } } } }
+    post:
+      tags: [system]
+      summary: 新建便签（025，写需 system.manage；上限 50 条，超出 400）
+      security: [cookieAuth, csrfHeader]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [content], properties: { content: { type: string, description: 便签内容，trim 后非空、≤500 字 } } } } } }
+      responses: { '200': { description: ok }, '400': { description: 内容为空/超长/条数达上限 } }
+  /api/v1/server/notes/{id}:
     patch:
       tags: [system]
-      summary: 更新本机说明（022，写需 system.manage）
+      summary: 更新便签（025，写需 system.manage；id 不存在 → 404）
       security: [cookieAuth, csrfHeader]
-      requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { content: { type: string, description: 本机说明，≤500 字 } } } } } }
-      responses: { '204': { description: ok } }
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [content], properties: { content: { type: string, description: 便签内容，trim 后非空、≤500 字 } } } } } }
+      responses: { '200': { description: ok }, '400': { description: 内容为空/超长 }, '404': { description: 便签不存在 } }
+    delete:
+      tags: [system]
+      summary: 删除便签（025，写需 system.manage；id 不存在 → 404）
+      security: [cookieAuth, csrfHeader]
+      responses: { '200': { description: ok }, '404': { description: 便签不存在 } }
   /api/v1/system/users:
     get:
       tags: [system]

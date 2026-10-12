@@ -31,10 +31,12 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (21, include_str!("../../../migrations/021_site_access_proxy_log.sql")),
     (22, include_str!("../../../migrations/022_remark.sql")),
     (23, include_str!("../../../migrations/023_site_last_applied.sql")),
+    // 024（apt-mark hold）无 schema 变更，版本号空置
+    (25, include_str!("../../../migrations/025_server_notes.sql")),
 ];
 
 /// 当前 schema 版本
-pub const LATEST: u32 = 23;
+pub const LATEST: u32 = 25;
 
 pub fn apply(conn: &mut Connection) -> Result<u32> {
     conn.execute_batch(
@@ -113,8 +115,11 @@ mod tests {
     }
 
     #[test]
-    fn latest_matches_embedded_count() {
-        assert_eq!(LATEST, MIGRATIONS.len() as u32,
-                   "新增迁移文件后必须递增 LATEST");
+    fn latest_matches_embedded_max() {
+        // 允许版本号空置（如 024 apt-hold 无 schema 变更、未建迁移文件），
+        // 故断言「LATEST == 最大已注册版本」而非数量相等——同样能抓住
+        // 「新增迁移文件后忘记递增 LATEST」。
+        let max = MIGRATIONS.iter().map(|(v, _)| *v).max().unwrap_or(0);
+        assert_eq!(LATEST, max, "新增迁移文件后必须递增 LATEST");
     }
 }
