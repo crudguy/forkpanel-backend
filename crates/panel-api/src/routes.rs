@@ -25,6 +25,7 @@ pub mod tasks;
 pub mod processes;
 pub mod security;
 pub mod dashboard;
+pub mod onboarding;
 pub mod settings;
 pub mod users;
 pub mod audit;
@@ -306,6 +307,10 @@ pub fn build_router(state: Shared) -> Router {
     let cfg_r = Router::new()
         .route("/api/v1/settings", get(settings::get).patch(settings::patch))
         .route("/api/v1/settings/dashboard", get(dashboard::get).put(dashboard::put))
+        // C2 首启上手清单：GET 只需登录，PUT（勾选/不再显示）需 settings.manage
+        .route("/api/v1/settings/onboarding", get(onboarding::get).put(onboarding::put))
+        // C10 设置页「测试连接」：真实探测 OpenAI 兼容 /v1/models（仅耗时探测，不改配置）
+        .route("/api/v1/settings/llm/test", post(settings::test_llm))
         .route("/api/v1/users", get(users::list).post(users::create))
         .route("/api/v1/users/{id}", patch(users::patch).delete(users::delete))
         .route("/api/v1/roles", get(roles::list).post(roles::create))

@@ -32,5 +32,12 @@ sha1       = "0.10"   # TOTP (RFC 6238)：HMAC-**SHA1**，Google Authenticator �
 time       = { version = "0.3", features = ["formatting", "parsing"] }
 rusqlite   = { workspace = true }
 
+# 外发 HTTP：本仓唯一用途是设置页「测试连接」——探测 OpenAI 兼容的 /v1/models
+# （评估报告 C10 的验证闭环）。刻意关掉默认特性控体积：只要 JSON 与 rustls
+# （纯 Rust TLS，不引入 openssl 构建依赖），不需要 http2 / 系统代理探测。
+# 注：reqwest 0.13 把 `rustls-tls` 更名为 `rustls`（默认 crypto provider），
+# `rustls-tls-*` 那套旧名字已不存在。
+reqwest    = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

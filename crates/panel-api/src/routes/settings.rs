@@ -149,9 +149,8 @@ pub async fn patch(
             | (K_LLM_API_KEY, Value::Null) => ops.push((k.as_str(), None)), // null = 清除
             (K_LLM_ENDPOINT, Value::String(url)) => {
                 let url = url.trim();
-                let ok = (url.starts_with("http://") || url.starts_with("https://"))
-                    && url.len() <= 256
-                    && !url.ends_with('/');
+                // 与「测试连接」共用同一条约束（valid_endpoint），避免两条路径漂移
+                let ok = valid_endpoint(url);
                 if !ok {
                     return Err(ApiError::bad_request(
                         "settings",
@@ -231,6 +230,287 @@ pub async fn patch(
 
     // 回读 runtime 段（api_key 永不明文）
     get(State(state), Auth(s)).await
+}
+
+// ─────────────────── 测试连接（C10 验证闭环）───────────────────
+
+/// endpoint 合法性。**PATCH 与「测试连接」必须共用这一条约束**——同一约束拆在
+/// 两条路径上是本仓踩过的高频 bug（一处校验一处不校验 → "能存但测不通"）。
+fn valid_endpoint(url: &str) -> bool {
+    (url.starts_with("http://") || url.starts_with("https://"))
+        && url.len() <= 256
+        && !url.ends_with('/')
+}
+
+/// 探测超时。宁可让用户等 8 秒后拿到明确超时，也不要挂住一个 axum worker。
+const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+#[derive(Debug, Deserialize)]
+pub struct TestLlmReq {
+    /// 省略（或 null）= 用库里已存的值；填了则以本次为准（**先测后存**）
+    pub endpoint: Option<String>,
+    pub model: Option<String>,
+    /// 明文密钥：省略则用库里已存的那把（库里是主密钥加密的，此处解开后只用不存）
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TestLlmResp {
+    pub ok: bool,
+    pub latency_ms: u64,
+    pub endpoint: String,
+    pub model: Option<String>,
+    /// 该 model 是否出现在 /v1/models 的返回里（model 未配置时恒 false）
+    pub model_found: bool,
+    /// 可用模型数量（解析失败为 null）
+    pub model_count: Option<usize>,
+    pub status: Option<u16>,
+    /// 人话结论：成功摘要 / 失败原因
+    pub detail: String,
+}
+
+/// 非 2xx 的失败原因。**只回显响应体前 200 字符且不含任何请求侧内容**——
+/// 端点由管理员填写，本函数回显的内容可能是内网服务的报错，截断是必要的。
+fn status_detail(status: u16, body: &str) -> String {
+    let tail: String = body.chars().take(200).collect();
+    let brief = if tail.is_empty() { String::new() } else { format!("：{tail}") };
+    match status {
+        401 => format!("密钥被拒绝（HTTP 401）——API Key 无效或已撤销{brief}"),
+        403 => format!("无访问权限（HTTP 403）——Key 可能没有该模型/接口的权限{brief}"),
+        404 => format!("接口不存在（HTTP 404）——Endpoint 可能少写了 /v1{brief}"),
+        429 => format!("被限流（HTTP 429）——稍后重试{brief}"),
+        s if s >= 500 => format!("服务端错误（HTTP {s}）——对方服务异常{brief}"),
+        s => format!("未预期的响应（HTTP {s}）{brief}"),
+    }
+}
+
+/// 请求层失败（连不上 / 超时 / TLS）的原因。reqwest 的错误类型已能区分这几类，
+/// 不区分的话用户只能看到一句 "error sending request"。
+fn err_detail(e: &reqwest::Error) -> String {
+    if e.is_timeout() {
+        format!("连接超时（{}s 内无响应）", TEST_TIMEOUT.as_secs())
+    } else if e.is_connect() {
+        "无法建立连接：主机名解析失败、端口不通或被防火墙拒绝".to_string()
+    } else if e.is_request() {
+        format!("请求被拒绝（多半是 Endpoint 不被识别为 http/https）：{e}")
+    } else if e.is_body() || e.is_decode() {
+        format!("响应读取/解析失败（对方返回的可能不是 JSON）：{e}")
+    } else {
+        format!("请求失败：{e}")
+    }
+}
+
+/// 从 `enc:<hex>` 解出明文（库里 api_key 的落库形态）。
+fn plain_api_key(state: &Shared, raw: &str) -> Option<String> {
+    let s = serde_json::from_str::<Value>(raw).ok().and_then(|v| v.as_str().map(str::to_string))?;
+    let hex = s.strip_prefix("enc:")?;
+    let blob: Vec<u8> = (0..hex.len() / 2).filter_map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()).collect();
+    if blob.is_empty() || blob.len() * 2 != hex.len() {
+        return None;
+    }
+    let master = state.require_secret_key().ok()?;
+    master.decrypt(&blob).ok().and_then(|b| String::from_utf8(b).ok())
+}
+
+/// `POST /api/v1/settings/llm/test`——真实探测 OpenAI 兼容的 `/v1/models`。
+///
+/// 设计要点：
+/// - **先测后存**：请求里带的 endpoint/model/api_key 优先于库里的值，用户改完
+///   输入框就能验证，不必先保存才知道配错了（C10 原话："避免保存后才报错"）。
+/// - **绝不 500**：所有探测失败都落成 `ok:false + detail`，配置错了是用户的事，
+///   不是服务器错误——返回 500 会让前端把"密钥填错"显示成"请求失败"。
+/// - **密钥不落日志、不回显**：只回布尔与结论。
+/// - 端点由管理员填写 ⇒ 这是一次由管理员发起的外发请求（SSRF 面）；仅
+///   `settings.manage` 可调用，且响应体截断到 200 字符。
+pub async fn test_llm(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    Json(req): Json<TestLlmReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::SETTINGS_MANAGE)?;
+
+    let table = load_table(&state).await?;
+    let stored = |k: &str| -> Option<String> {
+        table
+            .get(k)
+            .and_then(|j| serde_json::from_str::<Value>(j).ok())
+            .and_then(|v| v.as_str().map(str::to_string))
+    };
+
+    let endpoint = match req.endpoint.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(e) => e.to_string(),
+        None => stored(K_LLM_ENDPOINT).unwrap_or_default(),
+    };
+    if endpoint.is_empty() {
+        return Err(ApiError::bad_request("endpoint", "尚未配置 API Endpoint，无法测试"));
+    }
+    if !valid_endpoint(&endpoint) {
+        return Err(ApiError::bad_request(
+            "endpoint",
+            "API Endpoint 须为 http(s) URL（≤256 字符、无尾斜杠）",
+        ));
+    }
+    let model = match req.model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(m) => Some(m.to_string()),
+        None => stored(K_LLM_MODEL),
+    };
+    let api_key = match req.api_key.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(k) => Some(k.to_string()),
+        None => table
+            .get(K_LLM_API_KEY)
+            .and_then(|raw| plain_api_key(&state, raw)),
+    };
+
+    let client = match reqwest::Client::builder().timeout(TEST_TIMEOUT).build() {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(ok(TestLlmResp {
+                ok: false,
+                latency_ms: 0,
+                endpoint,
+                model,
+                model_found: false,
+                model_count: None,
+                status: None,
+                detail: format!("无法创建 HTTP 客户端：{e}"),
+            }))
+        }
+    };
+
+    let url = format!("{endpoint}/models");
+    let started = std::time::Instant::now();
+    let mut call = client.get(&url).header("accept", "application/json");
+    if let Some(k) = api_key.as_deref() {
+        call = call.bearer_auth(k);
+    }
+    let outcome = call.send().await;
+    let latency_ms = started.elapsed().as_millis() as u64;
+
+    let resp: TestLlmResp = match outcome {
+        Err(e) => TestLlmResp {
+            ok: false,
+            latency_ms,
+            endpoint,
+            model,
+            model_found: false,
+            model_count: None,
+            status: None,
+            detail: err_detail(&e),
+        },
+        Ok(r) => {
+            let status = r.status().as_u16();
+            let body = r.text().await.unwrap_or_default();
+            if !(200..300).contains(&status) {
+                TestLlmResp {
+                    ok: false,
+                    latency_ms,
+                    endpoint,
+                    model,
+                    model_found: false,
+                    model_count: None,
+                    status: Some(status),
+                    detail: status_detail(status, &body),
+                }
+            } else {
+                let v = serde_json::from_str::<Value>(&body).ok();
+                let ids: Vec<String> = v
+                    .as_ref()
+                    .and_then(|v| v.get("data"))
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.get("id").and_then(Value::as_str).map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let model_count = if v.is_some() { Some(ids.len()) } else { None };
+                let model_found = model.as_deref().map(|m| ids.iter().any(|i| i == m)).unwrap_or(false);
+                let detail = match (model.as_deref(), model_count, model_found) {
+                    (Some(m), Some(_), false) => format!(
+                        "连通（{} ms，可用模型 {} 个），但列表里没有 `{m}`——请核对模型名",
+                        latency_ms,
+                        ids.len()
+                    ),
+                    (Some(m), None, _) => format!(
+                        "连通（{} ms），但响应不是预期的 OpenAI 兼容 JSON，无法核对 `{m}`",
+                        latency_ms
+                    ),
+                    (Some(_), Some(_), true) => {
+                        format!("连通且模型可用（{} ms，可用模型 {} 个）", latency_ms, ids.len())
+                    }
+                    (None, Some(_), _) => format!("连通（{} ms，可用模型 {} 个）", latency_ms, ids.len()),
+                    (None, None, _) => format!("连通（{} ms），但响应不是 JSON", latency_ms),
+                };
+                TestLlmResp {
+                    ok: true,
+                    latency_ms,
+                    endpoint,
+                    model,
+                    model_found,
+                    model_count,
+                    status: Some(status),
+                    detail,
+                }
+            }
+        }
+    };
+
+    audit(
+        &state,
+        &s,
+        "settings.llm_test",
+        &resp.endpoint,
+        if resp.ok { "ok" } else { "fail" },
+    )
+    .await;
+
+    Ok(ok(resp))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_rule_is_shared_by_patch_and_probe() {
+        // PATCH 与「测试连接」共用 valid_endpoint：任一处退化成自己的一份判断，
+        // 就会出现"能存但测不通"或"能测但存不下"。
+        assert!(valid_endpoint("https://api.openai.com/v1"));
+        assert!(valid_endpoint("http://127.0.0.1:11434/v1"), "内网/本地网关是合法用例");
+        assert!(!valid_endpoint("https://api.openai.com/v1/"), "尾斜杠会拼出 //models");
+        assert!(!valid_endpoint("ftp://x/v1"), "非 http(s)");
+        assert!(!valid_endpoint("api.openai.com/v1"), "缺 scheme");
+        let long = format!("https://{}", "a".repeat(300));
+        assert!(!valid_endpoint(&long), "超长");
+    }
+
+    #[test]
+    fn status_detail_names_the_cause_and_truncates_body() {
+        assert!(status_detail(401, "").contains("密钥被拒绝"));
+        assert!(status_detail(404, "").contains("Endpoint 可能少写了 /v1"));
+        assert!(status_detail(503, "").contains("服务端错误"));
+        // 端点由管理员填写 ⇒ 回显必须截断（否则可能把内网服务的整页报错带出来）。
+        // 数回显字符而不是字节：detail 里有中文，String::len() 是字节数。
+        let d = status_detail(401, &"x".repeat(5000));
+        assert_eq!(d.chars().filter(|c| *c == 'x').count(), 200, "回显须截断到 200 字符：{d}");
+    }
+
+    #[tokio::test]
+    async fn err_detail_distinguishes_connect_failure() {
+        // 端口 1 必然连不上（无外发、无依赖）；若这条都拿不到 is_connect，
+        // 用户看到的就只剩一句 "error sending request"。
+        let c = reqwest::Client::builder()
+            .timeout(TEST_TIMEOUT)
+            .build()
+            .expect("client");
+        let e = c
+            .get("http://127.0.0.1:1/models")
+            .send()
+            .await
+            .expect_err("端口 1 应拒绝连接");
+        let d = err_detail(&e);
+        assert!(d.contains("无法建立连接"), "分类失准：{d}");
+    }
 }
 
 fn tier_str(t: panel_core::Tier) -> String {

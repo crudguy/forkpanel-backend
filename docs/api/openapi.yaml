@@ -1085,6 +1085,51 @@ components:
           minItems: 1
           maxItems: 5
           items: { $ref: '#/components/schemas/DashboardCardPref' }
+    OnboardingStep:
+      type: object
+      description: 上手清单的一步；done = checked || auto（真实状态优先于勾选，防进度撒谎）
+      properties:
+        id:      { type: string, enum: [trust_ca, create_site, issue_cert, enable_waf, backup_plan] }
+        title:   { type: string }
+        desc:    { type: string }
+        route:   { type: string, description: 前端路由（清单每步「前往」直达） }
+        checked: { type: boolean, description: 用户手动勾选 }
+        auto:    { type: boolean, description: 由后端真实状态判定已完成（此时勾选框禁用：勾了结果也不变） }
+        done:    { type: boolean, description: checked || auto —— 前端只看这一个字段 }
+    OnboardingState:
+      type: object
+      description: 首启上手清单整体状态（读：仅需登录；写：需 settings.manage）
+      properties:
+        steps:      { type: array, items: { $ref: '#/components/schemas/OnboardingStep' } }
+        dismissed:  { type: boolean, description: 用户选择「不再显示」 }
+        updated_at: { type: [integer, "null"] }
+        done_count: { type: integer }
+        total:      { type: integer }
+    OnboardingPut:
+      type: object
+      description: 整体替换勾选集合（未提供 checked 视为清空）；未知 id → 400 且不部分写入
+      properties:
+        checked:   { type: array, items: { type: string } }
+        dismissed: { type: boolean }
+    LlmTestReq:
+      type: object
+      description: 省略/null 字段回落到库里已存值；填写则以本次为准（先测后存，避免保存后才发现配错）
+      properties:
+        endpoint: { type: string }
+        model:    { type: string }
+        api_key:  { type: string, description: 明文密钥，仅用于本次探测：不落库、不回显、不入日志 }
+    LlmTestResult:
+      type: object
+      description: 探测结论。**探测失败一律 ok:false + detail，不返回 500**——配置错是用户的事，不是服务器错误
+      properties:
+        ok:          { type: boolean }
+        latency_ms:  { type: integer }
+        endpoint:    { type: string }
+        model:       { type: [string, "null"] }
+        model_found: { type: boolean, description: model 是否出现在 /v1/models 的返回里 }
+        model_count: { type: [integer, "null"], description: 可用模型数；响应不是预期 JSON 时为 null }
+        status:      { type: [integer, "null"], description: HTTP 状态码；请求层失败（连不上/超时）时为 null }
+        detail:      { type: string, description: 人话结论：成功摘要或失败原因 }
     User:
       type: object
       properties:
@@ -3083,6 +3128,49 @@ paths:
       security: [cookieAuth, csrfHeader]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/DashboardLayout' } } } }
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/DashboardLayout' } } } } } } }
+  /api/v1/settings/onboarding:
+    get:
+      tags: [settings]
+      summary: 首启上手清单（5 步 + 自动判定进度）
+      description: |
+        返回固定的 5 步：信任根证书 → 创建站点 → 申请证书 → 开启 WAF → 备份计划。
+        `done = checked ∪ 后端可判定的真实状态`：建了站就算完成，不靠用户记得勾选；
+        `auto=true` 的步骤由真实状态判定，前端据此禁用勾选框（勾了结果也不变）。
+        仅需登录。
+      security: [cookieAuth]
+      responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/OnboardingState' } } } } } } }
+    put:
+      tags: [settings]
+      summary: 保存上手清单进度（整体替换，需 settings.manage）
+      description: |
+        `checked` 元素须为已知步骤 id（重复自动去重，未知 id → 400）；
+        `dismissed=true` = 不再显示清单。任一字段非法 → 400，不部分写入。
+      security: [cookieAuth, csrfHeader]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/OnboardingPut' } } } }
+      responses:
+        '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/OnboardingState' } } } } } }
+        '400': { description: checked 含未知 id / dismissed 非布尔 }
+  /api/v1/settings/llm/test:
+    post:
+      tags: [settings]
+      summary: 测试 AI 助手 LLM 接入（真实探测 OpenAI 兼容 /v1/models，需 settings.manage）
+      description: |
+        请求体三个字段都可省略：省略即测库里已存的配置，填写即测当前输入
+        （**先测后存**，避免保存后才发现配错）。
+
+        判定：HTTP 2xx 且响应可解析为 OpenAI 兼容 JSON ⇒ ok=true，并核对
+        配置的 model 是否在 /v1/models 列表里（model_found）。
+
+        **探测失败一律 ok:false + detail，不返回 500**——密钥填错是配置问题，
+        不是服务器错误；返回 500 会让前端把「密钥无效」显示成「请求失败」。
+
+        端点由管理员填写 ⇒ 这是一次管理员发起的外发请求：仅 settings.manage
+        可调用，响应体回显截断到 200 字符，密钥不落日志、不回显。
+      security: [cookieAuth, csrfHeader]
+      requestBody: { required: false, content: { application/json: { schema: { $ref: '#/components/schemas/LlmTestReq' } } } }
+      responses:
+        '200': { description: 探测完成（成功与失败都在这里，看 data.ok）, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/LlmTestResult' } } } } } }
+        '400': { description: 未配置 Endpoint / Endpoint 不是合法 http(s) URL }
   /api/v1/roles:
     get:
       tags: [users]
