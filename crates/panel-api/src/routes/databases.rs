@@ -18,6 +18,7 @@ use crate::{
 };
 // Path 与 std::path::PathBuf 同名，按全仓约定别名成 AxPath
 use axum::{extract::{Path as AxPath, Query, State}, Json};
+use axum::http::StatusCode;
 use panel_core::{PanelError, Result, SafePath};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -40,14 +41,16 @@ pub struct ConnDto {
     pub client_ready: bool,
     /// 是否有口令（**绝不返回口令本身**）
     pub has_password: bool,
+    /// 对象说明（备注，022）：这个库干嘛的、为何这样配置——手写意图
+    pub remark: String,
 }
 
 /// 列表端点的目标列。**列序即 `conn_row` 的索引**——加列必须同步改这两处。
 const CONN_SELECT: &str =
-    "SELECT id, name, engine, host, port, default_db, password_enc FROM db_connections";
+    "SELECT id, name, engine, host, port, default_db, password_enc, remark FROM db_connections";
 
 /// 一行 `db_connections` 的原始形态（与 `CONN_SELECT` 列序严格对应）。
-type ConnRow = (i64, String, String, Option<String>, Option<i64>, Option<String>, Option<Vec<u8>>);
+type ConnRow = (i64, String, String, Option<String>, Option<i64>, Option<String>, Option<Vec<u8>>, String);
 
 /// 行 → 元组。
 ///
@@ -61,6 +64,8 @@ fn conn_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ConnRow> {
         // 不匹配，**列表端点直接 500**（`Invalid column type Blob at index: 6`）。
         // 下游只用 `pwd.is_some()`，取字节即可，无需解密。
         r.get(6)?,
+        // 第 8 列 `remark`（022）是 TEXT，顺序追加，不影响上面 BLOB 列索引。
+        r.get(7)?,
     ))
 }
 
@@ -80,7 +85,7 @@ pub async fn list(
     }).await?;
 
     let mut dtos = Vec::new();
-    for (id, name, engine, host, port, default_db, pwd) in rows {
+    for (id, name, engine, host, port, default_db, pwd, remark) in rows {
         let eng = match engine.as_str() {
             "mysql" => panel_os::DbEngine::MySql,
             "postgres" => panel_os::DbEngine::Postgres,
@@ -96,6 +101,7 @@ pub async fn list(
             host, port, default_db,
             client_ready: available,
             has_password: pwd.is_some(),
+            remark,
         });
     }
     Ok(ok(dtos))
@@ -175,6 +181,55 @@ pub async fn create(
 
 #[derive(Debug, Deserialize)]
 pub struct BackupReq { pub id: i64, pub out: String }
+
+/// 备注更新请求体（022）。
+#[derive(Debug, Deserialize)]
+pub struct ConnRemarkReq {
+    pub remark: String,
+}
+
+/// 更新数据库连接说明（对象备注，022）。仅 `db.manage`。
+///
+/// 连接按 `id` 或 `name` 解析（路由段为字符串）：先读后写，不存在返回 404。
+pub async fn update_remark(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    AxPath(conn): AxPath<String>,
+    Json(req): Json<ConnRemarkReq>,
+) -> ApiResult<StatusCode> {
+    crate::auth::require(&s, perm::DB_MANAGE)?;
+    let id: i64 = state
+        .pool
+        .with(move |c| {
+            c.query_row(
+                // 注意：`?1` 在同一语句中可重复引用，params 只需给**一个**值——
+                // 给两个会触发 InvalidParameterCount，被下方 map_err 吞成 404。
+                "SELECT id FROM db_connections WHERE id = ?1 OR name = ?1",
+                rusqlite::params![conn],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(|e| PanelError::Database(e.to_string()))
+        })
+        .await
+        .map_err(|_| ApiError::not_found("connection"))?;
+    let remark = req.remark.trim().to_string();
+    if remark.chars().count() > 500 {
+        return Err(ApiError::bad_request("remark", "备注最多 500 字"));
+    }
+    state
+        .db
+        .exec(move |c| {
+            c.execute(
+                "UPDATE db_connections SET remark = ?1 WHERE id = ?2",
+                rusqlite::params![remark, id],
+            )
+            .map(|_| panel_db::WriteAck { rows_changed: 1 })
+            .map_err(|e| PanelError::Database(e.to_string()))
+        })
+        .await?;
+    audit(&state, &s, "db.remark", &id.to_string(), "ok").await;
+    Ok(StatusCode::NO_CONTENT)
+}
 
 pub async fn backup(
     State(state): State<Shared>, Auth(s): Auth, Json(req): Json<BackupReq>,
@@ -862,7 +917,8 @@ mod tests {
     fn password_is_never_returned() {
         // 列表接口只返回 has_password 布尔，不返回口令
         let dto = ConnDto { id: 1, name: "x".into(), engine: "mysql", host: None,
-            port: None, default_db: None, client_ready: true, has_password: true };
+            port: None, default_db: None, client_ready: true, has_password: true,
+            remark: String::new() };
         let v = serde_json::to_value(&dto).unwrap();
         assert!(!v.as_object().unwrap().contains_key("password"));
         assert_eq!(v["has_password"], true);

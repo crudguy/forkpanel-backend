@@ -28,6 +28,7 @@ pub mod settings;
 pub mod users;
 pub mod audit;
 pub mod multipart;
+pub mod notes;
 pub mod roles;
 pub mod terminal;
 
@@ -136,6 +137,8 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/sites/apply", post(sites::apply))
         .route("/api/v1/sites/root", get(sites::root_info))
         .route("/api/v1/sites/{id}", get(sites::get).patch(sites::patch).delete(sites::delete))
+        // 站点说明（对象备注，022）：内联编辑保存
+        .route("/api/v1/sites/{id}/remark", patch(sites::update_remark))
         .route("/api/v1/apps", get(apps::list).post(apps::create))
         .route("/api/v1/apps/catalog", get(apps::catalog))
         .route(
@@ -202,7 +205,9 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/db/{conn}/{db}/{table}/rows", get(databases::rows))
         .route("/api/v1/db/{conn}/backup", post(databases::backup))
         .route("/api/v1/db/{conn}/query", post(databases::query))
-        .route("/api/v1/db/{conn}/restore", post(databases::restore));
+        .route("/api/v1/db/{conn}/restore", post(databases::restore))
+        // 数据库连接说明（对象备注，022）
+        .route("/api/v1/db/{conn}/remark", patch(databases::update_remark));
 
     // ── 防火墙 ──
     let fw_r = Router::new()
@@ -273,7 +278,13 @@ pub fn build_router(state: Shared) -> Router {
         // 复用 services 的 PackageTask 任务队列，按包管理器选对包名。
         .route("/api/v1/containers/install", post(containers::install))
         // 修复 daemon_unreachable：把面板运行用户加入 docker 组（高危，需二次确认）。
-        .route("/api/v1/containers/join-docker-group", post(containers::join_docker_group));
+        .route("/api/v1/containers/join-docker-group", post(containers::join_docker_group))
+        // 容器备注（022）：容器不入库，存 container_remarks 引用表；读写不强制 Docker 可达
+        .route("/api/v1/containers/{id}/remark", get(containers::get_remark).patch(containers::update_remark));
+
+    // ── 本机说明（022） ──
+    let notes_r = Router::new()
+        .route("/api/v1/server/note", get(notes::get_note).patch(notes::update_note));
 
     // ── 任务中心 ──
     let task_r = Router::new()
@@ -334,6 +345,7 @@ pub fn build_router(state: Shared) -> Router {
         .merge(notify_r)
         .merge(backup_r)
         .merge(container_r)
+        .merge(notes_r)
         .merge(task_r)
         .merge(cfg_r)
         .merge(sse_r)

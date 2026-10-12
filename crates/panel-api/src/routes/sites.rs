@@ -115,6 +115,8 @@ struct RawSite {
     log_error: i32,
     /// 错误日志级别（021）
     log_error_level: String,
+    /// 对象说明（备注，022）：这台站点干嘛的、为什么这么配——手写意图，非系统日志
+    remark: String,
 }
 
 impl RawSite {
@@ -222,6 +224,8 @@ pub struct SiteOut {
     pub log_error: bool,
     /// 错误日志级别（021）
     pub log_error_level: String,
+    /// 对象说明（备注，022）：这台站点干嘛的、为什么这么配
+    pub remark: String,
 }
 
 /// API 口径的单条路由。
@@ -677,6 +681,7 @@ fn to_out(r: &RawSite) -> SiteOut {
         log_access: r.log_access != 0,
         log_error: r.log_error != 0,
         log_error_level: r.log_error_level.clone(),
+        remark: r.remark.clone(),
     }
 }
 
@@ -695,7 +700,7 @@ const SITE_SELECT: &str = "s.id, s.name, s.domains, s.root, s.kind, s.enabled, s
        (SELECT v.hash FROM site_conf_versions v WHERE v.site_id = s.id ORDER BY v.id DESC LIMIT 1) AS last_ver_hash,
        s.ip_allow, s.ip_deny, s.auth_basic, s.auth_user, s.lb_policy,
        s.proxy_connect_timeout, s.proxy_send_timeout, s.proxy_read_timeout,
-       s.log_access, s.log_error, s.log_error_level";
+       s.log_access, s.log_error, s.log_error_level, s.remark";
 // ⚠ 列序与下方 `r.get(N)` 一一对应。加列**一律追加到末尾**（routes_json = 18、
 //   manual_conf = 19、conf_snapshot = 20、custom_conf = 21、www_redirect = 22 …
 //   rewrite_custom = 29、last_ver_hash = 30、ip_allow = 31 … log_error_level = 41），这样既有索引全部不变——
@@ -765,6 +770,7 @@ async fn fetch_all(state: &Shared) -> Result<Vec<RawSite>> {
                     log_access: r.get(40)?,
                     log_error: r.get(41)?,
                     log_error_level: r.get(42)?,
+                    remark: r.get(43)?,
                     })
                 })
                 .map_err(db_err)?;
@@ -829,6 +835,7 @@ async fn fetch_one(state: &Shared, id: i64) -> Result<Option<RawSite>> {
                     log_access: r.get(40)?,
                     log_error: r.get(41)?,
                     log_error_level: r.get(42)?,
+                    remark: r.get(43)?,
                 })
             })
             .map_err(db_err)?;
@@ -890,6 +897,7 @@ async fn fetch_one_by_name(state: &Shared, name: &str) -> Result<Option<RawSite>
                     log_access: r.get(40)?,
                     log_error: r.get(41)?,
                     log_error_level: r.get(42)?,
+                    remark: r.get(43)?,
                 })
             })
             .map_err(db_err)?;
@@ -1121,6 +1129,8 @@ pub async fn create(
                     log_access: false,
                     log_error: false,
                     log_error_level: "error".to_string(),
+                    // 兜底分支：站点刚创建，尚无对象说明
+                    remark: String::new(),
                 });
             Ok(ok(out))
         }
@@ -1330,6 +1340,44 @@ async fn prune_stale_conf(
     }
     state.os.webserver().remove(&old_path).await?;
     Ok(true)
+}
+
+/// 备注更新请求体（022）。
+#[derive(Debug, Deserialize)]
+pub struct RemarkReq {
+    pub remark: String,
+}
+
+/// 更新站点说明（对象备注，022）。内联编辑保存；仅 `site.manage`。
+pub async fn update_remark(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    AxPath(id): AxPath<i64>,
+    Json(req): Json<RemarkReq>,
+) -> ApiResult<StatusCode> {
+    crate::auth::require(&s, perm::SITE_MANAGE)?;
+    // 先读后写：站点不存在返回 404（校验必须在读路径上，不能塞进 db.exec 闭包，
+    // 否则闭包内的 NotFound 会被包成 Database → 端点误报 500）。
+    if fetch_one(&state, id).await?.is_none() {
+        return Err(ApiError::not_found("site"));
+    }
+    let remark = req.remark.trim().to_string();
+    if remark.chars().count() > 500 {
+        return Err(ApiError::bad_request("remark", "备注最多 500 字"));
+    }
+    state
+        .db
+        .exec(move |conn| {
+            conn.execute(
+                "UPDATE sites SET remark = ?1 WHERE id = ?2",
+                rusqlite::params![remark, id],
+            )
+            .map(|_| panel_db::WriteAck { rows_changed: 1 })
+            .map_err(|e| PanelError::Database(e.to_string()))
+        })
+        .await?;
+    audit(&state, &s, "site.remark", &id.to_string(), "ok").await;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn patch(
@@ -4434,6 +4482,7 @@ mod tests {
             log_access: 0,
             log_error: 0,
             log_error_level: "error".into(),
+            remark: String::new(),
         }
     }
 

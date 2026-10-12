@@ -29,7 +29,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use panel_core::cap_keys;
+use panel_core::{cap_keys, PanelError};
 use panel_os::{cmd, ContainerAction, ContainerCreateReq, ContainerProvider};
 use serde::Deserialize;
 use std::time::Duration;
@@ -80,7 +80,40 @@ pub async fn list(State(state): State<Shared>, Auth(s): Auth) -> ApiResult<Json<
     crate::auth::require(&s, perm::CONTAINER_VIEW)?;
     ensure_supported(&state)?;
     let items = state.os.containers().list().await?;
-    Ok(ok(items))
+    // 022：一次性联查 container_remarks，把备注挂到每个容器上（无则为空串）。
+    // 容器不入库，若逐行 GET /remark 会产生 N+1 请求。表按容器**名称**索引：
+    // 完整 ID 随重建变化，名称在重建时通常保留——按 ID 存会让重建后备注变孤儿。
+    let remarks: std::collections::HashMap<String, String> = state
+        .pool
+        .with(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT name, remark FROM container_remarks")
+                .map_err(|e| PanelError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .map_err(|e| PanelError::Database(e.to_string()))?;
+            let mut m = std::collections::HashMap::new();
+            for row in rows {
+                let (k, v) = row.map_err(|e| PanelError::Database(e.to_string()))?;
+                m.insert(k, v);
+            }
+            Ok(m)
+        })
+        .await
+        .unwrap_or_default();
+    let mut arr = serde_json::to_value(&items).map_err(|e| {
+        ApiError::new(60000, StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+    if let serde_json::Value::Array(list) = &mut arr {
+        for item in list.iter_mut() {
+            if let Some(obj) = item.as_object_mut() {
+                let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                let remark = remarks.get(&name).cloned().unwrap_or_default();
+                obj.insert("remark".to_string(), serde_json::Value::String(remark));
+            }
+        }
+    }
+    Ok(ok(arr))
 }
 
 /// 镜像列表（等价 `docker images`，含悬空镜像）。
@@ -89,6 +122,75 @@ pub async fn images(State(state): State<Shared>, Auth(s): Auth) -> ApiResult<Jso
     ensure_supported(&state)?;
     let items = state.os.containers().images().await?;
     Ok(ok(items))
+}
+
+// ─────────────── 容器备注（022） ───────────────
+//
+// 容器不入库，备注存 `container_remarks` 引用表（按容器 id 字符串）。
+// 便签可先于对象存在，故读/写**不**强制 Docker 可达，仅做权限校验。
+
+/// 备注更新请求体（022）。
+#[derive(Debug, Deserialize)]
+pub struct ContainerRemarkReq {
+    pub remark: String,
+}
+
+/// 读取容器备注（全部有 `container.view` 的用户可读）。
+pub async fn get_remark(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    AxPath(id): AxPath<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::CONTAINER_VIEW)?;
+    if !panel_core::rules::is_valid_container_ref(&id) {
+        return Err(ApiError::bad_request("id", "容器 ID/名称非法"));
+    }
+    let remark: String = state
+        .pool
+        .with(move |conn| {
+            conn.query_row(
+                "SELECT remark FROM container_remarks WHERE name = ?1",
+                [id.clone()],
+                |r| r.get::<_, String>(0),
+            )
+            .map_err(|e| PanelError::Database(e.to_string()))
+        })
+        .await
+        .unwrap_or_default();
+    Ok(ok(serde_json::json!({ "remark": remark })))
+}
+
+/// 更新容器备注（仅 `container.manage`）。
+pub async fn update_remark(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    AxPath(id): AxPath<String>,
+    Json(req): Json<ContainerRemarkReq>,
+) -> ApiResult<StatusCode> {
+    crate::auth::require(&s, perm::CONTAINER_MANAGE)?;
+    if !panel_core::rules::is_valid_container_ref(&id) {
+        return Err(ApiError::bad_request("id", "容器 ID/名称非法"));
+    }
+    let remark = req.remark.trim().to_string();
+    if remark.chars().count() > 500 {
+        return Err(ApiError::bad_request("remark", "备注最多 500 字"));
+    }
+    // `id` 移入写闭包，审计用预先克隆的副本
+    let id_audit = id.clone();
+    state
+        .db
+        .exec(move |conn| {
+            conn.execute(
+                "INSERT INTO container_remarks(name, remark) VALUES(?1, ?2)
+                 ON CONFLICT(name) DO UPDATE SET remark = ?2",
+                rusqlite::params![id, remark],
+            )
+            .map(|_| panel_db::WriteAck { rows_changed: 1 })
+            .map_err(|e| PanelError::Database(e.to_string()))
+        })
+        .await?;
+    audit(&state, &s, "container.remark", &id_audit, "ok").await;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ─────────────── 创建 ───────────────

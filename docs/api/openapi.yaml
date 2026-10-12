@@ -499,6 +499,7 @@ components:
         log_access:     { type: boolean, description: "站点独立访问日志开关（021）：开启后由面板指定路径，可下载/清空" }
         log_error:      { type: boolean, description: "站点独立错误日志开关（021）" }
         log_error_level: { type: string, enum: [debug, info, notice, warn, error, crit, alert, emerg], description: "错误日志级别（021），默认 error" }
+        remark: { type: string, description: "对象说明（备注，022）：这台站点干嘛的、为什么这么配；无则为空串" }
     SiteRoute:
       type: object
       required: [prefix, kind]
@@ -745,6 +746,7 @@ components:
         # 仅表示外部客户端（psql / mysqldump 等）是否已安装；不代表该连接可以连通
         client_ready: { type: boolean }
         tls_mode:   { type: string, enum: [disable, prefer, require], default: prefer }
+        remark:     { type: string, description: "对象说明（备注，022）：这个库干嘛的、为何这样配置；无则为空串" }
     DbConnectionCreate:
       required: [name, engine]
       type: object
@@ -877,6 +879,7 @@ components:
         status:  { type: string, description: CLI 的人类可读状态，如 `Up 9 days`、`Exited (0) 2 hours ago` }
         ports:   { type: string, example: "0.0.0.0:80->80/tcp" }
         created: { type: string, description: 容器创建时间（CLI 原始格式，不做本地化推算） }
+        remark:  { type: string, description: "对象说明（备注，022）：容器不入库，备注存 container_remarks 引用表；列表端点一次性联查挂载，无则为空串" }
     ContainerImage:
       type: object
       description: 等价 `docker images` 的一行（含悬空镜像 `<none>`）
@@ -1254,6 +1257,17 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/Overview' } } }
 
+  /api/v1/server/note:
+    get:
+      tags: [system]
+      summary: 读取本机说明（022，单例 server_note；全部登录用户可读）
+      responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { content: { type: string } } } } } } } } }
+    patch:
+      tags: [system]
+      summary: 更新本机说明（022，写需 system.manage）
+      security: [cookieAuth, csrfHeader]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { content: { type: string, description: 本机说明，≤500 字 } } } } } }
+      responses: { '204': { description: ok } }
   /api/v1/system/users:
     get:
       tags: [system]
@@ -1643,6 +1657,14 @@ paths:
       summary: 删除站点（可选保留根目录）
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses: { '204': { description: ok } }
+  /api/v1/sites/{id}/remark:
+    patch:
+      tags: [sites]
+      summary: 更新站点说明（对象备注，022）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { remark: { type: string, description: 备注内容，≤500 字 } } } } } }
       responses: { '204': { description: ok } }
   /api/v1/apps:
     get:
@@ -2085,7 +2107,7 @@ paths:
       tags: [files]
       summary: 中止上传并清理分片（幂等：会话已不存在也返回 204）
       security: [cookieAuth, csrfHeader]
-      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID；表按名称索引（ID 随重建变化，名称通常保留），不强制 Docker 可达" }]
       responses: { '204': { description: ok } }
   /api/v1/files/multipart/{id}/complete:
     post:
@@ -2097,7 +2119,7 @@ paths:
         不因"是我们自己写的"就信任。合并后核对字节数，不符即删除目标并报错——
         宁可报错，也不留一个"大小不对但看起来正常"的文件。
       security: [cookieAuth, csrfHeader]
-      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID；表按名称索引（ID 随重建变化，名称通常保留），不强制 Docker 可达" }]
       responses:
         '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/FileUploadResult' } } } } } }
         '400': { description: 缺片 / 路径非法 }
@@ -2301,6 +2323,14 @@ paths:
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: conn, in: path, required: true, schema: { type: integer } }]
       responses: { '202': { description: 已入队 } }
+  /api/v1/db/{conn}/remark:
+    patch:
+      tags: [databases]
+      summary: 更新数据库连接说明（对象备注，022）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: conn, in: path, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { remark: { type: string, description: 备注内容，≤500 字 } } } } } }
+      responses: { '204': { description: ok } }
   /api/v1/db/{conn}/restore:
     post:
       tags: [db]
@@ -2524,6 +2554,19 @@ paths:
       responses:
         '200': { description: 已入队，返回 task_id / created / package }
         '400': { description: 已安装或守护进程不可达（无需重装），或确认词不正确 }
+  /api/v1/containers/{id}/remark:
+    get:
+      tags: [containers]
+      summary: 读取容器备注（022，容器不入库，存 container_remarks 引用表）
+      parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID；表按名称索引（ID 随重建变化，名称通常保留），不强制 Docker 可达" }]
+      responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { remark: { type: string } } } } } } } } }
+    patch:
+      tags: [containers]
+      summary: 更新容器备注（022）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID；表按名称索引（ID 随重建变化，名称通常保留），不强制 Docker 可达" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { remark: { type: string, description: 备注内容，≤500 字 } } } } } }
+      responses: { '204': { description: ok } }
   /api/v1/containers/join-docker-group:
     post:
       tags: [containers]
@@ -2553,7 +2596,7 @@ paths:
       tags: [containers]
       summary: 停止容器（优雅停机 10s 后强制）
       security: [cookieAuth, csrfHeader]
-      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID；表按名称索引（ID 随重建变化，名称通常保留），不强制 Docker 可达" }]
       responses:
         '204': { description: ok }
         '400': { description: ID/名称非法 }
@@ -2563,7 +2606,7 @@ paths:
       tags: [containers]
       summary: 重启容器
       security: [cookieAuth, csrfHeader]
-      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID；表按名称索引（ID 随重建变化，名称通常保留），不强制 Docker 可达" }]
       responses:
         '204': { description: ok }
         '400': { description: ID/名称非法 }
@@ -2573,7 +2616,7 @@ paths:
       tags: [containers]
       summary: 删除容器（**刻意不带 -f**：运行中的容器会被拒绝，需先停止）
       security: [cookieAuth, csrfHeader]
-      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID；表按名称索引（ID 随重建变化，名称通常保留），不强制 Docker 可达" }]
       responses:
         '204': { description: ok }
         '400': { description: ID/名称非法 }
@@ -2618,7 +2661,7 @@ paths:
       tags: [firewall]
       summary: 删除规则
       security: [cookieAuth, csrfHeader]
-      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID；表按名称索引（ID 随重建变化，名称通常保留），不强制 Docker 可达" }]
       responses: { '204': { description: ok } }
 
   /api/v1/firewall/fail2ban:
@@ -2711,7 +2754,7 @@ paths:
       tags: [security]
       summary: 吊销会话（允许吊销自己的当前会话=自我登出）
       security: [cookieAuth, csrfHeader]
-      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID；表按名称索引（ID 随重建变化，名称通常保留），不强制 Docker 可达" }]
       responses: { '204': { description: ok }, '404': { description: 会话不存在或已过期 } }
 
   # ───────── 计划任务 ─────────
@@ -2734,38 +2777,38 @@ paths:
   /api/v1/cron/jobs/{id}:
     get:
       tags: [cron]
-      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID；表按名称索引（ID 随重建变化，名称通常保留），不强制 Docker 可达" }]
       responses: { '200': { description: ok } }
     patch:
       tags: [cron]
       security: [cookieAuth, csrfHeader]
-      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID；表按名称索引（ID 随重建变化，名称通常保留），不强制 Docker 可达" }]
       requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { enabled: { type: boolean }, expr: { type: string }, timeout_sec: { type: integer } } } } } }
       responses: { '204': { description: ok } }
     delete:
       tags: [cron]
       security: [cookieAuth, csrfHeader]
-      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID；表按名称索引（ID 随重建变化，名称通常保留），不强制 Docker 可达" }]
       responses: { '204': { description: ok } }
   /api/v1/cron/jobs/{id}/run:
     post:
       tags: [cron]
       summary: 手动执行（任务化）
       security: [cookieAuth, csrfHeader]
-      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID；表按名称索引（ID 随重建变化，名称通常保留），不强制 Docker 可达" }]
       responses: { '202': { description: 已入队 } }
   /api/v1/cron/jobs/{id}/webhook:
     post:
       tags: [cron]
       summary: 测试该任务已配置的 Webhook（POST 一条 test 事件）
       security: [cookieAuth, csrfHeader]
-      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID；表按名称索引（ID 随重建变化，名称通常保留），不强制 Docker 可达" }]
       responses: { '200': { description: ok } }
   /api/v1/cron/jobs/{id}/runs:
     get:
       tags: [cron]
       summary: 执行记录（最近 100 条/任务）
-      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID；表按名称索引（ID 随重建变化，名称通常保留），不强制 Docker 可达" }]
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/CronRun' } } } } } } } }
   /api/v1/cron/preview:
     post:
@@ -2938,13 +2981,13 @@ paths:
       tags: [tasks]
       summary: 取消（终止子进程组）
       security: [cookieAuth, csrfHeader]
-      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID；表按名称索引（ID 随重建变化，名称通常保留），不强制 Docker 可达" }]
       responses: { '204': { description: ok } }
   /api/v1/tasks/{id}/output:
     get:
       tags: [tasks]
       summary: 任务输出尾部读取
-      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID；表按名称索引（ID 随重建变化，名称通常保留），不强制 Docker 可达" }]
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: string } } } } } } }
 
   # ───────── 设置 / 用户 / 审计 ─────────

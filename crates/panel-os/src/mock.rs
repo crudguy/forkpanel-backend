@@ -538,8 +538,8 @@ impl crate::OsAdapter for MockOsAdapter {
         for k in [cap_keys::METRICS_READ, cap_keys::PROCESS_LIST, cap_keys::PROCESS_SIGNAL,
                   cap_keys::SERVICE_MANAGE, cap_keys::PACKAGE_INSTALL, cap_keys::FIREWALL_MANAGE,
                   cap_keys::WEBSERVER_MANAGE, cap_keys::SCHEDULER_MANAGE, cap_keys::LOGS_READ,
-                  cap_keys::DBMS_MANAGE, cap_keys::SSL_ACME, cap_keys::CONTAINER_MANAGE,
-                  cap_keys::TERMINAL_MANAGE] {
+                  cap_keys::DBMS_MANAGE, cap_keys::SSL_ACME, cap_keys::CONTAINER_VIEW,
+                  cap_keys::CONTAINER_MANAGE, cap_keys::TERMINAL_MANAGE] {
             m.insert(k.into(), Capability::yes("mock"));
         }
         m
