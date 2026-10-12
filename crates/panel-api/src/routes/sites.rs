@@ -117,6 +117,9 @@ struct RawSite {
     log_error_level: String,
     /// 对象说明（备注，022）：这台站点干嘛的、为什么这么配——手写意图，非系统日志
     remark: String,
+    /// 上次成功下发（deploy + reload）的 unix 秒（023）；NULL = 从未下发。
+    /// 停用（撤下配置）不更新——「撤下」不是「下发」。
+    last_applied_at: Option<i64>,
 }
 
 impl RawSite {
@@ -226,6 +229,8 @@ pub struct SiteOut {
     pub log_error_level: String,
     /// 对象说明（备注，022）：这台站点干嘛的、为什么这么配
     pub remark: String,
+    /// 上次成功下发（deploy + reload）的 unix 秒（023）；null = 从未下发
+    pub last_applied_at: Option<i64>,
 }
 
 /// API 口径的单条路由。
@@ -682,6 +687,7 @@ fn to_out(r: &RawSite) -> SiteOut {
         log_error: r.log_error != 0,
         log_error_level: r.log_error_level.clone(),
         remark: r.remark.clone(),
+        last_applied_at: r.last_applied_at,
     }
 }
 
@@ -700,10 +706,11 @@ const SITE_SELECT: &str = "s.id, s.name, s.domains, s.root, s.kind, s.enabled, s
        (SELECT v.hash FROM site_conf_versions v WHERE v.site_id = s.id ORDER BY v.id DESC LIMIT 1) AS last_ver_hash,
        s.ip_allow, s.ip_deny, s.auth_basic, s.auth_user, s.lb_policy,
        s.proxy_connect_timeout, s.proxy_send_timeout, s.proxy_read_timeout,
-       s.log_access, s.log_error, s.log_error_level, s.remark";
+       s.log_access, s.log_error, s.log_error_level, s.remark, s.last_applied_at";
 // ⚠ 列序与下方 `r.get(N)` 一一对应。加列**一律追加到末尾**（routes_json = 18、
 //   manual_conf = 19、conf_snapshot = 20、custom_conf = 21、www_redirect = 22 …
-//   rewrite_custom = 29、last_ver_hash = 30、ip_allow = 31 … log_error_level = 41），这样既有索引全部不变——
+//   rewrite_custom = 29、last_ver_hash = 30、ip_allow = 31 … log_error_level = 42、
+//   remark = 43、last_applied_at = 44），这样既有索引全部不变——
 //   中途插列会让每个 r.get 静默错位（本项目已踩过一次：tls_count 子查询列把后续
 //   整体后移一位，apply 运行时才报 `Invalid column type`）。
 //   三个 fetch 函数中的 get(18…30) 必须同步（last_ver_hash 是子查询派生列）。
@@ -771,6 +778,7 @@ async fn fetch_all(state: &Shared) -> Result<Vec<RawSite>> {
                     log_error: r.get(41)?,
                     log_error_level: r.get(42)?,
                     remark: r.get(43)?,
+                    last_applied_at: r.get(44)?,
                     })
                 })
                 .map_err(db_err)?;
@@ -836,6 +844,7 @@ async fn fetch_one(state: &Shared, id: i64) -> Result<Option<RawSite>> {
                     log_error: r.get(41)?,
                     log_error_level: r.get(42)?,
                     remark: r.get(43)?,
+                    last_applied_at: r.get(44)?,
                 })
             })
             .map_err(db_err)?;
@@ -898,6 +907,7 @@ async fn fetch_one_by_name(state: &Shared, name: &str) -> Result<Option<RawSite>
                     log_error: r.get(41)?,
                     log_error_level: r.get(42)?,
                     remark: r.get(43)?,
+                    last_applied_at: r.get(44)?,
                 })
             })
             .map_err(db_err)?;
@@ -1131,6 +1141,8 @@ pub async fn create(
                     log_error_level: "error".to_string(),
                     // 兜底分支：站点刚创建，尚无对象说明
                     remark: String::new(),
+                    // 兜底分支：刚创建、尚未 apply，无下发时间
+                    last_applied_at: None,
                 });
             Ok(ok(out))
         }
@@ -1342,6 +1354,46 @@ async fn prune_stale_conf(
     Ok(true)
 }
 
+/// 下发收尾（023）：按需 reload + 记录「上次成功下发时间」。
+///
+/// 五条下发入口共用（apply / conf PUT / regen / rollback / 停用后重新启用）——
+/// 漏一路就会出现「配置已真实下发、列表却显示从未下发」的假状态。
+/// 铁律：先同步外部状态成功，才写库（`touch_applied` 只在 reload 成功后调）。
+/// `pruned` = 旧配置已由 `prune_stale_conf` 移除（其内部自带 reload，不必再重载）。
+async fn finish_deploy(state: &Shared, id: i64, pruned: bool) -> Result<()> {
+    if !pruned {
+        state.os.webserver().reload().await.map_err(|e| PanelError::Command {
+            bin: "reload".to_string(),
+            detail: format!("配置已写入但 reload 失败：{e}"),
+        })?;
+    }
+    touch_applied(state, id).await;
+    Ok(())
+}
+
+/// touch_applied 用的 SQL（单测直接引用本常量，不另抄一份）。
+const TOUCH_APPLIED_SQL: &str = "UPDATE sites SET last_applied_at = ?1 WHERE id = ?2";
+
+/// 落「上次成功下发时间」（023）。仅在外部已真实接收后调用；失败仅记录不中断——
+/// 配置明明已下发，不能因为一个展示字段写库失败就把整次应用判成失败。
+async fn touch_applied(state: &Shared, id: i64) {
+    let now = crate::now_unix();
+    if let Err(e) = state
+        .db
+        .exec(move |conn| {
+            conn.execute(
+                TOUCH_APPLIED_SQL,
+                rusqlite::params![now, id],
+            )
+            .map(|_| panel_db::WriteAck { rows_changed: 1 })
+            .map_err(|e| PanelError::Database(e.to_string()))
+        })
+        .await
+    {
+        eprintln!("[sites] 记录上次下发时间失败（site {id}）: {e}");
+    }
+}
+
 /// 备注更新请求体（022）。
 #[derive(Debug, Deserialize)]
 pub struct RemarkReq {
@@ -1478,14 +1530,7 @@ pub async fn patch(
             // 域名改过则文件名跟着变：新配置已就位，**此刻**才轮到删旧域名遗留的孤儿
             // 配置。`remove` 自带 reload —— 删过就等于重载过了，下面不必再 reload 一次。
             let pruned = prune_stale_conf(&state, conf_path.as_deref(), &target).await?;
-            if !pruned {
-                if let Err(e) = state.os.webserver().reload().await {
-                    return Err(ApiError::from(PanelError::Command {
-                        bin: "reload".to_string(),
-                        detail: format!("配置已写入但 reload 失败：{e}"),
-                    }));
-                }
-            }
+            finish_deploy(&state, id, pruned).await?;
             conf_path = Some(target.display().to_string());
         } else {
             // 真→假：移除配置，使站点真正下线（`remove` 内部含 reload）。
@@ -2392,8 +2437,9 @@ pub async fn apply(
             //      `remove` 自带 reload —— 删过就等于重载过了，不再重复 reload。
             let stale_conf = cur_row.as_ref().and_then(|r| r.conf_path.as_deref());
             let pruned = prune_stale_conf(&state, stale_conf, &target).await?;
-
-            // 6) reload。失败时配置已写入但服务未加载 —— 这是可恢复的（配置语法已校验过）
+            // 6) reload。失败时配置已写入但服务未加载 —— 这是可恢复的（配置语法已校验过）。
+            //    apply 按 name upsert：新建站点的 id 要等下面落库才生成，故时间戳在
+            //    upsert 后补记（其余四条入口在 finish_deploy 里落）。
             if !pruned {
                 if let Err(e) = state.os.webserver().reload().await {
                     return Err(ApiError::from(PanelError::Command {
@@ -2503,6 +2549,15 @@ pub async fn apply(
             .map_err(|e| PanelError::Database(e.to_string()))
         })
         .await?;
+
+    // 上次下发时间（023）：apply 按 name upsert，新建站点的 id 由本次落库才生成，
+    // 只能在此刻补记（其余四条入口在 finish_deploy 里落）。deploy=false 的停用态
+    // apply 没有真实下发，不记——与 finish_deploy 同口径。
+    if deploy {
+        if let Some(row) = fetch_one_by_name(&state, &req.name).await? {
+            touch_applied(&state, row.id).await;
+        }
+    }
 
     // 版本留档（018）：真实落盘 + 落库成功 → 进版本链（「重新生成」与普通下发作区分）。
     // 站点 id 回读——apply 按 name upsert，新建站点的 id 由本次落库才生成。
@@ -2888,12 +2943,7 @@ pub async fn conf_put(
     }
     // 原子替换 + reload；reload 失败时配置已写入（语法已验过，可恢复）——与 apply 同口径
     state.os.webserver().deploy(&target, &req.content).await?;
-    if let Err(e) = state.os.webserver().reload().await {
-        return Err(ApiError::from(PanelError::Command {
-            bin: "reload".to_string(),
-            detail: format!("配置已写入但 reload 失败：{e}"),
-        }));
-    }
+    finish_deploy(&state, id, false).await?;
 
     let path_str = target.display().to_string();
     let path_db = path_str.clone();
@@ -2986,14 +3036,7 @@ pub async fn conf_restore(
     let (target, rendered) = render_spec_for_row(&state, &row, &domains, &row.root).await?;
     state.os.webserver().deploy(&target, &rendered).await?;
     let pruned = prune_stale_conf(&state, row.conf_path.as_deref(), &target).await?;
-    if !pruned {
-        if let Err(e) = state.os.webserver().reload().await {
-            return Err(ApiError::from(PanelError::Command {
-                bin: "reload".to_string(),
-                detail: format!("配置已写入但 reload 失败：{e}"),
-            }));
-        }
-    }
+    finish_deploy(&state, id, pruned).await?;
 
     let path_str = target.display().to_string();
     let path_db = path_str.clone();
@@ -3234,12 +3277,7 @@ pub async fn conf_rollback(
     }
     // 原子替换 + reload（reload 失败时配置已写入、语法已验过，可恢复——与 apply 同口径）
     state.os.webserver().deploy(&target, &content).await?;
-    if let Err(e) = state.os.webserver().reload().await {
-        return Err(ApiError::from(PanelError::Command {
-            bin: "reload".to_string(),
-            detail: format!("配置已写入但 reload 失败：{e}"),
-        }));
-    }
+    finish_deploy(&state, id, false).await?;
     // 自动定态（判据见 `rollback_state` 与其单测）
     let form_fp = fingerprint_of(&row);
     let (manual_new, snap_new) = rollback_state(ver_fp.as_deref(), &form_fp);
@@ -4483,7 +4521,19 @@ mod tests {
             log_error: 0,
             log_error_level: "error".into(),
             remark: String::new(),
+            last_applied_at: None,
         }
+    }
+
+    /// 纯映射（023）：RawSite.last_applied_at 必须原样透传到 SiteOut——None 不被
+    /// 误转成 0（0 是合法时间戳 1970，与「从未下发」语义相反）。
+    #[test]
+    fn to_out_maps_last_applied_at_through_verbatim() {
+        let mut r = raw_site();
+        r.last_applied_at = Some(1_772_000_000);
+        assert_eq!(to_out(&r).last_applied_at, Some(1_772_000_000));
+        r.last_applied_at = None;
+        assert_eq!(to_out(&r).last_applied_at, None);
     }
 
     #[test]
@@ -4588,5 +4638,73 @@ mod tests {
         let (m, snap) = rollback_state(None, "FP");
         assert_eq!(m, 1);
         assert!(snap.is_none());
+    }
+}
+
+/// ── 上次下发时间（023）：迁移列 / SITE_SELECT 列序 / to_out 映射 / touch SQL ──
+///
+/// 背景事故形状：`tls_count` 子查询列曾把 SITE_SELECT 后续列整体后移一位，
+/// 编译 + 单测全绿、实机 `apply` 才报 `Invalid column type`。故本组测试全部
+/// 走**真实迁移 + 真实 SITE_SELECT + 生产 to_out**，把列序钉死在测试里。
+#[cfg(test)]
+mod last_applied_tests {
+    use super::*;
+
+    fn insert_site(c: &rusqlite::Connection, name: &str) -> i64 {
+        c.execute(
+            "INSERT INTO sites(name, domains, root, kind, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![name, r#"["a.example.com"]"#, "/var/www/x", "static", 1_700_000_000],
+        )
+        .unwrap();
+        c.last_insert_rowid()
+    }
+
+    fn read_applied(c: &rusqlite::Connection, id: i64) -> Option<i64> {
+        let sql = format!("SELECT {SITE_SELECT} FROM sites s WHERE s.id = ?1");
+        c.query_row(&sql, rusqlite::params![id], |r| r.get(44)).unwrap()
+    }
+
+    /// 列序回归：SITE_SELECT 第 44 列必须是 last_applied_at（索引错位时这里
+    /// 要么类型错、要么把 remark 读成时间戳——两种都会挂）。
+    #[test]
+    fn site_select_column_44_is_last_applied_at_and_defaults_null() {
+        let mut c = rusqlite::Connection::open_in_memory().unwrap();
+        panel_db::migrate::apply(&mut c).unwrap();
+        let id = insert_site(&c, "fresh-site");
+        assert_eq!(
+            read_applied(&c, id),
+            None,
+            "从未下发过的站点必须是 NULL；若是 0 会被格式化成 1970-01-01 谎报下发时间"
+        );
+        // 同行前后列也必须读得动：证明 44 之前没有整体错位
+        let sql = format!("SELECT {SITE_SELECT} FROM sites s WHERE s.id = ?1");
+        let (remark, conf_path): (String, Option<String>) = c
+            .query_row(&sql, rusqlite::params![id], |r| Ok((r.get(43)?, r.get(17)?)))
+            .unwrap();
+        assert_eq!(remark, "");
+        assert_eq!(conf_path, None);
+    }
+
+    /// touch SQL 语义：只更新目标行；同值可重入（幂等）；不存在的 id 静默 0 行。
+    #[test]
+    fn touch_applied_sql_updates_only_the_target_row() {
+        let mut c = rusqlite::Connection::open_in_memory().unwrap();
+        panel_db::migrate::apply(&mut c).unwrap();
+        let a = insert_site(&c, "site-a");
+        let b = insert_site(&c, "site-b");
+
+        let n = c
+            .execute(TOUCH_APPLIED_SQL, rusqlite::params![1_772_000_000i64, a])
+            .unwrap();
+        assert_eq!(n, 1, "只应命中一行");
+        assert_eq!(read_applied(&c, a), Some(1_772_000_000));
+        assert_eq!(read_applied(&c, b), None, "不得波及其他站点");
+
+        // 重入（重复 apply 同一站点）：覆盖为新值，不报错
+        c.execute(TOUCH_APPLIED_SQL, rusqlite::params![1_772_000_999i64, a]).unwrap();
+        assert_eq!(read_applied(&c, a), Some(1_772_000_999));
+        // 幽灵 id：0 行、不报错（调用方只 eprintln，不中断下发）
+        assert_eq!(c.execute(TOUCH_APPLIED_SQL, rusqlite::params![1i64, 999_999]).unwrap(), 0);
     }
 }

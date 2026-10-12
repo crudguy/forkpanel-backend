@@ -500,6 +500,7 @@ components:
         log_error:      { type: boolean, description: "站点独立错误日志开关（021）" }
         log_error_level: { type: string, enum: [debug, info, notice, warn, error, crit, alert, emerg], description: "错误日志级别（021），默认 error" }
         remark: { type: string, description: "对象说明（备注，022）：这台站点干嘛的、为什么这么配；无则为空串" }
+        last_applied_at: { type: [integer, "null"], description: "上次下发时间（023）：最近一次「配置写入磁盘且 nginx reload 成功」的 Unix 时间戳（秒）。五条下发路径（apply/重新生成/自定义配置写入/回滚/站点 PATCH）均会刷新；从未下发过为 null" }
     SiteRoute:
       type: object
       required: [prefix, kind]
