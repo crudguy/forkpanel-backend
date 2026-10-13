@@ -41,6 +41,25 @@ pub fn is_sensitive_path(p: &Path) -> bool {
     false
 }
 
+/// 目录内排序比较器：**dirs_first 与 sort 两个维度同时生效**。
+///
+/// 此前两个平台实现各写一分支（`dirs_first=true` 时走独立分支，文件段被写死跟
+/// 名称排），`opt.sort`（size/modified）被完全忽略，调用方传了也无效。两个维度
+/// 本就正交：dirs_first 决定**是否分群**，sort 决定**群内键序**，互不覆盖。
+/// 提为公共函数让 linux 与 mock 两路共用同一约束，避免再次漂移。
+pub(crate) fn cmp_entries(a: &DirEntry, b: &DirEntry, opt: &ListOpt) -> std::cmp::Ordering {
+    if opt.dirs_first {
+        let ad = a.kind == EntryKind::Dir;
+        let bd = b.kind == EntryKind::Dir;
+        if ad != bd { return bd.cmp(&ad) }
+    }
+    match opt.sort {
+        SortBy::Name => a.name.cmp(&b.name),
+        SortBy::Size => b.size.cmp(&a.size),
+        SortBy::Modified => b.modified_unix.cmp(&a.modified_unix),
+    }
+}
+
 #[async_trait::async_trait]
 impl FileProvider for LinuxFileProvider {
     async fn list_dir(&self, dir: &SafePath, opt: ListOpt) -> Result<Vec<DirEntry>> {
@@ -86,19 +105,9 @@ impl FileProvider for LinuxFileProvider {
                 });
             }
 
-            if opt.dirs_first {
-                v.sort_by(|a, b| {
-                    let ad = a.kind == EntryKind::Dir;
-                    let bd = b.kind == EntryKind::Dir;
-                    bd.cmp(&ad).then_with(|| a.name.cmp(&b.name))
-                });
-            } else {
-                match opt.sort {
-                    SortBy::Name => v.sort_by(|a, b| a.name.cmp(&b.name)),
-                    SortBy::Size => v.sort_by(|a, b| b.size.cmp(&a.size)),
-                    SortBy::Modified => v.sort_by(|a, b| b.modified_unix.cmp(&a.modified_unix)),
-                }
-            }
+            // dirs_first 与 sort 是正交的两个维度：分群与否看 dirs_first，
+            // 群内键序看 sort。此前两维各写一分支，文件段被写死跟名称。
+            v.sort_by(|a, b| cmp_entries(a, b, &opt));
             Ok(v)
         })
         .await
@@ -405,6 +414,44 @@ mod tests {
         let p = LinuxFileProvider;
         assert!(p.remove(&sp, false).await.is_err(), "未显式允许时不得删目录");
         assert!(p.remove(&sp, true).await.is_ok());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// 回归：`dirs_first=true`（默认）时 sort 必须仍然生效。
+    /// 修复前 dirs_first 走独立分支，文件段被写死跟名称排，size/modified 全无效。
+    #[tokio::test]
+    async fn sort_applies_within_dirs_first() {
+        let d = std::env::temp_dir().join(format!("panel-srt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("zdir")).unwrap();
+        std::fs::create_dir_all(d.join("adir")).unwrap();
+        std::fs::write(d.join("big.bin"), vec![0u8; 900]).unwrap();
+        std::fs::write(d.join("small.bin"), vec![0u8; 10]).unwrap();
+        let sp = unsafe { SafePath::from_raw(d.clone()) };
+        let p = LinuxFileProvider;
+
+        let names = |v: &[DirEntry]| v.iter().map(|e| e.name.clone()).collect::<Vec<_>>();
+
+        // dirs_first + size：目录仍在最前（目录内按名称），文件段按 size 降序
+        let by_size = p.list_dir(&sp, ListOpt {
+            sort: SortBy::Size, dirs_first: true, ..Default::default()
+        }).await.unwrap();
+        assert_eq!(names(&by_size), vec!["adir", "zdir", "big.bin", "small.bin"],
+            "dirs_first 下文件段应按 size 降序");
+
+        // dirs_first + name：与默认行为一致（全量按名称，目录优先）
+        let by_name = p.list_dir(&sp, ListOpt {
+            sort: SortBy::Name, dirs_first: true, ..Default::default()
+        }).await.unwrap();
+        assert_eq!(names(&by_name), vec!["adir", "zdir", "big.bin", "small.bin"]);
+
+        // dirs_first=false：不分组，纯按 size 降序（big 900B > small 10B > 目录 0B）
+        let flat = p.list_dir(&sp, ListOpt {
+            sort: SortBy::Size, dirs_first: false, ..Default::default()
+        }).await.unwrap();
+        assert_eq!(names(&flat), vec!["big.bin", "small.bin", "adir", "zdir"],
+            "dirs_first=false 时不得分组，纯按 sort 键排");
+
         std::fs::remove_dir_all(&d).ok();
     }
 }

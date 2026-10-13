@@ -1,8 +1,9 @@
 //! 内存文件系统 mock：让文件管理在无 root / 非 Linux 环境下也能跑完整流程，
 //! 同时给一致性测试提供一个"平台无关的参考实现"。
 
+use crate::linux::files::cmp_entries;
 use crate::traits::{
-    DirEntry, EntryKind, FileProvider, FileStat, ListOpt, SortBy,
+    DirEntry, EntryKind, FileProvider, FileStat, ListOpt,
 };
 use panel_core::{PanelError, Result, SafePath};
 use std::{
@@ -91,19 +92,9 @@ impl FileProvider for MockFiles {
             if v.len() >= opt.limit { break; }
         }
 
-        if opt.dirs_first {
-            v.sort_by(|a, b| {
-                let ad = a.kind == EntryKind::Dir;
-                let bd = b.kind == EntryKind::Dir;
-                bd.cmp(&ad).then_with(|| a.name.cmp(&b.name))
-            });
-        } else {
-            match opt.sort {
-                SortBy::Name => v.sort_by(|a, b| a.name.cmp(&b.name)),
-                SortBy::Size => v.sort_by(|a, b| b.size.cmp(&a.size)),
-                SortBy::Modified => v.sort_by(|a, b| b.modified_unix.cmp(&a.modified_unix)),
-            }
-        }
+        // 与 Linux 实现共用同一比较器（dirs_first × sort 正交）——此前两路各写
+        // 一份，mock 的文件段同样被写死跟名称排。见 linux::files::cmp_entries。
+        v.sort_by(|a, b| cmp_entries(a, b, &opt));
         Ok(v)
     }
 
