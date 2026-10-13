@@ -323,29 +323,17 @@ fn bucketize(ts: &[i64], n: usize) -> Vec<HistBucket> {
     out
 }
 
-/// level 归一。优先采信 provider 给的结构化 level；缺失时从文本做启发式关键词匹配
-/// （文件日志没有优先级字段，只能看内容）。匹配不中一律归 `other`，**不硬塞成 info**。
+/// level 归一。**判决逻辑只有一份**（panel_os::normalize_log_level）——统计分布与
+/// `level` 查询参数的筛选必须同口径，否则「统计说 50 条 error、按 error 筛出另一批」。
+/// 此处只把归一结果映射到固定五档的下标（缺失 → other）。
 fn level_idx(level: Option<&str>, text: &str) -> usize {
-    if let Some(l) = level {
-        let l = l.trim().to_ascii_lowercase();
-        if !l.is_empty() {
-            if l.starts_with("err") || l.starts_with("crit") || l.starts_with("fatal")
-                || l.starts_with("emerg") || l.starts_with("alert") {
-                return LV_ERROR;
-            }
-            if l.starts_with("warn") { return LV_WARN; }
-            if l.starts_with("info") || l.starts_with("notice") { return LV_INFO; }
-            if l.starts_with("debug") || l.starts_with("trace") { return LV_DEBUG; }
-        }
+    match panel_os::normalize_log_level(level, text) {
+        Some("error") => LV_ERROR,
+        Some("warn") => LV_WARN,
+        Some("info") => LV_INFO,
+        Some("debug") => LV_DEBUG,
+        _ => LV_OTHER,
     }
-    let low = text.to_ascii_lowercase();
-    if low.contains("error") || low.contains("failed") || low.contains("fatal") || low.contains("panic") {
-        return LV_ERROR;
-    }
-    if low.contains("warn") { return LV_WARN; }
-    if low.contains("debug") || low.contains("trace") { return LV_DEBUG; }
-    if low.contains("info") { return LV_INFO; }
-    LV_OTHER
 }
 
 /// 把一行归一化为「模式」，让仅 ID/数字不同的同源日志聚成一条：

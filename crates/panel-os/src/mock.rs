@@ -11,7 +11,7 @@ use panel_core::{
     PanelError, PlatformInfo, Result, SafePath, UnitName,
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -136,6 +136,16 @@ impl ServiceProvider for MockServices {
     async fn status(&self, name: &UnitName) -> Result<ServiceState> {
         let st = self.state.lock().unwrap();
         Ok(st.service_states.get(name.as_str()).copied().unwrap_or(ServiceState::Unknown))
+    }
+
+    async fn statuses(&self, names: &[UnitName]) -> Result<HashMap<String, ServiceState>> {
+        let st = self.state.lock().unwrap();
+        let mut map = HashMap::with_capacity(names.len());
+        for n in names {
+            let s = st.service_states.get(n.as_str()).copied().unwrap_or(ServiceState::Unknown);
+            map.insert(n.as_str().to_string(), s);
+        }
+        Ok(map)
     }
 
     async fn show(&self, name: &UnitName) -> Result<Option<ServiceUnit>> {
@@ -342,6 +352,13 @@ impl UserProvider for MockUsers {
     async fn exists(&self, name: &str) -> Result<bool> { Ok(name == "www-data") }
     async fn ensure(&self, _n: &str, _s: bool, _l: bool) -> Result<()> { Ok(()) }
     async fn uid_gid(&self, _n: &str) -> Result<(u32, u32)> { Ok((33, 33)) }
+    async fn list(&self) -> Result<Vec<SystemUser>> {
+        Ok(vec![
+            SystemUser { name: "root".into(), uid: 0, gid: 0, shell: "/bin/bash".into(), login_allowed: true },
+            SystemUser { name: "www-data".into(), uid: 33, gid: 33, shell: "/usr/sbin/nologin".into(), login_allowed: false },
+            SystemUser { name: "nobody".into(), uid: 65534, gid: 65534, shell: "/usr/sbin/nologin".into(), login_allowed: false },
+        ])
+    }
 }
 
 #[async_trait]
@@ -359,11 +376,17 @@ impl LogProvider for MockLogs {
         Ok(vec![LogSource { id: "panel".into(), label: "Panel".into(), kind: LogSourceKind::Panel }])
     }
     async fn read(&self, _s: &LogSource, q: LogQuery) -> Result<Vec<LogLine>> {
+        // mock 同为 LogProvider 实现，必须与真实实现同口径尊重查询条件——
+        // 否则 mock 模式下「筛选返回未筛选结果」，与 Linux 实现行为不一致。
         Ok((0..q.lines.min(10)).map(|i| LogLine {
             ts_unix: Some(1_700_000_000 + i as i64),
             level: Some("INFO".into()),
             text: format!("mock log {i}"),
-        }).collect())
+        })
+        .filter(|l| q.grep.as_deref().map(|g| g.is_empty() || l.text.contains(g)).unwrap_or(true))
+        .filter(|l| crate::traits::level_matches(q.level.as_deref(), l.level.as_deref(), &l.text))
+        .filter(|l| q.since_unix.map(|s| l.ts_unix.is_some_and(|t| t >= s)).unwrap_or(true))
+        .collect())
     }
     async fn follow(&self, _s: &LogSource, _q: LogQuery) -> Result<Receiver<LogLine>> {
         let (_tx, rx) = channel(1);

@@ -3348,7 +3348,8 @@ pub async fn logs(
         label: format!("{} · {}", site.name, which),
         kind,
     };
-    crate::sse::follow_source(state.clone(), src, q.filter, q.limit.unwrap_or(200)).await
+    // 站点日志流契约无 level 参数（access 无级别、error 已按 kind 区分）→ 传 None
+    crate::sse::follow_source(state.clone(), src, q.filter, None, q.limit.unwrap_or(200)).await
 }
 
 // ─────────────── TLS 落盘与查询辅助 ───────────────

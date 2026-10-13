@@ -687,6 +687,65 @@ pub struct LogLine {
     pub text: String,
 }
 
+/// 日志级别归一：结构化 level 优先，缺失时从文本做启发式关键词匹配
+/// （文件日志没有优先级字段，只能看内容）。返回 `None` 表示落不进四档
+/// （调用方按需归入 other）——**不硬塞成 info**。
+///
+/// ## 为什么必须在 panel-os（而非 panel-api）
+/// 统计（`/logs/{id}/stats` 的 level 分布）与筛选（`level` 查询参数）必须
+/// **同口径**：统计说 50 条 error，按 error 筛选就必须命中这 50 条。两处
+/// 各写一份判决逻辑必然漂移（本仓库已因此出过同类 bug：`dirs_first` 与
+/// `sort` 两个维度在两平台实现里各写一分支）。故唯一实现放底层，
+/// panel-api 的 `level_idx` 委托到这里。
+pub fn normalize_log_level(level: Option<&str>, text: &str) -> Option<&'static str> {
+    if let Some(l) = level {
+        let l = l.trim().to_ascii_lowercase();
+        if !l.is_empty() {
+            // journald 的 PRIORITY 是数字（0-7）：0-3→error、4→warn、5-6→info、7→debug。
+            // 此处原生处理，使归一函数成为唯一权威——parse_journal_json 是否先转都不影响结果。
+            if l.bytes().all(|b| b.is_ascii_digit()) {
+                return match l.as_str() {
+                    "0" | "1" | "2" | "3" => Some("error"),
+                    "4" => Some("warn"),
+                    "5" | "6" => Some("info"),
+                    "7" => Some("debug"),
+                    _ => None,
+                };
+            }
+            if l.starts_with("err") || l.starts_with("crit") || l.starts_with("fatal")
+                || l.starts_with("emerg") || l.starts_with("alert") {
+                return Some("error");
+            }
+            if l.starts_with("warn") { return Some("warn"); }
+            if l.starts_with("info") || l.starts_with("notice") { return Some("info"); }
+            if l.starts_with("debug") || l.starts_with("trace") { return Some("debug"); }
+        }
+    }
+    let low = text.to_ascii_lowercase();
+    if low.contains("error") || low.contains("failed") || low.contains("fatal") || low.contains("panic") {
+        return Some("error");
+    }
+    if low.contains("warn") { return Some("warn"); }
+    if low.contains("debug") || low.contains("trace") { return Some("debug"); }
+    if low.contains("info") { return Some("info"); }
+    None
+}
+
+/// 行级 level 筛选：请求值归一后与行归一结果精确比较。
+/// 请求为空 = 不筛；落不进四档的行（None）匹配任何具体档位都为 false。
+pub fn level_matches(want: Option<&str>, level: Option<&str>, text: &str) -> bool {
+    let Some(w) = want.map(|w| w.trim().to_ascii_lowercase()).filter(|w| !w.is_empty()) else {
+        return true;
+    };
+    normalize_log_level(level, text) == Some(match w.as_str() {
+        "error" | "err" | "crit" | "fatal" | "emerg" | "alert" => "error",
+        "warn" | "warning" => "warn",
+        "info" | "notice" => "info",
+        "debug" | "trace" => "debug",
+        _ => return false,
+    })
+}
+
 #[async_trait]
 pub trait LogProvider: Send + Sync {
     fn backend(&self) -> LogBackend;
@@ -1741,5 +1800,44 @@ mod tests {
         assert_eq!(AppRuntime::from_key(""), None);
         // ⚠ runtime_pkg 的字符串必须存在于后端 ALLOWED_PACKAGES —— 该约束跨 crate
         //   （panel-os 不依赖 panel-api），故由 ci/check-pkg-whitelist.sh 的 [E] 项把守。
+    }
+
+    // ── 日志 level 归一 / 筛选（A8） ──
+
+    #[test]
+    fn normalize_level_prefers_structured_over_text() {
+        // 结构化优先：journald 的 PRIORITY 说 error，文本里出现 "info" 也不算 info
+        assert_eq!(normalize_log_level(Some("3"), "starting info service"), Some("error"));
+        // 大小写 / 别名
+        assert_eq!(normalize_log_level(Some("WARNING"), "x"), Some("warn"));
+        assert_eq!(normalize_log_level(Some("notice"), "x"), Some("info"));
+        assert_eq!(normalize_log_level(Some("trace"), "x"), Some("debug"));
+    }
+
+    #[test]
+    fn normalize_level_falls_back_to_text_for_file_logs() {
+        // 文件日志没有结构化 level，只能看内容（与 stats 的口径一致）
+        assert_eq!(normalize_log_level(None, "connection failed"), Some("error"));
+        assert_eq!(normalize_log_level(None, "WARN: disk almost full"), Some("warn"));
+        // 匹配不中归 None（other），**不硬塞成 info**
+        assert_eq!(normalize_log_level(None, "GET /index.html 200"), None);
+    }
+
+    #[test]
+    fn level_matches_is_exact_bucket_and_passes_when_unset() {
+        // 不筛 = 全过
+        assert!(level_matches(None, None, "anything"));
+        assert!(level_matches(Some(""), None, "anything"));
+        // 精确档位：选 error 不混入 warn，选 warn 不混入 error
+        assert!(level_matches(Some("error"), Some("err"), "boom"));
+        assert!(!level_matches(Some("warn"), Some("err"), "boom"));
+        assert!(!level_matches(Some("error"), Some("warning"), "meh"));
+        // 请求侧别名容忍（err→error、warning→warn）
+        assert!(level_matches(Some("err"), None, "fatal panic"));
+        assert!(level_matches(Some("warning"), None, "warn: low disk"));
+        // 落不进四档的行匹配任何具体档位都为 false
+        assert!(!level_matches(Some("info"), None, "GET / 200"));
+        // 未知档位请求不匹配任何行（不静默放行）
+        assert!(!level_matches(Some("verbose"), None, "verbose debug output"));
     }
 }

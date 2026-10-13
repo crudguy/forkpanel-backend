@@ -690,7 +690,7 @@ fn is_file_source(kind: LogSourceKind) -> bool {
 }
 
 /// 有界文件 tail：最多回读 4MB，取最后 n 行，按需字面量过滤。
-fn read_file_tail(path: &Path, n: usize, grep: Option<&str>) -> Vec<LogLine> {
+fn read_file_tail(path: &Path, n: usize, grep: Option<&str>, q: &LogQuery) -> Vec<LogLine> {
     use std::io::{Read, Seek, SeekFrom};
     const CAP: u64 = 4 * 1024 * 1024;
     let Ok(mut f) = std::fs::File::open(path) else { return Vec::new() };
@@ -704,13 +704,19 @@ fn read_file_tail(path: &Path, n: usize, grep: Option<&str>) -> Vec<LogLine> {
     let mut out: Vec<LogLine> = it
         .filter(|l| grep.map(|g| g.is_empty() || l.contains(g)).unwrap_or(true))
         .map(|l| LogLine { ts_unix: None, level: None, text: l.to_string() })
+        // level / since 与统计（analyze::level_idx → normalize_log_level）同口径。
+        // 文件源的行没有时间戳：since 命中不了任何行——这是诚实的（"只要某时刻
+        // 之后的日志"，而我们从不知道这些行的时刻），前端会按数据禁用该控件。
+        .filter(|l| crate::traits::level_matches(q.level.as_deref(), l.level.as_deref(), &l.text))
+        .filter(|l| q.since_unix.map(|s| l.ts_unix.is_some_and(|t| t >= s)).unwrap_or(true))
         .collect();
     if out.len() > n { out = out.split_off(out.len() - n); }
     out
 }
 
 /// 文件跟随：500ms 轮询读新增行；文件被截断/轮转（长度回退）即从头重读。
-fn follow_file(path: PathBuf, grep: Option<String>) -> tokio::sync::mpsc::Receiver<LogLine> {
+/// level 与一次性读同口径（normalize_log_level 文本兜底）。
+fn follow_file(path: PathBuf, grep: Option<String>, level: Option<String>) -> tokio::sync::mpsc::Receiver<LogLine> {
     use std::io::{Read, Seek, SeekFrom};
     let (tx, rx) = tokio::sync::mpsc::channel::<LogLine>(64);
     tokio::spawn(async move {
@@ -731,6 +737,7 @@ fn follow_file(path: PathBuf, grep: Option<String>) -> tokio::sync::mpsc::Receiv
                 if let Some(g) = &grep {
                     if !g.is_empty() && !line.contains(g.as_str()) { continue; }
                 }
+                if !crate::traits::level_matches(level.as_deref(), None, line) { continue; }
                 if tx.send(LogLine { ts_unix: None, level: None, text: line.to_string() }).await.is_err() {
                     return;
                 }
@@ -770,13 +777,18 @@ fn parse_journal_json(line: &str) -> Option<LogLine> {
     Some(LogLine { ts_unix, level, text })
 }
 
-async fn journal_read(src: &LogSource, n: usize, grep: Option<&str>) -> Result<Vec<LogLine>> {
-    // 过滤在 Rust 侧做（journalctl --grep 是正则）：多取一些再筛，保证过滤后仍够 n 行
-    let fetch = if grep.is_some() { (n * 8).min(2000) } else { n };
+async fn journal_read(src: &LogSource, n: usize, q: &LogQuery) -> Result<Vec<LogLine>> {
+    // 过滤在 Rust 侧做（journalctl --grep 是正则）：多取一些再筛，保证过滤后仍够 n 行。
+    // level 同理——且刻意**不**用 journalctl 的 -p：那是"此级及更严重"的阈值语义，
+    // 与面板统计/筛选的"精确档位"口径不同（选 warn 应只出 warn，不该混入 error）。
+    let filtered = q.grep.is_some() || q.level.is_some();
+    let fetch = if filtered { (n * 8).min(2000) } else { n };
     let mut args: Vec<String> = vec![
         "-n".into(), fetch.to_string(), "--no-pager".into(), "-o".into(), "json".into(),
     ];
     args.extend(journal_source_args(src));
+    // since 走 journalctl 原生参数：@<unix> 精确到秒，服务端过滤，无需拉回再丢
+    if let Some(s) = q.since_unix { args.push("--since".into()); args.push(format!("@{s}")); }
     let aref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let out = crate::cmd::run(
         Bin::Journalctl, &aref,
@@ -785,7 +797,8 @@ async fn journal_read(src: &LogSource, n: usize, grep: Option<&str>) -> Result<V
     let mut lines: Vec<LogLine> = out.stdout
         .lines()
         .filter_map(parse_journal_json)
-        .filter(|l| grep.map(|g| g.is_empty() || l.text.contains(g)).unwrap_or(true))
+        .filter(|l| q.grep.as_deref().map(|g| g.is_empty() || l.text.contains(g)).unwrap_or(true))
+        .filter(|l| crate::traits::level_matches(q.level.as_deref(), l.level.as_deref(), &l.text))
         .collect();
     if lines.len() > n { lines = lines.split_off(lines.len() - n); }
     Ok(lines)
@@ -835,10 +848,10 @@ impl LogProvider for LinuxLogs {
         if is_file_source(src.kind) {
             let path = self.site_file(&src.id)
                 .ok_or_else(|| PanelError::NotFound(format!("log source {}", src.id)))?;
-            return Ok(read_file_tail(&path, n, q.grep.as_deref()));
+            return Ok(read_file_tail(&path, n, q.grep.as_deref(), &q));
         }
         if self.has_journal() {
-            return journal_read(src, n, q.grep.as_deref()).await;
+            return journal_read(src, n, &q).await;
         }
         unsupported!("logs.read: 无 journald 且非文件源")
     }
@@ -847,15 +860,20 @@ impl LogProvider for LinuxLogs {
         if is_file_source(src.kind) {
             let path = self.site_file(&src.id)
                 .ok_or_else(|| PanelError::NotFound(format!("log source {}", src.id)))?;
-            return Ok(follow_file(path, q.grep.clone()));
+            return Ok(follow_file(path, q.grep.clone(), q.level.clone()));
         }
         if self.has_journal() {
             let mut raw = journal_follow(src)?;
             let (tx, rx) = tokio::sync::mpsc::channel::<LogLine>(64);
+            // level 在解析后过滤（PRIORITY 字段此时才可用）；与一次性读同口径
+            let level = q.level.clone();
             tokio::spawn(async move {
                 while let Some(l) = raw.recv().await {
                     let parsed = parse_journal_json(&l)
                         .unwrap_or(LogLine { ts_unix: None, level: None, text: l.clone() });
+                    if !crate::traits::level_matches(level.as_deref(), parsed.level.as_deref(), &parsed.text) {
+                        continue;
+                    }
                     if tx.send(parsed).await.is_err() { break; }
                 }
             });
@@ -3712,5 +3730,48 @@ mod user_provider_tests {
         for u in &users {
             assert!(!u.name.is_empty(), "账户名不应为空");
         }
+    }
+
+    /// A8 回归：文件源的 level 筛选必须生效（此前 ReadQ.level 一路传到 provider 却被丢弃）。
+    /// 数据与断言刻意让「文本含 error」的行只有一条——若筛选被绕过，条数立刻对不上。
+    #[test]
+    fn read_file_tail_applies_level_filter() {
+        let d = std::env::temp_dir().join(format!("panel-loglvl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("app.log");
+        std::fs::write(&f, "started ok\nconnection failed\nserved request\nwarn: disk low\nboom panic\n").unwrap();
+
+        let base = LogQuery { lines: 100, grep: None, level: None, follow: false, since_unix: None };
+
+        // 不筛：5 行全在
+        assert_eq!(read_file_tail(&f, 100, None, &base).len(), 5);
+
+        // level=error：只有 "connection failed" 与 "boom panic"（文本兜底口径）
+        let errs = read_file_tail(&f, 100, None,
+            &LogQuery { level: Some("error".into()), ..base.clone() });
+        assert_eq!(errs.len(), 2, "error 档应命中 2 行：{errs:?}");
+        assert!(errs.iter().all(|l| l.text.contains("failed") || l.text.contains("panic")));
+
+        // level=warn：仅 "warn: disk low"
+        let warns = read_file_tail(&f, 100, None,
+            &LogQuery { level: Some("warn".into()), ..base.clone() });
+        assert_eq!(warns.len(), 1, "warn 档应命中 1 行：{warns:?}");
+
+        // level=info：不匹配任何行（"started ok"/"served request" 归 other）
+        assert_eq!(read_file_tail(&f, 100, None,
+            &LogQuery { level: Some("info".into()), ..base.clone() }).len(), 0);
+
+        // level 与 grep 叠加：先文本子串再档位
+        let both = read_file_tail(&f, 100, Some("disk"),
+            &LogQuery { level: Some("warn".into()), ..base.clone() });
+        assert_eq!(both.len(), 1);
+
+        // 文件源行无时间戳：since 命中不了任何行（诚实语义，前端按数据禁用该控件）
+        let since = read_file_tail(&f, 100, None,
+            &LogQuery { since_unix: Some(1), ..base.clone() });
+        assert!(since.is_empty(), "无时间戳的源 + since 应返回空，而非静默忽略筛选");
+
+        std::fs::remove_dir_all(&d).ok();
     }
 }
