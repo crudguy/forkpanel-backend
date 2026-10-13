@@ -443,11 +443,20 @@ async fn register_internal_jobs(
     {
         let os = os.clone();
         let metrics = metrics.clone();
+        // 闭包是 move 且会被周期反复调用，故在这里 clone 一份，进 async 块前再 clone，
+        // 否则外层 state 会被移走（E0382）/ 闭包第二次调用时无值可用。
+        let state_for_sample = state.clone();
         sched.register("metrics.sample", move || {
             let os = os.clone();
             let metrics = metrics.clone();
+            let state_for_sample = state_for_sample.clone();
             async move {
                 let snap = os.metrics().snapshot().await?;
+                // 采集循环是**唯一**的采样者：把结果缓存起来供 HTTP 接口读。
+                // 否则每个调 snapshot() 的请求都会重置 panel-os 的共享采样基准，
+                // 既拿到抖动值、又截短下一次采样窗口（见 AppState::cached_snapshot）。
+                let snap = Arc::new(snap);
+                state_for_sample.record_snapshot(snap.clone()).await;
                 let mut g = metrics.lock().unwrap_or_else(|e| e.into_inner());
                 g.record(panel_db::ring::Sample {
                     ts: snap.ts_unix,

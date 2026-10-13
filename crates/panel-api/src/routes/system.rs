@@ -60,7 +60,14 @@ pub struct OverviewResp {
 /// 一次性快照（仪表盘卡片数据）。
 pub async fn overview(State(state): State<Shared>, Auth(s): Auth) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SYSTEM_VIEW)?;
-    let snap = state.os.metrics().snapshot().await?;
+    // 只读采集循环缓存的快照，不自己触发采样：CPU 是区间值，谁调 snapshot() 谁重置
+    // panel-os 的共享采样基准，既拿到被截断的抖动值、又截短采集循环的下一次窗口
+    // （详见 AppState::cached_snapshot 的注释）。缓存尚未产出（首启 1 秒内）才兜底。
+    // 用全限定 Arc 以免为此在 WIP 文件里多加一处 use。
+    let snap = match state.cached_snapshot().await {
+        Some(s) => s,
+        None => std::sync::Arc::new(state.os.metrics().snapshot().await?),
+    };
     Ok(ok(OverviewResp {
         ts: snap.ts_unix,
         uptime_sec: snap.uptime_sec,
