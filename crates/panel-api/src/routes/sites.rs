@@ -1019,8 +1019,6 @@ pub struct CreateReq {
     pub domains: Vec<String>,
     /// 站点根目录（相对 site_root；留空则用站点名）。仅允许落在 site_root 之内。
     pub root: Option<String>,
-    /// 是否启用 PHP（当前 schema 未单独建模，仅占位接受）。
-    pub php: Option<bool>,
     /// 创建后是否「启用」（默认 true）。
     ///
     /// 注意 `create` 只写库、不下发配置——无论此处传什么，站点都要等一次
