@@ -19,8 +19,16 @@ def prod_files(root, ext):
         # tests/ 目录整体豁免（集成测试的 fixture 也是数据）
         dirs[:] = [d for d in dirs if d != "tests"]
         for fn in files:
-            if fn.endswith(ext):
-                yield os.path.join(dirpath, fn)
+            if not fn.endswith(ext):
+                continue
+            # 单元测试子模块文件（tests.rs / <name>_tests.rs）整体豁免——与行内
+            # #[cfg(test)] mod 同等：里面是测试 fixture / 注入样本 / 路径字面量，
+            # 是被测数据而非生产违规。这类文件的 cfg(test) 在父模块的 `mod X;`
+            # 声明上、文件自身无 #[cfg(test)] 行，prod_lines 切不断，故按命名约定在此豁免。
+            base = fn[: -len(ext)]
+            if base == "tests" or base.endswith("_tests"):
+                continue
+            yield os.path.join(dirpath, fn)
 
 def prod_lines(path):
     """返回 (行号, 内容) 的生产代码行"""
