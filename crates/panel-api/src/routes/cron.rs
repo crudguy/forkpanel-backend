@@ -291,7 +291,7 @@ fn truncate(s: &str, n: usize) -> String {
     if s.len() > n { format!("{}…", &s[..n]) } else { s.to_string() }
 }
 
-// ─────────────── 文档式定时任务端点（M3 占位） ───────────────
+// ─────────────── 文档式定时任务端点 ───────────────
 
 pub async fn get_job(
     State(state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<String>,

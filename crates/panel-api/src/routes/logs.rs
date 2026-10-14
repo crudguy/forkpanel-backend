@@ -121,7 +121,7 @@ async fn find_source(state: &Shared, id: &str) -> Result<panel_os::LogSource> {
         .ok_or_else(|| panel_core::PanelError::NotFound(format!("log source {id}")))
 }
 
-// ─────────────── 文档式日志端点（M3 占位） ───────────────
+// ─────────────── 文档式日志端点 ───────────────
 // 注：`/api/v1/logs/stream` 的实时跟随已实装，见 `crate::sse::log_stream`。
 
 /// 下载允许比在线读更大（全量消费场景），但仍有服务端硬上限：
