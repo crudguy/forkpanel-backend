@@ -173,5 +173,15 @@ pub async fn snapshot(State(state): State<Shared>, Auth(s): Auth) -> ApiResult<J
     Ok(ok(snap))
 }
 
+/// 枚举本机系统账户（只读 `/etc/passwd`），供「运行用户」下拉等选择入口使用。
+///
+/// 权限用 `SERVICE_VIEW`：与应用（apps）列表同级——运行用户选择本就是应用创建/编辑
+/// 表单的辅助信息，应用页可见即可见本列表；它只读不写，不会扩大攻击面。
+pub async fn users(State(state): State<Shared>, Auth(s): Auth) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::SERVICE_VIEW)?;
+    let list = state.os.users().list().await?;
+    Ok(ok(list))
+}
+
 #[allow(dead_code)]
 fn _cap_keys_used() -> &'static str { cap_keys::METRICS_READ }
