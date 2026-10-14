@@ -55,16 +55,10 @@ pub async fn list(
     }
 
     let jobs = state.os.scheduler().list().await?;
-    let rows = state.pool.with(|conn| {
-        let mut st = conn.prepare(
-            "SELECT name, kind, enabled, timeout_sec, last_run_at, last_status, \
-             max_overlap, webhook_url, webhook_events FROM cron_jobs")
-            .map_err(|e| PanelError::Database(e.to_string()))?;
-        let it = st.query_map([], |r| Ok((
-            r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i32>(2)?,
-            r.get::<_, i64>(3)?, r.get::<_, Option<i64>>(4)?, r.get::<_, Option<String>>(5)?,
-            r.get::<_, i64>(6)?, r.get::<_, Option<String>>(7)?, r.get::<_, String>(8)?,
-        ))).map_err(|e| PanelError::Database(e.to_string()))?;
+    let rows: Vec<CronMeta> = state.pool.with(|conn| {
+        let sql = format!("SELECT {CRON_META_COLS} FROM cron_jobs");
+        let mut st = conn.prepare(&sql).map_err(|e| PanelError::Database(e.to_string()))?;
+        let it = st.query_map([], cron_meta_row).map_err(|e| PanelError::Database(e.to_string()))?;
         let mut v = Vec::new();
         for x in it { v.push(x.map_err(|e| PanelError::Database(e.to_string()))?); }
         Ok(v)
@@ -72,24 +66,9 @@ pub async fn list(
 
     // 以系统里的任务为准（系统是真相），库只补充面板元数据
     let dtos: Vec<JobDto> = jobs.into_iter().map(|j| {
-        let meta = rows.iter().find(|(n, _, _, _, _, _, _, _, _)| *n == j.id);
+        let meta = rows.iter().find(|m| m.name == j.id);
         let next = state.os.scheduler().next_fire_times(&j.expression, 3).unwrap_or_default();
-        JobDto {
-            id: j.id.clone(),
-            name: j.id.clone(),
-            expr: j.expression,
-            kind: meta.map(|m| kind_str(&m.1)).unwrap_or("script"),
-            command: j.command,
-            user: j.user,
-            enabled: meta.map(|m| m.2 != 0).unwrap_or(j.enabled),
-            timeout_sec: meta.map(|m| m.3).unwrap_or(j.timeout.as_secs() as i64),
-            last_run_at: meta.and_then(|m| m.4),
-            last_status: meta.and_then(|m| m.5.clone()),
-            max_overlap: meta.map(|m| m.6 as u64).unwrap_or(j.max_overlap as u64),
-            webhook_url: meta.and_then(|m| m.7.clone()),
-            webhook_events: meta.map(|m| split_events(&m.8)).unwrap_or_default(),
-            next,
-        }
+        merge_job(j, meta, next)
     }).collect();
 
     Ok(ok(dtos))
@@ -98,6 +77,65 @@ pub async fn list(
 fn kind_str(s: &str) -> &'static str {
     match s { "backup" => "backup", "cert_renew" => "cert_renew",
               "internal" => "internal", _ => "script" }
+}
+
+/// `cron_jobs` 表面板元数据的列清单。`list` 与 `get_job` 共用同一份 SELECT，
+/// 避免两处各抄一遍列名——加列时只改这里一处（两处共用才不会漏配）。
+/// 列名是编译期常量、无用户输入，故可安全地 format! 进 SQL；路径参数仍走 `?1` 绑定。
+const CRON_META_COLS: &str =
+    "name, kind, enabled, timeout_sec, last_run_at, last_status, \
+     max_overlap, webhook_url, webhook_events";
+
+/// `cron_jobs` 一行的面板元数据（`list` 与 `get_job` 共用同一行映射）。
+#[derive(Debug)]
+struct CronMeta {
+    name: String,
+    kind: String,
+    enabled: i32,
+    timeout_sec: i64,
+    last_run_at: Option<i64>,
+    last_status: Option<String>,
+    max_overlap: i64,
+    webhook_url: Option<String>,
+    webhook_events: String,
+}
+
+fn cron_meta_row(r: &rusqlite::Row) -> rusqlite::Result<CronMeta> {
+    Ok(CronMeta {
+        name: r.get(0)?,
+        kind: r.get(1)?,
+        enabled: r.get(2)?,
+        timeout_sec: r.get(3)?,
+        last_run_at: r.get(4)?,
+        last_status: r.get(5)?,
+        max_overlap: r.get(6)?,
+        webhook_url: r.get(7)?,
+        webhook_events: r.get(8)?,
+    })
+}
+
+/// 把「系统里的任务」（真相）与「库里的面板元数据」（补充）合并成一个 JobDto。
+/// `list` 与 `get_job` 共用——同一合并规则走两条路径必漏配（项目高频 bug）。
+/// 语义（务必与两端原实现逐字一致）：kind / enabled / timeout_sec / max_overlap
+/// 缺 meta 时回退到系统任务值；last_run_at / last_status / webhook_url /
+/// webhook_events **只认 meta**（无 meta 行即为空），不回退系统任务字段。
+fn merge_job(j: panel_os::ScheduledJob, meta: Option<&CronMeta>, next: Vec<i64>) -> JobDto {
+    JobDto {
+        id: j.id.clone(),
+        name: j.id.clone(),
+        expr: j.expression,
+        kind: meta.map(|m| kind_str(&m.kind)).unwrap_or("script"),
+        command: j.command,
+        user: j.user,
+        enabled: meta.map(|m| m.enabled != 0).unwrap_or(j.enabled),
+        timeout_sec: meta.map(|m| m.timeout_sec).unwrap_or(j.timeout.as_secs() as i64),
+        last_run_at: meta.and_then(|m| m.last_run_at),
+        last_status: meta.and_then(|m| m.last_status.clone()),
+        max_overlap: meta.map(|m| m.max_overlap as u64).unwrap_or(j.max_overlap as u64),
+        webhook_url: meta.and_then(|m| m.webhook_url.clone()),
+        webhook_events: meta.map(|m| split_events(&m.webhook_events)).unwrap_or_default(),
+        next,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -267,37 +305,16 @@ pub async fn get_job(
         .ok_or_else(|| ApiError::not_found(format!("cron job `{id}`")))?;
 
     let id_key = id.clone();
-        let meta = state.pool.with(move |conn| {
-            let mut st = conn.prepare(
-                "SELECT name, kind, enabled, timeout_sec, last_run_at, last_status, \
-                 max_overlap, webhook_url, webhook_events FROM cron_jobs \
-                 WHERE name = ?1")
-                .map_err(|e| PanelError::Database(e.to_string()))?;
-            let mut it = st.query_map([id_key.as_str()], |r| Ok((
-                r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i32>(2)?,
-                r.get::<_, i64>(3)?, r.get::<_, Option<i64>>(4)?, r.get::<_, Option<String>>(5)?,
-                r.get::<_, i64>(6)?, r.get::<_, Option<String>>(7)?, r.get::<_, String>(8)?,
-            ))).map_err(|e| PanelError::Database(e.to_string()))?;
-            Ok(it.next().transpose().map_err(|e| PanelError::Database(e.to_string()))?)
-        }).await?;
+    let meta: Option<CronMeta> = state.pool.with(move |conn| {
+        let sql = format!("SELECT {CRON_META_COLS} FROM cron_jobs WHERE name = ?1");
+        let mut st = conn.prepare(&sql).map_err(|e| PanelError::Database(e.to_string()))?;
+        let mut it = st.query_map([id_key.as_str()], cron_meta_row)
+            .map_err(|e| PanelError::Database(e.to_string()))?;
+        Ok(it.next().transpose().map_err(|e| PanelError::Database(e.to_string()))?)
+    }).await?;
 
-        let next = state.os.scheduler().next_fire_times(&j.expression, 3).unwrap_or_default();
-        let dto = JobDto {
-            id: j.id.clone(),
-            name: j.id.clone(),
-            expr: j.expression,
-            kind: meta.as_ref().map(|m| kind_str(&m.1)).unwrap_or("script"),
-            command: j.command,
-            user: j.user,
-            enabled: meta.as_ref().map(|m| m.2 != 0).unwrap_or(j.enabled),
-            timeout_sec: meta.as_ref().map(|m| m.3).unwrap_or(j.timeout.as_secs() as i64),
-            last_run_at: meta.as_ref().and_then(|m| m.4),
-            last_status: meta.as_ref().and_then(|m| m.5.clone()),
-            max_overlap: meta.as_ref().map(|m| m.6 as u64).unwrap_or(j.max_overlap as u64),
-            webhook_url: meta.as_ref().and_then(|m| m.7.clone()),
-            webhook_events: meta.as_ref().map(|m| split_events(&m.8)).unwrap_or_default(),
-            next,
-        };
+    let next = state.os.scheduler().next_fire_times(&j.expression, 3).unwrap_or_default();
+    let dto = merge_job(j, meta.as_ref(), next);
     Ok(ok(dto))
 }
 
