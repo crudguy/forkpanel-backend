@@ -75,6 +75,18 @@ panel serve --bind 127.0.0.1:2083
   契约正文大量使用 flow 风格单行（`{ a: 1 }`），**值里出现 `{`/`}` 必须加单引号**，
   否则整份文件无法被 YAML 解析器读取——该脚本会定位到行号。
 
+## 质量门禁（手动运行；本项目无自动 CI 流水线）
+
+按改动类型跑对应 `ci/` 门禁：
+
+- 分层 / 权限：`ci/check-layering.sh`、`ci/check-permissions.sh`
+- 前后端契约：`ci/check-api-contract.sh`（内含契约结构体检 `ci/check_openapi.py`）
+- 依赖安全：`ci/check-audit.sh`——`cargo audit` 扫 `Cargo.lock` 已知漏洞（RustSec advisory-db）。
+  需先 `cargo install cargo-audit`；**找不到即判失败**（恒绿纪律：静默跳过比没门禁更危险）。
+  联网更新 advisory-db 失败时自动回退本地缓存 `~/.cargo/advisory-db`（首次 `cargo audit` 生成），
+  建议定期联网刷新以纳入新公布 advisory。默认只有**漏洞**才红，unmaintained 等 warning 不拦
+  （要连 warning 一起拒可自行加 `-D warnings`）。
+
 ## 前端页面（索引）
 
 前端约 27 个路由：登录 + 概览 + 主机监控（实时趋势 / 专业快照 / 进程管理）+ 软件与服务（软件 / 服务 / 服务详情）+ 网站 / 应用 / WAF / 证书 / 文件 / 数据库 / 容器 / 备份 + 安全（防火墙规则 / 安全基线）+ 任务（计划任务 / 任务中心）+ 日志（系统日志 / 审计日志）+ 通知 / 终端 / AI 助手 / 设置 / 用户。
