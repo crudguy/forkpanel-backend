@@ -13,6 +13,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use panel_core::{InitSystem, Result, UnitName};
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::mpsc::{self, Receiver};
 
@@ -67,20 +68,46 @@ impl ServiceProvider for LinuxServices {
         match self.init {
             InitSystem::Systemd => {
                 let out = cmd::run(Bin::Systemctl, &["is-active", name.as_str()], CmdOpt::default()).await?;
-                Ok(match out.stdout.trim() {
-                    "active" => ServiceState::Active,
-                    "inactive" => ServiceState::Inactive,
-                    "failed" => ServiceState::Failed,
-                    "activating" => ServiceState::Activating,
-                    "deactivating" => ServiceState::Deactivating,
-                    _ => ServiceState::Unknown,
-                })
+                Ok(parse_is_active_state(&out.stdout))
             }
             InitSystem::SysV => {
                 let out = cmd::run(Bin::Service, &[name.as_str(), "status"], CmdOpt::default()).await?;
                 Ok(if out.code == Some(0) { ServiceState::Active } else { ServiceState::Inactive })
             }
             _ => Err(panel_core::PanelError::Unsupported("service.status")),
+        }
+    }
+
+    async fn statuses(&self, names: &[UnitName]) -> Result<HashMap<String, ServiceState>> {
+        if names.is_empty() {
+            return Ok(HashMap::new());
+        }
+        match self.init {
+            InitSystem::Systemd => {
+                // 一次 `systemctl is-active` 取多个单元，输出按入参顺序逐行（已本机实证）。
+                let mut args: Vec<&str> = Vec::with_capacity(names.len() + 1);
+                args.push("is-active");
+                args.extend(names.iter().map(|n| n.as_str()));
+                let out = cmd::run(Bin::Systemctl, &args, CmdOpt::default()).await?;
+                let mut lines = out.stdout.lines();
+                let mut map = HashMap::with_capacity(names.len());
+                for u in names {
+                    let line = lines.next().map(str::trim).unwrap_or("");
+                    let st = parse_is_active_state(line);
+                    map.insert(u.as_str().to_string(), st);
+                }
+                Ok(map)
+            }
+            // 非 systemd：无单次批量原语，退化为逐次 status（保持语义，仅为保底路径）。
+            _ => {
+                let mut map = HashMap::with_capacity(names.len());
+                for u in names {
+                    if let Ok(s) = self.status(u).await {
+                        map.insert(u.as_str().to_string(), s);
+                    }
+                }
+                Ok(map)
+            }
         }
     }
 
@@ -404,6 +431,19 @@ fn parse_systemd_list(s: &str) -> Vec<ServiceUnit> {
     out
 }
 
+/// 解析 `systemctl is-active` 的单行输出 → 状态。未知/异常/空值一律 `Unknown`。
+/// 抽成自由函数：① `status` 与 `statuses` 共用，避免映射漂移；② 可单测、不依赖 systemd。
+fn parse_is_active_state(line: &str) -> ServiceState {
+    match line.trim() {
+        "active" => ServiceState::Active,
+        "inactive" => ServiceState::Inactive,
+        "failed" => ServiceState::Failed,
+        "activating" => ServiceState::Activating,
+        "deactivating" => ServiceState::Deactivating,
+        _ => ServiceState::Unknown,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,5 +479,19 @@ mod tests {
         assert!(parse_systemd_show("LoadState=not-found\n", &un).is_none());
         // 输出为空（异常）也应 None
         assert!(parse_systemd_show("", &un).is_none());
+    }
+
+    #[test]
+    fn parse_is_active_state_maps_each_line_and_defaults_unknown() {
+        // 与 `systemctl is-active` 真实输出逐行映射一致（已在本机实证：输出顺序 = 入参顺序）
+        assert_eq!(parse_is_active_state("active\n"), ServiceState::Active);
+        assert_eq!(parse_is_active_state("inactive"), ServiceState::Inactive);
+        assert_eq!(parse_is_active_state("failed"), ServiceState::Failed);
+        assert_eq!(parse_is_active_state("activating"), ServiceState::Activating);
+        assert_eq!(parse_is_active_state("deactivating"), ServiceState::Deactivating);
+        // 空行 / 未知值（如不存在单元返回 "unknown"、或异常输出）一律 Unknown
+        assert_eq!(parse_is_active_state(""), ServiceState::Unknown);
+        assert_eq!(parse_is_active_state("unknown"), ServiceState::Unknown);
+        assert_eq!(parse_is_active_state("weird\noutput"), ServiceState::Unknown);
     }
 }

@@ -252,9 +252,17 @@ pub async fn list(
             it.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)
         })
         .await?;
-    let mut out = Vec::with_capacity(tuples.len());
-    for t in &tuples {
-        out.push(row_to_out(&tuple_to_raw(t), &state).await);
+    // 一次性批量快照：N 个应用只起 1 次 `systemctl is-active`，避免列表逐单元各起一次进程。
+    let raws: Vec<RawApp> = tuples.iter().map(tuple_to_raw).collect();
+    let unit_names: Vec<UnitName> = raws.iter().filter_map(|r| unit_of(&r.name).ok()).collect();
+    let snap = state.os.services().statuses(&unit_names).await.unwrap_or_default();
+    let mut out = Vec::with_capacity(raws.len());
+    for r in &raws {
+        let state_name = unit_of(&r.name)
+            .ok()
+            .and_then(|u| snap.get(u.as_str()))
+            .map(|s| format!("{s:?}").to_lowercase());
+        out.push(row_to_out(r, state_name));
     }
     Ok(ok(out))
 }
@@ -269,7 +277,7 @@ pub async fn get(
     let app = fetch_one(&state, id)
         .await?
         .ok_or_else(|| ApiError::not_found("app"))?;
-    Ok(ok(row_to_out(&app, &state).await))
+    Ok(ok(row_to_out(&app, resolve_state(&state, &app.name).await)))
 }
 
 async fn fetch_one(state: &Shared, id: i64) -> ApiResult<Option<RawApp>> {
@@ -284,10 +292,9 @@ async fn fetch_one(state: &Shared, id: i64) -> ApiResult<Option<RawApp>> {
     Ok(t.as_ref().map(tuple_to_raw))
 }
 
-/// 行 → DTO。状态探测失败只把该项 `state` 置 `null`，**不让整页 500**。
-async fn row_to_out(row: &RawApp, state: &Shared) -> AppOut {
-    let runtime = AppRuntime::from_key(&row.runtime).unwrap_or(AppRuntime::Custom);
-    let state_name = match unit_of(&row.name) {
+/// 单条路径的状态解析（列表走一次性批量快照 `statuses`，无需逐条 `status`）。
+async fn resolve_state(state: &Shared, name: &str) -> Option<String> {
+    match unit_of(name) {
         Ok(u) => state
             .os
             .services()
@@ -296,7 +303,13 @@ async fn row_to_out(row: &RawApp, state: &Shared) -> AppOut {
             .ok()
             .map(|s| format!("{s:?}").to_lowercase()),
         Err(_) => None,
-    };
+    }
+}
+
+/// 行 → DTO。`state_name` 由调用方解析（列表走一次性批量快照 `statuses`，单条走 `resolve_state`），
+/// 状态探测失败只把该项 `state` 置 `null`，**不让整页 500**。
+fn row_to_out(row: &RawApp, state_name: Option<String>) -> AppOut {
+    let runtime = AppRuntime::from_key(&row.runtime).unwrap_or(AppRuntime::Custom);
     AppOut {
         id: row.id,
         name: row.name.clone(),
@@ -746,7 +759,7 @@ pub async fn create(
 
     row.id = insert_row(&state, &row).await?;
     audit(&state, &s, "app.create", &name, "ok").await;
-    Ok(ok(row_to_out(&row, &state).await))
+    Ok(ok(row_to_out(&row, resolve_state(&state, &row.name).await)))
 }
 
 pub async fn patch(
@@ -827,7 +840,7 @@ pub async fn patch(
 
     update_row(&state, id, &next).await?;
     audit(&state, &s, "app.patch", &next.name, "ok").await;
-    Ok(ok(row_to_out(&next, &state).await))
+    Ok(ok(row_to_out(&next, resolve_state(&state, &next.name).await)))
 }
 
 pub async fn delete(
@@ -878,7 +891,7 @@ pub async fn act(
         }
     }
     audit(&state, &s, "app.act", &app.name, "ok").await;
-    Ok(ok(row_to_out(&app, &state).await))
+    Ok(ok(row_to_out(&app, resolve_state(&state, &app.name).await)))
 }
 
 // ═══════════════════════════ DB 写入 ═══════════════════════════
