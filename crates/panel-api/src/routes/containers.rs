@@ -224,7 +224,7 @@ pub async fn create(
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::CONTAINER_MANAGE)?;
     ensure_supported(&state)?;
-    if req.confirm_token.as_deref() != Some(CREATE_CONFIRM) {
+    if !is_create_confirm(req.confirm_token.as_deref()) {
         return Err(ApiError::bad_request("confirm_token", "需手输确认词「创建容器」"));
     }
     let inner = ContainerCreateReq {
@@ -327,7 +327,7 @@ pub async fn install(
         Some("binary_missing") => {}
         Some(other) => return Err(ApiError::bad_request("docker", format!("未知的不可用原因：{other}"))),
     }
-    if req.confirm_token.as_deref() != Some(INSTALL_CONFIRM) {
+    if !is_install_confirm(req.confirm_token.as_deref()) {
         return Err(ApiError::bad_request("confirm_token", "需手输确认词「安装 Docker」"));
     }
     // 按包管理器选对引擎包名：Debian/Ubuntu 上 docker 引擎包为 docker.io（而非 docker）
@@ -379,4 +379,55 @@ pub async fn join_docker_group(
         .await?;
     audit(&state, &s, "container.join_docker_group", &user, "ok").await;
     Ok(ok(serde_json::json!({ "user": user, "output": out.stdout })))
+}
+
+/// 创建容器的二次确认词校验（纯函数，便于单测）：须逐字等于「创建容器」。
+/// 不 trim —— 带尾空格的近似词必须被拒，防止误触一键创建特权/宿主挂载容器。
+fn is_create_confirm(token: Option<&str>) -> bool {
+    token == Some(CREATE_CONFIRM)
+}
+
+/// 安装 Docker 的二次确认词校验：须逐字等于「安装 Docker」（大小写敏感）。
+fn is_install_confirm(token: Option<&str>) -> bool {
+    token == Some(INSTALL_CONFIRM)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_confirm_requires_exact_word() {
+        assert!(is_create_confirm(Some("创建容器")));
+        assert!(!is_create_confirm(Some("创建容器 "))); // 不 trim
+        assert!(!is_create_confirm(Some("创建")));
+        assert!(!is_create_confirm(None));
+    }
+    #[test]
+    fn install_confirm_requires_exact_word() {
+        assert!(is_install_confirm(Some("安装 Docker")));
+        assert!(!is_install_confirm(Some("安装docker"))); // 大小写敏感
+        assert!(!is_install_confirm(None));
+    }
+
+    fn sess(permissions: &[&str]) -> crate::auth::Session {
+        crate::auth::Session {
+            user_id: 1, username: "tester".into(), role: "admin".into(),
+            permissions: permissions.iter().map(|s| s.to_string()).collect(),
+            allowed_roots: vec![], ip: "unknown".into(),
+            created_at: 0, last_seen: 0, expires_at: 0,
+        }
+    }
+    #[test]
+    fn container_manage_required_for_create() {
+        assert!(crate::auth::require(&sess(&[perm::CONTAINER_MANAGE]), perm::CONTAINER_MANAGE).is_ok());
+        assert!(crate::auth::require(&sess(&[]), perm::CONTAINER_MANAGE).is_err());
+        // 有 view 但缺 manage → 仍拒（防越权）
+        assert!(crate::auth::require(&sess(&[perm::CONTAINER_VIEW]), perm::CONTAINER_MANAGE).is_err());
+    }
+    #[test]
+    fn container_view_sufficient_for_list() {
+        assert!(crate::auth::require(&sess(&[perm::CONTAINER_VIEW]), perm::CONTAINER_VIEW).is_ok());
+        assert!(crate::auth::require(&sess(&[]), perm::CONTAINER_VIEW).is_err());
+    }
 }

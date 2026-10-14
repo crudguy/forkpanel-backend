@@ -58,7 +58,7 @@ pub async fn baseline_apply(
     Json(req): Json<BaselineApplyReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SECURITY_MANAGE)?;
-    if req.confirm_token.trim() != APPLY_CONFIRM_WORD {
+    if !is_apply_confirm(&req.confirm_token) {
         return Err(ApiError::bad_request(
             "confirm_token",
             format!("请输入确认词「{APPLY_CONFIRM_WORD}」以继续"),
@@ -123,4 +123,54 @@ pub async fn revoke_session(
     // 审计不落完整 sid（sid=凭据，落库等于泄密），截断前 8 位
     audit(&state, &s, "session.revoke", &format!("{}…", &id[..id.len().min(8)]), "ok").await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// 一键修复的二次确认词校验（纯函数，便于单测）：须逐字等于「确认修复」
+/// （trim 容忍首尾空白）。近似词/空词一律拒绝，防止误触高危 SSH 配置写回。
+fn is_apply_confirm(token: &str) -> bool {
+    token.trim() == APPLY_CONFIRM_WORD
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_confirm_requires_exact_word() {
+        assert!(is_apply_confirm("确认修复"));
+        assert!(is_apply_confirm("  确认修复  ")); // trim 容忍首尾空白
+        assert!(!is_apply_confirm("确认修复X"));
+        assert!(!is_apply_confirm("确认"));
+        assert!(!is_apply_confirm(""));
+        assert!(!is_apply_confirm("  "));
+    }
+
+    fn sess(permissions: &[&str]) -> crate::auth::Session {
+        crate::auth::Session {
+            user_id: 1,
+            username: "tester".into(),
+            role: "admin".into(),
+            permissions: permissions.iter().map(|s| s.to_string()).collect(),
+            allowed_roots: vec![],
+            ip: "unknown".into(),
+            created_at: 0,
+            last_seen: 0,
+            expires_at: 0,
+        }
+    }
+
+    /// RBAC：基线扫描/修复/会话管理端点都要求 SECURITY_MANAGE。
+    #[test]
+    fn baseline_requires_security_manage() {
+        assert!(crate::auth::require(&sess(&[perm::SECURITY_MANAGE]), perm::SECURITY_MANAGE).is_ok());
+        assert!(crate::auth::require(&sess(&[]), perm::SECURITY_MANAGE).is_err());
+        // 有别的 manage 权限但缺本权限 → 仍拒（防越权）
+        assert!(crate::auth::require(&sess(&[perm::CONTAINER_MANAGE]), perm::SECURITY_MANAGE).is_err());
+    }
+
+    #[test]
+    fn sessions_requires_security_manage() {
+        assert!(crate::auth::require(&sess(&[perm::SECURITY_MANAGE]), perm::SECURITY_MANAGE).is_ok());
+        assert!(crate::auth::require(&sess(&[]), perm::SECURITY_MANAGE).is_err());
+    }
 }
