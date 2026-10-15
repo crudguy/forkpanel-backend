@@ -1,9 +1,11 @@
 //! AI 运维助手（#52 / roadmap P2-2）。
 //!
-//! **定位（诚实版）**：当前内核是**内置规则诊断引擎**——把面板独有的数据面
+//! **定位（诚实版）**：内核是**内置规则诊断引擎**——把面板独有的数据面
 //! （指标 + 进程 + 服务状态 + 实时日志 + 安全基线 + 备份记录）汇成诊断上下文，
-//! 用确定性规则产出「证据 + 建议」。自然语言理解是**轻量关键词路由**，
-//! 不是大模型；LLM 叙事层留作可选增强（后续以 settings 配置接入）。
+//! 用确定性规则产出「证据 + 建议」。自然语言理解是**轻量关键词路由**，不是大模型。
+//! **LLM 叙事层（可选）**：若面板设置里已配置 LLM（endpoint/model/api_key），
+//! `diagnose` 会用规则诊断的结构化结果请求一次 OpenAI 兼容对话补全，生成 `narrative`
+//! 人话解读；未配置或调用失败/超时则优雅降级，回退纯规则报告（响应不含 `narrative`）。
 //!
 //! **护栏**：助手**只读**。Findings 里的 `action` 只有 `navigate`（跳转视图）
 //! 一种——不携带任何可自动执行的语义；任何处置动作仍由用户在对应视图内
@@ -31,6 +33,10 @@ pub struct AssistantReport {
     pub scope: &'static str,
     pub generated_at: i64,
     pub summary: String,
+    /// LLM 人话叙事（可选）：仅当面板已配置 LLM 且调用成功时填充；
+    /// 未配置/失败/超时则省略（serde skip_serializing_if），回退纯规则报告。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub narrative: Option<String>,
     pub findings: Vec<Finding>,
     /// 体检基线：即使无异常也给出关键真实数值
     pub ctx: ContextBrief,
@@ -433,6 +439,72 @@ fn brief(ctx: &Ctx) -> ContextBrief {
     }
 }
 
+/// LLM 叙事请求超时。宁可让用户多等若干秒拿到人话解读，也不要挂住一个 axum worker；
+/// 超时即视为「叙事不可用」，回退纯规则报告（不影响 findings/summary）。
+const NARRATIVE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// 把结构化诊断拼成给 LLM 的纯数据提示词。**只含我们真实采集到的字段**——
+/// 系统提示明确要求不得编造诊断中没有的数据，从源头杜绝幻觉式臆测。
+fn build_prompt(scope: &str, summary: &str, findings: &[Finding]) -> String {
+    let mut s = String::new();
+    s.push_str(&format!("诊断范围：{scope}\n一句话结论：{summary}\n"));
+    if findings.is_empty() {
+        s.push_str("未发现异常项。\n");
+    } else {
+        s.push_str("发现项（按严重度，证据均为系统实采）：\n");
+        for f in findings {
+            let sev = match f.severity {
+                Severity::Crit => "严重",
+                Severity::Warn => "风险",
+                Severity::Info => "提醒",
+            };
+            s.push_str(&format!(
+                "- [{}] {}。证据：{}。建议：{}\n",
+                sev, f.title, f.evidence.join("；"), f.suggestion
+            ));
+        }
+    }
+    s.push_str(
+        "\n请用简体中文写一段 2-4 句的人话总结：先说整体状况，再点最关键的一两件事与优先处置，\
+         不要给出命令行，不要编造诊断结果里没有的数据。",
+    );
+    s
+}
+
+/// 请求一次 OpenAI 兼容 `/chat/completions`，把规则诊断转成人话叙事。
+/// **全链路失败即 `None`**——LLM 是增强层，任何错误（无配置/网络/超时/非 2xx/解析失败）
+/// 都不许影响主报告；错误只在后端日志留痕，前端永远拿到一份可用的规则诊断。
+async fn generate_narrative(
+    cfg: &crate::routes::settings::LlmConfig,
+    scope: &str,
+    summary: &str,
+    findings: &[Finding],
+) -> Option<String> {
+    let prompt = build_prompt(scope, summary, findings);
+    let client = reqwest::Client::builder().timeout(NARRATIVE_TIMEOUT).build().ok()?;
+    let url = format!("{}/chat/completions", cfg.endpoint.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "model": cfg.model,
+        "messages": [
+            {"role": "system", "content": "你是服务器运维助手，擅长把结构化诊断翻译成运维人员能一眼看懂的人话。"},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 400,
+    });
+    let resp = client.post(&url).bearer_auth(&cfg.api_key).json(&body).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: serde_json::Value = resp.json().await.ok()?;
+    v.get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .map(|s| s.trim().to_string())
+}
+
 // ───────────────────────── 端点 ─────────────────────────
 
 /// POST /api/v1/assistant/diagnose
@@ -450,11 +522,17 @@ pub async fn diagnose(
     let ctx = collect(&state).await;
     let findings = run_diagnosis(&ctx, scope);
     let summary = build_summary(&ctx, &findings);
+    // LLM 叙事：仅当已配置且调用成功才填充；失败/未配置 → None（优雅降级）。
+    let narrative = match crate::routes::settings::llm_config(&state).await {
+        Ok(Some(cfg)) => generate_narrative(&cfg, scope, &summary, &findings).await,
+        _ => None,
+    };
     let report = AssistantReport {
         question,
         scope,
         generated_at: crate::now_unix(),
         summary,
+        narrative,
         findings,
         ctx: brief(&ctx),
     };
@@ -579,5 +657,23 @@ mod tests {
         assert_eq!(run_diagnosis(&c, "backup")[0].id, "backup.stale");
         c.backup_last_ok_age = Some(3600);
         assert!(run_diagnosis(&c, "backup").is_empty(), "最近备份成功 → 无发现");
+    }
+
+    #[test]
+    fn narrative_prompt_carries_real_findings_only() {
+        // 约束：提示词只能含我们真实采集到的字段，不得凭空给 LLM 喂系统内部数据。
+        let f = Finding {
+            id: "cpu.high",
+            severity: Severity::Crit,
+            title: "CPU 使用率过高（92%）".into(),
+            evidence: vec!["mining_frenzy (pid 7) — CPU 91.0%".into()],
+            suggestion: "按占用排行定位来源进程".into(),
+            action: Some(Action { kind: "navigate", view: "/processes" }),
+        };
+        let p = build_prompt("cpu", "发现 1 项严重", std::slice::from_ref(&f));
+        assert!(p.contains("cpu"), "应含诊断域");
+        assert!(p.contains("发现 1 项严重"), "应含一句话结论");
+        assert!(p.contains("mining_frenzy"), "应含真实证据（进程点名）");
+        assert!(p.contains("不要编造"), "应约束 LLM 不得编造数据");
     }
 }

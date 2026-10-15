@@ -53,6 +53,41 @@ pub struct SettingsReport {
     reserved: Value,
 }
 
+/// LLM 运行时配置（明文 api_key）。仅在三键齐全时构造，`llm_config` 返回 `None`
+/// 表示未配置——调用方据此优雅降级（不生成叙事，回退纯规则报告）。
+pub struct LlmConfig {
+    pub endpoint: String,
+    pub model: String,
+    /// 已解密的明文密钥（仅内存使用，绝不落日志/回显）
+    pub api_key: String,
+}
+
+/// 读取已保存的 LLM 配置；三键任一缺失或 api_key 解密失败 → `None`（优雅降级）。
+/// 复用本模块的 `load_table` 与 `plain_api_key`，密钥处理集中在此一处。
+pub async fn llm_config(state: &Shared) -> ApiResult<Option<LlmConfig>> {
+    let table = load_table(state).await?;
+    let endpoint = table
+        .get(K_LLM_ENDPOINT)
+        .and_then(|j| serde_json::from_str::<Value>(j).ok())
+        .and_then(|v| v.as_str().map(str::to_string))
+        .filter(|s| !s.is_empty());
+    let model = table
+        .get(K_LLM_MODEL)
+        .and_then(|j| serde_json::from_str::<Value>(j).ok())
+        .and_then(|v| v.as_str().map(str::to_string))
+        .filter(|s| !s.is_empty());
+    let raw = table.get(K_LLM_API_KEY);
+    let (endpoint, model, raw) = match (endpoint, model, raw) {
+        (Some(e), Some(m), Some(r)) => (e, m, r),
+        _ => return Ok(None),
+    };
+    let api_key = match plain_api_key(state, raw) {
+        Some(k) => k,
+        None => return Ok(None), // 密钥存储损坏（主密钥轮换等）→ 视作未配置
+    };
+    Ok(Some(LlmConfig { endpoint, model, api_key }))
+}
+
 // ───────────────────────── GET ─────────────────────────
 
 pub async fn get(

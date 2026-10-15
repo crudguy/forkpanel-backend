@@ -837,6 +837,7 @@ components:
         scope:        { type: string, enum: [all, cpu, mem, disk, log, service, security, backup] }
         generated_at: { type: integer }
         summary:      { type: string }
+        narrative:    { type: string, nullable: true, description: LLM 人话叙事（未配置 LLM 时缺省不返回） }
         findings:     { type: array, items: { $ref: '#/components/schemas/AssistantFinding' } }
         ctx:          { $ref: '#/components/schemas/AssistantContext' }
 
