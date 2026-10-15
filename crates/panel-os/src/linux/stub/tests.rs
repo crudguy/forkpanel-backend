@@ -999,6 +999,109 @@ use super::logs::*;
         assert!(matches!(ws.render(&spec_static()), Err(PanelError::Unsupported(_))));
     }
 
+    fn caddy_server() -> LinuxWebServer {
+        LinuxWebServer { name: Some("caddy"), paths: Arc::new(LinuxPathLayout::default()) }
+    }
+
+    // ── caddy 基础样板渲染（纯函数黄金单测；validate/reload 的 CLI 沙箱无 caddy 未真机验证）──
+
+    #[test]
+    fn caddy_static_renders_http_site_with_root_and_file_server() {
+        let out = render_caddy(&spec_static());
+        // 无证书 → 仅 http，绝不产出 https/443（同 nginx 纪律）
+        assert!(out.contains("http://example.com {"), "应 http 站点块：{out}");
+        assert!(!out.contains("https://"), "无证书不得出现 https：{out}");
+        assert!(out.contains("root * /var/www/example"), "应声明 root：{out}");
+        assert!(out.contains("file_server"), "静态站应 file_server：{out}");
+    }
+
+    #[test]
+    fn caddy_spa_fallback_emits_try_files_index_html() {
+        let mut s = spec_static();
+        s.spa_fallback = true;
+        let out = render_caddy(&s);
+        assert!(out.contains("try_files {path} {path}/ /index.html"), "SPA 回退：{out}");
+    }
+
+    #[test]
+    fn caddy_reverse_proxy_sets_upstream_and_client_headers() {
+        let mut s = spec_static();
+        s.kind = SiteKind::ReverseProxy { upstreams: vec!["http://127.0.0.1:3000".into()] };
+        let out = render_caddy(&s);
+        assert!(out.contains("reverse_proxy http://127.0.0.1:3000"), "应反代到后端：{out}");
+        assert!(out.contains("header_up Host {host}"), "应透传 Host：{out}");
+        assert!(out.contains("header_up X-Forwarded-Proto {scheme}"), "应透传 Proto：{out}");
+    }
+
+    #[test]
+    fn caddy_php_normalizes_unix_socket_and_host_port() {
+        // 纯函数：nginx `unix:/x` → caddy `unix//x`（双斜杠）；host:port 原样
+        assert_eq!(caddy_fpm_upstream("unix:/run/php/php8.2-fpm.sock"), "unix//run/php/php8.2-fpm.sock");
+        assert_eq!(caddy_fpm_upstream("127.0.0.1:9000"), "127.0.0.1:9000");
+        let mut s = spec_static();
+        s.kind = SiteKind::Php { fpm: "unix:/run/php/php8.2-fpm.sock".into() };
+        let out = render_caddy(&s);
+        assert!(out.contains("php_fastcgi unix//run/php/php8.2-fpm.sock"), "fpm 应归一化：{out}");
+    }
+
+    #[test]
+    fn caddy_tls_site_uses_https_and_tls_directive() {
+        let mut s = spec_static();
+        s.tls_cert = Some(PathBuf::from("/etc/panel/tls/example.crt"));
+        s.tls_key = Some(PathBuf::from("/etc/panel/tls/example.key"));
+        let out = render_caddy(&s);
+        assert!(out.contains("https://example.com {"), "有证书应 https：{out}");
+        assert!(out.contains("tls /etc/panel/tls/example.crt /etc/panel/tls/example.key"), "应 tls 指令：{out}");
+    }
+
+    #[test]
+    fn caddy_force_https_with_tls_adds_http_redirect_block() {
+        let mut s = spec_static();
+        s.tls_cert = Some(PathBuf::from("/etc/panel/tls/example.crt"));
+        s.tls_key = Some(PathBuf::from("/etc/panel/tls/example.key"));
+        s.force_https = true;
+        let out = render_caddy(&s);
+        // 手动 tls 不会自动重定向，须显式 http 块 301 → https
+        assert!(out.contains("http://example.com {"), "应有独立 http 重定向块：{out}");
+        assert!(out.contains("redir https://example.com{uri} permanent"), "应 301 跳 https：{out}");
+    }
+
+    #[test]
+    fn caddy_routed_renders_handle_blocks_and_fallback() {
+        let out = render_caddy(&spec_routed());
+        assert!(out.contains("handle /api* {"), "反代路由应 handle：{out}");
+        assert!(out.contains("reverse_proxy http://127.0.0.1:3000"), "handle 内反代：{out}");
+        assert!(out.contains("handle {"), "兜底路由应无参 handle：{out}");
+    }
+
+    #[test]
+    fn caddy_redirect_emits_redir_with_uri() {
+        let mut s = spec_static();
+        s.kind = SiteKind::Redirect { target: "https://target.com".into(), code: 301 };
+        let out = render_caddy(&s);
+        assert!(out.contains("redir https://target.com{uri} 301"), "整站重定向：{out}");
+    }
+
+    #[test]
+    fn caddy_sites_dir_and_main_conf_are_caddy_paths() {
+        assert_eq!(caddy_sites_dir(), PathBuf::from("/etc/caddy/sites"));
+        assert_eq!(caddy_main_conf(), PathBuf::from("/etc/caddy/Caddyfile"));
+    }
+
+    #[test]
+    fn caddy_provider_render_and_conf_path_use_caddy_layout() {
+        // provider 层：caddy 的 render 走 render_caddy，conf_path 落 sites/*.caddy
+        let (path, content) = caddy_server().render(&spec_static()).unwrap();
+        assert!(path.to_string_lossy().ends_with("panel-example.com.caddy"), "conf_path 应落 caddy 片段：{path:?}");
+        assert!(content.contains("http://example.com {"), "render 应产出 Caddyfile：{content}");
+    }
+
+    #[test]
+    fn caddy_provider_render_rejects_when_no_webserver() {
+        let ws = LinuxWebServer { name: None, paths: Arc::new(LinuxPathLayout::default()) };
+        assert!(matches!(ws.render(&spec_static()), Err(PanelError::Unsupported(_))));
+    }
+
     #[tokio::test]
     async fn deploy_writes_target_without_leaving_tmp() {
         let dir = std::env::temp_dir().join(format!("panel-deploy-test-{}", uniq_counter()));

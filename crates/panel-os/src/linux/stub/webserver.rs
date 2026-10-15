@@ -29,7 +29,12 @@ impl LinuxWebServer {
     ///  trait 里同名方法委托到它，调用方经 `dyn` 也能拿到与 render 同源的路径）
     pub fn conf_path(&self, server_names: &[String]) -> PathBuf {
         let stem = server_names.first().map(|s| slug(s)).unwrap_or_else(|| "site".into());
-        self.paths.web_conf_dir().join(format!("panel-{stem}.conf"))
+        match self.name {
+            // caddy 站点片段进 sites/、扩展名 .caddy（靠主 Caddyfile import 加载）
+            Some("caddy") => caddy_sites_dir().join(format!("panel-{stem}.caddy")),
+            // nginx 走 conf.d、扩展名 .conf
+            _ => self.paths.web_conf_dir().join(format!("panel-{stem}.conf")),
+        }
     }
 }
 
@@ -874,6 +879,178 @@ pub(super) fn render_acme_challenge_location(root: &std::path::Path) -> String {
     )
 }
 
+// ═════════════════════ Caddy 渲染（基础样板，方案 A） ═════════════════════
+//
+// **诚实边界（务必读）**：
+// - 本渲染器是 caddy **核心链路样板**：覆盖最常见站点形态（Static / ReverseProxy /
+//   Php / Routed）与 force_https、手动 TLS 证书，让面板在 caddy 主机上从"恒不可用"
+//   变为"基础可用"。
+// - **未覆盖**（nginx 有、caddy 样板刻意暂不做，在此显式列出而非静默丢弃）：
+//   WAF、精细 TLS 档位（tls_min/tls_profile）、HSTS、IP 白/黑名单、Basic Auth、
+//   伪静态 preset/custom、www 跳转、多域名/多 listen 端口组合、Routed-Php 的
+//   front_controller 精确语义。`custom_conf` 是**原始 nginx 文本**，caddy 语法不同，
+//   无法原样透传（caddy 渲染直接忽略它）。
+// - **沙箱无 caddy 二进制**：`render` 是纯函数（有黄金单测）；但
+//   `validate`(`caddy validate`) / `reload`(`caddy reload`) **未经真机验证**，
+//   只能代码推理。能力位按 `caddy` 二进制存在性诚实判定（装了即可用、未装置灰）。
+//
+// Caddyfile 用 **tab 缩进**（caddy 官方风格）。`{host}`/`{uri}`/`{path}` 等是 caddy
+// 占位符（快捷指令），在 format! 字符串里必须写成 `{{...}}` 转义。
+
+/// caddy 站点片段目录（平台默认）。caddy **无** nginx 的 `conf.d/*.conf` 自动
+/// include——多站点靠**主 Caddyfile 显式 `import`**。故部署约定：
+/// 主 Caddyfile（[`caddy_main_conf`]）需含 `import /etc/caddy/sites/*`，
+/// 面板每站点写一个 `panel-<slug>.caddy` 进 sites/。缺那条 import 时面板下发的
+/// 站点不生效（reload 无报错但站点缺席）——能力位注释与文档均已注明此约定。
+pub(super) fn caddy_sites_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from("/etc/caddy/sites")
+}
+
+/// caddy 主配置文件路径（reload 用）。caddy reload 必须指向**主配置**（含 import），
+/// 与 nginx `-s reload` 自动找主配置不同。
+pub(super) fn caddy_main_conf() -> std::path::PathBuf {
+    std::path::PathBuf::from("/etc/caddy/Caddyfile")
+}
+
+/// nginx 风格 fpm 地址 → caddy `php_fastcgi` 接受的 upstream。
+/// nginx: `unix:/run/php/fpm.sock` 或 `127.0.0.1:9000`；
+/// caddy: `unix//run/php/fpm.sock`（**双斜杠**，caddy 网络地址语法）或 `127.0.0.1:9000`。
+/// 只改 unix socket 前缀，host:port 原样透传。
+pub(super) fn caddy_fpm_upstream(fpm: &str) -> String {
+    match fpm.strip_prefix("unix:") {
+        Some(path) => format!("unix/{path}"),
+        None => fpm.to_string(),
+    }
+}
+
+/// 站点地址（基础样板：单主域 + 单 scheme）。
+/// 有手动证书 → `https://<name>`（监听 443，配 `tls cert key`）；
+/// 无证书 → `http://<name>[:port]`（**绝不**产出 https 监听——同 nginx 纪律：
+/// 无证书的 https 毫无意义，且 caddy 会因缺证书/ACME 失败而起不来）。
+pub(super) fn caddy_site_addr(spec: &SiteSpec) -> String {
+    let name = spec.server_names.first().cloned().unwrap_or_else(|| "site".into());
+    if spec.tls_cert.is_some() && spec.tls_key.is_some() {
+        format!("https://{name}")
+    } else {
+        let port = spec.listen.iter().copied().find(|p| *p != 443).unwrap_or(80);
+        if port == 80 { format!("http://{name}") } else { format!("http://{name}:{port}") }
+    }
+}
+
+/// 渲染 caddy 站点块（纯函数，黄金单测）。
+pub(super) fn render_caddy(spec: &SiteSpec) -> String {
+    let has_tls = spec.tls_cert.is_some() && spec.tls_key.is_some();
+    let primary = spec.server_names.first().cloned().unwrap_or_else(|| "site".into());
+    let mut out = String::new();
+    out.push_str("# 由 ForkPanel 自动生成（caddy 托管中：保存并应用会覆盖）。\n");
+    out.push_str("# 基础样板：单主域+单 scheme；WAF/精细TLS/IP名单/BasicAuth/伪静态/www跳转/多域名 暂未实装。\n\n");
+
+    // force_https + 有证书：单独 http 站点块做 301 → https。caddy 的自动 HTTP→HTTPS
+    // 重定向只在走 ACME 时生效；手动 `tls cert key` **不会**自动重定向，需显式块。
+    if spec.force_https && has_tls {
+        out.push_str(&format!("http://{primary} {{\n"));
+        out.push_str(&format!("\tredir https://{primary}{{uri}} permanent\n"));
+        out.push_str("}\n\n");
+    }
+
+    out.push_str(&format!("{} {{\n", caddy_site_addr(spec)));
+
+    // 手动 TLS 证书（caddy `tls <cert> <key>`）
+    if let (Some(cert), Some(key)) = (&spec.tls_cert, &spec.tls_key) {
+        out.push_str(&format!("\ttls {} {}\n", cert.display(), key.display()));
+    }
+
+    match &spec.kind {
+        SiteKind::Static => {
+            out.push_str(&format!("\troot * {}\n", spec.root.display()));
+            if spec.spa_fallback {
+                // SPA：未命中文件回退 /index.html（history 路由）
+                out.push_str("\tfile_server {\n\t\ttry_files {path} {path}/ /index.html\n\t}\n");
+            } else {
+                out.push_str("\tfile_server\n");
+            }
+        }
+        SiteKind::ReverseProxy { upstreams } => {
+            out.push_str(&caddy_proxy_block(upstreams, 1));
+        }
+        SiteKind::Php { fpm } => {
+            out.push_str(&format!("\troot * {}\n", spec.root.display()));
+            // caddy php_fastcgi 自动设 SCRIPT_FILENAME = root + uri（免 nginx 的
+            // fastcgi_param 手工拼装）。fpm 地址经 caddy_fpm_upstream 归一化。
+            out.push_str(&format!("\tphp_fastcgi {}\n", caddy_fpm_upstream(fpm)));
+        }
+        SiteKind::Redirect { target, code } => {
+            out.push_str(&format!("\tredir {target}{{uri}} {code}\n"));
+        }
+        SiteKind::Routed { routes } => {
+            // caddy handle 互斥、按最长前缀自动排序（无需 nginx 手动降序）；仍按
+            // sorted() 输出纯为可读性。兜底路由（prefix=="/"）用无参 `handle {`。
+            for r in routes.sorted() {
+                let matcher = if r.prefix == "/" {
+                    String::new()
+                } else {
+                    format!("{}*", r.prefix.trim_end_matches('/'))
+                };
+                // 兜底（无 matcher）用标准 `handle {`；带前缀用 `handle <prefix>* {`。
+                // （兜底走空串分支，避免 `handle  {` 的双空格。）
+                let handle_open = if matcher.is_empty() {
+                    "\thandle {\n".to_string()
+                } else {
+                    format!("\thandle {matcher} {{\n")
+                };
+                match &r.kind {
+                    RouteKind::Proxy { upstreams } => {
+                        out.push_str(&handle_open);
+                        out.push_str(&caddy_proxy_block(upstreams, 2));
+                        out.push_str("\t}\n");
+                    }
+                    RouteKind::Static { spa, root } => {
+                        out.push_str(&handle_open);
+                        if let Some(rv) = root {
+                            out.push_str(&format!("\t\troot * {rv}\n"));
+                        } else {
+                            out.push_str(&format!("\t\troot * {}\n", spec.root.display()));
+                        }
+                        if *spa {
+                            out.push_str("\t\tfile_server {\n\t\t\ttry_files {path} {path}/ /index.html\n\t\t}\n");
+                        } else {
+                            out.push_str("\t\tfile_server\n");
+                        }
+                        out.push_str("\t}\n");
+                    }
+                    RouteKind::Php { fpm, .. } => {
+                        // 基础样板：php_fastcgi；front_controller 的"整个前缀交给入口
+                        // 脚本"精确语义在 caddy 需额外 rewrite，留待后续（注释如实标注）。
+                        out.push_str(&handle_open);
+                        out.push_str(&format!("\t\troot * {}\n", spec.root.display()));
+                        out.push_str(&format!("\t\tphp_fastcgi {}\n", caddy_fpm_upstream(fpm)));
+                        out.push_str("\t}\n");
+                    }
+                }
+            }
+        }
+    }
+
+    out.push_str("}\n");
+    out
+}
+
+/// caddy `reverse_proxy` 块（含传递客户端信息的 header_up）。`indent` = tab 数。
+/// caddy reverse_proxy 自动处理 WebSocket 升级与多后端负载均衡——无需 nginx 的
+/// map/upstream 那套。多 upstream 直接空格并列（caddy 默认轮询）。
+fn caddy_proxy_block(upstreams: &[String], indent: usize) -> String {
+    let t = "\t".repeat(indent);
+    let t2 = "\t".repeat(indent + 1);
+    let mut o = String::new();
+    o.push_str(&format!("{t}reverse_proxy {} {{\n", upstreams.join(" ")));
+    o.push_str(&format!("{t2}header_up Host {{host}}\n"));
+    o.push_str(&format!("{t2}header_up X-Real-IP {{remote_host}}\n"));
+    o.push_str(&format!("{t2}header_up X-Forwarded-For {{remote_host}}\n"));
+    o.push_str(&format!("{t2}header_up X-Forwarded-Proto {{scheme}}\n"));
+    o.push_str(&format!("{t}}}\n"));
+    o
+}
+
 #[async_trait]
 impl WebServerProvider for LinuxWebServer {
     fn name(&self) -> &'static str { self.name.unwrap_or("none") }
@@ -885,47 +1062,59 @@ impl WebServerProvider for LinuxWebServer {
     }
 
     fn render(&self, spec: &SiteSpec) -> Result<(PathBuf, String)> {
-        match self.name {
-            Some("nginx") => {}
-            Some("caddy") => return unsupported!("webserver.render: caddy 尚未实装（当前仅 nginx）"),
-            _ => return unsupported!("webserver.render: 未检测到 nginx"),
-        }
         if spec.server_names.is_empty() {
             return Err(PanelError::ConfigInvalid { detail: "server_names 为空".into() });
         }
         let target = self.conf_path(&spec.server_names);
-        Ok((target, render_nginx(spec)))
+        let content = match self.name {
+            Some("nginx") => render_nginx(spec),
+            Some("caddy") => render_caddy(spec),
+            _ => return unsupported!("webserver.render: 未检测到 nginx/caddy"),
+        };
+        Ok((target, content))
     }
 
-    /// 语法校验：把片段包进临时 wrapper 主配置后跑 `nginx -t`。**在 deploy 之前**，
-    /// 失败则旧配置纹丝不动。
-    ///
-    /// wrapper 与 argv 都由 [`validate_wrapper`] / [`nginx_test_argv`] 生成——
-    /// 生产与测试共用同一份，测试才不会"在验一个不存在的东西"。
+    /// 语法校验（**在 deploy 之前**，失败则旧配置纹丝不动）。
+    /// nginx：片段包进临时 wrapper 主配置跑 `nginx -t`；caddy：临时 Caddyfile 跑
+    /// `caddy validate --adapter caddyfile`。wrapper / argv 与生产同源，测试才不会
+    /// "在验一个不存在的东西"。（caddy 分支**未经真机验证**——沙箱无 caddy。）
     async fn validate(&self, rendered: &str) -> Result<()> {
-        if self.name != Some("nginx") { return unsupported!("webserver.validate: 仅 nginx"); }
+        if !matches!(self.name, Some("nginx") | Some("caddy")) {
+            return unsupported!("webserver.validate: 未检测到 nginx/caddy");
+        }
         let base = self.paths.tmp_dir()
             .join(format!("panel-validate-{}-{}", std::process::id(), uniq_counter()));
-        let conf_dir = base.join("conf");
-        tokio::fs::create_dir_all(&conf_dir).await.map_err(|e| PanelError::Internal(e.to_string()))?;
+        tokio::fs::create_dir_all(&base).await.map_err(|e| PanelError::Internal(e.to_string()))?;
 
-        // 片段：该站点配置
-        let frag = base.join("site.conf");
-        tokio::fs::write(&frag, rendered).await.map_err(|e| PanelError::Internal(e.to_string()))?;
-        // 片段的相对 include 也要在临时 conf/ 下可见（见 stage_relative_includes）
-        stage_relative_includes(
-            rendered,
-            &nginx_conf_source_dir(&self.paths.web_conf_dir()),
-            &conf_dir,
-        )
-        .await?;
-        tokio::fs::write(conf_dir.join("nginx.conf"), validate_wrapper(&base, &frag))
-            .await.map_err(|e| PanelError::Internal(e.to_string()))?;
+        let (bin, argv): (Bin, Vec<String>) = match self.name {
+            Some("caddy") => {
+                // caddy Caddyfile 单文件自包含（面板片段无 import），直接验片段本身。
+                let frag = base.join("Caddyfile");
+                tokio::fs::write(&frag, rendered).await.map_err(|e| PanelError::Internal(e.to_string()))?;
+                (Bin::Caddy, vec![
+                    "validate".into(), "--adapter".into(), "caddyfile".into(),
+                    "--config".into(), frag.display().to_string(),
+                ])
+            }
+            _ => {
+                let conf_dir = base.join("conf");
+                tokio::fs::create_dir_all(&conf_dir).await.map_err(|e| PanelError::Internal(e.to_string()))?;
+                let frag = base.join("site.conf");
+                tokio::fs::write(&frag, rendered).await.map_err(|e| PanelError::Internal(e.to_string()))?;
+                stage_relative_includes(
+                    rendered,
+                    &nginx_conf_source_dir(&self.paths.web_conf_dir()),
+                    &conf_dir,
+                ).await?;
+                tokio::fs::write(conf_dir.join("nginx.conf"), validate_wrapper(&base, &frag))
+                    .await.map_err(|e| PanelError::Internal(e.to_string()))?;
+                (Bin::Nginx, nginx_test_argv(&base))
+            }
+        };
 
-        let argv = nginx_test_argv(&base);
         let argv_ref: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
         let r = crate::cmd::run(
-            Bin::Nginx,
+            bin,
             &argv_ref,
             CmdOpt { timeout: Duration::from_secs(20), ..Default::default() },
         ).await;
@@ -942,8 +1131,11 @@ impl WebServerProvider for LinuxWebServer {
     }
 
     /// 原子替换：同目录写临时文件 → `rename`（同文件系统下 POSIX 保证原子）。
+    /// **后端无关**（只是写文件）：nginx / caddy 走同一套。
     async fn deploy(&self, target: &std::path::Path, content: &str) -> Result<()> {
-        if self.name != Some("nginx") { return unsupported!("webserver.deploy: 仅 nginx"); }
+        if !matches!(self.name, Some("nginx") | Some("caddy")) {
+            return unsupported!("webserver.deploy: 未检测到 nginx/caddy");
+        }
         if let Some(parent) = target.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| PanelError::Internal(e.to_string()))?;
         }
@@ -958,30 +1150,54 @@ impl WebServerProvider for LinuxWebServer {
     }
 
     async fn reload(&self) -> Result<()> {
-        if self.name != Some("nginx") { return unsupported!("webserver.reload: 仅 nginx"); }
-        // 优先对运行中的 master 发信号
-        if let Ok(o) = crate::cmd::run(
-            Bin::Nginx, &["-s", "reload"],
-            CmdOpt { timeout: Duration::from_secs(10), ..Default::default() },
-        ).await {
-            if o.code == Some(0) { return Ok(()); }
+        match self.name {
+            Some("nginx") => {
+                // 优先对运行中的 master 发信号
+                if let Ok(o) = crate::cmd::run(
+                    Bin::Nginx, &["-s", "reload"],
+                    CmdOpt { timeout: Duration::from_secs(10), ..Default::default() },
+                ).await {
+                    if o.code == Some(0) { return Ok(()); }
+                }
+                // 回退 systemd（nginx 由 unit 托管时）
+                let o = crate::cmd::run(
+                    Bin::Systemctl, &["reload", "nginx"],
+                    CmdOpt { timeout: Duration::from_secs(15), ..Default::default() },
+                ).await?;
+                if o.code == Some(0) { Ok(()) }
+                else { Err(PanelError::Command { bin: "nginx".into(), detail: truncate_err(&o.stderr) }) }
+            }
+            Some("caddy") => {
+                // caddy reload 必须指向**主配置**（含 `import sites/*`），与 nginx 的
+                // `-s reload` 自动找主配置不同。admin API 不可达（caddy 未运行）时回退 systemd。
+                // （未经真机验证——沙箱无 caddy。）
+                let main = caddy_main_conf().display().to_string();
+                if let Ok(o) = crate::cmd::run(
+                    Bin::Caddy, &["reload", "--adapter", "caddyfile", "--config", &main],
+                    CmdOpt { timeout: Duration::from_secs(15), ..Default::default() },
+                ).await {
+                    if o.code == Some(0) { return Ok(()); }
+                }
+                let o = crate::cmd::run(
+                    Bin::Systemctl, &["reload", "caddy"],
+                    CmdOpt { timeout: Duration::from_secs(15), ..Default::default() },
+                ).await?;
+                if o.code == Some(0) { Ok(()) }
+                else { Err(PanelError::Command { bin: "caddy".into(), detail: truncate_err(&o.stderr) }) }
+            }
+            _ => unsupported!("webserver.reload: 未检测到 nginx/caddy"),
         }
-        // 回退 systemd（nginx 由 unit 托管时）
-        let o = crate::cmd::run(
-            Bin::Systemctl, &["reload", "nginx"],
-            CmdOpt { timeout: Duration::from_secs(15), ..Default::default() },
-        ).await?;
-        if o.code == Some(0) { Ok(()) }
-        else { Err(PanelError::Command { bin: "nginx".into(), detail: truncate_err(&o.stderr) }) }
     }
 
     async fn remove(&self, conf_path: &std::path::Path) -> Result<()> {
-        if self.name != Some("nginx") { return unsupported!("webserver.remove: 仅 nginx"); }
+        if !matches!(self.name, Some("nginx") | Some("caddy")) {
+            return unsupported!("webserver.remove: 未检测到 nginx/caddy");
+        }
         if conf_path.exists() {
             std::fs::remove_file(conf_path)
                 .map_err(|e| PanelError::Io(format!("remove {}: {e}", conf_path.display())))?;
         }
-        // 删完必须 reload：否则 nginx 仍按内存旧配置继续服务该站点（"已删除"却仍在线）
+        // 删完必须 reload：否则仍按内存旧配置继续服务该站点（"已删除"却仍在线）
         self.reload().await
     }
 }

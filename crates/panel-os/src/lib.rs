@@ -132,8 +132,11 @@ impl OsAdapter for linux::LinuxOsAdapter {
         // 仅 nginx 已实装渲染/下发；caddy 已探测但 render 未实现，
         // 不能"探测到就报 yes"——那正是"假装可移植"。诚实置 no 并给出原因。
         m.insert(k::WEBSERVER_MANAGE.into(), match self.webserver.name() {
+            // nginx 完整实装；caddy 基础样板已实装（render + validate/deploy/reload CLI），
+            // 与 nginx 同样按二进制存在性诚实判定。未覆盖的高级特性（WAF/精细TLS/IP名单/
+            // BasicAuth/伪静态/www跳转/多域名）见 render_caddy 顶部注释——是"部分支持"而非不可用。
             "nginx" => Capability::yes("nginx"),
-            "caddy" => Capability::no("caddy_render_not_implemented"),
+            "caddy" => Capability::yes("caddy"),
             _ => Capability::no("binary_missing"),
         });
         // scheduler 已随 crontab 落地，能力位必须跟着实现走（不要写死 no）
