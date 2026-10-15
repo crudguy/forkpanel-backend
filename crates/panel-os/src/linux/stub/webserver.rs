@@ -972,8 +972,8 @@ pub(super) fn render_caddy(spec: &SiteSpec) -> String {
     let has_tls = spec.tls_cert.is_some() && spec.tls_key.is_some();
     let mut out = String::new();
     out.push_str("# 由 ForkPanel 自动生成（caddy 托管中：保存并应用会覆盖）。\n");
-    out.push_str("# 已覆盖：静态/反代/PHP/多路由 + force_https + 手动TLS(protocols) + HSTS + IP名单 + www跳转 + 多域名。\n");
-    out.push_str("# 未覆盖（nginx 有、caddy 刻意暂不做）：WAF、tls_profile 套件档(caddy 不开放)、Basic Auth(apr1 不兼容)、伪静态 preset、Routed-PHP front_controller、custom_conf 透传。\n\n");
+    out.push_str("# 已覆盖：静态/反代/PHP/多路由 + force_https + 手动TLS(protocols) + HSTS + IP名单 + WAF(规则集同nginx) + www跳转 + 多域名。\n");
+    out.push_str("# 未覆盖（nginx 有、caddy 刻意暂不做）：WAF限速(标准caddy无rate_limit)、tls_profile 套件档(caddy 不开放)、Basic Auth(apr1 不兼容)、伪静态 preset、Routed-PHP front_controller、custom_conf 透传。\n\n");
 
     // www ↔ 非 www 跳转（复用 nginx 的同一判定 www_pair）；命中时来源域从主块剔除
     let www = www_pair(&spec.server_names, spec.www_redirect.as_deref());
@@ -1029,6 +1029,11 @@ pub(super) fn render_caddy(spec: &SiteSpec) -> String {
             out.push_str(&format!("\t@{tok}_denied remote_ip {}\n", list.join(" ")));
             out.push_str(&format!("\trespond @{tok}_denied 403\n"));
         }
+    }
+
+    // ── WAF（命中即拒；规则集与 nginx 同源；限速对 caddy 不实装、如实注释）──
+    if let Some(w) = &spec.waf {
+        out.push_str(&render_caddy_waf(&spec.server_names, w));
     }
 
     match &spec.kind {
@@ -1119,6 +1124,65 @@ fn caddy_proxy_block(upstreams: &[String], indent: usize) -> String {
     o.push_str(&format!("{t2}header_up X-Forwarded-For {{remote_host}}\n"));
     o.push_str(&format!("{t2}header_up X-Forwarded-Proto {{scheme}}\n"));
     o.push_str(&format!("{t}}}\n"));
+    o
+}
+
+/// nginx 规则集的正则 → caddy expression matcher（CEL `.matches()`）可用的正则串。
+/// 两步翻译：① POSIX 类**主体** `[:space:]` → `\s`（RE2 不认 POSIX 类；替换主体而非
+/// 整个 `[[:space:]]`，是为了同时覆盖两种形态——独立类 `[[:space:]]`→`[\s]`，
+/// 嵌在更大类里的 `[[:space:](/*]`→`[\s(/*]`，二者 RE2 均合法。真机 caddy validate
+/// 抓过"只替换完整 `[[:space:]]` 会漏掉嵌入形态"的 bug，见 tests.rs 真机测试）；
+/// ② 反斜杠双写——CEL 字符串字面量里 `\\` 才解析出一个反斜杠，正则才收得到 `\s`。
+/// （nginx 规则集为 token 安全本就只用 `[.]`/`[(]`/`[[:space:]]` 这类字符类，
+/// 前两者 RE2 原生支持、原样不动。）
+pub(super) fn caddy_cel_regex(pat: &str) -> String {
+    pat.replace("[:space:]", "\\s").replace('\\', "\\\\")
+}
+
+/// caddy WAF 片段（站点级 named matcher + `respond`）。
+///
+/// 规则内容**复用 nginx 的同一套常量**（`waf_ua/sqli/xss/trav`）——单一事实源、
+/// 两边不漂移；只做 RE2/CEL 翻译（[`caddy_cel_regex`]）。语义对齐 nginx 版：
+/// UA/SQLi/XSS/Trav 命中即 403；严格档追加非白名单方法 405、空 UA 403。
+///
+/// ⚠ **限速对 caddy 不实装**：标准 caddy 无 `rate_limit` 指令（属第三方
+/// caddy-ratelimit 模块），故 `WafSpec.rate_per_sec/burst` 在 caddy 上**有意忽略**，
+/// 输出里留一行注释明说——绝不做成"配了却不生效"的静默丢弃。
+///
+/// `respond` 站点级、先于 handle 求值，故对多路由站点同样全程生效（同 IP 名单）。
+/// matcher 名取 `upstream_name` 净化名（caddy matcher 名不含点）。
+///
+/// ⚠ expression matcher 的 CEL 语法**必须真机 `caddy validate` 验证**（见 tests.rs
+/// 的 `caddy_waf_rendered_config_passes_real_caddy_validate`；二进制缺失时跳过）。
+pub(super) fn render_caddy_waf(server_names: &[String], w: &WafSpec) -> String {
+    let t = upstream_name(server_names);
+    let strict = w.profile == WafProfile::Strict;
+    let mut o = String::new();
+    o.push_str("\n\t# ── WAF（caddy matcher + respond；规则集与 nginx 同源，RE2/CEL 翻译）──\n");
+    // UA：header_regexp 直接吃纯交替规则（无 [[:space:]]，无需翻译）
+    o.push_str(&format!("\t@{t}_waf_ua header_regexp User-Agent `{}`\n", waf_ua(w.profile)));
+    // SQLi / XSS / 路径穿越：对完整 URI（含查询串）正则。expression matcher（CEL）
+    // 的 `.matches()` 走 RE2。⚠ 占位符**不能包引号**——caddy 会把 `{...}` 重写成
+    // `ph(req, "...")` 函数调用（caddy 2.7+ 的 CEL 占位符机制），包了引号会成嵌套
+    // 引号破坏 CEL 语法（真机 caddy validate 抓过，见 tests.rs 真机测试）。
+    o.push_str(&format!("\t@{t}_waf_sqli expression `{{http.request.uri}}.matches(\"{}\")`\n", caddy_cel_regex(&waf_sqli(w.profile))));
+    o.push_str(&format!("\t@{t}_waf_xss expression `{{http.request.uri}}.matches(\"{}\")`\n", caddy_cel_regex(&waf_xss(w.profile))));
+    o.push_str(&format!("\t@{t}_waf_trav expression `{{http.request.uri}}.matches(\"{}\")`\n", caddy_cel_regex(&waf_trav(w.profile))));
+    o.push_str(&format!("\trespond @{t}_waf_ua 403\n"));
+    o.push_str(&format!("\trespond @{t}_waf_sqli 403\n"));
+    o.push_str(&format!("\trespond @{t}_waf_xss 403\n"));
+    o.push_str(&format!("\trespond @{t}_waf_trav 403\n"));
+    if strict {
+        // 非白名单方法 → 405（`not method` 列白名单，默认拒绝——将来 caddy 支持新方法时默认仍拒）
+        o.push_str(&format!("\t@{t}_waf_method not method GET HEAD POST PUT DELETE PATCH OPTIONS\n"));
+        o.push_str(&format!("\trespond @{t}_waf_method 405\n"));
+        // 空 UA → 403（缺失头按空值匹配）
+        o.push_str(&format!("\t@{t}_waf_noua header User-Agent \"\"\n"));
+        o.push_str(&format!("\trespond @{t}_waf_noua 403\n"));
+    }
+    if w.rate_per_sec.is_some() {
+        o.push_str(&format!("\t# ⚠ 限速未实装：caddy 标准版无 rate_limit 指令（需第三方 caddy-ratelimit 模块），rate_per_sec/burst 已忽略\n"));
+    }
     o
 }
 

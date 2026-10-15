@@ -1134,6 +1134,86 @@ use super::logs::*;
         assert!(out.contains("http://example.com, http://www.example.com {"), "多域名逗号列表：{out}");
     }
 
+    // ── caddy WAF（规则集与 nginx 同源；expression 语法另经真机 caddy validate 验证）──
+
+    #[test]
+    fn caddy_waf_basic_emits_matchers_and_403() {
+        let out = render_caddy(&spec_waf(WafProfile::Basic, None, 0));
+        assert!(out.contains("header_regexp User-Agent `sqlmap|nikto|"), "UA 规则与 nginx 同源：{out}");
+        assert!(out.contains("_waf_sqli expression"), "SQLi matcher：{out}");
+        assert!(out.contains("_waf_xss expression"), "XSS matcher：{out}");
+        assert!(out.contains("_waf_trav expression"), "路径穿越 matcher：{out}");
+        assert!(out.contains("respond @panel_example_com_waf_ua 403"), "命中即 403：{out}");
+        // 基础档不出方法白名单 / 空 UA 规则
+        assert!(!out.contains("_waf_method"), "基础档不应有方法白名单：{out}");
+        assert!(!out.contains("_waf_noua"), "基础档不应有空 UA 规则：{out}");
+    }
+
+    #[test]
+    fn caddy_waf_strict_adds_method_whitelist_and_empty_ua() {
+        let out = render_caddy(&spec_waf(WafProfile::Strict, None, 0));
+        assert!(out.contains("not method GET HEAD POST PUT DELETE PATCH OPTIONS"), "严格档方法白名单：{out}");
+        assert!(out.contains("respond @panel_example_com_waf_method 405"), "非白名单方法 405：{out}");
+        assert!(out.contains("header User-Agent \"\""), "空 UA matcher：{out}");
+        assert!(out.contains("nmap|zaproxy"), "严格档 UA 应含附加备选：{out}");
+    }
+
+    #[test]
+    fn caddy_waf_rate_limit_is_honestly_noted_not_silently_dropped() {
+        let out = render_caddy(&spec_waf(WafProfile::Basic, Some(10), 20));
+        assert!(out.contains("限速未实装"), "限速不支持必须显式说明：{out}");
+        // 注释里会出现 rate_limit 这个词（说明缺的是什么），但不得出现**指令调用**。
+        assert!(!out.contains("rate_limit {") && !out.contains("rate_limit{"), "标准 caddy 无 rate_limit 指令，不得输出指令调用：{out}");
+    }
+
+    #[test]
+    fn caddy_cel_regex_translates_posix_class_and_escapes_for_cel() {
+        let got = caddy_cel_regex("union[[:space:]]+select");
+        assert!(!got.contains("[[:space:]]"), "POSIX 类应被翻译掉：{got:?}");
+        // \s 经 CEL 双写后是两个反斜杠 + s（CEL 字符串里 \\ 才解析出一个反斜杠）。
+        // 注意 [[:space:]] 自带方括号，替换后不再有 []——输出 union\\s+select。
+        assert_eq!(got.matches('\\').count(), 2, "反斜杠应双写：{got:?}");
+        assert!(got.starts_with("union"), "前缀不动：{got:?}");
+        assert!(got.ends_with("+select"), "后缀不动：{got:?}");
+        // RE2 原生字符类原样保留
+        assert_eq!(caddy_cel_regex("a[.]b[(]c"), "a[.]b[(]c");
+        assert_eq!(caddy_cel_regex("plain"), "plain");
+        // 嵌入形态：POSIX 类主体替换后仍是合法 RE2 字符类（真机 caddy validate 抓过的 bug）
+        let embedded = caddy_cel_regex("union[[:space:](/*]+select");
+        assert!(!embedded.contains("[:space:]"), "嵌入 POSIX 类也应被翻译：{embedded:?}");
+        assert!(embedded.contains("(/*"), "类内其余字符不动：{embedded:?}");
+    }
+
+    /// 真机验证：渲染的 WAF Caddyfile 必须过 `caddy validate`。
+    /// **expression matcher 的 CEL 语法只能靠真机证伪**——字符串单测看不出 caddy 认不认。
+    /// 二进制缺失（CI）时跳过而非失败，与 nginx 的 `validate_roundtrip_when_nginx_present`
+    /// 同模式；本地验证设 `CADDY_BIN=/path/to/caddy`。
+    #[tokio::test]
+    async fn caddy_waf_rendered_config_passes_real_caddy_validate() {
+        let bin = std::env::var("CADDY_BIN").ok().filter(|s| !s.is_empty())
+            .or_else(|| which("caddy").then(|| "caddy".to_string()));
+        let Some(bin) = bin else { return };
+        for profile in [WafProfile::Basic, WafProfile::Strict] {
+            let rendered = render_caddy(&spec_waf(profile, None, 0));
+            let dir = std::env::temp_dir().join(format!("panel-caddy-waf-{}-{:?}", std::process::id(), profile));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join("Caddyfile");
+            std::fs::write(&file, &rendered).unwrap();
+            let out = std::process::Command::new(&bin)
+                .args(["validate", "--adapter", "caddyfile", "--config"])
+                .arg(&file)
+                .output()
+                .expect("spawn caddy validate");
+            let _ = std::fs::remove_dir_all(&dir);
+            assert!(
+                out.status.success(),
+                "caddy validate 拒绝 WAF 配置（{profile:?}）：\n{}\n--- rendered ---\n{rendered}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
     #[test]
     fn caddy_routed_renders_handle_blocks_and_fallback() {
         let out = render_caddy(&spec_routed());
