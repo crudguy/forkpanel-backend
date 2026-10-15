@@ -15,7 +15,9 @@
 //! 已知边界（如实）：
 //! - `Protocol::Icmp` 渲染为 `icmp`（仅匹配 IPv4 ICMP）；IPv6 的 `icmpv6` 暂未单独建模。
 //! - `Protocol::Any` 且指定端口时，兜底渲染为 `tcp dport`（nft 的 `dport` 必须依附传输层协议）。
-//! - fail2ban 由独立服务管理，本后端不接管（能力位报 `no`）。
+//! - fail2ban 由独立服务管理，经共享实现 `fail2ban.rs` 接管：能力位只按
+//!   `fail2ban-client` 二进制存在性判定，与本 nft 后端无因果关系（fail2ban 配
+//!   nftables banaction 封禁时，fail2ban-client 照样能管理 jail 与解封）。
 
 use crate::cmd::{Bin, CmdOpt};
 use crate::traits::*;
@@ -199,19 +201,21 @@ impl FirewallProvider for NftFirewall {
     }
 
     fn fail2ban_capability(&self) -> Capability {
-        Capability::no("nftables 后端不接管 fail2ban")
+        // fail2ban 与防火墙后端正交（fail2ban 配 nftables banaction 封禁时亦然），
+        // 统一委托共享实现，按 fail2ban-client 二进制存在性诚实判定——不再武断判死。
+        super::fail2ban::Fail2ban::capability()
     }
 
     async fn fail2ban_status(&self) -> Result<Fail2banStatus> {
-        Ok(Fail2banStatus { available: false, active: false, jails: vec![] })
+        super::fail2ban::Fail2ban::status().await
     }
 
-    async fn fail2ban_set_jail(&self, _name: &str, _enabled: bool) -> Result<()> {
-        Err(PanelError::Unsupported("nftables 后端不接管 fail2ban"))
+    async fn fail2ban_set_jail(&self, name: &str, enabled: bool) -> Result<()> {
+        super::fail2ban::Fail2ban::set_jail(name, enabled).await
     }
 
-    async fn fail2ban_unban(&self, _jail: &str, _ip: &str) -> Result<()> {
-        Err(PanelError::Unsupported("nftables 后端不接管 fail2ban"))
+    async fn fail2ban_unban(&self, jail: &str, ip: &str) -> Result<()> {
+        super::fail2ban::Fail2ban::unban(jail, ip).await
     }
 }
 
@@ -530,5 +534,17 @@ table inet panelfw {
         let fw = NftFirewall;
         assert_eq!(fw.capability().supported, Bin::Nft.available(),
                    "能力位必须与二进制实际可用性一致，否则前端会伪造成功");
+    }
+
+    /// nft 后端的 fail2ban 能力位必须与共享实现一致（按 fail2ban-client 存在性，
+    /// 不得因后端是 nft 就被判死）。防未来有人回退成硬编码 `no`。
+    #[test]
+    fn fail2ban_capability_delegates_to_shared_impl() {
+        let fw = NftFirewall;
+        assert_eq!(
+            fw.fail2ban_capability().supported,
+            crate::linux::fail2ban::Fail2ban::capability().supported,
+            "nft 后端的 fail2ban 能力位必须与共享实现一致，不得硬编码 no"
+        );
     }
 }

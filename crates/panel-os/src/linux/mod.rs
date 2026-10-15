@@ -8,6 +8,7 @@ pub mod containers;
 pub mod files;
 /// 第三方官方 apt 源注入（方案1：加官方源；含 GPG 指纹校验）。
 pub mod repo;
+pub mod fail2ban;
 pub mod firewall;
 pub mod firewall_nft;
 pub mod metrics;
