@@ -923,41 +923,112 @@ pub(super) fn caddy_fpm_upstream(fpm: &str) -> String {
     }
 }
 
-/// 站点地址（基础样板：单主域 + 单 scheme）。
-/// 有手动证书 → `https://<name>`（监听 443，配 `tls cert key`）；
-/// 无证书 → `http://<name>[:port]`（**绝不**产出 https 监听——同 nginx 纪律：
-/// 无证书的 https 毫无意义，且 caddy 会因缺证书/ACME 失败而起不来）。
-pub(super) fn caddy_site_addr(spec: &SiteSpec) -> String {
-    let name = spec.server_names.first().cloned().unwrap_or_else(|| "site".into());
-    if spec.tls_cert.is_some() && spec.tls_key.is_some() {
-        format!("https://{name}")
+/// caddy 站点地址列表（多域名逗号分隔）。
+/// `exclude` 剔除 www 跳转的来源域（两块争同一主机会让 caddy 报警）；`force_http`
+/// 强制 http scheme（force_https 重定向块用）。有手动证书 → `https://`（监听 443，
+/// 配 `tls cert key`）；无证书 → `http://[:port]`（**绝不**产出 https 监听——同 nginx
+/// 纪律：无证书的 https 毫无意义，且 caddy 会因缺证书/ACME 失败而起不来）。
+pub(super) fn caddy_site_addrs(spec: &SiteSpec, exclude: &[String], force_http: bool) -> String {
+    let names: Vec<String> = spec.server_names.iter()
+        .filter(|n| !exclude.iter().any(|e| e == *n))
+        .cloned()
+        .collect();
+    // 全被 exclude（极端：单域名且正是跳转来源域）时兜底用首个域名，别产出空地址。
+    let names = if names.is_empty() {
+        vec![spec.server_names.first().cloned().unwrap_or_else(|| "site".into())]
     } else {
-        let port = spec.listen.iter().copied().find(|p| *p != 443).unwrap_or(80);
-        if port == 80 { format!("http://{name}") } else { format!("http://{name}:{port}") }
+        names
+    };
+    let has_tls = !force_http && spec.tls_cert.is_some() && spec.tls_key.is_some();
+    let port = spec.listen.iter().copied().find(|p| *p != 443).unwrap_or(80);
+    names.iter()
+        .map(|n| {
+            if has_tls {
+                format!("https://{n}")
+            } else if port == 80 {
+                format!("http://{n}")
+            } else {
+                format!("http://{n}:{port}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// TLS 版本下限 → caddy `protocols` 列表（caddy 用小写 `tls1.2` 形式）。
+/// ⚠ caddy v2 **最低只支持 tls1.2**，故 `TLSv1`/`TLSv1.1` 下限如实回落 tls1.2
+/// （配了更低也不会生效——明确回落比静默撒谎好）。**caddy 不开放加密套件配置**
+/// （自行策划安全套件），故 `tls_profile` 在 caddy 上无对应项、被有意忽略
+/// （nginx 才分 compat/modern/strict 三档）。
+pub(super) fn caddy_tls_protocols(min: Option<&str>) -> &'static str {
+    match min.unwrap_or("TLSv1.2") {
+        "TLSv1.3" => "tls1.3",
+        _ => "tls1.2 tls1.3",
     }
 }
 
 /// 渲染 caddy 站点块（纯函数，黄金单测）。
 pub(super) fn render_caddy(spec: &SiteSpec) -> String {
     let has_tls = spec.tls_cert.is_some() && spec.tls_key.is_some();
-    let primary = spec.server_names.first().cloned().unwrap_or_else(|| "site".into());
     let mut out = String::new();
     out.push_str("# 由 ForkPanel 自动生成（caddy 托管中：保存并应用会覆盖）。\n");
-    out.push_str("# 基础样板：单主域+单 scheme；WAF/精细TLS/IP名单/BasicAuth/伪静态/www跳转/多域名 暂未实装。\n\n");
+    out.push_str("# 已覆盖：静态/反代/PHP/多路由 + force_https + 手动TLS(protocols) + HSTS + IP名单 + www跳转 + 多域名。\n");
+    out.push_str("# 未覆盖（nginx 有、caddy 刻意暂不做）：WAF、tls_profile 套件档(caddy 不开放)、Basic Auth(apr1 不兼容)、伪静态 preset、Routed-PHP front_controller、custom_conf 透传。\n\n");
 
-    // force_https + 有证书：单独 http 站点块做 301 → https。caddy 的自动 HTTP→HTTPS
-    // 重定向只在走 ACME 时生效；手动 `tls cert key` **不会**自动重定向，需显式块。
-    if spec.force_https && has_tls {
-        out.push_str(&format!("http://{primary} {{\n"));
-        out.push_str(&format!("\tredir https://{primary}{{uri}} permanent\n"));
+    // www ↔ 非 www 跳转（复用 nginx 的同一判定 www_pair）；命中时来源域从主块剔除
+    let www = www_pair(&spec.server_names, spec.www_redirect.as_deref());
+    let exclude: Vec<String> = www.iter().map(|(from, _)| from.clone()).collect();
+
+    // ── www ↔ 非 www 跳转：独立站点块 + redir permanent（来源域已剔除，不争主机）──
+    if let Some((from, to)) = &www {
+        // 有证书跳 https（省一次跳转）；无证书保持 {scheme}（不把明文硬拗成 https）
+        let scheme = if has_tls { "https" } else { "{scheme}" };
+        out.push_str(&format!("http://{from} {{\n"));
+        out.push_str(&format!("\tredir {scheme}://{to}{{uri}} permanent\n"));
         out.push_str("}\n\n");
     }
 
-    out.push_str(&format!("{} {{\n", caddy_site_addr(spec)));
+    // ── force_https + 有证书：http 整域 301 → https（{host} 占位符覆盖多域名）──
+    // caddy 的自动 HTTP→HTTPS 重定向只在走 ACME 时生效；手动 `tls cert key`
+    // **不会**自动重定向，需显式块。
+    if spec.force_https && has_tls {
+        out.push_str(&format!("{} {{\n", caddy_site_addrs(spec, &exclude, true)));
+        out.push_str("\tredir https://{host}{uri} permanent\n");
+        out.push_str("}\n\n");
+    }
 
-    // 手动 TLS 证书（caddy `tls <cert> <key>`）
+    out.push_str(&format!("{} {{\n", caddy_site_addrs(spec, &exclude, false)));
+
+    // 手动 TLS 证书 + 版本下限（caddy `tls <cert> <key> { protocols ... }`）+ HSTS
     if let (Some(cert), Some(key)) = (&spec.tls_cert, &spec.tls_key) {
-        out.push_str(&format!("\ttls {} {}\n", cert.display(), key.display()));
+        out.push_str(&format!("\ttls {} {} {{\n", cert.display(), key.display()));
+        out.push_str(&format!("\t\tprotocols {}\n", caddy_tls_protocols(spec.tls_min.as_deref())));
+        out.push_str("\t}\n");
+        // HSTS：浏览器在 max-age 期间强制 HTTPS、服务端无法撤回——默认关闭（同 nginx）
+        if spec.hsts {
+            let mut v = format!("max-age={}", spec.hsts_max_age.max(0));
+            if spec.hsts_include_sub { v.push_str("; includeSubDomains"); }
+            if spec.hsts_preload { v.push_str("; preload"); }
+            out.push_str(&format!("\theader Strict-Transport-Security \"{v}\"\n"));
+        }
+    }
+
+    // ── 访问控制：IP 白/黑名单（caddy matcher + respond 403）──
+    // 白名单优先（同 nginx：ip_allow 非空即只放行名单内，ip_deny 忽略——caddy 无
+    // allow/deny 顺序匹配，用 matcher 表达等价语义）。matcher 名取站点净化名，
+    // 避免多站点片段拼进同一主配置时撞名。respond 站点级、先于 handle 求值，
+    // 故对多路由站点同样全程生效。
+    let tok = upstream_name(&spec.server_names);
+    if let Some(list) = &spec.ip_allow {
+        if !list.is_empty() {
+            out.push_str(&format!("\t@{tok}_blocked not remote_ip {}\n", list.join(" ")));
+            out.push_str(&format!("\trespond @{tok}_blocked 403\n"));
+        }
+    } else if let Some(list) = &spec.ip_deny {
+        if !list.is_empty() {
+            out.push_str(&format!("\t@{tok}_denied remote_ip {}\n", list.join(" ")));
+            out.push_str(&format!("\trespond @{tok}_denied 403\n"));
+        }
     }
 
     match &spec.kind {

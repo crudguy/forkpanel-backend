@@ -1009,7 +1009,7 @@ use super::logs::*;
     fn caddy_static_renders_http_site_with_root_and_file_server() {
         let out = render_caddy(&spec_static());
         // 无证书 → 仅 http，绝不产出 https/443（同 nginx 纪律）
-        assert!(out.contains("http://example.com {"), "应 http 站点块：{out}");
+        assert!(out.contains("http://example.com, http://www.example.com {"), "应 http 站点块（多域名列表）：{out}");
         assert!(!out.contains("https://"), "无证书不得出现 https：{out}");
         assert!(out.contains("root * /var/www/example"), "应声明 root：{out}");
         assert!(out.contains("file_server"), "静态站应 file_server：{out}");
@@ -1050,7 +1050,7 @@ use super::logs::*;
         s.tls_cert = Some(PathBuf::from("/etc/panel/tls/example.crt"));
         s.tls_key = Some(PathBuf::from("/etc/panel/tls/example.key"));
         let out = render_caddy(&s);
-        assert!(out.contains("https://example.com {"), "有证书应 https：{out}");
+        assert!(out.contains("https://example.com, https://www.example.com {"), "有证书应 https（多域名）：{out}");
         assert!(out.contains("tls /etc/panel/tls/example.crt /etc/panel/tls/example.key"), "应 tls 指令：{out}");
     }
 
@@ -1061,9 +1061,77 @@ use super::logs::*;
         s.tls_key = Some(PathBuf::from("/etc/panel/tls/example.key"));
         s.force_https = true;
         let out = render_caddy(&s);
-        // 手动 tls 不会自动重定向，须显式 http 块 301 → https
-        assert!(out.contains("http://example.com {"), "应有独立 http 重定向块：{out}");
-        assert!(out.contains("redir https://example.com{uri} permanent"), "应 301 跳 https：{out}");
+        // 手动 tls 不会自动重定向，须显式 http 块 301 → https；{host} 占位符覆盖多域名
+        assert!(out.contains("http://example.com, http://www.example.com {"), "应有独立 http 重定向块（覆盖全部域名）：{out}");
+        assert!(out.contains("redir https://{host}{uri} permanent"), "应 301 跳 https：{out}");
+    }
+
+    #[test]
+    fn caddy_www_redirect_to_www_emits_block_and_excludes_source() {
+        let mut s = spec_static();
+        s.www_redirect = Some("to_www".into());
+        let out = render_caddy(&s);
+        // 来源域 example.com 进跳转块、不进主块（两块争主机会让 caddy 报警）
+        assert!(out.contains("http://example.com {\n\tredir {scheme}://www.example.com{uri} permanent"), "裸域→www 跳转块：{out}");
+        assert!(out.contains("http://www.example.com {"), "主块只含 www 域：{out}");
+    }
+
+    #[test]
+    fn caddy_www_redirect_to_bare_emits_block_and_excludes_source() {
+        // spec_static 的 names 含 www.example.com；to_bare：www → 裸域
+        let mut s = spec_static();
+        s.www_redirect = Some("to_bare".into());
+        let out = render_caddy(&s);
+        assert!(out.contains("http://www.example.com {\n\tredir {scheme}://example.com{uri} permanent"), "www→裸域跳转块：{out}");
+        assert!(out.contains("http://example.com {"), "主块只含裸域：{out}");
+    }
+
+    #[test]
+    fn caddy_tls_protocols_and_hsts_on_tls_site() {
+        let mut s = spec_static();
+        s.tls_cert = Some(PathBuf::from("/etc/panel/tls/example.crt"));
+        s.tls_key = Some(PathBuf::from("/etc/panel/tls/example.key"));
+        s.tls_min = Some("TLSv1.2".into());
+        s.hsts = true;
+        s.hsts_max_age = 31536000;
+        s.hsts_include_sub = true;
+        let out = render_caddy(&s);
+        assert!(out.contains("tls /etc/panel/tls/example.crt /etc/panel/tls/example.key {"), "tls 块：{out}");
+        assert!(out.contains("protocols tls1.2 tls1.3"), "TLS 下限→protocols：{out}");
+        assert!(out.contains("header Strict-Transport-Security \"max-age=31536000; includeSubDomains\""), "HSTS：{out}");
+    }
+
+    #[test]
+    fn caddy_tls_min_v13_maps_to_tls13_only() {
+        assert_eq!(caddy_tls_protocols(Some("TLSv1.3")), "tls1.3");
+        // caddy v2 最低 tls1.2：更低下限如实回落
+        assert_eq!(caddy_tls_protocols(Some("TLSv1.1")), "tls1.2 tls1.3");
+        assert_eq!(caddy_tls_protocols(None), "tls1.2 tls1.3");
+    }
+
+    #[test]
+    fn caddy_ip_whitelist_and_blacklist_use_matchers() {
+        let mut s = spec_static();
+        s.ip_allow = Some(vec!["10.0.0.0/8".into(), "192.168.1.5".into()]);
+        let out = render_caddy(&s);
+        assert!(out.contains("@panel_example_com_blocked not remote_ip 10.0.0.0/8 192.168.1.5"), "白名单 matcher：{out}");
+        assert!(out.contains("respond @panel_example_com_blocked 403"), "名单外 403：{out}");
+        // 白名单模式忽略 ip_deny（同 nginx：二者互斥、白名单优先）
+        s.ip_deny = Some(vec!["1.2.3.4".into()]);
+        assert!(!render_caddy(&s).contains("_denied"), "白名单优先时黑名单应被忽略");
+
+        let mut d = spec_static();
+        d.ip_deny = Some(vec!["1.2.3.4".into()]);
+        let out2 = render_caddy(&d);
+        assert!(out2.contains("@panel_example_com_denied remote_ip 1.2.3.4"), "黑名单 matcher：{out2}");
+        assert!(out2.contains("respond @panel_example_com_denied 403"), "黑名单 403：{out2}");
+    }
+
+    #[test]
+    fn caddy_multi_domain_lists_all_names_in_site_address() {
+        // 无 www 跳转时两个域名都进主块地址列表（逗号分隔）
+        let out = render_caddy(&spec_static());
+        assert!(out.contains("http://example.com, http://www.example.com {"), "多域名逗号列表：{out}");
     }
 
     #[test]
@@ -1093,7 +1161,7 @@ use super::logs::*;
         // provider 层：caddy 的 render 走 render_caddy，conf_path 落 sites/*.caddy
         let (path, content) = caddy_server().render(&spec_static()).unwrap();
         assert!(path.to_string_lossy().ends_with("panel-example.com.caddy"), "conf_path 应落 caddy 片段：{path:?}");
-        assert!(content.contains("http://example.com {"), "render 应产出 Caddyfile：{content}");
+        assert!(content.contains("http://example.com, http://www.example.com {"), "render 应产出 Caddyfile（多域名）：{content}");
     }
 
     #[test]
