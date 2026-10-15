@@ -1,8 +1,4 @@
 use super::*;
-use super::webserver::*;
-use super::packages::*;
-use super::databases::*;
-use super::logs::*;
 
     use crate::traits::DatabaseProvider;
 
@@ -1192,7 +1188,12 @@ use super::logs::*;
     async fn caddy_waf_rendered_config_passes_real_caddy_validate() {
         let bin = std::env::var("CADDY_BIN").ok().filter(|s| !s.is_empty())
             .or_else(|| which("caddy").then(|| "caddy".to_string()));
-        let Some(bin) = bin else { return };
+        let Some(bin) = bin else {
+            // ⚠ 静默跳过 = 假绿：这条守卫在没装 caddy 的机器上其实什么都没验。
+            // 必须把"没验"喊出来，否则 CI 一片全绿里藏着一条从未跑过的断言。
+            eprintln!("[skip] caddy_waf_rendered_config_passes_real_caddy_validate：无 caddy 二进制（设 CADDY_BIN= 或跑 ci/fetch-caddy.sh）");
+            return;
+        };
         for profile in [WafProfile::Basic, WafProfile::Strict] {
             let rendered = render_caddy(&spec_waf(profile, None, 0));
             let dir = std::env::temp_dir().join(format!("panel-caddy-waf-{}-{:?}", std::process::id(), profile));
@@ -1266,14 +1267,82 @@ use super::logs::*;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 需真机 nginx 的端到端校验：本沙箱无 nginx 时**跳过**（不是失败）。
+    /// provider 真机校验用的 provider 实例。**关键：data_dir 必须指向可写目录。**
+    ///
+    /// `validate()` 会在 `paths.tmp_dir()` 下建临时目录跑 `nginx -t` / `caddy validate`，
+    /// 而 `LinuxPathLayout::default()` 的 data_dir 是 `/var/lib/panel`——**root 755**，
+    /// 非 root 跑测试会在 `create_dir_all` 这一步就 `Permission denied (os error 13)`。
+    /// 此前这两个真机测试在本沙箱/CI 恒红，一直被误读成"`nginx -t` 需要 root"；
+    /// 实测根因是 tmp 目录不可写（wrapper 本身已把 pid / error_log / 五个 temp 路径
+    /// 全部收进临时 prefix，语法校验并不需要 root）。故覆写 data_dir 到系统临时目录，
+    /// 让校验只依赖"二进制在不在"。
+    fn server_with_tmp_data(name: &'static str) -> LinuxWebServer {
+        let dir = std::env::temp_dir().join(format!("panel-wsval-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = LinuxPathLayout::default().with_overrides(None, None, Some(dir), None);
+        LinuxWebServer { name: Some(name), paths: Arc::new(paths) }
+    }
+
+    /// 需真机 nginx 的端到端校验：二进制缺失（CI）时跳过而非失败。
     #[tokio::test]
     async fn validate_roundtrip_when_nginx_present() {
         if !which("nginx") { return; }
-        let ok = nginx_server().validate(&render_nginx(&spec_static())).await;
-        assert!(ok.is_ok(), "合法 server 块应通过 nginx -t: {ok:?}");
-        let bad = nginx_server().validate("server { listen ; }").await;
+        let srv = server_with_tmp_data("nginx");
+        let ok = srv.validate(&render_nginx(&spec_static())).await;
+        if let Err(e) = &ok {
+            let msg = format!("{e:?}");
+            // ⚠ `nginx -t` **会真的 bind 监听端口**（不是只解析语法），且早期就要打开
+            // 编译期默认的 `/var/log/nginx/error.log`。非 root 必得 `Permission denied`
+            // ——那是环境限制不是代码缺陷；跳过而非恒红（恒红的守卫比没守卫更危险）。
+            // 实测输出：先 "syntax is ok"，随后 "bind() to 0.0.0.0:80 failed (13: Permission denied)"。
+            if msg.contains("Permission denied") && (msg.contains("bind()") || msg.contains("error log file")) {
+                eprintln!("[skip] validate_roundtrip_when_nginx_present：nginx -t 需 root（{msg}）");
+                return;
+            }
+            panic!("合法 server 块应通过 nginx -t: {e:?}");
+        }
+        let bad = srv.validate("server { listen ; }").await;
         assert!(bad.is_err(), "非法配置应被 validate 拒绝");
+    }
+
+    /// caddy 分支的 **provider 层**真机校验——此前只验了 `render_caddy` 纯函数，
+    /// `validate()` 真正 fork `caddy validate --adapter caddyfile` 这条链路没跑过。
+    /// 二进制缺失（CI）时跳过，与 nginx 同模式。
+    #[tokio::test]
+    async fn caddy_validate_roundtrip_when_caddy_present() {
+        if !crate::cmd::Bin::Caddy.available() {
+            eprintln!("[skip] caddy_validate_roundtrip_when_caddy_present：无 caddy 二进制（设 CADDY_BIN= 或跑 ci/fetch-caddy.sh）");
+            return;
+        }
+        let srv = server_with_tmp_data("caddy");
+        let ok = srv.validate(&render_caddy(&spec_static())).await;
+        assert!(ok.is_ok(), "合法 caddy 站点块应通过 caddy validate: {ok:?}");
+        let bad = srv.validate("http://example.com {{\n").await;
+        assert!(bad.is_err(), "未闭合的站点块应被 caddy validate 拒绝");
+    }
+
+    /// deploy → reload → remove 的 provider 真机闭环。**需 root 且环境已备**：
+    /// ① `/etc/caddy/Caddyfile` 存在（含 `import /etc/caddy/sites/*`）
+    /// ② 已有 caddy 在跑（admin 端点可达，`reload` 才会成功）
+    /// ③ 显式 `PANEL_CADDY_E2E=1`
+    /// 三者缺一即跳过——"环境不具备"绝不能伪装成代码缺陷（恒红的守卫比没守卫更危险）。
+    #[tokio::test]
+    async fn caddy_deploy_reload_remove_roundtrip_when_env_prepared() {
+        if std::env::var("PANEL_CADDY_E2E").as_deref() != Ok("1") { return; }
+        if !crate::cmd::Bin::Caddy.available() { return; }
+        if !std::path::Path::new("/etc/caddy/Caddyfile").exists() { return; }
+        let srv = server_with_tmp_data("caddy");
+        // ⚠ 端口必须避开 80/443：真机上 nginx 常已占着（本机实测就是），此处只验
+        // 「面板下发的片段能被主配置 import 且 reload 生效」，不抢生产端口。
+        let mut spec = spec_static();
+        spec.server_names = vec!["127.0.0.1:8080".into()];
+        let (path, content) = srv.render(&spec).expect("render 应产出路径与内容");
+        srv.validate(&content).await.expect("渲染出的配置应通过 caddy validate");
+        srv.deploy(&path, &content).await.expect("deploy 应写入 /etc/caddy/sites");
+        assert!(path.exists(), "deploy 后片段应在磁盘上：{path:?}");
+        srv.reload().await.expect("reload 应对主 Caddyfile 生效");
+        srv.remove(&path).await.expect("remove 应删除片段");
+        assert!(!path.exists(), "remove 后片段不应残留：{path:?}");
     }
 
     // ── 数据库备份/恢复：sqlite roundtrip + mysql/pg 客户端缺失诚实 501 ──

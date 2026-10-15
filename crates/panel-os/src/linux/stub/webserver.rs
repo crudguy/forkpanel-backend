@@ -973,7 +973,7 @@ pub(super) fn render_caddy(spec: &SiteSpec) -> String {
     let mut out = String::new();
     out.push_str("# 由 ForkPanel 自动生成（caddy 托管中：保存并应用会覆盖）。\n");
     out.push_str("# 已覆盖：静态/反代/PHP/多路由 + force_https + 手动TLS(protocols) + HSTS + IP名单 + WAF(规则集同nginx) + www跳转 + 多域名。\n");
-    out.push_str("# 未覆盖（nginx 有、caddy 刻意暂不做）：WAF限速(标准caddy无rate_limit)、tls_profile 套件档(caddy 不开放)、Basic Auth(apr1 不兼容)、伪静态 preset、Routed-PHP front_controller、custom_conf 透传。\n\n");
+    out.push_str("# 未覆盖（nginx 有、caddy 刻意暂不做，**前端据此置灰**，勿静默丢弃）：WAF限速(标准caddy无rate_limit)、tls_profile 套件档(caddy 不开放)、Basic Auth(apr1 不兼容)、伪静态 preset、Routed-PHP front_controller、custom_conf 透传(语法不同)、lb_policy/反代超时(caddy 侧暂未映射)、站点独立日志(log 指令未产出)。\n\n");
 
     // www ↔ 非 www 跳转（复用 nginx 的同一判定 www_pair）；命中时来源域从主块剔除
     let www = www_pair(&spec.server_names, spec.www_redirect.as_deref());
