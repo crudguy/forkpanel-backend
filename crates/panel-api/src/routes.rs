@@ -32,6 +32,7 @@ pub mod audit;
 pub mod multipart;
 pub mod notes;
 pub mod waf_templates;
+pub mod waf_events;
 pub mod roles;
 pub mod terminal;
 
@@ -305,6 +306,10 @@ pub fn build_router(state: Shared) -> Router {
             get(waf_templates::get).patch(waf_templates::update).delete(waf_templates::delete),
         );
 
+    // ── 拦截事件 / 威胁日志（027） ──
+    let waf_evt_r = Router::new()
+        .route("/api/v1/waf/events", get(waf_events::list_events));
+
     // ── 任务中心 ──
     let task_r = Router::new()
         .route("/api/v1/tasks", get(tasks::list))
@@ -371,6 +376,7 @@ pub fn build_router(state: Shared) -> Router {
         .merge(container_r)
         .merge(notes_r)
         .merge(waf_tpl_r)
+        .merge(waf_evt_r)
         .merge(task_r)
         .merge(cfg_r)
         .merge(sse_r)

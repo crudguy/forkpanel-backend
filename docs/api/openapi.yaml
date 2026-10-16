@@ -447,6 +447,24 @@ components:
         created_at: { type: integer, description: 创建时间（unix 秒） }
         updated_at: { type: integer, description: 更新时间（unix 秒） }
 
+    # ───────────── 拦截事件（027，威胁日志） ─────────────
+    BlockEvent:
+      type: object
+      properties:
+        id:         { type: integer, description: 事件 id }
+        site:       { type: string, description: 站点名 }
+        ts:         { type: integer, description: 发生时间（unix 秒，UTC） }
+        remote_addr: { type: string, description: 客户端 IP }
+        method:     { type: string, description: HTTP 方法 }
+        uri:        { type: string, description: 请求路径（含查询串） }
+        status:     { type: integer, description: 状态码（403 拦截/拒绝、405 方法被拒、429 限速） }
+        referer:    { type: string, description: Referer }
+        user_agent: { type: string, description: User-Agent }
+      description: |
+        拦截事件（WAF 页「威胁日志」数据源）。⚠ 无规则级归因：WAF 规则 / 敏感文件拒绝 /
+        IP 黑名单都返回同色 403，access log 无标记可区分，故只记状态码。仅采集「开了独立
+        access log」的站点；由内部周期任务 waf.collect 每 60s 增量采集，保留 30 天。
+
     # ───────────── 软件包 ─────────────
     Package:
       type: object
@@ -1392,6 +1410,17 @@ paths:
       summary: 删除 WAF 策略模板（026，写需 site.manage）
       security: [cookieAuth, csrfHeader]
       responses: { '200': { description: ok }, '404': { description: 模板不存在 } }
+  /api/v1/waf/events:
+    get:
+      tags: [sites]
+      summary: 拦截事件列表（027，威胁日志；读需 site.view）
+      parameters:
+        - { name: site, in: query, required: false, schema: { type: string }, description: 按站点名过滤 }
+        - { name: status, in: query, required: false, schema: { type: integer }, description: 按状态码过滤（403/405/429） }
+        - { name: since, in: query, required: false, schema: { type: integer }, description: 起始时间（unix 秒，含） }
+        - { name: limit, in: query, required: false, schema: { type: integer }, description: 每页条数（默认 100，上限 500） }
+        - { name: offset, in: query, required: false, schema: { type: integer }, description: 偏移 }
+      responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/BlockEvent' } } } } } } } }
   /api/v1/system/users:
     get:
       tags: [system]

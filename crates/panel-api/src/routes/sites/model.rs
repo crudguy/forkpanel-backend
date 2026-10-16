@@ -454,12 +454,12 @@ pub(super) fn split_list(v: &Option<String>) -> Vec<String> {
 }
 
 /// 站点独立日志目录（021）：面板数据目录下的 `log/`。
-pub(super) fn site_log_dir(state: &Shared) -> std::path::PathBuf {
+pub(crate) fn site_log_dir(state: &Shared) -> std::path::PathBuf {
     state.os.paths().data_dir().join("log")
 }
 
 /// 该站点的 access / error 日志路径；未开启对应开关则为 None（沿用 nginx 全局日志）。
-pub(super) fn site_log_paths(
+pub(crate) fn site_log_paths(
     state: &Shared,
     domains: &[String],
     access: bool,

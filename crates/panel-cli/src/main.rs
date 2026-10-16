@@ -604,6 +604,23 @@ async fn register_internal_jobs(
             }
         }).await;
     }
+
+    // ── 拦截事件采集（027）：读开日志站点的 access log 增量，落 403/405/429 事件 ──
+    {
+        let state = state.clone();
+        sched.register("waf.collect", move || {
+            let state = state.clone();
+            async move {
+                match panel_api::routes::waf_events::collect_block_events(&state).await {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        tracing::warn!("拦截事件采集失败: {e}");
+                        Err(e)
+                    }
+                }
+            }
+        }).await;
+    }
 }
 
 fn now_unix() -> i64 {

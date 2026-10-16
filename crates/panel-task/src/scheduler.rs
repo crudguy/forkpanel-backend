@@ -69,6 +69,11 @@ pub fn builtin_schedules(tier: panel_core::Tier) -> Vec<Schedule> {
             kind: ScheduleKind::DailyAt { hour: 4, minute: 5 },
             jitter_sec: 30,
         },
+        Schedule {
+            name: "waf.collect",
+            kind: ScheduleKind::Every(Duration::from_secs(60)),
+            jitter_sec: 10,
+        },
     ];
     // nano 档位不做每日备份：512MB 机器上 VACUUM INTO 的 IO 与内存开销不划算
     if !matches!(tier, panel_core::Tier::Nano) {
