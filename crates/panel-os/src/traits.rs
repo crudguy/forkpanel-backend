@@ -1444,6 +1444,8 @@ pub enum ContainerAction {
     Stop,
     Restart,
     Remove,
+    /// 强制删除（docker rm -f）：先强制停止再移除。仅当调用方显式传 force 时选用。
+    RemoveForce,
 }
 
 impl ContainerAction {
@@ -1453,6 +1455,7 @@ impl ContainerAction {
             ContainerAction::Stop => "stop",
             ContainerAction::Restart => "restart",
             ContainerAction::Remove => "remove",
+            ContainerAction::RemoveForce => "remove --force",
         }
     }
 }

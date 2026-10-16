@@ -181,9 +181,12 @@ impl ContainerProvider for LinuxContainers {
             ContainerAction::Start => vec!["start", id],
             ContainerAction::Stop => vec!["stop", "-t", STOP_GRACE_SECS, id],
             ContainerAction::Restart => vec!["restart", "-t", STOP_GRACE_SECS, id],
-            // 刻意**不带 -f**：运行中的容器会拒绝删除，属安全默认——
-            // 强制删除是用户的显式两步决策（先停再删），不给"一键抹掉生产容器"。
+            // 非强制删除**不带 -f**：运行中的容器会被守护进程拒绝，属默认安全行为——
+            // 强制删除需显式 `force` 参数（前端确认框里默认不勾选的复选框），
+            // 仍是用户的显式决策，不给"一键抹掉生产容器"。
             ContainerAction::Remove => vec!["rm", id],
+            // 强制删除：先强制停止再移除（docker rm -f）。仅当调用方显式传 force 时走此分支。
+            ContainerAction::RemoveForce => vec!["rm", "-f", id],
         };
         let out = crate::cmd::run(
             Bin::Docker,
@@ -472,6 +475,7 @@ mod tests {
         assert_eq!(ContainerAction::Start.as_str(), "start");
         assert_eq!(ContainerAction::Stop.as_str(), "stop");
         assert_eq!(ContainerAction::Remove.as_str(), "remove");
+        assert_eq!(ContainerAction::RemoveForce.as_str(), "remove --force");
         assert_eq!(STOP_GRACE_SECS, "10");
     }
 

@@ -25,7 +25,7 @@ use crate::{
 };
 use crate::routes::services::{PackageTask, PkgOp};
 use axum::{
-    extract::{Path as AxPath, State},
+    extract::{Path as AxPath, Query, State},
     http::StatusCode,
     Json,
 };
@@ -278,12 +278,23 @@ pub async fn restart(
 
 /// 删除容器。**刻意不带 `-f`**：运行中的容器会被拒绝删除，
 /// 强制删除属于用户显式的两步决策（先停再删），不提供"一键抹掉运行中容器"。
-pub async fn remove(
+/// 删除容器。`force=true` 走 `docker rm -f`（先强制停止再移除）；默认 `force=false`
+/// 即 `docker rm`，运行中的容器会被守护进程拒绝（前端引导先停或勾选强制删除）。
+/// 强制删除是显式 opt-in（非默认），保持"非一键抹掉生产容器"的安全意图。
+#[derive(Debug, Deserialize)]
+pub(crate) struct RemoveQ {
+    #[serde(default)]
+    force: bool,
+}
+
+pub(crate) async fn remove(
     State(state): State<Shared>,
     Auth(s): Auth,
     AxPath(id): AxPath<String>,
+    Query(q): Query<RemoveQ>,
 ) -> ApiResult<StatusCode> {
-    run_action(state, s, id, ContainerAction::Remove, "container.remove").await
+    let action = if q.force { ContainerAction::RemoveForce } else { ContainerAction::Remove };
+    run_action(state, s, id, action, "container.remove").await
 }
 
 /// 供测试与静态检查引用：确认 provider trait 在业务层以 trait 对象方式使用

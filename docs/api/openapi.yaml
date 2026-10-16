@@ -2822,9 +2822,15 @@ paths:
   /api/v1/containers/{id}:
     delete:
       tags: [containers]
-      summary: 删除容器（**刻意不带 -f**：运行中的容器会被拒绝，需先停止）
+      summary: 删除容器（默认 `docker rm`；运行中的容器会被拒绝，需先停止。`force=true` 走 `docker rm -f`）
       security: [cookieAuth, csrfHeader]
-      parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID；表按名称索引（ID 随重建变化，名称通常保留），不强制 Docker 可达" }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID；表按名称索引（ID 随重建变化，名称通常保留），不强制 Docker 可达" }
+        - name: force
+          in: query
+          required: false
+          schema: { type: boolean }
+          description: "`true` 走 `docker rm -f`（先强制停止再移除）；默认 `false` 即 `docker rm`，运行中的容器会被守护进程拒绝"
       responses:
         '204': { description: ok }
         '400': { description: ID/名称非法 }
