@@ -33,10 +33,11 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (23, include_str!("../../../migrations/023_site_last_applied.sql")),
     // 024（apt-mark hold）无 schema 变更，版本号空置
     (25, include_str!("../../../migrations/025_server_notes.sql")),
+    (26, include_str!("../../../migrations/026_waf_templates.sql")),
 ];
 
 /// 当前 schema 版本
-pub const LATEST: u32 = 25;
+pub const LATEST: u32 = 26;
 
 pub fn apply(conn: &mut Connection) -> Result<u32> {
     conn.execute_batch(

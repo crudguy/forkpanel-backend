@@ -433,6 +433,20 @@ components:
         content:    { type: string, description: 便签内容（trim 后非空，≤500 字） }
         updated_at: { type: integer, description: 最近更新时间（unix 秒） }
 
+    # ───────────── WAF 策略模板（026） ─────────────
+    WafTemplate:
+      type: object
+      properties:
+        id:         { type: integer, description: 模板 id }
+        name:       { type: string, description: 模板名（唯一，trim 后非空，≤64 字） }
+        waf_profile: { type: string, enum: [basic, strict], description: 防护档位（basic / strict） }
+        rate_per_sec: { type: integer, description: CC 限速（每 IP 每秒请求数）；0 = 不限速 }
+        burst:      { type: integer, description: 突发桶容量；0 = 由 rate×2 计算（仅限速时生效） }
+        ip_allow:   { type: array, items: { type: string }, description: IP 白名单（IPv4 或 IPv4/前缀）；非空即白名单模式（只放行名单内，其余拒绝），此时 ip_deny 被忽略 }
+        ip_deny:    { type: array, items: { type: string }, description: IP 黑名单（IPv4 或 IPv4/前缀）；ip_allow 非空时被忽略 }
+        created_at: { type: integer, description: 创建时间（unix 秒） }
+        updated_at: { type: integer, description: 更新时间（unix 秒） }
+
     # ───────────── 软件包 ─────────────
     Package:
       type: object
@@ -1351,6 +1365,33 @@ paths:
       summary: 删除便签（025，写需 system.manage；id 不存在 → 404）
       security: [cookieAuth, csrfHeader]
       responses: { '200': { description: ok }, '404': { description: 便签不存在 } }
+  /api/v1/waf/templates:
+    get:
+      tags: [sites]
+      summary: WAF 策略模板列表（026，读需 site.view）
+      responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/WafTemplate' } } } } } } } }
+    post:
+      tags: [sites]
+      summary: 新建 WAF 策略模板（026，写需 site.manage；重名 409、超量 400）
+      security: [cookieAuth, csrfHeader]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [name], properties: { name: { type: string, description: 模板名（唯一，trim 后非空，≤64 字） }, profile: { type: string, enum: [basic, strict], description: 防护档位，缺省 basic }, rate_per_sec: { type: integer, description: CC 限速；0 = 不限速 }, burst: { type: integer, description: 突发桶；0 = 由 rate×2 计算 }, ip_allow: { type: string, description: IP 白名单，逗号或空格分隔 }, ip_deny: { type: string, description: IP 黑名单，逗号或空格分隔 } } } } } }
+      responses: { '200': { description: ok }, '400': { description: 校验失败（空名/超长/未知档位/数值越界/burst 无限速/非法 IP） }, '409': { description: 模板名已存在或数量达上限 } }
+  /api/v1/waf/templates/{id}:
+    get:
+      tags: [sites]
+      summary: WAF 策略模板详情（026，读需 site.view）
+      responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/WafTemplate' } } } } } }, '404': { description: 模板不存在 } }
+    patch:
+      tags: [sites]
+      summary: 更新 WAF 策略模板（026，写需 site.manage；可改名，重名 409）
+      security: [cookieAuth, csrfHeader]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [name], properties: { name: { type: string }, profile: { type: string, enum: [basic, strict] }, rate_per_sec: { type: integer }, burst: { type: integer }, ip_allow: { type: string }, ip_deny: { type: string } } } } } }
+      responses: { '200': { description: ok }, '400': { description: 校验失败 }, '404': { description: 模板不存在 }, '409': { description: 模板名已存在 } }
+    delete:
+      tags: [sites]
+      summary: 删除 WAF 策略模板（026，写需 site.manage）
+      security: [cookieAuth, csrfHeader]
+      responses: { '200': { description: ok }, '404': { description: 模板不存在 } }
   /api/v1/system/users:
     get:
       tags: [system]

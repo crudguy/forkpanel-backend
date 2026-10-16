@@ -31,6 +31,7 @@ pub mod users;
 pub mod audit;
 pub mod multipart;
 pub mod notes;
+pub mod waf_templates;
 pub mod roles;
 pub mod terminal;
 
@@ -296,6 +297,14 @@ pub fn build_router(state: Shared) -> Router {
             patch(notes::update).delete(notes::delete),
         );
 
+    // ── WAF 策略模板（026） ──
+    let waf_tpl_r = Router::new()
+        .route("/api/v1/waf/templates", get(waf_templates::list).post(waf_templates::create))
+        .route(
+            "/api/v1/waf/templates/{id}",
+            get(waf_templates::get).patch(waf_templates::update).delete(waf_templates::delete),
+        );
+
     // ── 任务中心 ──
     let task_r = Router::new()
         .route("/api/v1/tasks", get(tasks::list))
@@ -361,6 +370,7 @@ pub fn build_router(state: Shared) -> Router {
         .merge(backup_r)
         .merge(container_r)
         .merge(notes_r)
+        .merge(waf_tpl_r)
         .merge(task_r)
         .merge(cfg_r)
         .merge(sse_r)

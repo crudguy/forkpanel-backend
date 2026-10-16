@@ -488,7 +488,7 @@ pub(super) fn timeout_db(
 
 /// 解析并校验 IP / CIDR 列表（这些值**直接进 nginx 配置文本**，必须白名单校验）。
 /// 只接受 IPv4 与可选的前缀长度（0~32）——IPv6 暂不支持，宁可拒也不猜。
-pub(super) fn parse_ip_list(raw: &str) -> std::result::Result<Vec<String>, ApiError> {
+pub(crate) fn parse_ip_list(raw: &str) -> std::result::Result<Vec<String>, ApiError> {
     let mut out = Vec::new();
     for part in raw.split(|c: char| c == ',' || c.is_whitespace()) {
         let t = part.trim();

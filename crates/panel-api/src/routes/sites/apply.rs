@@ -124,14 +124,14 @@ pub struct WafReq {
 
 /// 限速上限。上限存在的理由：`rate` 决定每 IP 的放行速率，`burst` 决定
 /// 单 IP 能用掉多少缓冲——两者都直接换内存（每个 zone 10m 是硬上限）。
-pub(super) const WAF_RATE_MAX: u32 = 1000;
-pub(super) const WAF_BURST_MAX: u32 = 10_000;
+pub(crate) const WAF_RATE_MAX: u32 = 1000;
+pub(crate) const WAF_BURST_MAX: u32 = 10_000;
 
 /// 归一化 + 校验 WAF 配置。
 ///
 /// 规则集本身是**编译期常量**，用户只能选档位与数值——所以这里没有"正则注入"面。
 /// 但数值边界仍必须挡：`rate=0` 会让 nginx 直接拒绝加载配置。
-pub(super) fn build_waf(
+pub(crate) fn build_waf(
     req: Option<&WafReq>,
     cur: Option<&panel_os::WafSpec>,
 ) -> ApiResult<Option<panel_os::WafSpec>> {
