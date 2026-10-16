@@ -2457,6 +2457,18 @@ paths:
       security: [cookieAuth, csrfHeader]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/DbConnectionCreate' } } } }
       responses: { '201': { description: 已创建 } }
+  /api/v1/db/connections/{id}:
+    patch:
+      tags: [db]
+      summary: 更新数据库连接（写需 db.manage；字段缺省保留现值，口令留空=不修改）
+      security: [cookieAuth, csrfHeader]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { name: { type: string, description: 连接名 }, engine: { type: string, enum: [mysql, postgres, sqlite], description: 引擎 }, host: { type: string, description: 主机 }, port: { type: integer, description: 端口 }, user: { type: string, description: 账号（mysql/postgres 必填） }, password: { type: string, description: 口令，留空=不修改 }, default_db: { type: string, description: 默认库（sqlite 为 .db 文件路径） } } } } } }
+      responses: { '200': { description: ok }, '400': { description: 校验失败 }, '404': { description: 连接不存在 }, '409': { description: 连接名已存在 } }
+    delete:
+      tags: [db]
+      summary: 删除数据库连接（写需 db.manage；仅删面板登记，不动真实库/文件）
+      security: [cookieAuth, csrfHeader]
+      responses: { '200': { description: ok }, '404': { description: 连接不存在 } }
   /api/v1/db/{conn}/databases:
     get:
       tags: [db]

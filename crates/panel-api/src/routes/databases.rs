@@ -20,6 +20,7 @@ use crate::{
 use axum::{extract::{Path as AxPath, Query, State}, Json};
 use axum::http::StatusCode;
 use panel_core::{PanelError, Result, SafePath};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -178,6 +179,170 @@ pub async fn create(
 }
 
 // ─────────────── 备份 / 恢复（走任务队列） ───────────────
+
+/// 更新连接（写需 `db.manage`）。字段缺省保留现值；口令**留空 = 不修改**（不必每次
+/// 保存都重输口令，密文原样回写）。改名前查重（排除自身）→ 409。校验与 create 完全同源。
+pub async fn update(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    AxPath(id): AxPath<i64>,
+    Json(req): Json<UpdateReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::DB_MANAGE)?;
+    let cur = fetch_conn(&state, id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("连接不存在"))?;
+    let orig_name = cur.name.clone();
+
+    // 合并：缺省保留现值（前端编辑弹窗送全字段；此处兼顾部分更新）
+    let name = req.name.clone().unwrap_or(cur.name);
+    let engine = req.engine.clone().unwrap_or(cur.engine);
+    let host = req.host.clone().or(cur.host);
+    let port = req.port.map(|p| p as i64).or(cur.port);
+    let user = req.user.clone().or(cur.username);
+    let default_db = req.default_db.clone().or(cur.default_db);
+
+    // 校验（与 create 同源：库名 / 默认库 / 引擎白名单 / mysql·pg 必填 user）
+    if !panel_core::rules::is_valid_db_name(&name) {
+        return Err(ApiError::bad_request("name", "invalid database name"));
+    }
+    if let Some(db) = &default_db {
+        if engine == "sqlite" {
+            validate_sqlite_path(&state, db)?;
+        } else if !panel_core::rules::is_valid_db_name(db) {
+            return Err(ApiError::bad_request("default_db", "invalid database name"));
+        }
+    }
+    if !matches!(engine.as_str(), "mysql" | "postgres" | "sqlite") {
+        return Err(ApiError::bad_request("engine", format!("unsupported: {engine}")));
+    }
+    validate_connection_create(&engine, &user)?;
+
+    // 口令：提供且非空 → 重新加密；否则保留现值（密文原样回写，不触碰主密钥）
+    let password_enc: Option<Vec<u8>> = match &req.password {
+        Some(pw) if !pw.is_empty() => {
+            let key = state.require_secret_key()?;
+            Some(key.encrypt(pw.as_bytes()).map_err(ApiError::from)?)
+        }
+        _ => cur.password_enc,
+    };
+
+    // 改名前查重（排除自身）；唯一冲突不能依赖 UNIQUE 兜底误报 500
+    if name != orig_name && name_taken(&state, &name, Some(id)).await? {
+        return Err(ApiError::conflict("connection name exists"));
+    }
+
+    state
+        .db
+        .exec(move |conn| {
+            conn.execute(
+                "UPDATE db_connections SET name = ?1, engine = ?2, host = ?3, port = ?4, username = ?5, password_enc = ?6, default_db = ?7 WHERE id = ?8",
+                rusqlite::params![name, engine, host, port, user, password_enc, default_db, id],
+            )
+            .map_err(|e| PanelError::Database(e.to_string()))?;
+            Ok(panel_db::WriteAck { rows_changed: 1 })
+        })
+        .await?;
+    audit(&state, &s, "db.update", &id.to_string(), "ok").await;
+    Ok(ok(serde_json::json!({ "ok": true })))
+}
+
+/// 删除连接（写需 `db.manage`；id 不存在 → 404）。仅删面板登记，不动真实库 / 文件。
+pub async fn delete(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    AxPath(id): AxPath<i64>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::DB_MANAGE)?;
+    let exists: bool = state
+        .pool
+        .with(move |conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM db_connections WHERE id = ?1)",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .map_err(|e| PanelError::Database(e.to_string()))
+        })
+        .await?;
+    if !exists {
+        return Err(ApiError::not_found("连接不存在"));
+    }
+    state
+        .db
+        .exec(move |conn| {
+            conn.execute("DELETE FROM db_connections WHERE id = ?1", rusqlite::params![id])
+                .map_err(|e| PanelError::Database(e.to_string()))?;
+            Ok(panel_db::WriteAck { rows_changed: 1 })
+        })
+        .await?;
+    audit(&state, &s, "db.delete", &id.to_string(), "ok").await;
+    Ok(ok(serde_json::json!({ "ok": true })))
+}
+
+/// 读连接当前行（更新用：缺省保留 + 口令保留 + 改名查重排除自身）。
+struct CurConn {
+    name: String,
+    engine: String,
+    host: Option<String>,
+    port: Option<i64>,
+    username: Option<String>,
+    password_enc: Option<Vec<u8>>,
+    default_db: Option<String>,
+}
+
+async fn fetch_conn(state: &Shared, id: i64) -> std::result::Result<Option<CurConn>, ApiError> {
+    state
+        .pool
+        .with(move |conn| {
+            conn.query_row(
+                "SELECT name, engine, host, port, username, password_enc, default_db FROM db_connections WHERE id = ?1",
+                rusqlite::params![id],
+                |r| Ok(CurConn {
+                    name: r.get(0)?,
+                    engine: r.get(1)?,
+                    host: r.get(2)?,
+                    port: r.get(3)?,
+                    username: r.get(4)?,
+                    password_enc: r.get(5)?,
+                    default_db: r.get(6)?,
+                }),
+            )
+            .optional()
+            .map_err(|e| PanelError::Database(e.to_string()))
+        })
+        .await
+        .map_err(Into::into)
+}
+
+/// 连接名是否被占用（exclude 用于更新时排除自身）。
+async fn name_taken(state: &Shared, name: &str, exclude_id: Option<i64>) -> std::result::Result<bool, ApiError> {
+    let name = name.to_string();
+    state
+        .pool
+        .with(move |conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM db_connections WHERE name = ?1 AND (?2 IS NULL OR id != ?2))",
+                rusqlite::params![name, exclude_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| PanelError::Database(e.to_string()))
+        })
+        .await
+        .map_err(Into::into)
+}
+
+/// 更新请求体：字段缺省保留现值；口令留空 = 不修改。
+#[derive(Debug, Deserialize)]
+pub struct UpdateReq {
+    pub name: Option<String>,
+    pub engine: Option<String>,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub user: Option<String>,
+    pub password: Option<String>,
+    pub default_db: Option<String>,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct BackupReq { pub id: i64, pub out: String }

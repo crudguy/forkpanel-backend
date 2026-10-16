@@ -209,6 +209,7 @@ pub fn build_router(state: Shared) -> Router {
     // ── 数据库 ──
     let db_r = Router::new()
         .route("/api/v1/db/connections", get(databases::list).post(databases::create))
+        .route("/api/v1/db/connections/{id}", patch(databases::update).delete(databases::delete))
         .route("/api/v1/db/{conn}/databases", get(databases::databases_of))
         .route("/api/v1/db/{conn}/{db}/tables", get(databases::tables))
         .route("/api/v1/db/{conn}/{db}/{table}/rows", get(databases::rows))
