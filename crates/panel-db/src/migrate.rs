@@ -35,10 +35,11 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (25, include_str!("../../../migrations/025_server_notes.sql")),
     (26, include_str!("../../../migrations/026_waf_templates.sql")),
     (27, include_str!("../../../migrations/027_waf_block_events.sql")),
+    (28, include_str!("../../../migrations/028_waf_alert_cfg.sql")),
 ];
 
 /// 当前 schema 版本
-pub const LATEST: u32 = 27;
+pub const LATEST: u32 = 28;
 
 pub fn apply(conn: &mut Connection) -> Result<u32> {
     conn.execute_batch(

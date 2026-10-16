@@ -33,6 +33,7 @@ pub mod multipart;
 pub mod notes;
 pub mod waf_templates;
 pub mod waf_events;
+pub mod waf_alert;
 pub mod roles;
 pub mod terminal;
 
@@ -310,6 +311,10 @@ pub fn build_router(state: Shared) -> Router {
     let waf_evt_r = Router::new()
         .route("/api/v1/waf/events", get(waf_events::list_events));
 
+    // ── WAF 拦截告警配置（028） ──
+    let waf_alert_r = Router::new()
+        .route("/api/v1/waf/alert", get(waf_alert::get_alert).put(waf_alert::put_alert));
+
     // ── 任务中心 ──
     let task_r = Router::new()
         .route("/api/v1/tasks", get(tasks::list))
@@ -377,6 +382,7 @@ pub fn build_router(state: Shared) -> Router {
         .merge(notes_r)
         .merge(waf_tpl_r)
         .merge(waf_evt_r)
+        .merge(waf_alert_r)
         .merge(task_r)
         .merge(cfg_r)
         .merge(sse_r)

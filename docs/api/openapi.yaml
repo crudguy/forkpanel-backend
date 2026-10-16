@@ -465,6 +465,18 @@ components:
         IP 黑名单都返回同色 403，access log 无标记可区分，故只记状态码。仅采集「开了独立
         access log」的站点；由内部周期任务 waf.collect 每 60s 增量采集，保留 30 天。
 
+    # ───────────── WAF 拦截告警配置（028） ─────────────
+    WafAlertCfg:
+      type: object
+      properties:
+        enabled:   { type: boolean, description: 是否启用拦截告警 }
+        threshold: { type: integer, description: 阈值——近时间窗内单站拦截数超过即告警（1~100000） }
+        window_min: { type: integer, description: 时间窗（分钟，1~1440） }
+      description: |
+        WAF 拦截告警配置（单例）。采集后按「近 window_min 分钟内每站拦截数 > threshold」
+        推送站内通知（source=security）；同窗内每站至多一条（时间桶去重），攻击持续则每窗一条。
+        告警进站内通知中心。
+
     # ───────────── 软件包 ─────────────
     Package:
       type: object
@@ -1421,6 +1433,17 @@ paths:
         - { name: limit, in: query, required: false, schema: { type: integer }, description: 每页条数（默认 100，上限 500） }
         - { name: offset, in: query, required: false, schema: { type: integer }, description: 偏移 }
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/BlockEvent' } } } } } } } }
+  /api/v1/waf/alert:
+    get:
+      tags: [sites]
+      summary: WAF 拦截告警配置（028，读需 site.view）
+      responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/WafAlertCfg' } } } } } } }
+    put:
+      tags: [sites]
+      summary: 更新 WAF 拦截告警配置（028，写需 site.manage；缺省字段保留现值）
+      security: [cookieAuth, csrfHeader]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { enabled: { type: boolean }, threshold: { type: integer, description: 1~100000 }, window_min: { type: integer, description: 1~1440 } } } } } }
+      responses: { '200': { description: ok }, '400': { description: 阈值或窗宽越界 } }
   /api/v1/system/users:
     get:
       tags: [system]

@@ -278,6 +278,9 @@ pub async fn collect_block_events(state: &Shared) -> Result<()> {
             })
             .await?;
     }
+
+    // 采集后做阈值告警检查（旁路：失败不影响采集结果）
+    crate::routes::waf_alert::check_block_alerts(state).await;
     Ok(())
 }
 
