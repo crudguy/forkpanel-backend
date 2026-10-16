@@ -31,6 +31,8 @@ use std::time::Duration;
 /// 生命周期动作（start/stop）本身很快，但 stop 有 10s 优雅期。
 const LIST_TIMEOUT: Duration = Duration::from_secs(20);
 const ACT_TIMEOUT: Duration = Duration::from_secs(60);
+/// 拉取镜像可能很大、且经镜像源转发，超时给足（10 分钟）。
+const PULL_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// `docker stop` 的优雅停机等待秒数（默认 10s，显式写出避免依赖 CLI 默认值变化）
 const STOP_GRACE_SECS: &str = "10";
@@ -253,6 +255,38 @@ impl ContainerProvider for LinuxContainers {
             ports: req.ports.join(","),
             created: String::new(),
         })
+    }
+    async fn pull(&self, image: &str) -> Result<ImageSummary> {
+        self.ensure_ready()?;
+        // 注入防线：image 直接进 argv，须先校验无空白 / shell 元字符（与 create 同源）。
+        if !image_is_safe(image) {
+            return Err(PanelError::Validation {
+                field: "image",
+                reason: "镜像引用含非法字符（仅允许字母数字与 . _ : / -，不得含空白或 shell 元字符）".into(),
+            });
+        }
+        let out = crate::cmd::run(
+            Bin::Docker,
+            &["pull", image],
+            CmdOpt { timeout: PULL_TIMEOUT, ..Default::default() },
+        ).await?;
+        LinuxContainers::check(&out, "docker pull")?;
+        // 拉取成功后回填镜像摘要：解析 image 的 repo:tag（处理 registry 主机端口），
+        // 到 images() 里找匹配项；找不到则退回最小摘要（拉取本身已成功）。
+        let last_seg = image.rsplit('/').next().unwrap_or(image);
+        let (repo_full, tag) = match last_seg.split_once(':') {
+            Some((r, t)) if !r.is_empty() => (image[..image.len() - t.len() - 1].to_string(), t.to_string()),
+            _ => (image.to_string(), "latest".to_string()),
+        };
+        let imgs = self.images().await?;
+        Ok(imgs.into_iter().find(|i| i.repository == repo_full && i.tag == tag)
+            .unwrap_or(ImageSummary {
+                id: String::new(),
+                repository: repo_full,
+                tag,
+                size: String::new(),
+                created: String::new(),
+            }))
     }
 }
 

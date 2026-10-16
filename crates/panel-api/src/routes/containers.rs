@@ -214,6 +214,12 @@ pub struct CreateReq {
     pub confirm_token: Option<String>,
 }
 
+/// 拉取镜像请求。镜像引用须安全（无空白 / shell 元字符），由 provider 二次校验。
+#[derive(Debug, Deserialize)]
+pub(crate) struct PullReq {
+    pub image: String,
+}
+
 /// 二次确认词：手输才有效，防止误触一键创建特权/宿主挂载容器。
 const CREATE_CONFIRM: &str = "创建容器";
 
@@ -247,6 +253,26 @@ pub async fn create(
         "image": c.image,
         "state": c.state,
         "note": "已创建但未启动；请在列表中对它执行「启动」",
+    })))
+}
+
+/// 拉取镜像（等价 `docker pull`）。镜像引用须安全，由 provider 强制校验；
+/// 返回拉取后的镜像摘要。拉取属网络写入，需 container.manage。
+pub(crate) async fn pull(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    Json(req): Json<PullReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::CONTAINER_MANAGE)?;
+    ensure_supported(&state)?;
+    let img = state.os.containers().pull(req.image.trim()).await?;
+    audit(&state, &s, "container.pull", &img.id, "ok").await;
+    Ok(ok(serde_json::json!({
+        "id": img.id,
+        "repository": img.repository,
+        "tag": img.tag,
+        "size": img.size,
+        "created": img.created,
     })))
 }
 

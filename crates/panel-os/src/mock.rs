@@ -504,6 +504,22 @@ impl ContainerProvider for MockContainers {
             created: String::new(),
         })
     }
+
+    async fn pull(&self, image: &str) -> Result<ImageSummary> {
+        // mock 不真正拉取：解析 repo:tag 返回结构化摘要（id 用 image 派生）。
+        let last_seg = image.rsplit('/').next().unwrap_or(image);
+        let (repo, tag) = match last_seg.split_once(':') {
+            Some((r, t)) if !r.is_empty() => (r.to_string(), t.to_string()),
+            _ => (image.to_string(), "latest".to_string()),
+        };
+        Ok(ImageSummary {
+            id: format!("mock-{:x}", image.len()),
+            repository: repo,
+            tag,
+            size: "0B".into(),
+            created: String::new(),
+        })
+    }
 }
 
 #[async_trait]

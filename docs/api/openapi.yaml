@@ -2740,6 +2740,28 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/ContainerImage' } } } }
         '501': { description: 容器能力不可用 }
+  /api/v1/containers/images/pull:
+    post:
+      tags: [containers]
+      summary: 拉取镜像（等价 `docker pull`；可用来更新已有镜像）
+      security: [cookieAuth, csrfHeader]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [image]
+              properties:
+                image: { type: string, description: '镜像引用 `repo:tag` 或 `repo`（默认 latest）；由后端校验无空白 / shell 元字符' }
+      responses:
+        '200':
+          description: 已拉取（返回镜像摘要）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/ContainerImage' } } }
+        '400': { description: 校验失败（镜像引用非法） }
+        '501': { description: 容器能力不可用 }
   /api/v1/containers/install:
     post:
       tags: [containers]

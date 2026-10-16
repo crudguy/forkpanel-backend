@@ -1508,6 +1508,10 @@ pub trait ContainerProvider: Send + Sync {
     /// 创建容器（等价 `docker create`，**不自动运行**）。`privileged`/宿主挂载/镜像
     /// 白名单等安全约束由实现强制；返回新建容器的摘要（含完整 id）。
     async fn create(&self, req: ContainerCreateReq) -> Result<ContainerSummary>;
+    /// 拉取镜像（等价 `docker pull`）。`image` 为 `repo:tag` 或 `repo`（默认 latest）；
+    /// 实现须校验引用安全（无空白 / shell 元字符），返回拉取后的镜像摘要。
+    /// 拉取属网络写入（下载镜像到本地），需 container.manage。
+    async fn pull(&self, image: &str) -> Result<ImageSummary>;
 }
 
 // ═══════════════════════════ 终端 ═══════════════════════════

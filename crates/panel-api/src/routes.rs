@@ -280,6 +280,7 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/containers", get(containers::list))
         .route("/api/v1/containers", post(containers::create))
         .route("/api/v1/containers/images", get(containers::images))
+        .route("/api/v1/containers/images/pull", post(containers::pull))
         .route("/api/v1/containers/{id}/start", post(containers::start))
         .route("/api/v1/containers/{id}/stop", post(containers::stop))
         .route("/api/v1/containers/{id}/restart", post(containers::restart))
