@@ -439,13 +439,23 @@ impl SessionCache {
 
 // ═══════════════════════════ 防暴力 ═══════════════════════════
 
-/// 滑动窗口失败计数 + 指数退避 + 锁定（设计方案 §1.3）
+/// 滑动窗口失败计数 + 指数退避 + 锁定（设计方案 §1.3）。
+///
+/// ⚠ `attempts` 必须有**键数硬上限**：key 只在登录成功时被 `reset` 移除，若不做淘汰，
+/// 未授权请求刷不同用户名即可让这张表无限增长（面板以 root 运行，OOM = 整体不可用）。
+/// 上限与淘汰逻辑见 [`LoginGuard::record_failure`]。
 pub struct LoginGuard {
     attempts: Mutex<HashMap<String, Vec<Instant>>>,
     max_attempts: usize,
     lock_after: usize,
     lock_duration: Duration,
+    /// 失败 key 数硬上限（`MAX_KEYS`）
+    max_keys: usize,
 }
+
+/// 失败 key 数硬上限。单 key 在 15 分钟窗口内最多留 15 条记录，1 万个 key 足以覆盖
+/// 真实多用户场景（含共享 NAT 出口造成的少量误判），内存占用在 MB 级。
+const MAX_KEYS: usize = 10_000;
 
 impl LoginGuard {
     pub fn new() -> Self {
@@ -454,16 +464,27 @@ impl LoginGuard {
             max_attempts: 5,
             lock_after: 15,
             lock_duration: Duration::from_secs(900),
+            max_keys: MAX_KEYS,
         }
     }
 
-    /// 返回 None 表示允许尝试；Some(secs) 表示需等待
+    /// 返回 None 表示允许尝试；Some(secs) 表示需等待。
+    ///
+    /// ⚠ **只读，绝不插入**：这里曾经用 `entry(key).or_default()`，任何一次登录尝试
+    /// （包括随机编造的用户名）都会在 map 里留下一个 key，而 key 只在登录成功时才被
+    /// `reset` 移除 ⇒ 未授权请求就能把 map 撑到 OOM。现在没有记录就直接放行，插入
+    /// 只发生在 [`Self::record_failure`]。
     pub fn check(&self, key: &str) -> Option<u64> {
         let mut m = self.attempts.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
-        let v = m.entry(key.to_string()).or_default();
+        let Some(v) = m.get_mut(key) else { return None };
         // 只保留 15 分钟窗口内的记录
         v.retain(|t| now.duration_since(*t) < Duration::from_secs(900));
+        if v.is_empty() {
+            // 顺手回收：窗口滑过后这条 key 已无意义，不该永久占位
+            m.remove(key);
+            return None;
+        }
         let n = v.len();
         if n >= self.lock_after {
             let last = v.last().copied().unwrap_or(now);
@@ -480,9 +501,28 @@ impl LoginGuard {
         None
     }
 
+    /// 记录一次失败。到达 `max_keys` 时淘汰**最久没有活动**的 key（按该 key 最后一
+    /// 条记录的时间取最早者）——宁可错杀一个陈旧 key，也不能让表无限增长。
     pub fn record_failure(&self, key: &str) {
-        self.attempts.lock().unwrap_or_else(|e| e.into_inner())
-            .entry(key.to_string()).or_default().push(Instant::now());
+        let mut m = self.attempts.lock().unwrap_or_else(|e| e.into_inner());
+        if !m.contains_key(key) && m.len() >= self.max_keys {
+            let oldest = m
+                .iter()
+                .min_by_key(|(_, v)| v.last().copied().unwrap_or_else(Instant::now))
+                .map(|(k, _)| k.clone());
+            if let Some(k) = oldest { m.remove(&k); }
+        }
+        m.entry(key.to_string()).or_default().push(Instant::now());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn key_count(&self) -> usize {
+        self.attempts.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_max_keys_for_test(n: usize) -> Self {
+        Self { max_keys: n, ..Self::new() }
     }
 
     pub fn reset(&self, key: &str) {
@@ -807,5 +847,41 @@ mod tests {
         assert!(validate_username("   ").is_err());
         assert!(validate_username(&"x".repeat(65)).is_err());
         assert!(validate_username(&"x".repeat(64)).is_ok());
+    }
+
+    // ── LoginGuard：key 无界增长曾是 P0，下面几条把它钉死 ──
+
+    #[test]
+    fn check_must_not_insert_key() {
+        let g = LoginGuard::new();
+        // 只读的 check 绝不能留下 key：否则未授权请求刷不同用户名即可把 map 撑到 OOM
+        assert!(g.check("10.0.0.1:ghost").is_none());
+        assert_eq!(g.key_count(), 0, "check 不得插入 key");
+    }
+
+    #[test]
+    fn failures_still_back_off_after_fix() {
+        let g = LoginGuard::new();
+        for _ in 0..5 { g.record_failure("admin"); }   // max_attempts = 5
+        assert_eq!(g.key_count(), 1, "失败要记账");
+        assert!(g.check("admin").is_some(), "达到 max_attempts 必须退避——修无界增长不能把限速修丢");
+        g.reset("admin");
+        assert!(g.check("admin").is_none(), "登录成功后 reset 应放行");
+        assert_eq!(g.key_count(), 0);
+    }
+
+    #[test]
+    fn key_count_is_capped_and_oldest_evicted() {
+        let g = LoginGuard::with_max_keys_for_test(3);
+        g.record_failure("a");
+        std::thread::sleep(Duration::from_millis(2));
+        g.record_failure("b");
+        std::thread::sleep(Duration::from_millis(2));
+        g.record_failure("c");
+        assert_eq!(g.key_count(), 3);
+        g.record_failure("d");   // 超限 → 淘汰最久没活动的 "a"
+        assert_eq!(g.key_count(), 3, "key 数不得超过硬上限");
+        assert!(g.check("a").is_none(), "被淘汰的 key 应视为无记录");
+        assert!(g.check("d").is_none(), "新 key 正常放行");
     }
 }
