@@ -562,8 +562,18 @@ impl BackupJob {
         let out_path = match self.kind.as_str() {
             "panel" => {
                 let dest = self.dest.join(format!("plan{}-{}.db", self.id, ts));
-                // 独立连接备份：写者把 op 包在事务里，事务内不能 VACUUM INTO
-                panel_db::backup_file(&self.db_path, &dest)?;
+                // 独立连接备份：写者把 op 包在事务里，事务内不能 VACUUM INTO。
+                //
+                // ⚠ backup_file 是**同步**阻塞调用（开连接 + VACUUM INTO 整个库），
+                // 必须放 blocking 池：若在 async fn 里直接调用，大库备份会占住一个
+                // tokio worker，期间该 worker 无法服务其他请求。同函数的 tar_gz
+                // （异步子进程）与 encrypt_file（spawn_blocking）都已正确处理，
+                // 此处是漏改。
+                let db = self.db_path.clone();
+                let out = dest.clone();
+                tokio::task::spawn_blocking(move || panel_db::backup_file(&db, &out))
+                    .await
+                    .map_err(|e| PanelError::Internal(format!("备份线程异常: {e}")))??;
                 dest
             }
             "site" => {
@@ -1165,5 +1175,67 @@ mod prune_tests {
     fn missing_dir_is_not_an_error() {
         let d = std::env::temp_dir().join(format!("panel-prune4-nope-{}", std::process::id()));
         assert!(prune_old_artifacts(&d, 1, 3).is_empty(), "目录不存在应静默返回空");
+    }
+}
+
+
+#[cfg(test)]
+mod exec_tests {
+    use super::*;
+    use panel_task::{Progress, ProgressBus, TaskBody};
+
+    /// `panel` 备份必须真的产出一个能被独立打开、schema 齐全的库文件。
+    ///
+    /// 这条钉住 `BackupJob` 的整条执行路径——包括 `panel_db::backup_file` 由
+    /// 「直接占住 async worker」改为 `spawn_blocking` 后的卸载是否正确：
+    /// 「不阻塞」测不出「跑不出文件」，必须落到产物本身。
+    #[tokio::test]
+    async fn panel_backup_produces_a_readable_db() {
+        let base = std::env::temp_dir().join(format!("panel-bkexec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src_db = base.join("src/panel.db");
+        let dest = base.join("out");
+        std::fs::create_dir_all(src_db.parent().unwrap()).unwrap();
+
+        // 源库先跑迁移：备份的意义就在于"把 schema 和数据一起带走"
+        {
+            let mut c = rusqlite::Connection::open(&src_db).unwrap();
+            panel_db::migrate::apply(&mut c).unwrap();
+        }
+        let writer = std::sync::Arc::new(
+            panel_db::WriterActor::spawn(src_db.clone(), panel_core::Tier::Nano).unwrap(),
+        );
+
+        let job = BackupJob {
+            id: 1,
+            kind: "panel".into(),
+            root: None,
+            dest: dest.clone(),
+            keep_count: 3,
+            db_path: src_db.clone(),
+            writer,
+            encrypt: false,
+            remote: None,
+            master: None,
+        };
+        let bus = std::sync::Arc::new(ProgressBus::new());
+        job.run(Progress::new(1, bus)).await.expect("备份任务应成功");
+
+        // 产物：目录里那个 .db，且能被独立连接打开、schema 齐全
+        let produced = std::fs::read_dir(&dest)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().map(|x| x == "db").unwrap_or(false))
+            .expect("应产出 .db 备份产物");
+        let c = rusqlite::Connection::open(&produced).unwrap();
+        let objs: i64 = c
+            .query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))
+            .unwrap();
+        assert!(objs > 0, "备份库应含 schema 对象（迁移后的表/索引）");
+        let users: i64 = c.query_row("SELECT count(*) FROM users", [], |r| r.get(0)).unwrap();
+        assert_eq!(users, 0, "备份库内容应与源库一致（刚迁移完 users 为空）");
+
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }
