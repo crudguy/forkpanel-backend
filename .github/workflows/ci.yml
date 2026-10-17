@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: 静态门禁 + 全量测试
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # 与本地 `make check` 完全一致
+      - name: 门禁（make check）
+        run: make check
+
+  audit:
+    name: 依赖安全审计（cargo audit）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # 预编译二进制，比 cargo install 快得多
+      - uses: taiki-e/install-action@cargo-audit
+
+      # 单独 job：advisory-db 在 GitHub，网络抖动时只红这一个 job，
+      # 不连带拖红主门禁（check-audit.sh 自身也有网络失败回退本地缓存的逻辑）
+      - name: 审计（make audit）
+        run: make audit
