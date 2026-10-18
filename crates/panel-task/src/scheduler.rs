@@ -74,6 +74,14 @@ pub fn builtin_schedules(tier: panel_core::Tier) -> Vec<Schedule> {
             kind: ScheduleKind::Every(Duration::from_secs(60)),
             jitter_sec: 10,
         },
+        // 分片上传残包清理（P2-1）。TTL 24h，1h 扫一次有 24 倍冗余——扫频再高只是
+        // 白扫目录，再低则残包多留一会儿。此前它只在 `init` 开新上传时顺手做，
+        // 没人上传就永不清理。
+        Schedule {
+            name: "uploads.sweep",
+            kind: ScheduleKind::Every(Duration::from_secs(3600)),
+            jitter_sec: 120,
+        },
     ];
     // nano 档位不做每日备份：512MB 机器上 VACUUM INTO 的 IO 与内存开销不划算
     if !matches!(tier, panel_core::Tier::Nano) {
@@ -212,6 +220,19 @@ mod tests {
         assert!(names.contains(&"metrics.aggregate_1m"));
         assert!(names.contains(&"db.cleanup"));
         assert!(names.contains(&"cert.renew_check"));
+        assert!(names.contains(&"uploads.sweep"),
+            "分片残包清理必须挂在内置调度上，否则闲置面板永不回收（P2-1）");
+    }
+
+    /// 残包清理的周期必须明显短于会话 TTL（24h）——否则等于没扫。
+    #[test]
+    fn uploads_sweep_runs_well_within_session_ttl() {
+        let v = builtin_schedules(panel_core::Tier::Standard);
+        let d = v.iter().find(|s| s.name == "uploads.sweep")
+            .map(|s| match s.kind { ScheduleKind::Every(d) => d.as_secs(), _ => 0 })
+            .unwrap_or(0);
+        assert!(d > 0 && d <= 6 * 3600,
+            "uploads.sweep 周期应 <= 6h（会话 TTL 24h），实际 {d}s");
     }
 
     #[test]

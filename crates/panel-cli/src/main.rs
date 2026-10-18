@@ -481,6 +481,18 @@ async fn register_internal_jobs(
         }).await;
     }
 
+    // ── 分片上传残包清理（P2-1）：1h 一次，让闲置面板也能回收 ──
+    {
+        let state = state.clone();
+        sched.register("uploads.sweep", move || {
+            let state = state.clone();
+            async move {
+                panel_api::routes::multipart::sweep_expired(&state).await;
+                Ok(())
+            }
+        }).await;
+    }
+
     // ── 1m 聚合：nano 档位是 no-op（不落盘）──
     {
         let writer = writer.clone();

@@ -135,9 +135,14 @@ async fn load_session(
 
 /// 清理超时的未完成会话。
 ///
-/// 在 `init` 时顺手做，不额外起后台任务——代价是"长期没人开新上传就不会清理"；
-/// 对当前场景够用（面板闲置时留着几片残包也不会有实际危害）。
-async fn sweep_expired(state: &Shared) {
+/// 两个触发点（P2-1）：
+/// ① `init` 开新上传时顺手做——启动后不必等一个周期就能回收历史残包；
+/// ② 内置调度 `uploads.sweep`（1h 一次）——**这条才是主路径**：此前只有 ①，
+///    长期没人开新上传的闲置面板永远不清理。
+///
+/// 保守原则不变：拿不到创建时间（meta 缺失）时用目录 mtime 兜底，仍拿不到就
+/// **留着**——宁可下次再看，也不凭猜测删掉别人正在传的数据。
+pub async fn sweep_expired(state: &Shared) {
     let root = uploads_root(state);
     let Ok(mut rd) = tokio::fs::read_dir(&root).await else { return };
     let now = crate::now_unix();
@@ -193,6 +198,7 @@ pub async fn init(
     let target = files::resolve_new(&state, &s, &req.path)?;
     files::ensure_not_sensitive(&state, &target)?;
 
+    // 保留这次"顺手清理"：启动后立刻回收历史残包，不必等第一个调度周期。
     sweep_expired(&state).await;
 
     let id = new_upload_id();
