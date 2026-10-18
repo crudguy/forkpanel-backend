@@ -1162,6 +1162,62 @@ use super::*;
         assert!(!out.contains("rate_limit {") && !out.contains("rate_limit{"), "标准 caddy 无 rate_limit 指令，不得输出指令调用：{out}");
     }
 
+    /// **前端置灰 ↔ 后端未实装 的一致性守卫**。
+    ///
+    /// 前端 `useSiteCaps.isCaddy` 把一批字段置灰（Basic Auth / 伪静态 / lb_policy /
+    /// 反代超时 / 站点日志 / custom_conf / tls_profile），理由写的是「caddy 下未实装、
+    /// 填了也不会写进配置」。这条断言把**这句话钉死**：把这些字段全填上，caddy 渲染
+    /// 里仍不得出现对应指令。
+    ///
+    /// 为什么值得一条测试：置灰是**前端单方面的承诺**，后端没有任何东西阻止某人明天
+    /// 就给 caddy 加上 `basicauth`——那时前端仍置灰，用户白白用不上一个已经能用的
+    /// 功能，而编译、类型、所有其它测试全绿。反之若后端悄悄丢了某项而前端没置灰，
+    /// 用户点了会静默失效。两侧各改一处都会在这里变红。
+    ///
+    /// ⚠ 若将来真为 caddy 实装了其中某项：**同步改前端置灰与本条断言**，三者一起动。
+    #[test]
+    fn caddy_render_emits_none_of_the_fields_frontend_greys_out() {
+        let mut s = spec_static();
+        // 全部按「用户填满了」构造——置灰的承诺就是「填了也不生效」
+        s.auth_basic = true;
+        s.auth_user = Some("alice".into());
+        s.auth_file = Some(PathBuf::from("/etc/panel/htpasswd/x"));
+        s.rewrite_preset = Some("wordpress".into());
+        s.rewrite_custom = Some("try_files $uri $uri/ /index.php?$args;".into());
+        s.lb_policy = Some("least_conn".into());
+        s.proxy_connect_timeout = 5;
+        s.proxy_send_timeout = 5;
+        s.proxy_read_timeout = 5;
+        s.access_log = Some(PathBuf::from("/var/log/panel/x.access.log"));
+        s.error_log = Some(PathBuf::from("/var/log/panel/x.error.log"));
+        s.error_log_level = Some("warn".into());
+        s.tls_profile = Some("strict".into());
+        s.custom_conf = Some("location /static/ { expires 7d; }".into());
+        let out = render_caddy(&s);
+        // ⚠ 必须**剔除头部注释行**再比对：那两行「已覆盖/未覆盖」清单里本身就写着
+        // `lb_policy`、`custom_conf` 等字样（它们就是用来说明缺什么的）。拿整串去
+        // contains 会恒命中、断言变恒绿——先把 `#` 开头的行去掉。
+        let body: String = out.lines().filter(|l| !l.trim_start().starts_with('#')).collect::<Vec<_>>().join("\n");
+        for directive in [
+            "basicauth",          // Basic Auth
+            "auth_basic",
+            "lb_policy",          // 负载均衡策略
+            "proxy_connect_timeout",
+            "proxy_send_timeout",
+            "proxy_read_timeout",
+            "access_log",         // 站点独立日志
+            "error_log",
+            "log {",              // caddy 的 log 指令块
+            "\nlog ",
+            "expires 7d",         // custom_conf 原文（nginx 语法）
+            "location /static/",
+        ] {
+            assert!(!body.contains(directive), "caddy 渲染不应产出 `{directive}`（前端据此置灰）：\n{body}");
+        }
+        // 反向：承诺「已实装」的项必须真的在，否则前端不置灰就是撒谎
+        assert!(body.contains("file_server"), "静态站点基础形态必须仍在：{body}");
+    }
+
     #[test]
     fn caddy_cel_regex_translates_posix_class_and_escapes_for_cel() {
         let got = caddy_cel_regex("union[[:space:]]+select");

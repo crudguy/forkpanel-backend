@@ -886,10 +886,17 @@ pub(super) fn render_acme_challenge_location(root: &std::path::Path) -> String {
 //   Php / Routed）与 force_https、手动 TLS 证书，让面板在 caddy 主机上从"恒不可用"
 //   变为"基础可用"。
 // - **未覆盖**（nginx 有、caddy 样板刻意暂不做，在此显式列出而非静默丢弃）：
-//   WAF、精细 TLS 档位（tls_min/tls_profile）、HSTS、IP 白/黑名单、Basic Auth、
-//   伪静态 preset/custom、www 跳转、多域名/多 listen 端口组合、Routed-Php 的
-//   front_controller 精确语义。`custom_conf` 是**原始 nginx 文本**，caddy 语法不同，
-//   无法原样透传（caddy 渲染直接忽略它）。
+//   WAF **限速**（规则集本身已翻译实装，见 [`render_caddy_waf`]，只是标准 caddy 无
+//   `rate_limit` 指令）、`tls_profile` 加密套件档（caddy 不开放，自行策划）；
+//   Basic Auth（apr1 摘要 caddy 不认）、伪静态 preset/custom、Routed-Php 的
+//   `front_controller` 精确语义、`custom_conf` 透传（**原始 nginx 文本**，caddy 语法
+//   不同、无法原样透传，直接忽略）、`lb_policy` 与反代超时（caddy 侧暂未映射）、
+//   站点独立访问/错误日志（`log` 指令未产出）。
+//   ⚠ **已实装**（旧注释曾把这些也列为未覆盖，与代码矛盾）：手动 TLS + `tls_min`
+//   版本下限 + HSTS、IP 白/黑名单、www 跳转、多域名、force_https。
+//   ⚠ 上面这份清单与 [`render_caddy`] 写进 Caddyfile 的两行注释**必须一致**——后者
+//   是用户真能看见的版本，前端 `isCaddy` 置灰也照它逐项对齐。改任何一侧都要同步
+//   另一侧与前端，否则就是「前端置灰了但后端其实已实装」这类静默失真。
 // - **沙箱无 caddy 二进制**：`render` 是纯函数（有黄金单测）；但
 //   `validate`(`caddy validate`) / `reload`(`caddy reload`) **未经真机验证**，
 //   只能代码推理。能力位按 `caddy` 二进制存在性诚实判定（装了即可用、未装置灰）。
