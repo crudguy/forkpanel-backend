@@ -474,6 +474,14 @@ impl LoginGuard {
     /// （包括随机编造的用户名）都会在 map 里留下一个 key，而 key 只在登录成功时才被
     /// `reset` 移除 ⇒ 未授权请求就能把 map 撑到 OOM。现在没有记录就直接放行，插入
     /// 只发生在 [`Self::record_failure`]。
+    ///
+    /// ⚠ **被本函数拦下的尝试不计入 `attempts`**（计数只在真正走完校验的失败上发生，
+    /// 见 `routes/auth.rs`）。这条决定了防暴力的**实际强度**，真机压测实测：
+    /// - 快速连点（不等退避）：`n` 停在 `max_attempts`，每次都拿 `retry_after=1` 的
+    ///   429——实际效果是「1 次/秒」的软限速，**永远到不了 `lock_after` 的 15 分钟锁定**。
+    /// - 老实等满退避的尝试才推进 `n`：退避按 1→2→4→…→64s 递增，累计约 5 分钟才进锁定。
+    /// 即「15 次失败锁 15 分钟」只对**有耐心**的攻击者成立。改动前请先读
+    /// `blocked_attempts_do_not_advance_the_counter` 上的说明——它是有意保留的行为。
     pub fn check(&self, key: &str) -> Option<u64> {
         let mut m = self.attempts.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
@@ -868,6 +876,31 @@ mod tests {
         g.reset("admin");
         assert!(g.check("admin").is_none(), "登录成功后 reset 应放行");
         assert_eq!(g.key_count(), 0);
+    }
+
+    /// **特性测试**：把「被 `check` 拦下的尝试不推进计数」这一**当前行为**钉住。
+    ///
+    /// 真机压测（7.2 万次失败登录）实测出来的实际防暴力强度：
+    /// - 快速连点：第 6 次起恒为 `retry_after=1` 的 429，`n` 冻结在 `max_attempts`，
+    ///   于是退化成「1 次/秒」软限速，**永远进不了 15 分钟锁定**。
+    /// - 等满退避的尝试才推进 `n`（1→2→4→…→64s），累计约 5 分钟后才锁定。
+    ///
+    /// ⚠ 这条不是在说"现在这样最好"——它记录的是**现状**。若将来改成「429 也计数」
+    /// （防暴力强度大幅提升，但连点的正常用户会更快撞上 15 分钟锁定），本测试会变红；
+    /// 那是**有意的行为变更**，请连同上面 `check` 的注释、`docs/` 与审计报告一起改，
+    /// 别只改代码让测试"绿回来"。
+    #[test]
+    fn blocked_attempts_do_not_advance_the_counter() {
+        let g = LoginGuard::new();
+        for _ in 0..5 { g.record_failure("admin"); }   // n = max_attempts = 5
+        // 连点 30 次：每次都被拦下，但计数不动 ⇒ 退避恒为 2^0 = 1s
+        for _ in 0..30 {
+            let w = g.check("admin").expect("n>=max_attempts 应持续被拦下");
+            assert_eq!(w, 1, "n 未增长 ⇒ 退避停在下界 1s，而不是一路涨上去");
+        }
+        // 关键：仍远未到 lock_after（15），因而不该返回 ~900s 的 15 分钟锁定
+        let w = g.check("admin").unwrap();
+        assert!(w < 900, "快速连点不应进入 15 分钟锁定：{w}");
     }
 
     #[test]
