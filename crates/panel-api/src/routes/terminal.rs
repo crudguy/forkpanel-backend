@@ -88,8 +88,8 @@ pub async fn ws_handler(
     if !state.capabilities.get(cap_keys::TERMINAL_MANAGE).map(|c| c.supported).unwrap_or(false) {
         return ApiError::unsupported(cap_keys::TERMINAL_MANAGE).into_response();
     }
-    // 3) 只读模式：终端可改写宿主状态，一律拒绝
-    if std::env::var("PANEL_READ_ONLY").map(|v| v == "1").unwrap_or(false) {
+    // 3) 只读模式：终端可改写宿主状态，一律拒绝（与 read_only_guard 同一真值）
+    if state.read_only {
         return ApiError::read_only().into_response();
     }
     // 4) 同源校验（替代 CSRF：WS 升级无法带 x-csrf-token）

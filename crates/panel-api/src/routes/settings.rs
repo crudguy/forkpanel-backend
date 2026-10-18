@@ -113,9 +113,9 @@ pub async fn get(
 
     // deployment：只读展示实际生效值（不取自 settings 表）
     let deployment = json!({
-        "read_only": std::env::var("PANEL_READ_ONLY").map(|v| v == "1").unwrap_or(false),
+        "read_only": state.read_only,
         "tier": tier_str(state.tier),
-        "hint": "部署级配置：修改请编辑 config.toml（read_only 亦支持环境变量 PANEL_READ_ONLY）并重启面板",
+        "hint": "部署级配置：config.toml 的 [security] read_only = true，或环境变量 PANEL_READ_ONLY=1，二者任一即生效；修改后需重启面板",
     });
 
     // reserved：种子预留，值取表内（缺省回落种子字面量），一律 wired:false

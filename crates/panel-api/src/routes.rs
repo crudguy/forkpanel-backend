@@ -388,7 +388,7 @@ pub fn build_router(state: Shared) -> Router {
         .merge(task_r)
         .merge(cfg_r)
         .merge(sse_r)
-        .layer(middleware::from_fn(crate::middleware::read_only_guard))
+        .layer(middleware::from_fn_with_state(state.clone(), crate::middleware::read_only_guard))
         .layer(middleware::from_fn(crate::middleware::guard_write))
         // 认证守卫只罩在 authed 上：public（登录/版本/健康检查/SPA）无需登录即可进入。
         // 若误放到全局，登录接口会被自己的 401 挡在门外（历史 bug）。

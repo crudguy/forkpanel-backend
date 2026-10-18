@@ -33,6 +33,9 @@ pub struct AppState {
     pub capabilities: CapabilityMap,
     pub sessions: Arc<crate::auth::SessionCache>,
     pub logins: Arc<crate::auth::LoginGuard>,
+    /// 只读模式（启动期算一次）。**单一真值**：guard、设置页展示、终端入口都读它，
+    /// 不要再各自去读环境变量——那正是此前 config.toml 的 `read_only` 配了不生效的原因。
+    pub read_only: bool,
     /// 首启引导令牌（一次性、只存内存）。serve 首启无 owner 时生成。
     pub bootstrap: Arc<crate::auth::BootstrapGuard>,
     /// 主密钥（32 字节，内存常驻，不落库）。为 None 时所有"写入真实秘密"的操作被拒绝。
@@ -43,11 +46,21 @@ pub struct AppState {
     pub last_snapshot: tokio::sync::RwLock<Option<Arc<panel_os::traits::SystemSnapshot>>>,
 }
 
+/// 只读模式是否生效：**config 基线或环境变量**，任一为真即开。
+///
+/// 为什么是 OR 而不是「环境变量覆盖 config」：两条路径意图不同——config 是部署基线
+/// （写进 /etc/forkpanel/config.toml，跟着机器走），环境变量是临时 / 容器场景的快速
+/// 切换。覆盖语义会让「config 开了、env 设成 0」这种组合产生歧义，而 OR 下两个意图
+/// 都成立，也不需要规定优先级。
+pub fn read_only_from(config_read_only: bool) -> bool {
+    config_read_only || std::env::var("PANEL_READ_ONLY").map(|v| v == "1").unwrap_or(false)
+}
+
 impl AppState {
     pub fn new(os: Arc<dyn panel_os::OsAdapter>, db: Arc<panel_db::WriterActor>,
                pool: Arc<ReadPool>, tasks: Arc<panel_task::TaskRunner>,
                metrics: Arc<std::sync::Mutex<panel_db::aggregator::Aggregator>>,
-               tier: Tier, master_key: Option<MasterKey>) -> Self {
+               tier: Tier, master_key: Option<MasterKey>, read_only: bool) -> Self {
         let capabilities = os.capabilities();
         // 会话持久化：把写者交给 SessionCache（`sessions` 表 001 已定义、此前无人使用）。
         // 先 clone——下方 struct 字面量会把 db move 进字段。
@@ -60,6 +73,7 @@ impl AppState {
                 sessions_db,
             )),
             logins: Arc::new(crate::auth::LoginGuard::new()),
+            read_only,
             bootstrap: Arc::new(crate::auth::BootstrapGuard::new()),
             master_key,
             started_at: now_unix(),
@@ -120,6 +134,29 @@ impl<T: serde::Serialize> Envelope<T> {
 
 /// 把 `ApiResult<T>` 转成 HTTP 响应（IntoResponse 在 error.rs 中实现）
 pub type HandlerResult<T> = ApiResult<T>;
+
+#[cfg(test)]
+mod read_only_tests {
+    use super::read_only_from;
+
+    /// config 开了就必须生效——这是修复的核心：此前 guard 只读环境变量，
+    /// config.toml 里写 `read_only = true` 用户以为开了、实际写接口全通。
+    #[test]
+    fn config_true_wins_regardless_of_env() {
+        assert!(read_only_from(true), "config.read_only=true 必须让只读模式生效");
+    }
+
+    /// 两条都没开时是 false。前提是本进程没设 PANEL_READ_ONLY（开发/CI 默认不设）；
+    /// 若哪天真设了，这条会红——那说明环境被改过，应先查清再跑测试。
+    #[test]
+    fn both_off_is_off() {
+        if std::env::var("PANEL_READ_ONLY").is_ok() {
+            eprintln!("[skip] PANEL_READ_ONLY 已设置，跳过 both_off_is_off");
+            return;
+        }
+        assert!(!read_only_from(false));
+    }
+}
 
 #[allow(dead_code)]
 fn _assert_send_sync() {

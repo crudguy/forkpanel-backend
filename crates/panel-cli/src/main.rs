@@ -243,8 +243,11 @@ fn run(cli: Cli) -> Result<()> {
                 // 内存常驻、不落库；缺失则密钥加密存储不可用（对应操作被拒绝，而非明文入库）。
                 let master_key = load_master_key(&layout.data_dir());
 
+                // 只读模式：config 基线 **或** 环境变量（`read_only_from` 把两条路径合成
+                // 一个 bool，之后 guard / 设置页 / 终端入口都只认 AppState.read_only）。
+                let read_only = panel_api::read_only_from(cfg.security.read_only);
                 let state = Arc::new(panel_api::AppState::new(
-                    os.clone(), writer.clone(), pool, tasks.clone(), metrics.clone(), tier, master_key));
+                    os.clone(), writer.clone(), pool, tasks.clone(), metrics.clone(), tier, master_key, read_only));
 
                 // ── 内部周期任务 ──
                 register_internal_jobs(&sched_in, &os, writer.clone(), metrics.clone(), &layout, &cfg, tier, state.clone()).await;

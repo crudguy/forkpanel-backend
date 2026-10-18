@@ -3,8 +3,9 @@
 //! 设计约束（见《设计方案》§1.3）：
 //! - SQLite 中存储的密钥（SSL 私钥、数据库口令）**绝不明文入库**；
 //!   数据目录 0700 + 备份文件加密之外的第二道防线。
-//! - 主密钥来自 `/etc/panel/master.key`（0600）或环境变量 `PANEL_MASTER_KEY`，
-//!   **不落库**（见 `panel-cli/bootstrap.rs`）。
+//! - 主密钥来自 `<data_dir>/master.key`（0600，init/serve 时生成），**不落库**
+//!   （见 `panel-cli/bootstrap.rs`）。⚠ 没有 `PANEL_MASTER_KEY` 环境变量——本注释
+//!   曾那么写，但代码从未实现，已删；别照注释去找一个不存在的开关。
 //! - 本模块保持**零 IO**：只做 AES-256-GCM 计算；从文件/环境变量读取主密钥由调用方完成。
 //!
 //! 密文格式：`nonce(12 字节) || ciphertext(+GCM tag 16 字节)`。

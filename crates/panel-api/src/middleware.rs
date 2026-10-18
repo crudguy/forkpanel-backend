@@ -116,12 +116,18 @@ pub fn extract_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
 pub const BODY_LIMIT_JSON: usize = 1024 * 1024;
 pub const BODY_LIMIT_UPLOAD: usize = 100 * 1024 * 1024;
 
-/// 只读模式：配置 `read_only = true` 时，所有写请求返回 403 READ_ONLY。
-pub async fn read_only_guard(req: Request, next: Next) -> Response {
-    if matches!(*req.method(), Method::POST | Method::PUT | Method::PATCH | Method::DELETE) {
-        if std::env::var("PANEL_READ_ONLY").map(|v| v == "1").unwrap_or(false) {
-            return ApiError::read_only().into_response();
-        }
+/// 只读模式：所有写请求返回 403 READ_ONLY。
+///
+/// 判据取 `state.read_only`（启动期算一次），**不要在这里读环境变量**：
+/// 此前正是"guard 只认环境变量、设置页也只展示环境变量"，导致 `config.toml` 的
+/// `read_only = true` 是一条**配了不生效的假控制**——用户以为开了只读，实际写接口全通。
+pub async fn read_only_guard(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if state.read_only && matches!(*req.method(), Method::POST | Method::PUT | Method::PATCH | Method::DELETE) {
+        return ApiError::read_only().into_response();
     }
     next.run(req).await
 }
