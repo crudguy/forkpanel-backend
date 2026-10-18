@@ -39,8 +39,18 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Semaphore, SemaphorePermit};
 use axum::extract::ws::{Message, WebSocket};
 
-/// 全局并发上限：Web 终端是高危、低频操作，固定小容量即可（无需按档位配置）。
-static TERMINAL_SEM: Semaphore = Semaphore::const_new(4);
+/// 全局并发上限的**单一真值**（P2-5）。
+///
+/// 此前这里写死 `4`、前端 `MAX_TABS` 也写死 `4`，两端靠注释约定——改一端忘另一端
+/// 就表现为「面板说还能开、一点就 503」。现在上限由本常量构造信号量，同时经
+/// `/api/v1/system/capabilities` 的 `limits.terminal_max_sessions` 下发给前端，
+/// 前端读到的就是这个值。
+///
+/// 取值理由：Web 终端是高危、低频操作（合法代码执行入口），固定小容量即可，
+/// 无需按档位配置。
+pub const TERMINAL_MAX_SESSIONS: usize = 4;
+
+static TERMINAL_SEM: Semaphore = Semaphore::const_new(TERMINAL_MAX_SESSIONS);
 
 /// WS 升级初始终端尺寸（前端 fit 后会立即发 resize）。
 const DEFAULT_COLS: u16 = 80;
@@ -237,6 +247,14 @@ mod tests {
         assert!(!origin_ok(&Some("https://evil".into()), &Some("h".into())), "跨站必须拒绝");
         assert!(!origin_ok(&None, &Some("h".into())), "缺 Origin 必须拒绝");
         assert!(!origin_ok(&Some("https://h".into()), &None), "缺 Host 必须拒绝");
+    }
+
+    /// 下发给前端的上限必须与信号量**真实容量**一致。
+    /// 否则前端会放行一个必被 503 的会话——用户看到"能点"，点了连不上。
+    #[test]
+    fn published_limit_matches_semaphore_capacity() {
+        assert_eq!(TERMINAL_SEM.available_permits(), TERMINAL_MAX_SESSIONS,
+            "TERMINAL_MAX_SESSIONS 与 TERMINAL_SEM 容量漂移了：前端按前者放行，后端按后者拒绝");
     }
 
     #[test]

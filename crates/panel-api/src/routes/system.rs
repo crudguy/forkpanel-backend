@@ -29,9 +29,14 @@ pub async fn version() -> Json<serde_json::Value> {
 
 /// 能力矩阵。**前端菜单/按钮的唯一开关来源**（设计方案 §0.3.4）。
 pub async fn capabilities(State(state): State<Shared>, _: Auth) -> Json<serde_json::Value> {
+    // `limits`：高危操作的并发上限（P2-5）。前端读它而不是自己硬编码一份——
+    // 两端各写一个 4，改一端忘另一端就是「面板说能开、实际 503」。
     ok(serde_json::json!({
         "platform": state.os.platform(),
         "features": state.capabilities,
+        "limits": {
+            "terminal_max_sessions": crate::routes::terminal::TERMINAL_MAX_SESSIONS,
+        },
     }))
 }
 

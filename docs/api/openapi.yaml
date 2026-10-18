@@ -209,9 +209,19 @@ components:
       type: object
       properties:
         platform:   { $ref: '#/components/schemas/PlatformInfo' }
-        tier:       { type: string, enum: [nano, small, standard], example: standard }
-        polling:    { type: boolean, description: "true=前端应退化为轮询（nano 档位无 SSE）" }
         features:   { type: object, additionalProperties: { $ref: '#/components/schemas/Capability' } }
+        # 高危操作的并发上限（P2-5）。前端读它而不是硬编码，避免两端各写一个数。
+        limits:     { $ref: '#/components/schemas/Limits' }
+        # ⚠ tier / polling 曾在这里声明，但本 handler 从未下发（它们走 /auth/me），
+        #    属于契约漂移——已删。check_openapi 只查字节一致，抓不到这类语义偏差。
+    Limits:
+      type: object
+      description: 高危操作的并发上限。新增上限时**必须**同时加到这里与实现处，保持单一真值。
+      properties:
+        terminal_max_sessions:
+          type: integer
+          description: Web 终端全局并发上限（全实例共享，不是每用户）。超出返回 503。
+          example: 4
 
     ServiceConfig:
       type: object
@@ -249,10 +259,13 @@ components:
         user:         { type: string }
         role:         { type: string, enum: [owner, admin, operator, viewer] }
         permissions:   { type: array, items: { type: string } }
-        capabilities: { $ref: '#/components/schemas/CapabilitiesResponse' }
+        allowed_roots: { type: array, items: { type: string } }
+        # 能力矩阵（键=能力名）；与 /system/capabilities 的 features 同源
+        capabilities: { type: object, additionalProperties: { $ref: '#/components/schemas/Capability' } }
         tier:         { type: string, enum: [nano, small, standard] }
-        polling:      { type: boolean }
         mfa_enabled:  { type: boolean, description: "MFA 是否已启用（审计 F8：由 /auth/me 权威下发，前端不再靠 enroll 报错文案反推）" }
+        # ⚠ 曾把 capabilities 写成 CapabilitiesResponse（含 platform/features，那是
+        #   /system/capabilities 的形状）、还多一个 polling——均与 MeResp 不符，已修。
     ChangePasswordRequest:
       type: object
       required: [old, new]
