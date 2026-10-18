@@ -114,6 +114,22 @@ sudo panel --config /etc/forkpanel/config.toml passwd admin --pass '<新口令>'
 - `NoNewPrivileges / ProtectSystem=strict / ProtectHome / ProtectKernelTunables / ProtectControlGroups / RestrictSUIDSGID`
 - `ReadWritePaths` 仅开放数据、日志、站点、配置四个目录（由 `PathLayout` 提供，非硬编码）
 - `MemoryMax` 按档位（96M / 192M / 384M）、`CPUQuota=20%`、`TasksMax=256`
+- `Restart=on-failure` + `RestartSec=3`：**进程崩溃 / 非零退出会自愈**
+
+### 5.1 崩溃自愈的边界（如实说明）
+
+`Restart=on-failure` 覆盖的是「进程死了」。它**不覆盖**「进程活着但不服务」——
+例如事件循环被某个请求卡死、或监听 socket 丢失但主线程没退。这类故障 systemd
+从外部看不出来，需要下面之一：
+
+| 方案 | 做法 | 代价 |
+|---|---|---|
+| **外部探活（当前最现实）** | systemd timer / cron 每分钟 `curl -fsS http://127.0.0.1:2083/api/v1/version`，连续失败则 `systemctl restart panel` | 多一个计时器单元；探活脚本要自己幂等 |
+| **sd_notify watchdog** | 单元加 `WatchdogSec=60`，应用侧周期性 `sd_notify(0, "WATCHDOG=1")` | 需引 `libsystemd`（或自己实现 `sd_notify` 的 datagram 协议），依赖预算当前 38/38 已满，需先决策 |
+| **Type=notify** | 同上，启动完成也走 sd_notify | 同上 |
+
+面板已具备探活所需的一切（`/api/v1/version` 与 `/healthz` 均为免登录 GET），
+所以只差「谁来定时打它」这一层，没有应用侧阻塞项。
 
 ---
 

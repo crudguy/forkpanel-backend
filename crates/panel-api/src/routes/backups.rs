@@ -1016,6 +1016,10 @@ impl RestoreJob {
 ///
 /// **返回被删除的产物名**（不只是数量）——远端要按名字同步 DELETE 同名对象。
 /// 单点删除失败只记日志、不向上抛错：产物清理失败不该把一次「备份已成功」翻转为失败。
+/// ⚠ 这里是**刻意**的同步 `std::fs`：`read_dir` 列的是备份目录（通常几十项），
+/// `remove_file` 走 unlink（摘目录项，不随文件大小变慢）——都不必包 spawn_blocking，
+/// 判据见 crate 根的「同步 IO 约定」。真要改这里之前先读那段，别照"文件系统调用
+/// 就该异步"的直觉抄。
 fn prune_old_artifacts(dest: &std::path::Path, plan_id: i64, keep: i64) -> Vec<String> {
     let keep = keep.max(1) as usize;
     let prefix = format!("plan{plan_id}-");

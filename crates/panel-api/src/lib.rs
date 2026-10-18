@@ -5,6 +5,19 @@
 //! - handler **禁止**出现 SQL（走 panel-db）、**禁止**出现进程调用（走 panel-os）、
 //!   **禁止**出现路径字面量（走 PathLayout）。
 //! - 所有写操作必须可审计：由 `Audit` 中间件在响应阶段落库。
+//!
+//! ## 同步 IO 约定（P1-1 / P2-3）
+//!
+//! 本 crate 里有约 30 处 `std::fs::`，**绝大多数是刻意不包 `spawn_blocking` 的**——
+//! 它们是元数据级快操作（`create_dir_all` / `remove_file` / `read_dir` /
+//! `set_permissions` / `canonicalize` / 读几十字节的配置文件），耗时在微秒到毫秒级，
+//! 包一层 blocking 只会多一次线程切换。⚠ `remove_file` 删几个 GB 的文件也很快：
+//! unlink 只摘目录项、不擦内容，别被文件大小吓到。
+//!
+//! **需要包 `spawn_blocking` 的是另一类**：整库 VACUUM INTO、tar 打包、AES 加密
+//! 大文件、递归删大目录树——判据是「耗时随数据量增长」，而不是「调用了 std::fs」。
+//! 反例与正确写法见 `routes/backups.rs` 的 `backup_file`（P1-1 的修复现场）。
+//! 新增同步调用时按这条判据自判，别照着邻近代码抄。
 
 pub mod auth;
 pub mod error;
