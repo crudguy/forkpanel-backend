@@ -36,7 +36,25 @@ use tokio::sync::{mpsc, oneshot, Semaphore};
 /// - `journal_mode=WAL` 必须在事务外执行，且**数据目录不能是网络文件系统**
 ///   （启动前由 `panel_os::startup_fs_check` 拦截）。
 /// - `wal_autocheckpoint` **绝不能为 0**：实测关闭后写入 5 万行即让 WAL 涨到 7.71MB 且持续膨胀。
-pub fn open(path: &Path, tier: Tier) -> Result<Connection> {
+/// SQLite `synchronous` 合法取值（大小写不敏感）。非法值会在 `open` 时直接报错，
+/// 避免把用户的笔误静默降级成默认档（那种「配了不生效」最隐蔽）。
+pub const SYNCHRONOUS_MODES: &[&str] = &["OFF", "NORMAL", "FULL", "EXTRA"];
+pub const DEFAULT_SYNCHRONOUS: &str = "NORMAL";
+
+/// 校验并归一化 `synchronous` 配置值（大小写不敏感 → 标准大写）。
+fn normalize_synchronous(s: &str) -> Result<&'static str> {
+    let up = s.trim().to_uppercase();
+    SYNCHRONOUS_MODES
+        .iter()
+        .copied()
+        .find(|m| *m == up)
+        .ok_or_else(|| PanelError::Validation {
+            field: "db.synchronous",
+            reason: format!("必须是 OFF / NORMAL / FULL / EXTRA 之一，收到 {s:?}"),
+        })
+}
+
+pub fn open(path: &Path, tier: Tier, synchronous: &str) -> Result<Connection> {
     let c = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -47,9 +65,12 @@ pub fn open(path: &Path, tier: Tier) -> Result<Connection> {
 
     c.pragma_update(None, "journal_mode", "WAL")
         .map_err(|e| PanelError::Database(format!("set WAL: {e}")))?;
-    // WAL + NORMAL：进程崩溃不丢已提交事务（实测 kill -9 后 5,200 行完整、integrity_check ok）
-    // FULL 的代价：实测吞吐降 42%（624k → 361k rows/s），故仅在用户显式要求断电强保证时启用
-    c.pragma_update(None, "synchronous", "NORMAL")
+    // WAL + synchronous：进程崩溃不丢已提交事务（实测 kill -9 后 5,200 行完整、integrity_check ok）。
+    // FULL 的代价：实测吞吐降 42%（624k → 361k rows/s），故仅在用户于 config.toml 显式
+    // 配 `db.synchronous = "FULL"` 时启用断电强保证。此前此处硬编码 "NORMAL"，配置项形同虚设
+    // （与 session_* / max_login_attempts 同类「假控制」）；现经 `normalize_synchronous` 校验后透传。
+    let sync_mode = normalize_synchronous(synchronous)?;
+    c.pragma_update(None, "synchronous", sync_mode)
         .map_err(|e| PanelError::Database(e.to_string()))?;
     c.pragma_update(None, "foreign_keys", "ON")
         .map_err(|e| PanelError::Database(e.to_string()))?;
@@ -140,8 +161,8 @@ pub struct WriterActor {
 }
 
 impl WriterActor {
-    pub fn spawn(path: PathBuf, tier: Tier) -> Result<Self> {
-        let mut conn = open(&path, tier)?;
+    pub fn spawn(path: PathBuf, tier: Tier, synchronous: &str) -> Result<Self> {
+        let mut conn = open(&path, tier, synchronous)?;
         let (tx, mut rx) = mpsc::channel::<(WriteOp, oneshot::Sender<Result<WriteAck>>)>(256);
         let policy = FlushPolicy::for_tier(tier);
 
@@ -289,7 +310,7 @@ impl ReadPool {
         };
         let mut conns = Vec::with_capacity(n);
         for _ in 0..n {
-            let c = open(path, tier)?;
+            let c = open(path, tier, DEFAULT_SYNCHRONOUS)?;
             // 只读连接不需要 WAL 写侧资源
             let _ = c.pragma_update(None, "query_only", "ON");
             conns.push(Arc::new(std::sync::Mutex::new(c)));
@@ -405,5 +426,46 @@ mod tests {
 
     fn pool_size(t: Tier) -> usize {
         match t { Tier::Nano => 1, Tier::Small => 2, Tier::Standard => 4 }
+    }
+
+    /// 防「假控制」回归：`[db] synchronous` 必须真落到 SQLite pragma，而非硬编码 NORMAL。
+    ///
+    /// 此前 `open` 里写死 `"NORMAL"`，config.toml 配 `synchronous = "FULL"` 毫无效果
+    /// （与 session_* / max_login_attempts 同类 bug，lib.rs 注释还谎称「用户显式要求时启用」）。
+    /// 这条测试直接开后查 `PRAGMA synchronous` 的数值（0=OFF/1=NORMAL/2=FULL/3=EXTRA），
+    /// 把「配置驱动该值」钉死——改回硬编码会在第一步就挂。
+    #[test]
+    fn open_honors_configured_synchronous_mode() {
+        let dir = std::env::temp_dir().join(format!("panel-db-sync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("s.db");
+
+        // FULL 必须真生效（数值 2）
+        let c_full = open(&db, Tier::Standard, "FULL").unwrap();
+        let v_full: i64 = c_full.query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap();
+        assert_eq!(v_full, 2, "synchronous=FULL 必须真生效");
+
+        // 大小写不敏感
+        let c_low = open(&db, Tier::Standard, "normal").unwrap();
+        let v_low: i64 = c_low.query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap();
+        assert_eq!(v_low, 1, "synchronous=normal 大小写不敏感应生效");
+
+        // 非法值必须直接报错，而非静默降级成默认档（那种「配了不生效」最隐蔽）
+        assert!(open(&db, Tier::Standard, "BOGUS").is_err(), "非法 synchronous 必须报错");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_off_mode_is_zero() {
+        let dir = std::env::temp_dir().join(format!("panel-db-sync-off-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("s.db");
+        let c = open(&db, Tier::Standard, "OFF").unwrap();
+        let v: i64 = c.query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 0, "synchronous=OFF 必须真生效（数值 0）");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

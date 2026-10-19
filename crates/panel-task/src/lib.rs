@@ -207,6 +207,8 @@ pub struct TaskRunner {
     /// 任务输出落盘功能接入前未读取；构造签名保留该参数以维持注入契约。
     #[allow(dead_code)]
     output_dir: PathBuf,
+    /// `[db.synchronous]` 透传：任务创建的 INSERT 独立连接也遵循用户配置的断电强保证档。
+    synchronous: String,
     /// 任务创建专用写库路径。
     ///
     /// ⚠️ 任务创建的 INSERT **不走 writer actor 的攒批事务**：同 key 两个并发
@@ -217,7 +219,7 @@ pub struct TaskRunner {
 }
 
 impl TaskRunner {
-    pub fn new(writer: Arc<WriterActor>, tier: Tier, output_dir: PathBuf, db_path: PathBuf) -> Self {
+    pub fn new(writer: Arc<WriterActor>, tier: Tier, output_dir: PathBuf, db_path: PathBuf, synchronous: String) -> Self {
         Self {
             writer,
             bus: Arc::new(ProgressBus::new()),
@@ -227,6 +229,7 @@ impl TaskRunner {
             exclusive: Arc::new(Mutex::new(HashMap::new())),
             output_dir,
             db_path,
+            synchronous,
         }
     }
 
@@ -284,8 +287,9 @@ impl TaskRunner {
         let ikey = req.idempotency_key.clone();
         let db_path = self.db_path.clone();
         let tier = self.tier;
+        let sync = self.synchronous.clone();
         let ins = tokio::task::spawn_blocking(move || -> Result<i64> {
-            let conn = panel_db::open(&db_path, tier)
+            let conn = panel_db::open(&db_path, tier, &sync)
                 .map_err(|e| PanelError::Internal(format!("open task db: {e}")))?;
             match conn.execute(
                 "INSERT INTO task_runs(task_id, kind, state, progress, started_at)
@@ -551,8 +555,8 @@ mod tests {
             panel_db::migrate::apply(&mut c).unwrap();
         }
 
-        let writer = std::sync::Arc::new(panel_db::WriterActor::spawn(db.clone(), Tier::Nano).unwrap());
-        let runner = TaskRunner::new(writer, Tier::Nano, dir.clone(), db.clone());
+        let writer = std::sync::Arc::new(panel_db::WriterActor::spawn(db.clone(), Tier::Nano, "NORMAL").unwrap());
+        let runner = TaskRunner::new(writer, Tier::Nano, dir.clone(), db.clone(), "NORMAL".to_string());
 
         let req = |k: &str| TaskRequest {
             idempotency_key: k.to_string(),
@@ -594,8 +598,8 @@ mod tests {
             let mut c = rusqlite::Connection::open(&db).unwrap();
             panel_db::migrate::apply(&mut c).unwrap();
         }
-        let writer = std::sync::Arc::new(panel_db::WriterActor::spawn(db.clone(), Tier::Nano).unwrap());
-        let runner = TaskRunner::new(writer, Tier::Nano, dir.clone(), db.clone());
+        let writer = std::sync::Arc::new(panel_db::WriterActor::spawn(db.clone(), Tier::Nano, "NORMAL").unwrap());
+        let runner = TaskRunner::new(writer, Tier::Nano, dir.clone(), db.clone(), "NORMAL".to_string());
 
         let req = |k: &str| TaskRequest {
             idempotency_key: k.to_string(),
@@ -658,8 +662,8 @@ mod tests {
             let mut c = rusqlite::Connection::open(&db).unwrap();
             panel_db::migrate::apply(&mut c).unwrap();
         }
-        let writer = std::sync::Arc::new(panel_db::WriterActor::spawn(db.clone(), tier).unwrap());
-        (TaskRunner::new(writer, tier, dir.clone(), db), dir)
+        let writer = std::sync::Arc::new(panel_db::WriterActor::spawn(db.clone(), tier, "NORMAL").unwrap());
+        (TaskRunner::new(writer, tier, dir.clone(), db, "NORMAL".to_string()), dir)
     }
 
     /// 轮询等所有任务进终态（上限 20s）。不用固定 sleep，避免偶发翻红。

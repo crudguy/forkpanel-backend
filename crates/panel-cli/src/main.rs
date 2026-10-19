@@ -145,7 +145,7 @@ fn run(cli: Cli) -> Result<()> {
 
             let tier = detect_tier(&*os, &cfg);
             let db_path = layout.sqlite_path();
-            let mut conn = panel_db::open(&db_path, tier)?;
+            let mut conn = panel_db::open(&db_path, tier, &cfg.db.synchronous)?;
             panel_db::migrate::apply(&mut conn)?;
 
             // 幂等：已有 owner 则跳过
@@ -174,7 +174,7 @@ fn run(cli: Cli) -> Result<()> {
             let cfg = load_cfg(&cli, &layout0)?;
             let layout = build_layout(&os, Some(&cfg));
             let tier = detect_tier(&*os, &cfg);
-            let checks = doctor::run(&*os, &layout, &layout.sqlite_path(), tier);
+            let checks = doctor::run(&*os, &layout, &layout.sqlite_path(), tier, &cfg.db.synchronous);
             print!("{}", doctor::render(&checks));
             if doctor::has_fail(&checks) { std::process::exit(1); }
             Ok(())
@@ -184,7 +184,7 @@ fn run(cli: Cli) -> Result<()> {
             let layout0 = build_layout(&os, None);
             let cfg = load_cfg(&cli, &layout0)?;
             let layout = build_layout(&os, Some(&cfg));
-            let mut conn = panel_db::open(&layout.sqlite_path(), detect_tier(&*os, &cfg))?;
+            let mut conn = panel_db::open(&layout.sqlite_path(), detect_tier(&*os, &cfg), &cfg.db.synchronous)?;
             let v = panel_db::migrate::apply(&mut conn)?;
             println!("schema 版本 {v}");
             Ok(())
@@ -217,17 +217,17 @@ fn run(cli: Cli) -> Result<()> {
             }
 
             let db_path = layout.sqlite_path();
-            let mut conn = panel_db::open(&db_path, tier)?;
+            let mut conn = panel_db::open(&db_path, tier, &cfg.db.synchronous)?;
             panel_db::migrate::apply(&mut conn)?;
             drop(conn);
 
-            let writer = Arc::new(panel_db::WriterActor::spawn(db_path.clone(), tier)?);
+            let writer = Arc::new(panel_db::WriterActor::spawn(db_path.clone(), tier, &cfg.db.synchronous)?);
             let pool = Arc::new(panel_db::ReadPool::new(&db_path, tier)?);
 
             // 任务中心：输出落文件而非入库（实测：stdout 塞进 DB 会让体积失控）
             let task_out = layout.log_dir().join("tasks");
             std::fs::create_dir_all(&task_out).ok();
-            let tasks = Arc::new(panel_task::TaskRunner::new(writer.clone(), tier, task_out, db_path.clone()));
+            let tasks = Arc::new(panel_task::TaskRunner::new(writer.clone(), tier, task_out, db_path.clone(), cfg.db.synchronous.clone()));
 
             // run() 是同步函数，所有 .await 都必须发生在 runtime 的 block_on 之内，
             // 因此 runtime 要在异步初始化之前就构建好。
@@ -356,7 +356,7 @@ fn run(cli: Cli) -> Result<()> {
                     reason: format!("目标已存在：{}（VACUUM INTO 不覆盖，请先删除或换个路径）", dest.display()),
                 });
             }
-            let conn = panel_db::open(&layout.sqlite_path(), detect_tier(&*os, &cfg))?;
+            let conn = panel_db::open(&layout.sqlite_path(), detect_tier(&*os, &cfg), &cfg.db.synchronous)?;
             panel_db::backup_to(&conn, &dest)?;
             println!("备份完成：{}", dest.display());
             Ok(())
@@ -366,7 +366,7 @@ fn run(cli: Cli) -> Result<()> {
             let layout0 = build_layout(&os, None);
             let cfg = load_cfg(&cli, &layout0)?;
             let layout = build_layout(&os, Some(&cfg));
-            let conn = panel_db::open(&layout.sqlite_path(), detect_tier(&*os, &cfg))?;
+            let conn = panel_db::open(&layout.sqlite_path(), detect_tier(&*os, &cfg), &cfg.db.synchronous)?;
             panel_db::cleanup::checkpoint_truncate(&conn)?;
             println!("WAL 已回收");
             Ok(())
@@ -377,7 +377,7 @@ fn run(cli: Cli) -> Result<()> {
             let cfg = load_cfg(&cli, &layout0)?;
             let layout = build_layout(&os, Some(&cfg));
             let tier = detect_tier(&*os, &cfg);
-            let mut conn = panel_db::open(&layout.sqlite_path(), tier)?;
+            let mut conn = panel_db::open(&layout.sqlite_path(), tier, &cfg.db.synchronous)?;
 
             // 只改**已存在**用户的口令：passwd 不得具备建号能力，
             // 否则同机任意能执行 CLI 的进程都能给自己开账号（等于绕过引导令牌）。

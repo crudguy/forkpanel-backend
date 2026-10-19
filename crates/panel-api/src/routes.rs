@@ -482,7 +482,7 @@ mod tests {
             std::sync::Arc::new(panel_os::mock::MockOsAdapter::new());
         let dir = std::env::temp_dir().join("panel-router-test");
         std::fs::create_dir_all(&dir).unwrap();
-        let db = panel_db::open(&dir.join("t.db"), panel_core::Tier::Nano).unwrap();
+        let db = panel_db::open(&dir.join("t.db"), panel_core::Tier::Nano, "NORMAL").unwrap();
         let _ = db;
         // 仅验证 Router 类型可构造（WriterActor 需真实路径，故此处只做类型层校验）
         fn _assert_router(r: Router) { let _ = r; }

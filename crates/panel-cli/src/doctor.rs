@@ -18,7 +18,7 @@ pub struct Check {
     pub fix: Option<String>,
 }
 
-pub fn run(os: &dyn OsAdapter, layout: &dyn PathLayout, db_path: &Path, tier: Tier) -> Vec<Check> {
+pub fn run(os: &dyn OsAdapter, layout: &dyn PathLayout, db_path: &Path, tier: Tier, synchronous: &str) -> Vec<Check> {
     let mut v = Vec::new();
 
     // 1. 数据目录文件系统：网络文件系统上 WAL 不可靠（设计方案 §1.4-7 硬约束）
@@ -99,7 +99,7 @@ pub fn run(os: &dyn OsAdapter, layout: &dyn PathLayout, db_path: &Path, tier: Ti
 
     // 6. 数据库完整性
     if db_path.exists() {
-        match panel_db::open(db_path, tier) {
+        match panel_db::open(db_path, tier, synchronous) {
             Ok(c) => match panel_db::integrity_check(&c) {
                 Ok(s) if s == "ok" => v.push(Check { name: "db_integrity", level: Level::Ok,
                     message: "数据库完整性检查通过".into(), fix: None }),

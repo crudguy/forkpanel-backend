@@ -1363,7 +1363,7 @@ mod exec_tests {
             panel_db::migrate::apply(&mut c).unwrap();
         }
         let writer = std::sync::Arc::new(
-            panel_db::WriterActor::spawn(src_db.clone(), panel_core::Tier::Nano).unwrap(),
+            panel_db::WriterActor::spawn(src_db.clone(), panel_core::Tier::Nano, "NORMAL").unwrap(),
         );
 
         let job = BackupJob {
