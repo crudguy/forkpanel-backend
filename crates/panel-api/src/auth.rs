@@ -458,10 +458,10 @@ pub struct LoginGuard {
 const MAX_KEYS: usize = 10_000;
 
 impl LoginGuard {
-    pub fn new() -> Self {
+    pub fn new(max_attempts: usize) -> Self {
         Self {
             attempts: Mutex::new(HashMap::new()),
-            max_attempts: 5,
+            max_attempts,
             lock_after: 15,
             lock_duration: Duration::from_secs(900),
             max_keys: MAX_KEYS,
@@ -530,15 +530,20 @@ impl LoginGuard {
 
     #[cfg(test)]
     pub(crate) fn with_max_keys_for_test(n: usize) -> Self {
-        Self { max_keys: n, ..Self::new() }
+        Self { max_keys: n, ..Self::new(5) }
     }
 
     pub fn reset(&self, key: &str) {
         self.attempts.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
     }
+
+    /// 当前生效的最大登录尝试次数（来自 config.toml `[security] max_login_attempts`）。
+    /// 曾硬编码 5，配置项形同虚设——与 `session_*` 同一类"假控制"，现已由 `AppState`
+    /// 从配置注入。设置页 deployment 段展示此值，证明它是真接线而非死数据。
+    pub fn max_attempts(&self) -> usize { self.max_attempts }
 }
 
-impl Default for LoginGuard { fn default() -> Self { Self::new() } }
+impl Default for LoginGuard { fn default() -> Self { Self::new(5) } }
 
 // ═══════════════════════════ RBAC ═══════════════════════════
 
@@ -792,7 +797,7 @@ mod tests {
 
     #[test]
     fn login_guard_locks_after_threshold() {
-        let g = LoginGuard::new();
+        let g = LoginGuard::new(5);
         for i in 0..15 { g.record_failure("1.2.3.4"); let _ = i; }
         assert!(g.check("1.2.3.4").is_some(), "15 次后应锁定");
         g.reset("1.2.3.4");
@@ -861,7 +866,7 @@ mod tests {
 
     #[test]
     fn check_must_not_insert_key() {
-        let g = LoginGuard::new();
+        let g = LoginGuard::new(5);
         // 只读的 check 绝不能留下 key：否则未授权请求刷不同用户名即可把 map 撑到 OOM
         assert!(g.check("10.0.0.1:ghost").is_none());
         assert_eq!(g.key_count(), 0, "check 不得插入 key");
@@ -869,13 +874,28 @@ mod tests {
 
     #[test]
     fn failures_still_back_off_after_fix() {
-        let g = LoginGuard::new();
+        let g = LoginGuard::new(5);
         for _ in 0..5 { g.record_failure("admin"); }   // max_attempts = 5
         assert_eq!(g.key_count(), 1, "失败要记账");
         assert!(g.check("admin").is_some(), "达到 max_attempts 必须退避——修无界增长不能把限速修丢");
         g.reset("admin");
         assert!(g.check("admin").is_none(), "登录成功后 reset 应放行");
         assert_eq!(g.key_count(), 0);
+    }
+
+    /// **配置值必须真的被消费**（防"假控制"回归）。
+    ///
+    /// `max_attempts` 曾在 `LoginGuard::new()` 里硬编码 5，config.toml 的
+    /// `[security] max_login_attempts` 配了毫无效果（与 `session_*` 同一类 bug）。
+    /// 这里用非默认值 3，并断言"不等于硬编码 5 时的行为"——证明有判别力：
+    /// 若有人把 `new(max_attempts)` 改回 `new(5)` 硬编码，本测试会红。
+    #[test]
+    fn max_attempts_comes_from_config_not_hardcoded() {
+        let g = LoginGuard::new(3);
+        for _ in 0..3 { g.record_failure("admin"); }
+        assert!(g.check("admin").is_some(), "max_attempts=3 时第 3 次失败必须退避");
+        // 判别力：若仍是硬编码 5，第 3 次失败不应触发退避（要 5 次才触发）
+        assert_eq!(g.max_attempts(), 3, "getter 必须回传入值");
     }
 
     /// **特性测试**：把「被 `check` 拦下的尝试不推进计数」这一**当前行为**钉住。
@@ -891,7 +911,7 @@ mod tests {
     /// 别只改代码让测试"绿回来"。
     #[test]
     fn blocked_attempts_do_not_advance_the_counter() {
-        let g = LoginGuard::new();
+        let g = LoginGuard::new(5);
         for _ in 0..5 { g.record_failure("admin"); }   // n = max_attempts = 5
         // 连点 30 次：每次都被拦下，但计数不动 ⇒ 退避恒为 2^0 = 1s
         for _ in 0..30 {

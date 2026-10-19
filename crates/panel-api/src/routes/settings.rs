@@ -28,8 +28,8 @@ const K_LLM_API_KEY: &str = "assistant.llm_api_key";
 const RUNTIME_KEYS: [&str; 3] = [K_LLM_ENDPOINT, K_LLM_MODEL, K_LLM_API_KEY];
 
 /// 部署级键：在 settings 表里只有死种子，实际生效值来自 config.toml/env。
-const DEPLOYMENT_KEYS: [&str; 4] =
-    ["read_only", "tier", "max_login_attempts", "session_idle_timeout"];
+const DEPLOYMENT_KEYS: [&str; 5] =
+    ["read_only", "tier", "max_login_attempts", "session_idle", "session_absolute"];
 
 #[derive(Debug, Deserialize)]
 pub struct PatchReq {
@@ -115,7 +115,10 @@ pub async fn get(
     let deployment = json!({
         "read_only": state.read_only,
         "tier": tier_str(state.tier),
-        "hint": "部署级配置：config.toml 的 [security] read_only = true，或环境变量 PANEL_READ_ONLY=1，二者任一即生效；修改后需重启面板",
+        "max_login_attempts": state.logins.max_attempts(),
+        "session_idle": fmt_dur(state.session_idle),
+        "session_absolute": fmt_dur(state.session_absolute),
+        "hint": "部署级配置：config.toml [security] 的 read_only / max_login_attempts / session_idle / session_absolute 改后重启生效（此处 PATCH 会造成『改了却不生效』的谎言，故拒绝）",
     });
 
     // reserved：种子预留，值取表内（缺省回落种子字面量），一律 wired:false
@@ -127,8 +130,6 @@ pub async fn get(
             "audit_max_rows":            table.get("audit_max_rows").cloned().unwrap_or_else(|| "50000".into()),
             "metrics_retention_1m_days": table.get("metrics_retention_1m_days").cloned().unwrap_or_else(|| "7".into()),
             "metrics_retention_1h_days": table.get("metrics_retention_1h_days").cloned().unwrap_or_else(|| "90".into()),
-            "session_idle_timeout":      table.get("session_idle_timeout").cloned().unwrap_or_else(|| "\"30m\"".into()),
-            "max_login_attempts":        table.get("max_login_attempts").cloned().unwrap_or_else(|| "5".into()),
         },
     });
 
@@ -546,6 +547,14 @@ mod tests {
         let d = err_detail(&e);
         assert!(d.contains("无法建立连接"), "分类失准：{d}");
     }
+}
+
+/// 把 Duration 渲染成 config.toml 同款 "30m"/"12h"/"90s"（deployment 段展示用）。
+fn fmt_dur(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    if s % 3600 == 0 { format!("{}h", s / 3600) }
+    else if s % 60 == 0 { format!("{}m", s / 60) }
+    else { format!("{}s", s) }
 }
 
 fn tier_str(t: panel_core::Tier) -> String {

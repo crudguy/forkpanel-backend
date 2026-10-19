@@ -49,6 +49,10 @@ pub struct AppState {
     /// 只读模式（启动期算一次）。**单一真值**：guard、设置页展示、终端入口都读它，
     /// 不要再各自去读环境变量——那正是此前 config.toml 的 `read_only` 配了不生效的原因。
     pub read_only: bool,
+    /// 会话空闲/绝对超时（来自 config.toml `[security]`）。设置页 deployment 段展示用，
+    /// 也证明这两项已接线（曾硬编码 30m/12h、配置形同虚设，与 `read_only` 同类"假控制"）。
+    pub session_idle: std::time::Duration,
+    pub session_absolute: std::time::Duration,
     /// 首启引导令牌（一次性、只存内存）。serve 首启无 owner 时生成。
     pub bootstrap: Arc<crate::auth::BootstrapGuard>,
     /// 主密钥（32 字节，内存常驻，不落库）。为 None 时所有"写入真实秘密"的操作被拒绝。
@@ -70,26 +74,28 @@ pub fn read_only_from(config_read_only: bool) -> bool {
 }
 
 impl AppState {
-    /// `session_idle` / `session_absolute` 来自 `config.toml` 的 `[security]`
-    /// （秒）。**曾硬编码 30m/12h 于此**——配置项形同虚设，用户改了毫无效果
-    /// 却以为生效（与 `read_only` 同一类"假控制"）。现由调用方解析后传入。
+    /// `session_idle` / `session_absolute` / `max_login_attempts` 均来自 `config.toml`
+    /// 的 `[security]`。**曾经三者都硬编码于此**——配置项形同虚设，用户改了毫无效果
+    /// 却以为生效（与 `read_only` 同一类"假控制"）。`session_*` 与 `max_login_attempts`
+    /// 现由调用方解析后传入 `SessionCache` / `LoginGuard`。
     pub fn new(os: Arc<dyn panel_os::OsAdapter>, db: Arc<panel_db::WriterActor>,
                pool: Arc<ReadPool>, tasks: Arc<panel_task::TaskRunner>,
                metrics: Arc<std::sync::Mutex<panel_db::aggregator::Aggregator>>,
                tier: Tier, master_key: Option<MasterKey>, read_only: bool,
+               max_login_attempts: usize,
                session_idle: std::time::Duration, session_absolute: std::time::Duration) -> Self {
         let capabilities = os.capabilities();
         // 会话持久化：把写者交给 SessionCache（`sessions` 表 001 已定义、此前无人使用）。
         // 先 clone——下方 struct 字面量会把 db move 进字段。
         let sessions_db = db.clone();
         Self {
-            os, db, pool, tasks, metrics, tier, capabilities,
+            os, db, pool, tasks, metrics, tier, capabilities, session_idle, session_absolute,
             sessions: Arc::new(crate::auth::SessionCache::new_with_db(
                 session_idle,
                 session_absolute,
                 sessions_db,
             )),
-            logins: Arc::new(crate::auth::LoginGuard::new()),
+            logins: Arc::new(crate::auth::LoginGuard::new(max_login_attempts)),
             read_only,
             bootstrap: Arc::new(crate::auth::BootstrapGuard::new()),
             master_key,

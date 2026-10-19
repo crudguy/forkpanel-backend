@@ -272,9 +272,12 @@ fn run(cli: Cli) -> Result<()> {
                     dur_or(&cfg.security.session_idle, 30 * 60));
                 let session_absolute = std::time::Duration::from_secs(
                     dur_or(&cfg.security.session_absolute, 12 * 3600));
+                // 登录最大尝试次数：config.toml 的 `[security] max_login_attempts`。
+                // 曾硬编码 5 于 LoginGuard::new()——配置项形同虚设（与 session_* 同类）。
+                let max_login_attempts = cfg.security.max_login_attempts;
                 let state = Arc::new(panel_api::AppState::new(
                     os.clone(), writer.clone(), pool, tasks.clone(), metrics.clone(), tier,
-                    master_key, read_only, session_idle, session_absolute));
+                    master_key, read_only, max_login_attempts, session_idle, session_absolute));
 
                 // ── 内部周期任务 ──
                 register_internal_jobs(&sched_in, &os, writer.clone(), metrics.clone(), &layout, &cfg, tier, state.clone()).await;
