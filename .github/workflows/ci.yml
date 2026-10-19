@@ -29,6 +29,17 @@ jobs:
           path: forkpanel-frontend
           token: ${{ secrets.FRONTEND_REPO_TOKEN }}
 
+      # CI 只跑后端逻辑测试，不需要真实前端产物；但 embed.rs 的
+      # #[folder="../../web/dist"] 在**编译期**要求目录存在（web/dist 被 gitignore，
+      # 由前端仓构建后拷入）。生成一个占位 index.html 让 cargo test 可编译。
+      # ⚠ 发布构建仍必须拷真实前端 dist（占位仅用于 CI 测试编译）。
+      - name: 生成占位 web/dist（仅 CI，供 RustEmbed 编译）
+        run: |
+          mkdir -p web/dist
+          if [ ! -f web/dist/index.html ]; then
+            printf '<!doctype html><meta charset="utf-8"><title>ForkPanel CI placeholder</title>\n' > web/dist/index.html
+          fi
+
       # 与本地 `make check` 完全一致
       - name: 门禁（make check）
         run: make check
