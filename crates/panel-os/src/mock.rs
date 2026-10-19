@@ -169,9 +169,14 @@ impl ServiceProvider for MockServices {
 
     async fn journal(&self, _n: &UnitName, q: JournalQuery) -> Result<Receiver<String>> {
         let (tx, rx) = channel(16);
-        for i in 0..q.lines.min(50) {
-            if tx.send(format!("mock log line {i}")).await.is_err() { break; }
-        }
+        let n = q.lines.min(50);
+        // 与 Linux 实现同纪律：灌入必须离开本函数——否则 >16 行时 send 阻塞而
+        // 消费者尚未开始 recv，mock 自己就会死锁（真机 bug 的镜像，别留）。
+        tokio::spawn(async move {
+            for i in 0..n {
+                if tx.send(format!("mock log line {i}")).await.is_err() { break; }
+            }
+        });
         Ok(rx)
     }
 

@@ -148,7 +148,6 @@ impl ServiceProvider for LinuxServices {
 
     async fn journal(&self, name: &UnitName, q: JournalQuery) -> Result<Receiver<String>> {
         let (tx, rx) = mpsc::channel(64);
-        let _ = &tx;
         let lines = q.lines.min(2000).to_string();
         let unit = format!("-u{}", name.as_str());
 
@@ -159,9 +158,11 @@ impl ServiceProvider for LinuxServices {
                 &[&unit, "-n", &lines, "--no-pager", "-o", "cat"],
                 CmdOpt { timeout: Duration::from_secs(5), ..Default::default() },
             ).await?;
-            for line in out.stdout.lines() {
-                if tx.send(line.to_string()).await.is_err() { break; }
-            }
+            // ⚠ 绝不能在这里同步 `tx.send`：channel 有界（64），消费者要等本函数
+            // 返回拿到 rx 后才开始 recv ⇒ 日志 >64 行时 send 永久阻塞。实测
+            // accounts-daemon 139 行、路由的 10s 兜底都轮不到，请求直接挂死。
+            // 把灌入放到独立任务：本函数立即返回 rx，边收边灌（仍有背压）。
+            pump_lines(out.stdout, tx);
             return Ok(rx);
         }
 
@@ -444,9 +445,38 @@ fn parse_is_active_state(line: &str) -> ServiceState {
     }
 }
 
+/// 把已读到的多行文本灌入有界 channel，**在独立任务里**执行，调用方立即返回。
+/// 抽成函数是为了可单测「调用方不被阻塞」这一死锁回归（见 tests）。
+fn pump_lines(text: String, tx: mpsc::Sender<String>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        for line in text.lines() {
+            if tx.send(line.to_string()).await.is_err() { break; }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 回归：`journal()` 的非 follow 分支必须把灌入放到独立任务，调用方立即返回。
+    /// 旧实现同步 `tx.send` 进容量 64 的 channel，消费者要等 `journal()` 返回后才
+    /// recv ⇒ 日志 >64 行时死锁（dev 实测 accounts-daemon 139 行，请求挂死 >20s）。
+    /// 本测试不依赖 journalctl：直接给 `pump_lines` 200 行，要求立即返回且不丢行。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pump_lines_returns_immediately_and_delivers_all() {
+        let (tx, mut rx) = mpsc::channel::<String>(64);
+        let text = (0..200).map(|i| format!("line-{i}")).collect::<Vec<_>>().join("\n");
+        // 若 pump_lines 同步灌入，这里会在 64 行处阻塞，2s 超时直接失败。
+        let handle = tokio::time::timeout(Duration::from_secs(2), async move {
+            pump_lines(text, tx)
+        }).await.expect("pump_lines 不得阻塞调用方（否则 channel 满即死锁）");
+
+        let mut n = 0;
+        while rx.recv().await.is_some() { n += 1; }
+        handle.await.expect("pump 任务不应 panic");
+        assert_eq!(n, 200, "200 行必须全部送达");
+    }
 
     #[test]
     fn parser_skips_malformed() {
