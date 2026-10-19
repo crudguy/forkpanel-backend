@@ -1,9 +1,13 @@
 //! 静态资源服务：构建期内嵌 web/dist，运行期零 Node、零外部文件。
 //!
-//! 三条纪律：
+//! 四条纪律：
 //! 1. 资源名带内容哈希 → 可安全设置长期 Cache-Control。
 //! 2. `index.html` 绝不缓存（否则升级面板后浏览器仍加载旧入口）。
 //! 3. SPA 回退只回退**非 /api** 路径，避免把 API 404 吞成 HTML（会让前端拿到 HTML 当 JSON 解析）。
+//! 4. **构建产物只保留代码**：内嵌的 `web/dist` 必须是不含注释的产物——由前端
+//!    `vite build`（`esbuild.legalComments:'none'` + `scripts/check-no-comments.mjs`）
+//!    保证。Rust 源码注释不会进入二进制，故后端侧无需额外处理；但**不要**手工
+//!    往 `web/dist` 里塞带注释的文件（否则守卫被绕过，注释会进二进制）。
 
 use axum::{
     body::Body,
