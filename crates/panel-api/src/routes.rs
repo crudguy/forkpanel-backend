@@ -212,6 +212,10 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/db/connections", get(databases::list).post(databases::create))
         .route("/api/v1/db/connections/{id}", patch(databases::update).delete(databases::delete))
         .route("/api/v1/db/{conn}/databases", get(databases::databases_of))
+        // 「库」的下一级（PG → schema；MySQL/SQLite → 空）。**必须先于** `{db}/tables` 之外
+        // 单独存在：它与「库下有哪些表」是两个不同的问题，混成一个端点就会重演
+        // 「点任何一层都掉到同一句无表」。
+        .route("/api/v1/db/{conn}/{db}/schemas", get(databases::schemas))
         .route("/api/v1/db/{conn}/{db}/tables", get(databases::tables))
         .route("/api/v1/db/{conn}/{db}/{table}/rows", get(databases::rows))
         .route("/api/v1/db/{conn}/backup", post(databases::backup))

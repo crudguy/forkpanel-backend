@@ -856,6 +856,23 @@ components:
         name: { type: string }
         rows: { type: integer }
         engine: { type: [string, "null"] }
+        kind:
+          type: string
+          enum: [table, view]
+          description: |
+            表对象种类。它区分「表」与「视图」——两者在 `tables()` 里都会被返回，
+            前端据此能说清「这个库只有视图」这类情况，而不是笼统报「无表」。
+    DbSchema:
+      type: object
+      properties:
+        name: { type: string }
+        previewable:
+          type: boolean
+          description: |
+            点进这一层能否列出可预览的对象。**这是实现能力，不是"有没有东西"**：
+            PostgreSQL 当前 `tables()` 固定读 `table_schema='public'`，
+            所以其余 schema 为 false（点进去必然为空，需在控件上直接说清）；
+            MySQL 库恒为 true；SQLite 不返回 schema 层（空数组）。
     DbRowPreview:
       type: object
       properties:
@@ -2512,6 +2529,19 @@ paths:
       tags: [db]
       parameters: [{ name: conn, in: path, required: true, schema: { type: integer } }]
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { type: string } } } } } } } }
+  /api/v1/db/{conn}/{db}/schemas:
+    get:
+      tags: [db]
+      summary: 「库」的下一级（PostgreSQL → schema；MySQL/SQLite → 空数组）
+      description: |
+        三个引擎的「库」**不是同一种东西**：MySQL 的库下一级就是表，
+        PostgreSQL 的库下还有 schema，SQLite 的「库」其实是 attach 的 catalog
+        （面板连单个文件，通常只有 main）。
+        返回空数组表示「该引擎没有比『库』更下一层」——与「这一层是空的」不是一回事。
+      parameters:
+        - { name: conn, in: path, required: true, schema: { type: integer } }
+        - { name: db, in: path, required: true, schema: { type: string } }
+      responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/DbSchema' } } } } } } } }
   /api/v1/db/{conn}/{db}/tables:
     get:
       tags: [db]

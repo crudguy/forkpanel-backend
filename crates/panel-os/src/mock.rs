@@ -434,8 +434,13 @@ impl DatabaseProvider for MockDatabases {
     async fn available(&self) -> Result<bool> { Ok(true) }
     fn supports(&self, e: DbEngine) -> bool { matches!(e, DbEngine::Sqlite) }
     async fn databases(&self, _t: &DbTarget) -> Result<Vec<String>> { Ok(vec!["panel".into()]) }
+    async fn schemas(&self, _t: &DbTarget, _db: &str) -> Result<Vec<DbNode>> {
+        // 模拟 SQLite 的真实口径：面板连的是单文件，只有 main；**没有 schema 层**，
+        // 返回空而不是造一个假 layer（造了前端就会多渲染一级菜单，与真机不一致）
+        Ok(Vec::new())
+    }
     async fn tables(&self, _t: &DbTarget) -> Result<Vec<DbTable>> {
-        Ok(vec![DbTable { name: "sites".into(), rows: 3 }])
+        Ok(vec![DbTable { name: "sites".into(), rows: 3, kind: TableKind::Table }])
     }
     async fn rows(&self, _t: &DbTarget, _table: &str, _limit: usize, _offset: usize) -> Result<DbRows> {
         Ok(DbRows {

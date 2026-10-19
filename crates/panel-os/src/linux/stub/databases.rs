@@ -179,6 +179,70 @@ impl DatabaseProvider for LinuxDatabases {
         .map_err(join_err)?
     }
 
+    async fn schemas(&self, t: &DbTarget, db: &str) -> Result<Vec<DbNode>> {
+        match t.engine {
+            // MySQL：库的下一级直接就是表（`SHOW TABLES` 已带库名），没有 schema 层。
+            // 返回空 = 「没有更下一层」，前端据此跳过这一层，不把它当成「空目录」。
+            DbEngine::MySql => Ok(Vec::new()),
+            DbEngine::Postgres => {
+                // `previewable` 的依据是**当前 tables() 的实现**：它写死 `table_schema='public'`。
+                // 所以除 public 外的 schema 点进去一定列不出东西——这必须在数据里说清楚，
+                // 而不是让用户点进去看一句「无表」。将来 tables() 支持 schema 参数时，
+                // 这里要同步改成恒 true（否则前端会继续误标「不可预览」）。
+                let lit = db.replace('\'', "''");
+                let rows = LinuxDatabases::sql_query(
+                    t,
+                    &format!(
+                        "SELECT nspname FROM pg_namespace \
+                         WHERE nspname NOT IN ('pg_catalog','information_schema') \
+                           AND nspname NOT LIKE 'pg\\_toast%' AND nspname NOT LIKE 'pg\\_temp%' \
+                         ORDER BY nspname"
+                    ),
+                )
+                .await;
+                // 查不出来（老版本 PG / 权限）时**不谎报空**：退回「只有一个 public」
+                let rows = match rows {
+                    Ok(r) => r,
+                    Err(_) => return Ok(vec![DbNode {
+                        name: "public".into(),
+                        previewable: lit == "public",
+                    }]),
+                };
+                Ok(rows
+                    .into_iter()
+                    .filter_map(|r| r.into_iter().next())
+                    .map(|n| {
+                        let previewable = n == "public";
+                        DbNode { name: n, previewable }
+                    })
+                    .collect())
+            }
+            DbEngine::Sqlite => {
+                // SQLite 没有 schema 这一级；`PRAGMA database_list` 返回的是 **catalog**
+                // （main / temp / 以及 ATTACH 进来的别名），面板连的是单个只读文件，
+                // 正常情况下就只有 main。这里如实返回它，而不是凭空造一个 schema 层。
+                let t = t.clone();
+                tokio::task::spawn_blocking(move || {
+                    let conn = LinuxDatabases::open_sqlite(&t)?;
+                    let mut st = conn.prepare("PRAGMA database_list").map_err(db_err)?;
+                    // query_map 必须绑定到 let 再 collect（否则临时迭代器晚于 st 析构 → E0597）
+                    let names: Vec<String> = st
+                        .query_map([], |r| r.get::<_, String>(1))
+                        .map_err(db_err)?
+                        .filter_map(|x| x.ok())
+                        .filter(|n| n != "temp")
+                        .collect();
+                    Ok(names
+                        .into_iter()
+                        .map(|n| DbNode { name: n, previewable: true })
+                        .collect())
+                })
+                .await
+                .map_err(join_err)?
+            }
+        }
+    }
+
     async fn tables(&self, t: &DbTarget) -> Result<Vec<DbTable>> {
         match t.engine {
             DbEngine::Sqlite => {}
@@ -199,7 +263,7 @@ impl DatabaseProvider for LinuxDatabases {
                         .and_then(|r| r.into_iter().next())
                         .and_then(|s| s.trim().parse::<i64>().ok())
                         .unwrap_or(-1); // 取不到行数诚实给 -1，不伪造成 0
-                    out.push(DbTable { name: n, rows });
+                    out.push(DbTable { name: n, rows, kind: TableKind::Table });
                 }
                 return Ok(out);
             }
@@ -223,7 +287,7 @@ impl DatabaseProvider for LinuxDatabases {
                         .and_then(|r| r.into_iter().next())
                         .and_then(|s| s.trim().parse::<i64>().ok())
                         .unwrap_or(-1);
-                    out.push(DbTable { name: n, rows });
+                    out.push(DbTable { name: n, rows, kind: TableKind::Table });
                 }
                 return Ok(out);
             }
@@ -249,7 +313,7 @@ impl DatabaseProvider for LinuxDatabases {
                 let rows: i64 = conn
                     .query_row(&format!("SELECT COUNT(*) FROM {}", quote_ident(&name)), [], |r| r.get(0))
                     .unwrap_or(-1);
-                out.push(DbTable { name, rows });
+                out.push(DbTable { name, rows, kind: TableKind::Table });
             }
             Ok(out)
         })

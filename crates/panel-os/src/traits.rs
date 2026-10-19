@@ -1325,10 +1325,48 @@ pub struct DbTarget {
 }
 
 /// 表元信息（浏览用）：表名 + 行数（估算；无法取得时为 -1）
+///
+/// `kind` 是**表对象的种类**（`table` / `view`），不是「层级」。
+/// 它存在的唯一目的：让上层能把「这一层本来就没有可预览的对象」与
+/// 「当前实现只覆盖了一部分种类」**分开说**。没有它，前端只能把两者
+/// 都笼统地写成「无表」——而后者是一句关于实现的真话被说成了关于数据的假话。
 #[derive(Debug, Clone)]
 pub struct DbTable {
     pub name: String,
     pub rows: i64,
+    pub kind: TableKind,
+}
+
+/// 表对象的种类。**刻意只有两个变体**：只登记当前实现真的会返回的种类。
+/// 多加一个没人产出的变体等于给前端一个永远为空的分支，那比不写更糟。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableKind {
+    Table,
+    View,
+}
+
+impl TableKind {
+    /// 线上表示（随 API 下发的字符串）。**唯一来源**：前端 `enumLabel` 按它取词。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TableKind::Table => "table",
+            TableKind::View => "view",
+        }
+    }
+}
+
+/// 可浏览下级对象（库 / schema）的元信息。
+///
+/// `previewable` 回答的是**实现层面**的问题：「点进这一层，能否列出可预览的对象」。
+/// 它不是权限位，也不是「这里有没有东西」——两者必须分开：
+/// - PG 的 schema 一定可以点进去（下面可能有表），只是当前实现固定读 `public`，
+///   所以非 `public` 的 schema 是 `false`；
+/// - MySQL 的库恒为 `true`（`SHOW TABLES` 本来就带上库名）。
+/// 把「能否点进去」和「下面有没有东西」混成一个布尔，就是本次要修的那类误导。
+#[derive(Debug, Clone)]
+pub struct DbNode {
+    pub name: String,
+    pub previewable: bool,
 }
 
 /// 只读数据预览（分页）。值一律**字符串化**（NULL → None），保持引擎无关，
@@ -1361,6 +1399,14 @@ pub trait DatabaseProvider: Send + Sync {
     /// 该引擎是否**已实装**（用于逐连接可用性判定与能力位；未实装返回 false 而非撒谎）
     fn supports(&self, e: DbEngine) -> bool;
     async fn databases(&self, t: &DbTarget) -> Result<Vec<String>>;
+    /// 「库」的下一级对象（MySQL 没有这一层 → 空；PG → schema；SQLite → main/temp/…）。
+    ///
+    /// 为什么需要它：此前 `databases()` 返回的名字在三引擎里**不是同一种东西**
+    /// ——MySQL 是真正的库，PG 是「库」（下面还有 schema），SQLite 是
+    /// attach 进来的 catalog（面板连的是单个文件，通常只有 `main`）。
+    /// 前端拿同一个 `库` 菜单去展示这三种东西，必然有一半点进去是空的。
+    /// 默认实现返回空，表示「这个引擎没有比『库』更下一层」，与「这一层是空的」不同。
+    async fn schemas(&self, _t: &DbTarget, _db: &str) -> Result<Vec<DbNode>> { Ok(Vec::new()) }
     /// 表列表（含行数）
     async fn tables(&self, t: &DbTarget) -> Result<Vec<DbTable>>;
     /// **只读**数据预览（分页）。`table` 由业务层校验后传入，实现内部仍须安全加引号。
@@ -1897,6 +1943,41 @@ mod tests {
         assert_eq!(normalize_log_level(None, "WARN: disk almost full"), Some("warn"));
         // 匹配不中归 None（other），**不硬塞成 info**
         assert_eq!(normalize_log_level(None, "GET /index.html 200"), None);
+    }
+
+    /// 「库的下一级」必须如实表达：**没有这一层**时返回空数组，而不是造一层出来。
+    ///
+    /// 这条守的是这次修复的核心假设：前端用 `schemas().is_empty()` 判断
+    /// 「这个引擎没有更下一层」，据此决定要不要渲染 schema 选择器。
+    /// 如果某个 provider 为了"整齐"给 SQLite / MySQL 造一个假的 schema，
+    /// 前端就会多渲染一级菜单，点进去又是一句「没有表」——正是要修的那个病。
+    ///
+    /// 用 MockDatabases 而不是 LinuxDatabases：mock 的固定样例数据就是它的职责，
+    /// 而 Linux 实现要真连 PG 才能验（本机没有），那属于 E2E 而非单测。
+    #[tokio::test]
+    async fn schemas_absence_is_empty_not_a_fake_layer() {
+        use crate::mock::MockDatabases;
+        let p = MockDatabases;
+        let t = DbTarget {
+            engine: DbEngine::Sqlite,
+            host: None, port: None, user: None, password: None, database: None,
+        };
+        let got = p.schemas(&t, "panel").await.expect("mock schemas 不应报错");
+        // 核心判据：空 = 「没有更下一层」。若有人给它塞了一个 "default"/"main" 的假层，这里变红。
+        assert!(got.is_empty(), "SQLite 没有 schema 层，必须返回空数组，实际：{got:?}");
+        // 并且 tables() 仍然可用——即「没有 schema 层」不代表「没有表」，两者不能互相推导
+        let tables = p.tables(&t).await.expect("mock tables 不应报错");
+        assert!(!tables.is_empty(), "mock 应给出样例表，否则上一条断言因数据为空而平凡通过");
+    }
+
+    /// 表种类只登记**真的会产出**的两种，且线上表示是小写稳定字符串。
+    /// 前端 `enumLabel` 按这个字符串取词，改大小写会让中文标签整片落空。
+    #[test]
+    fn table_kind_wire_representation_is_stable_lowercase() {
+        assert_eq!(TableKind::Table.as_str(), "table");
+        assert_eq!(TableKind::View.as_str(), "view");
+        // 拼写像、但值不同就是另一个种类——不允许悄悄合并
+        assert_ne!(TableKind::Table.as_str(), TableKind::View.as_str());
     }
 
     #[test]

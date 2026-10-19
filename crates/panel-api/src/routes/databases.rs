@@ -699,7 +699,34 @@ pub async fn tables(
     let engine = engine_str(t.engine);
     let list = state.os.databases().tables(&t).await?;
     let out: Vec<serde_json::Value> = list.into_iter()
-        .map(|x| serde_json::json!({ "name": x.name, "rows": x.rows, "engine": engine }))
+        .map(|x| serde_json::json!({
+            "name": x.name,
+            "rows": x.rows,
+            "engine": engine,
+            // 种类（table/view）。前端据此把「这一层没有可预览对象」与
+            // 「只有视图、当前未列入」分开说——两者的用户动作完全不同。
+            "kind": x.kind.as_str(),
+        }))
+        .collect();
+    Ok(ok(out))
+}
+
+/// 「库」的下一级（PG 是 schema；MySQL/SQLite 没有这一层 → 空数组）。
+///
+/// 为什么单独一个端点而不是塞进 databases 响应里：
+/// 每选一个库都要重查，塞进列表意味着切换库时不刷新——那正是本次要修的病
+/// （点不同的库都显示同一句「无表」）。独立端点让「选了哪个库」与
+/// 「这一层有什么」严格一一对应。
+pub async fn schemas(
+    State(state): State<Shared>, Auth(s): Auth,
+    AxPath((conn, db)): AxPath<(i64, String)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::DB_VIEW)?;
+    validate_ident(&db, "db")?;
+    let t = load_target(&state, conn, Some(&db)).await?;
+    let list = state.os.databases().schemas(&t, &db).await?;
+    let out: Vec<serde_json::Value> = list.into_iter()
+        .map(|x| serde_json::json!({ "name": x.name, "previewable": x.previewable }))
         .collect();
     Ok(ok(out))
 }
