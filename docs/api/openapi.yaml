@@ -524,6 +524,22 @@ components:
         scenes:   { type: string, description: 适用场景：什么情况下该装它 }
         entry:    { type: string, description: "使用方式 / 访问入口：面板内入口 + 面板外的真实访问方式。面板没有的入口会如实写「面板无独立页面」，不编造" }
         howto:    { type: string, description: "怎么配：到了 entry 所指的页面之后具体填什么（必填项 / 典型值 / 常见错法）。与 entry 分开——「去哪」与「填什么」是用户卡住的两个不同位置；面板内无需填写时写「无需填」，不留空" }
+        units:
+          type: array
+          items: { type: string }
+          description: |
+            该包在 systemd 上对应的服务单元名（如 nginx.service、grafana-server.service）。
+            服务详情页据此在 catalog 里反查条目，**在本页**直接展开用途/功能/场景/怎么配，
+            而不是把用户送去「软件」页再点一次「?」。
+
+            为什么必须由后端给：包名与单元名不是同一个字符串，且差异没有规律
+            （mariadb-server→mariadb.service、grafana→grafana-server.service、
+            redis→redis-server.service、php-fpm→php8.4-fpm.service）。前端若按包名拼
+            `name + '.service'` 去猜，这几条会全部落空且**没有任何报错**，用户看到的是
+            「这个服务没有软件说明」——与「这个软件本来就没说明」无法区分。
+
+            空数组表示该包没有常驻服务单元（应用运行时 nodejs/default-jdk/golang-go/cargo、
+            工具链 wireguard-tools 之类），前端据此不渲染软件说明区。
 
     # ───────────── 站点 / SSL ─────────────
     Site:

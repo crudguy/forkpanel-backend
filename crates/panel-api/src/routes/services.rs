@@ -268,7 +268,8 @@ fn validate_pkg_version(v: &str) -> ApiResult<()> {
 /// `label` 是给人看的品牌名——刻意不带版本后缀，避免把主版本焊死在展示上
 /// （例如 `apache2` 的 "2" 只是 Debian 给 Apache 2.x 打的包名后缀，真出 Apache 3 就尴尬了）。
 ///
-/// 后五个字段（summary/features/scenes/entry/howto）是**面向用户的说明**，随 `/packages`
+/// 后六个字段（summary/features/scenes/entry/howto/units）是**面向用户的说明**
+/// 及其实例锚点，随 `/packages`
 /// 的 `catalog` 一起下发，供前端软件卡片上的「说明」渲染。放在后端是为了守住
 /// 「包集合 + 包的说明只有一个事实源」：前端若另维护一份 22 条文案表，后端加包
 /// 或改能力（例如某软件的入口页被下线）时前端不会有任何编译错误，只会静默说谎。
@@ -298,6 +299,23 @@ pub(crate) struct PkgDef {
     /// 不是凭想象写）。面板没有的配置步骤不许编——与 `entry` 同一条诚实边界。
     /// 面板内纯自动的包（无表单可填）写清「无需填任何东西」，不要留空。
     pub howto: &'static str,
+    /// 该包在 systemd 上的服务单元名（`dpkg -L` 实证所得，非按包名推导）。
+    ///
+    /// 为什么要单独一个字段、为什么不能在前端按包名拼：
+    /// 包名与单元名**不是同一个字符串**，而且差异没有规律。实测：
+    /// `mariadb-server` → `mariadb.service`、`grafana` → `grafana-server.service`、
+    /// `redis`（Debian 包名 redis-server）→ `redis-server.service`、
+    /// `php-fpm` → `php8.4-fpm.service`（元包本身没有单元，单元由它 Depends 的
+    /// 具体版本包提供，版本号随发行版变）。前端若写 `name + '.service'` 去猜，
+    /// 这四条**全部匹配失败**，表现为「服务详情页查不到软件说明」——静默、无报错。
+    ///
+    /// 用途：服务详情页用当前单元名在 catalog 里反查条目，**在本页**直接展开
+    /// 用途/功能/场景/怎么配，而不是把用户送去「软件」页再点一次 `?`。
+    ///
+    /// 空数组表示「该包没有常驻服务单元」（应用运行时、纯工具链、元包），
+    /// 前端据此不渲染软件说明区——与 `entry` 写「面板无独立页面」同一条诚实边界：
+    /// 宁可没有，也不给一个反查永远落空的入口。
+    pub units: &'static [&'static str],
 }
 
 const ALLOWED_PACKAGES: &[PkgDef] = &[
@@ -308,6 +326,7 @@ const ALLOWED_PACKAGES: &[PkgDef] = &[
         scenes: "搭建网站、把 Node / PHP 应用挂到 80 / 443、单机托管多个站点。",
         entry: "「网站」页建站与改站点；「证书」菜单配 TLS；「WAF」菜单配防护规则；「服务」页看状态与日志。",
         howto: "「网站」页→新建站点：名称（小写字母/数字/连字符，如 my-site）与域名（逗号分隔，须已解析到本机）必填；根目录留空即用站点名。填完点「保存并应用」——保存即下发，站点立刻对外服务。HTTPS 要到「证书」页选中该站点签发，证书才会被写进配置。",
+        units: &["nginx.service"],
     },
     PkgDef {
         name: "caddy", label: "Caddy",
@@ -316,6 +335,7 @@ const ALLOWED_PACKAGES: &[PkgDef] = &[
         scenes: "想省掉证书申请与续期、托管轻量站点。nginx 独有的能力（Basic Auth、伪静态、TLS 套件档、WAF 限速等）在 Caddy 下不可用，界面会置灰。",
         entry: "「网站」页（探测到 Caddy 时按 Caddyfile 渲染）；「证书」菜单；「服务」页。",
         howto: "「网站」页→新建站点，字段与 nginx 完全一致（面板自动按 Caddyfile 渲染，不用手写语法）。注意 Caddy 下部分能力置灰：限速、自定义片段、加密套件档位、Basic Auth 不支持。",
+        units: &["caddy.service", "caddy-api.service"],
     },
     PkgDef {
         name: "apache2", label: "Apache",
@@ -324,6 +344,7 @@ const ALLOWED_PACKAGES: &[PkgDef] = &[
         scenes: "兼容迁移过来的既有 Apache 项目。",
         entry: "面板的站点托管目前只渲染 nginx / caddy：Apache 装好后需自行维护配置。「服务」页仍可启停、看日志、改单元配置。",
         howto: "面板不代写 Apache 配置：建站请首选 nginx / caddy。若必须用 Apache，装好后到「服务」页启停、看日志，配置文件用「文件」页或「终端」自行编辑（/etc/apache2/）。",
+        units: &["apache2.service"],
     },
     PkgDef {
         name: "mariadb-server", label: "MariaDB",
@@ -332,6 +353,7 @@ const ALLOWED_PACKAGES: &[PkgDef] = &[
         scenes: "WordPress 等传统 PHP 应用、需要 MySQL 兼容性的存量项目。",
         entry: "「数据库」页新建连接（需本机 mysql 客户端）→ 备份 / 还原 / 浏览；「服务」页看状态。",
         howto: "「数据库」页「新增连接」：名称（随意，如 myapp）、引擎选 MySQL（MariaDB 走这个选项）、主机 127.0.0.1、端口 3306、用户名 root、口令、库名（如 myapp）。用户名必填，空着按钮点不动。只做备份与还原，不提供写库入口。",
+        units: &["mariadb.service"],
     },
     PkgDef {
         name: "postgresql", label: "PostgreSQL",
@@ -340,6 +362,7 @@ const ALLOWED_PACKAGES: &[PkgDef] = &[
         scenes: "新项目起步、需要复杂查询与严格事务语义。",
         entry: "「数据库」页新建连接（需本机 psql 客户端，账号必填）；「服务」页看状态。",
         howto: "「数据库」页「新增连接」：名称随意、引擎选 PostgreSQL、主机 127.0.0.1、端口 5432、用户名 postgres、口令、库名（如 myapp）。用户名必填。客户端装上只代表本机有 psql，不代表一定连得上目标库。",
+        units: &["postgresql.service"],
     },
     PkgDef {
         name: "redis", label: "Redis",
@@ -348,6 +371,7 @@ const ALLOWED_PACKAGES: &[PkgDef] = &[
         scenes: "加速读多写少的应用、跨进程共享状态。",
         entry: "面板无独立页面；应用连 127.0.0.1:6379（默认端口，以你的配置为准）；「服务」页看状态 / 日志 / 配置。",
         howto: "无需在面板里填连接：应用连 127.0.0.1:6379。要改端口/密码用「文件」页编辑/etc/redis/redis.conf，改完到「服务」页重启 redis-server。",
+        units: &["redis-server.service"],
     },
     PkgDef {
         name: "memcached", label: "Memcached",
@@ -356,6 +380,7 @@ const ALLOWED_PACKAGES: &[PkgDef] = &[
         scenes: "减轻数据库读压力，可接受缓存丢失。",
         entry: "面板无独立页面；应用连 127.0.0.1:11211（默认端口）；「服务」页看状态与日志。",
         howto: "无需填连接：应用连 127.0.0.1:11211。要调内存上限改 /etc/memcached.conf 后到「服务」页重启。",
+        units: &["memcached.service"],
     },
     // 只保留元包 php-fpm：它 Depends 当前发行版的默认 phpX.Y-fpm，任何一代
     // Debian/Ubuntu 上都必然可装。此前写死 php8.1/8.2/8.3-fpm 是想覆盖多发行版，
@@ -368,6 +393,7 @@ const ALLOWED_PACKAGES: &[PkgDef] = &[
         scenes: "PHP 建站（WordPress、ThinkPHP 等）。",
         entry: "「网站」页新建站点时选 PHP 运行方式；「服务」页看 php-fpm 状态与日志。",
         howto: "「网站」页建站时类型选「PHP (php-fpm)」，php-fpm 一栏填 unix:/run/php/php8.2-fpm.sock（版本号按已装的改）或 127.0.0.1:9000。路径写错站点会 502，不会给出更明确的提示。",
+        units: &["php8.4-fpm.service"],
     },
     PkgDef {
         name: "certbot", label: "Certbot",
@@ -376,6 +402,7 @@ const ALLOWED_PACKAGES: &[PkgDef] = &[
         scenes: "公网站点启用 HTTPS。",
         entry: "「证书」页签发 / 续期（依赖 ssl.acme 能力位）；「网站」页给站点绑定证书。",
         howto: "「证书」页→申请：先选站点，方式选「ACME http-01」，再填邮箱（ACME 注册用，如 ops@example.com）。用户名的域名必须公网 80 端口可达，否则签不下来。仅内网用请选「面板自签」。",
+        units: &["certbot.service", "certbot.timer"],
     },
     PkgDef {
         name: "fail2ban", label: "Fail2ban",
@@ -384,6 +411,7 @@ const ALLOWED_PACKAGES: &[PkgDef] = &[
         scenes: "公网 SSH 或面板登录防护。",
         entry: "「安全」菜单的防火墙规则页（fail2ban 区；nftables 后端下恒不支持）；「服务」页看状态。",
         howto: "面板不提供 fail2ban 的 jail 表单：规则请用「文件」页编辑 /etc/fail2ban/jail.local。nftables 后端下该能力位恒不支持，别在面板里找开关。",
+        units: &["fail2ban.service"],
     },
     PkgDef {
         name: "ufw", label: "UFW",
@@ -392,6 +420,7 @@ const ALLOWED_PACKAGES: &[PkgDef] = &[
         scenes: "基础主机防护，替代手写 iptables 规则。",
         entry: "「安全」菜单的防火墙规则页（后端按 nft / iptables / ufw / firewalld 实际探测适配）；「服务」页看状态。",
         howto: "「安全」菜单→防火墙规则：端口填 80,443 或区间 8000-8100，来源留空即 0.0.0.0/0（也可填 10.0.0.0/24），备注随便写便于日后辨认。只支持放行，不支持封禁。",
+        units: &["ufw.service"],
     },
     PkgDef {
         name: "minio", label: "MinIO",
@@ -400,6 +429,7 @@ const ALLOWED_PACKAGES: &[PkgDef] = &[
         scenes: "应用存图片 / 附件 / 备份，且希望用 S3 SDK 直连。",
         entry: "自带 Console（默认 :9001，S3 API 默认 :9000）——需先配好第三方源才能安装；「服务」页看状态。",
         howto: "装完先配第三方源，再用它自带 Console（默认 :9001，S3 API 走 :9000）建 bucket 与访问密钥。面板内没有对象存储页面，配好源后到「服务」页看状态。",
+        units: &[],
     },
     PkgDef {
         name: "valkey-server", label: "Valkey",
@@ -408,6 +438,7 @@ const ALLOWED_PACKAGES: &[PkgDef] = &[
         scenes: "Redis 变更许可证后的替代选择，客户端无需改动。",
         entry: "与 Redis 相同（面板无独立页面，应用连默认端口）；注意服务名是 valkey-server。",
         howto: "无需填连接：应用连 127.0.0.1:6379（与 Redis 同端口，二选一装）。配置文件在/etc/valkey/，改名后到「服务」页重启。",
+        units: &["valkey-server.service"],
     },
     PkgDef {
         name: "prometheus", label: "Prometheus",
@@ -416,6 +447,7 @@ const ALLOWED_PACKAGES: &[PkgDef] = &[
         scenes: "自建监控体系、需要长期留存历史指标。",
         entry: "面板无独立页面（「概览」的主机监控是内置采集，不依赖它）；用它自己的 Web UI（默认 :9090）看指标与告警。",
         howto: "无需在面板里配：面板的主机监控是内置采集，不读 Prometheus。要用它就到http://<本机>:9090 打开它自己的 Web UI，抓取目标写在 /etc/prometheus/prometheus.yml。",
+        units: &["prometheus.service"],
     },
     PkgDef {
         name: "grafana", label: "Grafana",
@@ -424,6 +456,7 @@ const ALLOWED_PACKAGES: &[PkgDef] = &[
         scenes: "接 Prometheus 等数据源做展示与看板。",
         entry: "面板无独立页面，也不内嵌 Grafana 面板；用它自己的 Web UI（默认 :3000）建仪表盘与配告警。",
         howto: "面板不内嵌 Grafana：装好后浏览器开 http://<本机>:3000，首次登录 admin/admin（会强制改密），数据源与仪表盘都在它自己的界面里配。",
+        units: &["grafana-server.service"],
     },
     PkgDef {
         name: "netdata", label: "Netdata",
@@ -432,6 +465,7 @@ const ALLOWED_PACKAGES: &[PkgDef] = &[
         scenes: "单机快速排障、看瞬时毛刺。",
         entry: "面板无独立页面（「概览」的主机监控为内置实现）；用它自己的 Web UI（默认 :19999）看秒级图表。",
         howto: "面板不内嵌 Netdata：装好后开 http://<本机>:19999 看秒级图表。要调告警编辑/etc/netdata/health.d/ 下的文件。",
+        units: &["netdata.service"],
     },
     PkgDef {
         name: "haproxy", label: "HAProxy",
@@ -440,6 +474,7 @@ const ALLOWED_PACKAGES: &[PkgDef] = &[
         scenes: "多个后端实例之间分流、需要比 Web 服务器更强的转发控制。",
         entry: "面板无独立页面；「服务」页改配置 / 看日志，或走「文件」「终端」。",
         howto: "面板不代写 HAProxy 配置：用「文件」页编辑 /etc/haproxy/haproxy.cfg（frontend / backend / server 三段），保存后到「服务」页重启 haproxy。只想给 Web 站点做反代与负载均衡，直接用「网站」页的「反向代理」类型更省事。",
+        units: &["haproxy.service"],
     },
     PkgDef {
         name: "nodejs", label: "Node.js",
@@ -448,6 +483,7 @@ const ALLOWED_PACKAGES: &[PkgDef] = &[
         scenes: "Node / NestJS / Next.js 等应用，或需要前端构建环境。",
         entry: "「应用」页选 Node.js 运行时（systemd 托管 + 自动反代）；未安装时应用页会提示到「软件」页装。",
         howto: "「应用」页新建：名称（如 my-blog）、运行时选 Node.js、工作目录填绝对路径且须已存在（如 /opt/blog，可用「浏览…」选）、启动命令填 node server.js --port 3000（程序名或绝对路径均可）、监听端口 3000、域名填 blog.example.com。运行用户留空则自动建 site-<应用名>。没装 Node 时页面会提示去「软件」页装。",
+        units: &[],
     },
     PkgDef {
         name: "default-jdk", label: "OpenJDK",
@@ -456,6 +492,7 @@ const ALLOWED_PACKAGES: &[PkgDef] = &[
         scenes: "Spring Boot 等 Java 应用、Jar 包部署。",
         entry: "「应用」页选 Java 运行时；或「终端」「文件」自行部署。",
         howto: "「应用」页新建：运行时选 Java，工作目录填 jar 所在目录（须已存在），启动命令写 java -jar app.jar，端口填应用实际监听的那个。缺 JVM 时在「软件」页装。",
+        units: &[],
     },
     // Go / Rust 是元包：`golang-go` → 当前发行版的 golang-1.XX-go；`cargo` Depends
     // `rustc`（实测 apt-cache depends），装一个包即得完整工具链。二者与上面的
@@ -467,6 +504,7 @@ const ALLOWED_PACKAGES: &[PkgDef] = &[
         scenes: "部署编译为单文件的 Go 二进制服务。",
         entry: "「应用」页选 Go 运行时；或「终端」「文件」自行编译部署。",
         howto: "「应用」页新建：运行时选 Go，工作目录填二进制所在目录，启动命令填二进制路径（如 /opt/app/server）。Go 只在构建时需要，机器上没装 Go 也能跑已编译好的二进制。",
+        units: &[],
     },
     PkgDef {
         name: "cargo", label: "Rust",
@@ -475,6 +513,7 @@ const ALLOWED_PACKAGES: &[PkgDef] = &[
         scenes: "编译并部署 Rust 服务。",
         entry: "「应用」页选 Rust 运行时；或「终端」「文件」自行编译部署。",
         howto: "「应用」页新建：运行时选 Rust，工作目录填二进制所在目录，启动命令填cargo run --release 或直接 /opt/app/target/release/app。运行不依赖 Rust 工具链。",
+        units: &[],
     },
     PkgDef {
         name: "wireguard-tools", label: "WireGuard",
@@ -483,6 +522,7 @@ const ALLOWED_PACKAGES: &[PkgDef] = &[
         scenes: "远程接入内网、在多台主机之间建立私有网络。",
         entry: "面板无独立页面；用「文件」或「终端」编辑 /etc/wireguard/*.conf；「服务」页看 wg-quick@ 单元状态。",
         howto: "面板不代写 WireGuard 配置：用「文件」页或「终端」编辑 /etc/wireguard/wg0.conf（私钥、Address、对端 PublicKey/Endpoint/AllowedIPs），再到「服务」页启停 wg-quick@wg0。",
+        units: &["wg-quick@.service"],
     },
 ];
 
@@ -951,6 +991,10 @@ pub async fn packages_list(
             "scenes": d.scenes,
             "entry": d.entry,
             "howto": d.howto,
+            // 服务单元名（可能多条）：服务详情页据此反查，在本页直接展开软件说明。
+            // 必须由后端给——包名与单元名不是同一字符串（mariadb-server→mariadb、
+            // grafana→grafana-server、php-fpm→php8.4-fpm），前端按包名拼一定落空。
+            "units": d.units,
         }))
         .collect();
     Ok(ok(serde_json::json!({ "packages": items, "catalog": catalog })))
@@ -1302,8 +1346,7 @@ mod tests {
         assert_eq!(SYNC_LIMIT.as_secs(), 2);
     }
 
-    /// 每个白名单条目都必须带齐五项说明，且不能是占位空串。
-    ///
+    /// 每个白名单条目都必须带齐五项说明，且不能是占位空串。    ///
     /// 为什么值得一条测试：这五项会原样进 `catalog`，前端软件卡片的「说明」直接渲染它。
     /// 加新包时忘了填字段 **不会编译报错**（`&'static str` 有默认空串的诱惑），
     /// 用户看到的是「点开说明，几个标签下面全是空白」——比不提供说明更糟。
@@ -1437,5 +1480,70 @@ mod tests {
                 panic!("{} 与 {prev} 的 howto 完全相同（复制粘贴未改内容）：{}", d.name, d.howto);
             }
         }
+    }
+
+    /// `units` 必须**真的能反查到条目**，且不能出现两个包抢同一个单元名。
+    ///
+    /// 为什么值得一条测试：`units` 是服务详情页的反查键。填错一个字符（`mariadb-service`
+    /// 写成 `mariadb-server.service`、`grafana.server` 少个横线）不会编译报错、不会运行报错，
+    /// 用户在服务详情页看到的就是「这个服务没有软件说明」——与「这个软件本来就没说明」
+    /// 长得一模一样，无从区分。这类**静默落空**必须由测试挡住。
+    ///
+    /// 三条判据：
+    /// 1. 每条都形如 `xxx.service` / `xxx.timer` / `xxx@.service`（后缀是 systemd 认识的
+    ///    四种之一），且只含小写字母、数字、`.` `-` `@` `_`——大写或空格在 systemd 里
+    ///    是非法单元名，这种值反查永远不命中。
+    /// 2. **同一单元名不得挂在两个包上**：否则 `Map` 反查会静默取到其中一个，用户看到的
+    ///    说明可能属于另一个软件（`caddy` 与假想中的 `caddy-api` 包就是这种风险）。
+    /// 3. 同一包内不得重复登记同一单元（`&["nginx.service", "nginx.service"]`）。
+    ///
+    /// 另有一条**活性**判据：至少要有 10 个包登记了单元。若有人为了过测试把 22 条全清成
+    /// `&[]`，上面三条都会平凡通过（空集合上没有违规项）——这正是「恒绿守卫」的典型形态，
+    /// 必须显式钉住下界。
+    #[test]
+    fn pkg_units_are_real_systemd_unit_names_and_unique() {
+        const UNIT_SUFFIXES: &[&str] = &[".service", ".socket", ".timer", ".target"];
+        assert!(!ALLOWED_PACKAGES.is_empty(), "白名单为空：测试前提不成立");
+
+        let mut seen: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        let mut with_units = 0usize;
+        for d in ALLOWED_PACKAGES {
+            if !d.units.is_empty() { with_units += 1; }
+            for u in d.units {
+                assert!(!u.is_empty(), "{} 的 units 里有空串（空串 = 反查恒不命中）", d.name);
+                assert!(
+                    UNIT_SUFFIXES.iter().any(|s| u.ends_with(s)),
+                    "{} 的单元名 {u} 不以已知 systemd 单元后缀结尾（不会出现在服务列表里）",
+                    d.name
+                );
+                assert!(
+                    u.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()
+                        || matches!(c, '.' | '-' | '@' | '_')),
+                    "{} 的单元名 {u} 含非法字符（systemd 单元名只用小写字母/数字/. - @ _）",
+                    d.name
+                );
+                assert!(
+                    !u.starts_with('.') && !u.contains(".."),
+                    "{} 的单元名 {u} 形如隐藏文件或含连续点",
+                    d.name
+                );
+                if let Some(prev) = seen.insert(u, d.name) {
+                    panic!("单元名 {u} 同时登记在 {prev} 与 {} 上：详情页反查会静默取到其中一个，\
+                            用户可能看到另一个软件的说明", d.name);
+                }
+            }
+            // 同一包内自查重复（上面的全局表已覆盖，这里留一条更明确的报错文案）
+            let mut local: Vec<&str> = Vec::new();
+            for u in d.units {
+                assert!(!local.contains(u), "{} 的 units 里 {u} 重复登记", d.name);
+                local.push(u);
+            }
+        }
+        // 活性下界：22 条里至少 10 条真的有常驻单元（实测 15 条有，5 条是运行时/工具链）。
+        assert!(
+            with_units >= 10,
+            "只有 {with_units} 个包登记了服务单元（实测应有 ≥10）；\
+             若确实是白名单整体改成无单元包，请同步更新这条下界与前端说明"
+        );
     }
 }

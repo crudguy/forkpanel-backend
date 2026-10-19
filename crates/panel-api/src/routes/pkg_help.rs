@@ -1,4 +1,4 @@
-//! 白名单软件包的**面向用户的说明**（用途 / 功能 / 场景 / 入口 / 怎么配）。
+//! 白名单软件包的**面向用户的说明**（用途 / 功能 / 场景 / 入口 / 怎么配 / 服务单元）。
 //!
 //! 为什么放在后端而不是前端常量表：
 //! 包集合的单一事实源是 `services::ALLOWED_PACKAGES`，前端只消费 `/packages` 下发的
@@ -21,6 +21,12 @@
 //!   是因为「去哪」和「填什么」是用户卡住的两个不同位置，混成一段就读不出重点。
 //!   写的字段名必须与前端表单里真实存在的输入对得上；面板内无需填写时写「无需填」，
 //!   不许留空（留空会被下一条测试挡住）。
+//! - **服务单元 `units`** 不是文案而是锚点：包名与 systemd 单元名不是同一个字符串
+//!   （`mariadb-server`→`mariadb.service`、`grafana`→`grafana-server.service`、
+//!   `php-fpm`→`php8.4-fpm.service`），前端按包名拼单元名**必然落空且无任何报错**。
+//!   服务详情页因此拿当前单元名在这里反查，在本页直接展开用途/功能/场景/怎么配，
+//!   而不是把用户送去「软件」页再点一次 `?`。空数组 = 该包没有常驻服务单元
+//!   （应用运行时、工具链、元包），前端据此不渲染说明区。
 //!
 //! 端口均为各软件默认值，文案里显式说明"以你的配置为准"（见前端统一脚注）。
 
@@ -35,6 +41,9 @@ pub(super) struct PkgHelp {
     pub scenes: &'static str,
     pub entry: &'static str,
     pub howto: &'static str,
+    /// 该包在 systemd 上的服务单元名（空 = 无常驻服务单元）。
+    /// 服务详情页用当前单元名在 catalog 里反查条目，在本页直接展开说明。
+    pub units: &'static [&'static str],
 }
 
 /// 从白名单条目投影出说明（顺序与 `ALLOWED_PACKAGES` 一致，不另排序）。
@@ -49,5 +58,6 @@ pub(super) fn projection<'a>(
         scenes: d.scenes,
         entry: d.entry,
         howto: d.howto,
+        units: d.units,
     })
 }

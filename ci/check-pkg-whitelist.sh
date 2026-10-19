@@ -57,8 +57,14 @@ done
 pass "后端 $BE_SRC / 前端 $FE_SRC 均存在"
 
 # ── 抽取后端白名单：const ALLOWED_PACKAGES ... ]; 之间的字符串 ──
+# 只取 `name:` 行上的名字，**不能**对整个块无差别抓字符串：
+# `PkgDef` 里还有 `units: &["nginx.service"]` 这类系统单元名，它们同样是
+# 小写 + 点号，会被同一条正则抓进来，于是每个包都变成「后端允许但前端无入口」，
+# 门禁直接误报 18 条（本轮实际踩到）。判据必须锚在**包名字段**上，而不是
+# "看起来像包名的字符串"——单元名不是包名，两者格式完全重叠，只能靠位置区分。
 BE=$(awk '/^const ALLOWED_PACKAGES/,/^\];/' "$BE_SRC" 2>/dev/null \
-  | grep -oE '"[a-z0-9][a-z0-9.+-]*"' | tr -d '"' | sort -u)
+  | grep -oE 'name: "[a-z0-9][a-z0-9.+-]*"' | grep -oE '"[a-z0-9][a-z0-9.+-]*"' \
+  | tr -d '"' | sort -u)
 
 # ── 抽取前端 CATEGORIES 的 pkgs 并集 ──
 # 只取 pkgs 数组，避免把 key/label 的中文标签也算进来
