@@ -258,8 +258,23 @@ fn run(cli: Cli) -> Result<()> {
                 // 只读模式：config 基线 **或** 环境变量（`read_only_from` 把两条路径合成
                 // 一个 bool，之后 guard / 设置页 / 终端入口都只认 AppState.read_only）。
                 let read_only = panel_api::read_only_from(cfg.security.read_only);
+                // 会话超时：config.toml 的 `[security]` session_idle / session_absolute。
+                // 解析失败（配了 "30分钟" 这种）**不让服务起不来**——回落到默认值并
+                // 打一条醒目的警告，而不是静默用默认值（静默 = 用户以为配生效了）。
+                let dur_or = |v: &str, dflt: u64| match crate::config::parse_duration(v) {
+                    Ok(d) => d.as_secs(),
+                    Err(e) => {
+                        eprintln!("[panel] ⚠ [security] {v:?} 解析失败（{e}），回落到 {dflt}s");
+                        dflt
+                    }
+                };
+                let session_idle = std::time::Duration::from_secs(
+                    dur_or(&cfg.security.session_idle, 30 * 60));
+                let session_absolute = std::time::Duration::from_secs(
+                    dur_or(&cfg.security.session_absolute, 12 * 3600));
                 let state = Arc::new(panel_api::AppState::new(
-                    os.clone(), writer.clone(), pool, tasks.clone(), metrics.clone(), tier, master_key, read_only));
+                    os.clone(), writer.clone(), pool, tasks.clone(), metrics.clone(), tier,
+                    master_key, read_only, session_idle, session_absolute));
 
                 // ── 内部周期任务 ──
                 register_internal_jobs(&sched_in, &os, writer.clone(), metrics.clone(), &layout, &cfg, tier, state.clone()).await;

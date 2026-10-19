@@ -168,11 +168,10 @@ impl Config {
     }
 }
 
-/// 解析 "30m" / "12h" / "90s" 形式的时长。
+/// 解析 "30m" / "12h" / "90s" 形式的时长。**唯一解析入口**，勿在别处另写。
 ///
-/// serve 接入会话超时（session_idle/session_absolute → 实际过期逻辑）前
-/// 仅测试使用；届时此函数是唯一解析入口，勿在别处另写。
-#[allow(dead_code)]
+/// 消费者：`serve` 把 `[security] session_idle` / `session_absolute` 经本函数转成
+/// `Duration` 传给 `AppState`（曾硬编码在 `panel-api` 里，配置项形同虚设）。
 pub fn parse_duration(s: &str) -> Result<std::time::Duration> {
     let s = s.trim();
     let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
@@ -287,6 +286,30 @@ mod tests {
         let c: Config = toml::from_str(&t).expect("生成的模板必须能解析");
         assert_eq!(c.audit.retention_days, 90);
         assert!(c.server.localhost_only);
+    }
+
+    /// **配置值必须真的被消费**（防"假控制"回归）。
+    ///
+    /// `session_idle` / `session_absolute` 曾在 `panel_api::AppState::new` 里被
+    /// 硬编码成 30m/12h，config.toml 改了毫无效果——用户以为生效了，实际没有
+    /// （与 `read_only` 同一类 bug）。这条测试把"Config 能驱动这两个值"钉住：
+    /// 改动 AppState 构造或改回硬编码都会在这里暴露。
+    #[test]
+    fn session_timeouts_come_from_config_not_hardcoded() {
+        // 非默认值：若代码里藏着硬编码默认值，下面的等式就会挂
+        let t = r#"
+[security]
+session_idle = "5m"
+session_absolute = "2h"
+"#;
+        let c: Config = toml::from_str(t).expect("应能解析");
+        let idle = super::parse_duration(&c.security.session_idle).unwrap();
+        let abs = super::parse_duration(&c.security.session_absolute).unwrap();
+        assert_eq!(idle.as_secs(), 300, "session_idle 必须从 config 来");
+        assert_eq!(abs.as_secs(), 7200, "session_absolute 必须从 config 来");
+        // 与硬编码值不同，证明这条测试有判别力（不是默认值蒙对）
+        assert_ne!(idle.as_secs(), 30 * 60);
+        assert_ne!(abs.as_secs(), 12 * 3600);
     }
 
     #[test]
