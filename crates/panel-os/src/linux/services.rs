@@ -155,7 +155,8 @@ impl ServiceProvider for LinuxServices {
             // 一次性读取（无 journald 时回退：读取 /var/log 下的对应文件由 LogProvider 负责）
             let out = cmd::run(
                 Bin::Journalctl,
-                &[&unit, "-n", &lines, "--no-pager", "-o", "cat"],
+                // `short-iso` 带 ISO8601 时间（`-o cat` 只有消息，日志看不出何时发生）。
+                &[&unit, "-n", &lines, "--no-pager", "-o", "short-iso"],
                 CmdOpt { timeout: Duration::from_secs(5), ..Default::default() },
             ).await?;
             // ⚠ 绝不能在这里同步 `tx.send`：channel 有界（64），消费者要等本函数
@@ -167,7 +168,7 @@ impl ServiceProvider for LinuxServices {
         }
 
         // follow 模式：走 cmd 唯一出口的流式变体（禁止在此处直接 spawn）
-        let args = [unit.as_str(), "-n", lines.as_str(), "-f", "--no-pager", "-o", "cat"];
+        let args = [unit.as_str(), "-n", lines.as_str(), "-f", "--no-pager", "-o", "short-iso"];
         return cmd::spawn_stream(Bin::Journalctl, &args, 64);
     }
 
