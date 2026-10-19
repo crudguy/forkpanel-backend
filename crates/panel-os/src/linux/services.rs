@@ -7,6 +7,7 @@
 
 use crate::{
     cmd::{self, Bin, CmdOpt},
+    linux::stub::parse_journal_json,
     traits::{
         JournalQuery, ServiceConfig, ServiceFilter, ServiceProvider, ServiceState, ServiceUnit,
     },
@@ -155,21 +156,40 @@ impl ServiceProvider for LinuxServices {
             // 一次性读取（无 journald 时回退：读取 /var/log 下的对应文件由 LogProvider 负责）
             let out = cmd::run(
                 Bin::Journalctl,
-                // `short-iso` 带 ISO8601 时间（`-o cat` 只有消息，日志看不出何时发生）。
-                &[&unit, "-n", &lines, "--no-pager", "-o", "short-iso"],
-                CmdOpt { timeout: Duration::from_secs(5), ..Default::default() },
+                // `-o json` 取结构化字段，再统一格式化成 `YYYY-MM-DD HH:MM:SS 消息`
+                // （`-o cat` 只有消息、丢时间；`short-iso` 带主机名/单元名前缀太杂）。
+                &[&unit, "-n", &lines, "--no-pager", "-o", "json"],
+                CmdOpt {
+                    timeout: Duration::from_secs(5),
+                    // JSON 每行比裸消息大数倍，2000 行可能 >1MB；放大上限避免
+                    // collect 从头累积时把**最新**的日志截掉。
+                    max_output: 4 * 1024 * 1024,
+                    ..Default::default()
+                },
             ).await?;
             // ⚠ 绝不能在这里同步 `tx.send`：channel 有界（64），消费者要等本函数
             // 返回拿到 rx 后才开始 recv ⇒ 日志 >64 行时 send 永久阻塞。实测
             // accounts-daemon 139 行、路由的 10s 兜底都轮不到，请求直接挂死。
             // 把灌入放到独立任务：本函数立即返回 rx，边收边灌（仍有背压）。
-            pump_lines(out.stdout, tx);
+            let formatted: Vec<String> =
+                out.stdout.lines().filter_map(format_journal_line).collect();
+            pump_lines(formatted, tx);
             return Ok(rx);
         }
 
-        // follow 模式：走 cmd 唯一出口的流式变体（禁止在此处直接 spawn）
-        let args = [unit.as_str(), "-n", lines.as_str(), "-f", "--no-pager", "-o", "short-iso"];
-        return cmd::spawn_stream(Bin::Journalctl, &args, 64);
+        // follow 模式：走 cmd 唯一出口的流式变体（禁止在此处直接 spawn）。
+        // 原始行是 journalctl 的 JSON，逐行转成 `YYYY-MM-DD HH:MM:SS 消息`再推给前端。
+        let args = [unit.as_str(), "-n", lines.as_str(), "-f", "--no-pager", "-o", "json"];
+        let mut raw = cmd::spawn_stream(Bin::Journalctl, &args, 64)?;
+        let (ftx, frx) = mpsc::channel(64);
+        tokio::spawn(async move {
+            while let Some(line) = raw.recv().await {
+                if let Some(f) = format_journal_line(&line) {
+                    if ftx.send(f).await.is_err() { break; }
+                }
+            }
+        });
+        return Ok(frx);
     }
 
     async fn config_read(&self, name: &UnitName, target: crate::traits::ConfigTarget) -> Result<ServiceConfig> {
@@ -446,14 +466,50 @@ fn parse_is_active_state(line: &str) -> ServiceState {
     }
 }
 
-/// 把已读到的多行文本灌入有界 channel，**在独立任务里**执行，调用方立即返回。
+/// 把已格式化的日志行灌入有界 channel，**在独立任务里**执行，调用方立即返回。
 /// 抽成函数是为了可单测「调用方不被阻塞」这一死锁回归（见 tests）。
-fn pump_lines(text: String, tx: mpsc::Sender<String>) -> tokio::task::JoinHandle<()> {
+fn pump_lines(lines: Vec<String>, tx: mpsc::Sender<String>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        for line in text.lines() {
-            if tx.send(line.to_string()).await.is_err() { break; }
+        for line in lines {
+            if tx.send(line).await.is_err() { break; }
         }
     })
+}
+
+/// `journalctl -o json` 的单行 → `YYYY-MM-DD HH:MM:SS 消息`（本地时区）。
+/// 非 JSON 行（`-- Boot ... --` 分隔符）原样保留；解析失败且不像分隔符则丢弃。
+fn format_journal_line(raw: &str) -> Option<String> {
+    match parse_journal_json(raw) {
+        Some(l) => Some(match l.ts_unix {
+            Some(secs) => format!("{} {}", format_local_ts(secs), l.text),
+            // 极少数缺 __REALTIME_TIMESTAMP 的条目：只给消息，不伪造时间
+            None => l.text,
+        }),
+        None if raw.starts_with("-- ") => Some(raw.to_string()),
+        None => None,
+    }
+}
+
+/// epoch 秒 → 本地时区 `YYYY-MM-DD HH:MM:SS`。
+/// 用 libc `localtime_r`（libc 已是本 crate 直接依赖），不引入 chrono/time 新依赖
+/// （直接依赖预算 38/38 已满）。转换失败给占位符，绝不 panic。
+fn format_local_ts(secs: i64) -> String {
+    let t: libc::time_t = secs as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: localtime_r 只写我们提供的 tm；t 为合法 time_t。
+    let ok = unsafe { !libc::localtime_r(&t, &mut tm).is_null() };
+    if !ok {
+        return "????-??-?? ??:??:??".to_string();
+    }
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    )
 }
 
 #[cfg(test)]
@@ -467,16 +523,39 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pump_lines_returns_immediately_and_delivers_all() {
         let (tx, mut rx) = mpsc::channel::<String>(64);
-        let text = (0..200).map(|i| format!("line-{i}")).collect::<Vec<_>>().join("\n");
+        let lines: Vec<String> = (0..200).map(|i| format!("line-{i}")).collect();
         // 若 pump_lines 同步灌入，这里会在 64 行处阻塞，2s 超时直接失败。
         let handle = tokio::time::timeout(Duration::from_secs(2), async move {
-            pump_lines(text, tx)
+            pump_lines(lines, tx)
         }).await.expect("pump_lines 不得阻塞调用方（否则 channel 满即死锁）");
 
         let mut n = 0;
         while rx.recv().await.is_some() { n += 1; }
         handle.await.expect("pump 任务不应 panic");
         assert_eq!(n, 200, "200 行必须全部送达");
+    }
+
+    /// `-o json` → `YYYY-MM-DD HH:MM:SS 消息`（时间部分只验形状，具体值依赖本地时区）。
+    #[test]
+    fn journal_json_is_formatted_with_local_timestamp() {
+        let raw = r#"{"__REALTIME_TIMESTAMP":"1700000000000000","MESSAGE":"hello world"}"#;
+        let got = format_journal_line(raw).expect("应能格式化");
+        let b = got.as_bytes();
+        assert!(b.len() > 20, "过短：{got}");
+        assert_eq!(&got[4..5], "-"); assert_eq!(&got[7..8], "-");
+        assert_eq!(&got[10..11], " ");
+        assert_eq!(&got[13..14], ":"); assert_eq!(&got[16..17], ":");
+        assert_eq!(&got[19..20], " ", "时间与消息之间应有空格：{got}");
+        assert_eq!(&got[20..], "hello world");
+        assert!(got.starts_with("20"), "年份应合理：{got}");
+
+        // 缺时间戳：只给消息，不伪造时间
+        let raw = r#"{"MESSAGE":"no ts"}"#;
+        assert_eq!(format_journal_line(raw).as_deref(), Some("no ts"));
+
+        // boot 分隔符原样保留；坏 JSON 丢弃
+        assert_eq!(format_journal_line("-- Boot abc --").as_deref(), Some("-- Boot abc --"));
+        assert!(format_journal_line("{not json").is_none());
     }
 
     #[test]

@@ -116,7 +116,7 @@ pub(super) fn prio_name(p: &str) -> String {
 }
 
 /// 解析 `journalctl -o json` 的单行。
-pub(super) fn parse_journal_json(line: &str) -> Option<LogLine> {
+pub(crate) fn parse_journal_json(line: &str) -> Option<LogLine> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     let text = match v.get("MESSAGE") {
         Some(serde_json::Value::String(s)) => s.clone(),

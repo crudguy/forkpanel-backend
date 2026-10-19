@@ -52,8 +52,8 @@ async fn journal_non_follow_returns_and_drains_within_timeout() {
             // 格式钉死：`-o short-iso` 的日志行以 `YYYY-MM-DDTHH:MM:SS` 开头。
             // 曾经用 `-o cat`（只有消息），用户看不出日志发生于何时；改回去这里会红。
             assert!(
-                lines.iter().any(|l| looks_like_iso(l)),
-                "服务日志必须带 ISO8601 时间（-o short-iso），实际首行：{:?}",
+                lines.iter().any(|l| looks_like_ts(l)),
+                "服务日志必须格式化为 `YYYY-MM-DD HH:MM:SS 消息`，实际首行：{:?}",
                 lines.first()
             );
             exercised = true;
@@ -73,8 +73,13 @@ async fn journal_non_follow_returns_and_drains_within_timeout() {
     }
 }
 
-/// `journalctl -o short-iso` 的行首形如 `2026-10-19T09:25:51+08:00 ...`。
-fn looks_like_iso(l: &str) -> bool {
+/// 后端格式化的行首形如 `2026-10-19 09:25:51 ...`。
+fn looks_like_ts(l: &str) -> bool {
     let b = l.as_bytes();
-    b.len() >= 19 && b[4] == b'-' && b[7] == b'-' && b[10] == b'T' && b[13] == b':'
+    b.len() >= 19
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[10] == b' '
+        && b[13] == b':'
+        && b[16] == b':'
 }
