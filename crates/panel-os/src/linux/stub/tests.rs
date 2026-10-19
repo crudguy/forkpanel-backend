@@ -1209,8 +1209,16 @@ use super::*;
             "error_log",
             "log {",              // caddy 的 log 指令块
             "\nlog ",
-            "expires 7d",         // custom_conf 原文（nginx 语法）
+            "expires 7d",         // custom_conf 原义（nginx 语法）
             "location /static/",
+            // ── 下面三项上面已「填满」，但旧断言列表漏了——属于「注释声称钉死了、实际没钉」
+            // 的恒绿缺口。caddy 渲染根本不读这些字段（见 webserver.rs 头部诚实清单），故填入的
+            // 哨兵值绝不应泄漏进 Caddyfile；一旦将来有人给 caddy 接上 伪静态 / tls_profile，
+            // 这里会变红提醒「前端仍置灰」的失同步。
+            "wordpress",         // rewrite_preset 哨兵（caddy 不读 rewrite_preset）
+            "/index.php",        // rewrite_custom 的 PHP 路由哨兵（caddy 不读 rewrite_custom；
+                                 // 注意 SPA 块只产 /index.html，不会误伤）
+            "strict",            // tls_profile 档位哨兵（caddy 不开放套件配置，tls_protocols 恒回落）
         ] {
             assert!(!body.contains(directive), "caddy 渲染不应产出 `{directive}`（前端据此置灰）：\n{body}");
         }
