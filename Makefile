@@ -8,10 +8,10 @@
 # （恒绿比没门禁更危险）。故 audit 单独成一个目标，CI 里单独一个 job——
 # advisory-db 托管在 GitHub，网络抖动时不该连带拖红主门禁。
 
-.PHONY: check guards audit test
+.PHONY: check guards audit test embed-fresh
 
 # 主门禁：静态守卫 + 全量测试（离线可跑，确定性高）
-check: guards test
+check: guards embed-fresh test
 
 # ci/ 下的静态门禁（layering / 契约 / 权限点 / 包白名单 / openapi 字节一致）
 guards:
@@ -20,6 +20,13 @@ guards:
 	bash ci/check-permissions.sh
 	bash ci/check-pkg-whitelist.sh
 	python3 ci/check_openapi.py
+
+# 内嵌前端新鲜度：改完前端只 cargo build **不会**重新 embed，必须
+# ① vite build → ② rm -rf web/dist/* → ③ cp -a → ④ touch embed.rs → ⑤ cargo build。
+# 漏任一步都会发出旧前端，而编译/类型/测试全绿。放在 guards 之后、test 之前：
+# 它是纯文件对账（秒级），失败时没必要再跑几分钟的测试。
+embed-fresh:
+	bash ci/check-embed-fresh.sh
 
 # 依赖安全审计（需 cargo-audit，且要联网拉 RustSec advisory-db）
 audit:
