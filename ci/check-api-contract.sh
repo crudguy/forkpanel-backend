@@ -24,6 +24,17 @@ FAIL=0
 fail() { echo "  ✗ $1"; FAIL=1; }
 pass() { echo "  ✓ $1"; }
 
+# ── CI 无前端仓时的诚实跳过（与 check-embed-fresh.sh / check_openapi.py 同纪律）──
+# GitHub Actions 只 checkout 后端仓；前端是私有独立仓，未配 token 时拉不到。
+# **跳过不是通过**：必须把「没验」喊出来；但恒红同样有害（会淹没真失败），
+# 故只在 CI 里跳过。本地开发两仓都在，仍走下面的硬失败，绝不静默放行。
+ci_skip_no_frontend() {
+  [ -n "${CI:-}" ] || return 1
+  echo "[skip] $(basename "$0")：找不到前端仓库（$1）——CI 只 checkout 后端仓，本轮跳过（非通过）" >&2
+  echo "       如需在 CI 真检查：把前端仓 checkout 到该路径，或设 PANEL_FRONTEND_ROOT" >&2
+  exit 0
+}
+
 # ── 定位前端源码目录 ──
 # 历史坑：本脚本早期硬编码 `web/src`（前后端未拆仓时的布局）。拆仓后前端移到
 # ../forkpanel-frontend，`web/` 只剩构建产物 dist，于是 grep 静默返回空 →
@@ -34,6 +45,7 @@ for cand in "$FE_ROOT/src" "$ROOT/web/src"; do
   if [ -d "$cand" ]; then FE_SRC="$cand"; break; fi
 done
 if [ -z "$FE_SRC" ]; then
+  ci_skip_no_frontend "$FE_ROOT"
   fail "找不到前端源码目录（试过 $FE_ROOT/src 与 $ROOT/web/src）"
   echo "      前端已拆为独立仓，请传第二个参数或设 PANEL_FRONTEND_ROOT 指向它"
   echo "      —— 绝不能在此静默通过：grep 抓不到文件会让 A/B/D 三项全部恒绿"

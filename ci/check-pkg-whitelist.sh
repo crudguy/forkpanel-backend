@@ -30,12 +30,24 @@ FAIL=0
 fail() { echo "  ✗ $1"; FAIL=1; }
 pass() { echo "  ✓ $1"; }
 
+# ── CI 无前端仓时的诚实跳过（与 check-embed-fresh.sh / check_openapi.py 同纪律）──
+# GitHub Actions 只 checkout 后端仓；前端是私有独立仓，未配 token 时拉不到。
+# **跳过不是通过**：必须把「没验」喊出来；但恒红同样有害（会淹没真失败），
+# 故只在 CI 里跳过。本地开发两仓都在，仍走下面的硬失败，绝不静默放行。
+ci_skip_no_frontend() {
+  [ -n "${CI:-}" ] || return 1
+  echo "[skip] $(basename "$0")：找不到前端仓库（$1）——CI 只 checkout 后端仓，本轮跳过（非通过）" >&2
+  echo "       如需在 CI 真检查：把前端仓 checkout 到该路径，或设 PANEL_FRONTEND_ROOT" >&2
+  exit 0
+}
+
 BE_SRC="crates/panel-api/src/routes/services.rs"
 FE_SRC="$FE_ROOT/src/views/ServicesView.vue"
 
 echo "== [A] 源文件存在性 =="
 for f in "$BE_SRC" "$FE_SRC"; do
   if [ ! -f "$f" ]; then
+    if [ "$f" = "$FE_SRC" ]; then ci_skip_no_frontend "$FE_ROOT"; fi
     fail "找不到源文件：$f"
     echo "      提取失败必须判失败——否则差集恒为空，门禁永远绿（恒绿门禁比没门禁更危险）"
     echo "      前端已拆为独立仓，请传第二个参数或设 PANEL_FRONTEND_ROOT 指向它"

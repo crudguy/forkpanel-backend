@@ -18,9 +18,25 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      # 契约 / 权限点 / 包白名单三个门禁需要前端源码。前端是**私有**独立仓：
+      # 配了 secrets.FRONTEND_REPO_TOKEN 才拉得下来；未配时本步失败但
+      # continue-on-error 不拖红 job，三个脚本会各自显式 [skip]（非通过）。
+      - name: 检出前端仓（私有仓需 secrets.FRONTEND_REPO_TOKEN）
+        uses: actions/checkout@v4
+        continue-on-error: true
+        with:
+          repository: crudguy/forkpanel-frontend
+          path: forkpanel-frontend
+          token: ${{ secrets.FRONTEND_REPO_TOKEN }}
+
       # 与本地 `make check` 完全一致
       - name: 门禁（make check）
         run: make check
+        env:
+          # 指向上面 checkout 的前端仓；未 checkout 成功时路径不存在 → 各门禁显式 [skip]
+          PANEL_FRONTEND_ROOT: ${{ github.workspace }}/forkpanel-frontend
+          PANEL_FRONTEND_OPENAPI: ${{ github.workspace }}/forkpanel-frontend/src/api/openapi.yaml
+          FE_DIST: ${{ github.workspace }}/forkpanel-frontend/dist
 
   audit:
     name: 依赖安全审计（cargo audit）
