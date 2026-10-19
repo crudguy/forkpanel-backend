@@ -514,7 +514,7 @@ components:
       type: object
       description: |
         白名单条目（完整集合）。前端据此渲染友好品牌名与**用途说明**——软件卡片上的
-        「说明」直接渲染这四个字段，前端不再硬编码文案（包集合与包的说明都只有一个事实源）。
+        「说明」直接渲染这几个字段，前端不再硬编码文案（包集合与包的说明都只有一个事实源）。
       properties:
         name:  { type: string }
         label: { type: string }
@@ -523,6 +523,7 @@ components:
         features: { type: string, description: 主要功能：用户会实际用到的能力 }
         scenes:   { type: string, description: 适用场景：什么情况下该装它 }
         entry:    { type: string, description: "使用方式 / 访问入口：面板内入口 + 面板外的真实访问方式。面板没有的入口会如实写「面板无独立页面」，不编造" }
+        howto:    { type: string, description: "怎么配：到了 entry 所指的页面之后具体填什么（必填项 / 典型值 / 常见错法）。与 entry 分开——「去哪」与「填什么」是用户卡住的两个不同位置；面板内无需填写时写「无需填」，不留空" }
 
     # ───────────── 站点 / SSL ─────────────
     Site:
