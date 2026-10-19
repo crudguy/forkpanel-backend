@@ -280,10 +280,15 @@ fn run(cli: Cli) -> Result<()> {
                 // 避免页面只显示 reserved 段的死占位而让用户误以为保留策略「未实现」。
                 let audit_retention_days = cfg.audit.retention_days;
                 let audit_max_rows = cfg.audit.max_rows;
+                // 暴露面 / 备份：`[server] localhost_only`（`Config::addr()` 强制覆盖
+                // bind）与 `[db] daily_backup`（调度器据此注册每日备份）均已真实生效，
+                // 注入 AppState 供设置页 deployment 段只读展示。
+                let localhost_only = cfg.server.localhost_only;
+                let daily_backup = cfg.db.daily_backup;
                 let state = Arc::new(panel_api::AppState::new(
                     os.clone(), writer.clone(), pool, tasks.clone(), metrics.clone(), tier,
                     master_key, read_only, max_login_attempts, session_idle, session_absolute,
-                    audit_retention_days, audit_max_rows));
+                    audit_retention_days, audit_max_rows, localhost_only, daily_backup));
 
                 // ── 内部周期任务 ──
                 register_internal_jobs(&sched_in, &os, writer.clone(), metrics.clone(), &layout, &cfg, tier, state.clone()).await;

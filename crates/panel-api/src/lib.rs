@@ -58,6 +58,13 @@ pub struct AppState {
     pub audit_retention_days: u32,
     /// 审计单表行数上限（来自 config.toml `[audit]`）。同上，deployment 段只读展示。
     pub audit_max_rows: u64,
+    /// 是否仅监听回环（来自 config.toml `[server] localhost_only`）。deployment 段展示用。
+    /// **真实生效**：`Config::addr()` 用它强制覆盖 bind（为 true 时永远只听 127.0.0.1，
+    /// 哪怕 bind 写了 0.0.0.0）——直接关系到面板暴露面。
+    pub localhost_only: bool,
+    /// 每日自动备份开关（来自 config.toml `[db] daily_backup`）。deployment 段展示用。
+    /// **真实生效**：`main.rs` 的调度器据此注册每日备份任务（nano 档位除外）。
+    pub daily_backup: bool,
     /// 首启引导令牌（一次性、只存内存）。serve 首启无 owner 时生成。
     pub bootstrap: Arc<crate::auth::BootstrapGuard>,
     /// 主密钥（32 字节，内存常驻，不落库）。为 None 时所有"写入真实秘密"的操作被拒绝。
@@ -89,14 +96,15 @@ impl AppState {
                tier: Tier, master_key: Option<MasterKey>, read_only: bool,
                max_login_attempts: usize,
                session_idle: std::time::Duration, session_absolute: std::time::Duration,
-               audit_retention_days: u32, audit_max_rows: u64) -> Self {
+               audit_retention_days: u32, audit_max_rows: u64,
+               localhost_only: bool, daily_backup: bool) -> Self {
         let capabilities = os.capabilities();
         // 会话持久化：把写者交给 SessionCache（`sessions` 表 001 已定义、此前无人使用）。
         // 先 clone——下方 struct 字面量会把 db move 进字段。
         let sessions_db = db.clone();
         Self {
             os, db, pool, tasks, metrics, tier, capabilities, session_idle, session_absolute,
-            audit_retention_days, audit_max_rows,
+            audit_retention_days, audit_max_rows, localhost_only, daily_backup,
             sessions: Arc::new(crate::auth::SessionCache::new_with_db(
                 session_idle,
                 session_absolute,
