@@ -18,6 +18,7 @@ pub mod files;
 pub mod firewall;
 pub mod logs;
 pub mod notifications;
+pub mod pkg_help;
 pub mod services;
 pub mod sites;
 pub mod system;

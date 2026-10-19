@@ -512,11 +512,17 @@ components:
 
     PackageCatalog:
       type: object
-      description: 白名单条目（完整集合），前端据此渲染友好品牌名
+      description: |
+        白名单条目（完整集合）。前端据此渲染友好品牌名与**用途说明**——软件卡片上的
+        「说明」直接渲染这四个字段，前端不再硬编码文案（包集合与包的说明都只有一个事实源）。
       properties:
         name:  { type: string }
         label: { type: string }
         external: { type: boolean, description: 官方仓库通常不含此包，需先在目标机配置第三方软件源才能安装 }
+        summary:  { type: string, description: 用途：一句话说明这个软件是什么 }
+        features: { type: string, description: 主要功能：用户会实际用到的能力 }
+        scenes:   { type: string, description: 适用场景：什么情况下该装它 }
+        entry:    { type: string, description: "使用方式 / 访问入口：面板内入口 + 面板外的真实访问方式。面板没有的入口会如实写「面板无独立页面」，不编造" }
 
     # ───────────── 站点 / SSL ─────────────
     Site:

@@ -267,38 +267,191 @@ fn validate_pkg_version(v: &str) -> ApiResult<()> {
 /// 白名单条目：`name` 是对外逻辑名（UI 展示、install/remove 入参、幂等键、审计都用它），
 /// `label` 是给人看的品牌名——刻意不带版本后缀，避免把主版本焊死在展示上
 /// （例如 `apache2` 的 "2" 只是 Debian 给 Apache 2.x 打的包名后缀，真出 Apache 3 就尴尬了）。
-struct PkgDef { name: &'static str, label: &'static str }
+///
+/// 后四个字段（summary/features/scenes/entry）是**面向用户的说明**，随 `/packages`
+/// 的 `catalog` 一起下发，供前端软件卡片上的「说明」渲染。放在后端是为了守住
+/// 「包集合 + 包的说明只有一个事实源」：前端若另维护一份 22 条文案表，后端加包
+/// 或改能力（例如某软件的入口页被下线）时前端不会有任何编译错误，只会静默说谎。
+///
+/// `pub(crate)`：`pkg_help` 模块只做投影（不改写文案），需要能看见这个结构。
+pub(crate) struct PkgDef {
+    /// 对外逻辑名（UI 展示、install/remove 入参、幂等键、审计都用它）
+    pub name: &'static str,
+    /// 给人看的品牌名
+    pub label: &'static str,
+    /// 用途：一句话说清"这东西是什么"
+    pub summary: &'static str,
+    /// 主要功能：用户真的会用的能力
+    pub features: &'static str,
+    /// 适用场景：什么时候该装它（帮用户做决策）
+    pub scenes: &'static str,
+    /// 使用方式 / 访问入口：面板内入口 + 面板外的真实访问方式。
+    /// **必须诚实**——面板没有的入口不许编，写「面板无独立页面」并给出真实路径。
+    pub entry: &'static str,
+}
 
 const ALLOWED_PACKAGES: &[PkgDef] = &[
-    PkgDef { name: "nginx",          label: "Nginx" },
-    PkgDef { name: "caddy",          label: "Caddy" },
-    PkgDef { name: "apache2",        label: "Apache" },
-    PkgDef { name: "mariadb-server", label: "MariaDB" },
-    PkgDef { name: "postgresql",     label: "PostgreSQL" },
-    PkgDef { name: "redis",          label: "Redis" },
-    PkgDef { name: "memcached",      label: "Memcached" },
+    PkgDef {
+        name: "nginx", label: "Nginx",
+        summary: "高性能 HTTP 服务器与反向代理。",
+        features: "静态站点、反向代理与负载均衡、TLS、伪静态、WAF、访问日志。",
+        scenes: "搭建网站、把 Node / PHP 应用挂到 80 / 443、单机托管多个站点。",
+        entry: "「网站」页建站与改站点；「证书」菜单配 TLS；「WAF」菜单配防护规则；「服务」页看状态与日志。",
+    },
+    PkgDef {
+        name: "caddy", label: "Caddy",
+        summary: "自带自动 HTTPS 的现代 Web 服务器。",
+        features: "静态站 / 反向代理 / PHP / 多路由、自动或手动 TLS、HSTS、IP 名单、WAF（规则集）。",
+        scenes: "想省掉证书申请与续期、托管轻量站点。nginx 独有的能力（Basic Auth、伪静态、TLS 套件档、WAF 限速等）在 Caddy 下不可用，界面会置灰。",
+        entry: "「网站」页（探测到 Caddy 时按 Caddyfile 渲染）；「证书」菜单；「服务」页。",
+    },
+    PkgDef {
+        name: "apache2", label: "Apache",
+        summary: "传统 Web 服务器（虚拟主机 / .htaccess）。",
+        features: "静态站点、PHP、虚拟主机、.htaccess 覆盖配置。",
+        scenes: "兼容迁移过来的既有 Apache 项目。",
+        entry: "面板的站点托管目前只渲染 nginx / caddy：Apache 装好后需自行维护配置。「服务」页仍可启停、看日志、改单元配置。",
+    },
+    PkgDef {
+        name: "mariadb-server", label: "MariaDB",
+        summary: "MySQL 兼容的关系型数据库。",
+        features: "建库建账号、SQL 查询、备份与还原。",
+        scenes: "WordPress 等传统 PHP 应用、需要 MySQL 兼容性的存量项目。",
+        entry: "「数据库」页新建连接（需本机 mysql 客户端）→ 备份 / 还原 / 浏览；「服务」页看状态。",
+    },
+    PkgDef {
+        name: "postgresql", label: "PostgreSQL",
+        summary: "功能完整的关系型数据库。",
+        features: "关系表、JSON / JSONB、扩展插件、备份与还原。",
+        scenes: "新项目起步、需要复杂查询与严格事务语义。",
+        entry: "「数据库」页新建连接（需本机 psql 客户端，账号必填）；「服务」页看状态。",
+    },
+    PkgDef {
+        name: "redis", label: "Redis",
+        summary: "内存键值数据库，常用作缓存。",
+        features: "缓存、会话存储、消息队列、分布式锁。",
+        scenes: "加速读多写少的应用、跨进程共享状态。",
+        entry: "面板无独立页面；应用连 127.0.0.1:6379（默认端口，以你的配置为准）；「服务」页看状态 / 日志 / 配置。",
+    },
+    PkgDef {
+        name: "memcached", label: "Memcached",
+        summary: "纯内存 KV 缓存，不做持久化。",
+        features: "对象缓存（重启即清空）。",
+        scenes: "减轻数据库读压力，可接受缓存丢失。",
+        entry: "面板无独立页面；应用连 127.0.0.1:11211（默认端口）；「服务」页看状态与日志。",
+    },
     // 只保留元包 php-fpm：它 Depends 当前发行版的默认 phpX.Y-fpm，任何一代
     // Debian/Ubuntu 上都必然可装。此前写死 php8.1/8.2/8.3-fpm 是想覆盖多发行版，
     // 但 Debian 每代只提供 1 个 PHP 版本（13→8.4、12→8.2、11→7.4），实测本机
     // 三条全部"仓库无此包"——即任意一台机器上最多 1 条有效，其余点了必失败。
-    PkgDef { name: "php-fpm",        label: "PHP-FPM" },
-    PkgDef { name: "certbot",        label: "Certbot" },
-    PkgDef { name: "fail2ban",       label: "Fail2ban" },
-    PkgDef { name: "ufw",            label: "UFW" },
-    PkgDef { name: "minio",          label: "MinIO" },
-    PkgDef { name: "valkey-server",  label: "Valkey" },
-    PkgDef { name: "prometheus",     label: "Prometheus" },
-    PkgDef { name: "grafana",        label: "Grafana" },
-    PkgDef { name: "netdata",        label: "Netdata" },
-    PkgDef { name: "haproxy",        label: "HAProxy" },
-    PkgDef { name: "nodejs",         label: "Node.js" },
-    PkgDef { name: "default-jdk",    label: "OpenJDK" },
+    PkgDef {
+        name: "php-fpm", label: "PHP-FPM",
+        summary: "PHP 的 FastCGI 进程管理器。",
+        features: "执行 PHP 站点、按进程池隔离与调优。",
+        scenes: "PHP 建站（WordPress、ThinkPHP 等）。",
+        entry: "「网站」页新建站点时选 PHP 运行方式；「服务」页看 php-fpm 状态与日志。",
+    },
+    PkgDef {
+        name: "certbot", label: "Certbot",
+        summary: "Let's Encrypt 的 ACME 证书客户端。",
+        features: "签发免费证书、自动续期、通配符证书（DNS 验证）。",
+        scenes: "公网站点启用 HTTPS。",
+        entry: "「证书」页签发 / 续期（依赖 ssl.acme 能力位）；「网站」页给站点绑定证书。",
+    },
+    PkgDef {
+        name: "fail2ban", label: "Fail2ban",
+        summary: "日志驱动的防暴力破解工具。",
+        features: "监控 SSH / 服务日志，按规则自动封禁来源 IP。",
+        scenes: "公网 SSH 或面板登录防护。",
+        entry: "「安全」菜单的防火墙规则页（fail2ban 区；nftables 后端下恒不支持）；「服务」页看状态。",
+    },
+    PkgDef {
+        name: "ufw", label: "UFW",
+        summary: "简易防火墙命令行前端。",
+        features: "按端口放行 / 拒绝、限流、按应用配置。",
+        scenes: "基础主机防护，替代手写 iptables 规则。",
+        entry: "「安全」菜单的防火墙规则页（后端按 nft / iptables / ufw / firewalld 实际探测适配）；「服务」页看状态。",
+    },
+    PkgDef {
+        name: "minio", label: "MinIO",
+        summary: "S3 协议兼容的对象存储。",
+        features: "桶与对象管理、S3 API、预签名 URL。",
+        scenes: "应用存图片 / 附件 / 备份，且希望用 S3 SDK 直连。",
+        entry: "自带 Console（默认 :9001，S3 API 默认 :9000）——需先配好第三方源才能安装；「服务」页看状态。",
+    },
+    PkgDef {
+        name: "valkey-server", label: "Valkey",
+        summary: "Redis 的开源分支，协议兼容。",
+        features: "功能同 Redis：缓存、会话、队列、分布式锁。",
+        scenes: "Redis 变更许可证后的替代选择，客户端无需改动。",
+        entry: "与 Redis 相同（面板无独立页面，应用连默认端口）；注意服务名是 valkey-server。",
+    },
+    PkgDef {
+        name: "prometheus", label: "Prometheus",
+        summary: "指标采集与时序数据库。",
+        features: "按目标抓取指标、PromQL 查询、告警规则。",
+        scenes: "自建监控体系、需要长期留存历史指标。",
+        entry: "面板无独立页面（「概览」的主机监控是内置采集，不依赖它）；用它自己的 Web UI（默认 :9090）看指标与告警。",
+    },
+    PkgDef {
+        name: "grafana", label: "Grafana",
+        summary: "可视化仪表盘与告警平台。",
+        features: "仪表盘编辑器、多数据源接入、告警通知。",
+        scenes: "接 Prometheus 等数据源做展示与看板。",
+        entry: "面板无独立页面，也不内嵌 Grafana 面板；用它自己的 Web UI（默认 :3000）建仪表盘与配告警。",
+    },
+    PkgDef {
+        name: "netdata", label: "Netdata",
+        summary: "秒级粒度的实时主机监控。",
+        features: "秒级指标采集、内置告警、开箱即用的图表面板。",
+        scenes: "单机快速排障、看瞬时毛刺。",
+        entry: "面板无独立页面（「概览」的主机监控为内置实现）；用它自己的 Web UI（默认 :19999）看秒级图表。",
+    },
+    PkgDef {
+        name: "haproxy", label: "HAProxy",
+        summary: "四层 / 七层负载均衡器。",
+        features: "TCP 与 HTTP 反向代理、健康检查、多后端分流。",
+        scenes: "多个后端实例之间分流、需要比 Web 服务器更强的转发控制。",
+        entry: "面板无独立页面；「服务」页改配置 / 看日志，或走「文件」「终端」。",
+    },
+    PkgDef {
+        name: "nodejs", label: "Node.js",
+        summary: "JavaScript 服务端运行时。",
+        features: "运行 Node 服务、执行前端构建工具链（npm / pnpm）。",
+        scenes: "Node / NestJS / Next.js 等应用，或需要前端构建环境。",
+        entry: "「应用」页选 Node.js 运行时（systemd 托管 + 自动反代）；未安装时应用页会提示到「软件」页装。",
+    },
+    PkgDef {
+        name: "default-jdk", label: "OpenJDK",
+        summary: "Java 运行时与开发工具包。",
+        features: "运行 Jar、编译 Java 代码。",
+        scenes: "Spring Boot 等 Java 应用、Jar 包部署。",
+        entry: "「应用」页选 Java 运行时；或「终端」「文件」自行部署。",
+    },
     // Go / Rust 是元包：`golang-go` → 当前发行版的 golang-1.XX-go；`cargo` Depends
     // `rustc`（实测 apt-cache depends），装一个包即得完整工具链。二者与上面的
     // nodejs / default-jdk 同属「应用运行时」，供「应用」页的运行时安装提示联动。
-    PkgDef { name: "golang-go",      label: "Go" },
-    PkgDef { name: "cargo",          label: "Rust" },
-    PkgDef { name: "wireguard-tools", label: "WireGuard" },
+    PkgDef {
+        name: "golang-go", label: "Go",
+        summary: "Go 语言工具链。",
+        features: "编译、测试、运行 Go 程序（go build / run / test）。",
+        scenes: "部署编译为单文件的 Go 二进制服务。",
+        entry: "「应用」页选 Go 运行时；或「终端」「文件」自行编译部署。",
+    },
+    PkgDef {
+        name: "cargo", label: "Rust",
+        summary: "Rust 语言工具链（含 rustc）。",
+        features: "cargo build / run / test，依赖管理与交叉编译。",
+        scenes: "编译并部署 Rust 服务。",
+        entry: "「应用」页选 Rust 运行时；或「终端」「文件」自行编译部署。",
+    },
+    PkgDef {
+        name: "wireguard-tools", label: "WireGuard",
+        summary: "现代轻量 VPN（点对点隧道）。",
+        features: "内核态加密隧道、点对点与站点互联、按密钥识别对端。",
+        scenes: "远程接入内网、在多台主机之间建立私有网络。",
+        entry: "面板无独立页面；用「文件」或「终端」编辑 /etc/wireguard/*.conf；「服务」页看 wg-quick@ 单元状态。",
+    },
 ];
 
 /// 白名单里**官方仓库通常不含**的包：需先在目标机上配好第三方软件源才能装。
@@ -751,14 +904,20 @@ pub async fn packages_list(
             "held": held_set.contains(&p.name),
         }));
     }
-    // 完整白名单（name+label）随清单一起下发：前端据此给「已装」和「可装」两类都渲染
-    // 友好品牌名，而不必在 CATEGORIES 里再维护一份标签（单一事实源在后端）。
-    let catalog: Vec<serde_json::Value> = ALLOWED_PACKAGES.iter()
+    // 完整白名单（name+label+说明）随清单一起下发：前端据此给「已装」和「可装」两类都
+    // 渲染友好品牌名与用途说明，而不必在 CATEGORIES / 前端常量表里再维护一份
+    // （单一事实源在后端）。
+    let catalog: Vec<serde_json::Value> = crate::routes::pkg_help::projection(ALLOWED_PACKAGES.iter())
         .map(|d| serde_json::json!({
             "name": d.name,
             "label": d.label,
             // 提示"官方源通常不含，需先配第三方源"；配好源后装上不受影响
             "external": EXTERNAL_SOURCE_PACKAGES.contains(&d.name),
+            // 说明四项：前端软件卡片「说明」直接渲染，不硬编码任何一条
+            "summary": d.summary,
+            "features": d.features,
+            "scenes": d.scenes,
+            "entry": d.entry,
         }))
         .collect();
     Ok(ok(serde_json::json!({ "packages": items, "catalog": catalog })))
@@ -1108,5 +1267,59 @@ mod tests {
     fn sync_limit_distinguishes_ops() {
         // 服务启停 <2s 可同步；安装耗时不可预测必须入队
         assert_eq!(SYNC_LIMIT.as_secs(), 2);
+    }
+
+    /// 每个白名单条目都必须带齐四项说明，且不能是占位空串。
+    ///
+    /// 为什么值得一条测试：这四项会原样进 `catalog`，前端软件卡片的「说明」直接渲染它。
+    /// 加新包时忘了填字段 **不会编译报错**（`&'static str` 有默认空串的诱惑），
+    /// 用户看到的是「点开说明，四个标签下面全是空白」——比不提供说明更糟。
+    /// 所以这里既查非空，也查长度下限（一两个字的敷衍值同样按空处理）。
+    #[test]
+    fn every_whitelisted_pkg_has_four_non_empty_help_fields() {
+        assert!(!ALLOWED_PACKAGES.is_empty(), "白名单为空：测试前提不成立");
+        for d in ALLOWED_PACKAGES {
+            let fields = [
+                ("summary", d.summary),
+                ("features", d.features),
+                ("scenes", d.scenes),
+                ("entry", d.entry),
+            ];
+            for (name, v) in fields {
+                assert!(!v.trim().is_empty(), "{} 的 {name} 为空", d.name);
+                // 中文说明里 8 个字符已短到没有信息量（如「数据库」三字）
+                assert!(
+                    v.chars().count() >= 8,
+                    "{} 的 {name} 过短（{} 字）：{v}",
+                    d.name,
+                    v.chars().count()
+                );
+            }
+            // 入口字段必须表态：要么给出面板内入口，要么明说面板没有独立页面。
+            // 这条挡住「留空」与「随手写句话糊过去」两种，逼迫作者真的去想入口在哪。
+            let e = d.entry;
+            assert!(
+                e.contains("页") || e.contains("菜单") || e.contains("面板无独立页面"),
+                "{} 的 entry 未说明任何入口（既没提页面/菜单，也没写「面板无独立页面」）：{e}",
+                d.name
+            );
+        }
+    }
+
+    /// 投影出的说明条数与白名单一一对应、name 不重复。
+    ///
+    /// `catalog` 是前端按 name 建 Map 消费的（`labelMap` / 说明表都是 Map），
+    /// 一旦出现同名条目就只会保留最后一条，用户看到的是「某个软件的说明莫名跑到了
+    /// 别的软件上」。白名单里手写 22 条字面量，这种手误必须由测试挡住。
+    #[test]
+    fn help_projection_matches_whitelist_one_to_one() {
+        let projected: Vec<_> = crate::routes::pkg_help::projection(ALLOWED_PACKAGES.iter()).collect();
+        assert_eq!(projected.len(), ALLOWED_PACKAGES.len());
+        let mut seen = std::collections::HashSet::new();
+        for h in &projected {
+            assert!(seen.insert(h.name), "catalog 出现重复 name：{}", h.name);
+            assert_eq!(h.label, ALLOWED_PACKAGES.iter()
+                .find(|d| d.name == h.name).expect("投影出现白名单外条目").label);
+        }
     }
 }
