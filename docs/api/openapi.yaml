@@ -881,7 +881,12 @@ components:
       type: object
       properties:
         name: { type: string }
-        rows: { type: integer }
+        rows:
+          type: integer
+          description: |
+            精确行数（PG/MySQL 用**一条** UNION ALL 查询一次取回全部对象的行数，
+            SQLite 在同一连接内逐表 COUNT(*)）。取不到时为 -1
+            ——刻意不伪造成 0：0 会被读成"空表"，而 -1 才是"未知"。
         engine: { type: [string, "null"] }
         kind:
           type: string

@@ -1689,3 +1689,73 @@ redis-server:
             "Candidate 被 pin 压低时仍应据版本表报出更新（旧口径漏报的场景）"
         );
     }
+
+    // ── 表清单：种类与行数（纯函数，不连数据库） ──
+    //
+    // 这些判定原本埋在 `tables()` 里，而 `tables()` 要真机 psql/mysql 才跑得动，
+    // 等于换个机器就只剩恒绿。抽成纯函数后，kind 映射与 SQL 拼装能被逐格钉住。
+
+    /// PG 的 relkind → TableKind。**改前三处恒为 Table**：视图被当成表，
+    /// 于是前端那句"有 N 个视图、没有表"永远走不到（契约承诺了却没兑现）。
+    #[test]
+    fn pg_tables_maps_every_relkind_to_its_kind() {
+        let out = pg_tables_from_rows(vec![
+            vec!["users".into(), "r".into()],
+            vec!["parts".into(), "p".into()],
+            vec!["v_active".into(), "v".into()],
+            vec!["mv_summary".into(), "m".into()],
+        ]);
+        let kinds: Vec<&str> = out.iter().map(|t| t.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["table", "table", "view", "view"]);
+        // 此刻行数还没取回，一律是 -1（未知）——**不是 0**（0 会被读成空表）。
+        assert!(out.iter().all(|t| t.rows == -1), "未取回时必须是 -1 而非 0");
+    }
+
+    /// 行数 SQL 必须是**一条**语句，且表名里的引号要转义——
+    /// 表名来自数据库，也是潜在注入口；不转义的话一个带引号的表名就能改语句结构。
+    #[test]
+    fn pg_row_counts_sql_is_one_statement_and_escapes_identifiers() {
+        let names = vec![
+            "a".to_string(),
+            "b".to_string(),
+            "we'ird".to_string(),
+            "qu\"ote".to_string(),
+        ];
+        let sql = pg_row_counts_sql(&names);
+        // 一条语句：靠 UNION ALL 拼接，绝不能出现分号（否则是多条语句）
+        assert!(!sql.contains(';'), "必须是一条语句");
+        assert_eq!(sql.matches("UNION ALL").count(), 3);
+        assert!(sql.contains("'we''ird'"), "字符串字面量里的单引号未加倍");
+        assert!(sql.contains("public.\"qu\"\"ote\""), "标识符里的双引号未加倍");
+        // 空清单不生成空 SQL（调用方据此跳过这次查询）
+        assert_eq!(pg_row_counts_sql(&[]), "");
+    }
+
+    /// MySQL 版本：库名与表名都要转义，且表名必须带库名限定。
+    #[test]
+    fn mysql_row_counts_sql_quotes_db_and_tables() {
+        let sql = mysql_row_counts_sql("my'db", &["t1".to_string(), "ba`ck".to_string()]);
+        assert!(!sql.contains(';'), "必须是一条语句");
+        assert!(sql.contains("`my''db`.`t1`"), "库名单引号未转义或没带库名限定");
+        assert!(sql.contains("`ba``ck`"), "表名反引号未加倍");
+        assert_eq!(mysql_row_counts_sql("d", &[]), "");
+    }
+
+    /// 缺列的行直接跳过，不拿"半个行"当表。
+    #[test]
+    fn tables_from_rows_skips_short_rows() {
+        assert!(pg_tables_from_rows(vec![vec!["x".into()]]).is_empty());
+        assert!(mysql_tables_from_rows(vec![vec!["x".into()]]).is_empty());
+    }
+
+    /// MySQL 的 TABLE_TYPE → TableKind（VIEW 与 SYSTEM VIEW 都算视图）。
+    #[test]
+    fn mysql_tables_maps_table_type_to_kind() {
+        let out = mysql_tables_from_rows(vec![
+            vec!["users".into(), "BASE TABLE".into()],
+            vec!["v_top".into(), "VIEW".into()],
+            vec!["sys_v".into(), "SYSTEM VIEW".into()],
+        ]);
+        let kinds: Vec<&str> = out.iter().map(|t| t.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["table", "view", "view"]);
+    }
