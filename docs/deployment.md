@@ -107,6 +107,27 @@ sudo panel --config /etc/forkpanel/config.toml passwd admin --pass '<新口令>'
 
 ---
 
+### 4.1 主密钥必须单独备份（最容易被漏的一步）
+
+`<data_dir>/master.key`（0600）加密着 **SSL 私钥、数据库口令、远端备份凭据**。
+它**不在任何备份里**——这是刻意的（密钥跟密文放一起，加密就白做了）。
+
+于是有一条必须写进运维清单的结论：
+
+> **`master.key` 丢了 = 备份全废。** 恢复出来的库能打开、账号能登录，
+> 但所有证书私钥解不开、所有数据库连不上、远端备份也传不出去。
+> 外观上"恢复成功了"，实际是个残废的面板。
+
+```bash
+# 初始化后立刻做一次，并存到与备份**不同**的地方（同盘等于没备份）
+sudo tar czf /root/forkpanel-master-$(date +%F).tar.gz -C /var/lib/forkpanel master.key
+sudo chmod 600 /root/forkpanel-master-*.tar.gz
+# 建议：再抄一份到密码管理器或异地；换机器时它是第一个要搬的东西
+```
+
+前端备份页对加密产物已有同义的红字警告（「主密钥一旦丢失无法恢复」），
+但那是**用户勾选加密时**才看得见——而密钥丢失影响的是全部备份，故在此再立一条。
+
 ## 5. systemd 硬化
 
 `panel systemd-unit --install` 生成的单元已含：
@@ -164,6 +185,60 @@ journalctl -u panel-healthcheck.service -n 20 --no-pager
 > 单测见 `bootstrap::tests::healthcheck_*`。
 
 ---
+
+### 5.3 停机恢复面板库（runbook，已真机演练）
+
+**适用范围**：`kind=panel` 的备份（面板自身数据库）。
+
+**为什么必须停机**：面板库是面板**运行中**的库。在线覆盖会损坏 SQLite WAL——
+写进去的那一刻旧的 WAL 帧还在，两边一对不上就是「库能打开但数据错乱」，
+比打不开更难查。所以站点文件备份可以在 Web 里在线恢复（`kind=site` 有完整实现），
+而面板库只能停机换文件。这不是缺功能，是 SQLite 的硬约束。
+
+> 恢复前先确认：**主密钥 `<data_dir>/master.key` 还在**。它不在备份里（那是它
+> 该在的地方），但 SSL 私钥、数据库口令、远端凭据全都靠它解密——丢了它，备份
+> 恢复回来也是一堆解不开的密文。
+
+```bash
+CFG=/etc/forkpanel/config.toml
+DATA=/var/lib/forkpanel
+
+# ① 停服务（systemd 环境下探活 timer 会连着报失败，属预期，恢复后自愈）
+systemctl stop panel
+
+# ② 备份当前态——哪怕它已经坏了。恢复失败时这是唯一的回退素材
+cp -a "$DATA/panel.db" "$DATA/panel.db.broken-$(date +%s)"
+
+# ③ 校验手上的备份真的能恢复（不要跳过这一步）
+panel --config "$CFG" verify-backup /path/to/plan1-1234567890.db
+#    ✅ 产物可恢复：… integrity_check=ok，含 users 表
+
+# ④ 换库。三个文件一起换：主库 + WAL + SHM。
+#    留着旧的 -wal/-shm 会让新主库去应用一套不属于它的帧，直接错乱。
+rm -f "$DATA/panel.db" "$DATA/panel.db-wal" "$DATA/panel.db-shm"
+cp /path/to/plan1-1234567890.db "$DATA/panel.db"
+chmod 600 "$DATA/panel.db"
+
+# ⑤ 起来，然后**验证数据真的回来了**——不只是 200
+systemctl start panel
+curl -fsS http://127.0.0.1:2083/api/v1/version
+# 登录进面板，核对站点数 / 用户数 / 最近备份时间与备份时刻一致
+```
+
+**验收标准**（恢复成功的定义）：能登录 + 站点与账号数量、内容与备份时刻一致。
+只看 `/api/v1/version` 返回 200 是不够的——那只能证明进程起来了。
+
+**真机演练记录**（2026-10-19，独立实例端口 2091，未碰 dev）：
+
+| 步骤 | 结果 |
+|---|---|
+| 灌入测试站点 `dr-site` 后备份 | 产物 237,568 B，`integrity_check=ok，含 users 表` |
+| 把主库覆写成 50,000 B 随机垃圾 | 服务随后无法正常读库 |
+| 按上面 ①~⑤ 换库重启 | `/api/v1/version` 200 |
+| 用备份里的账号登录 + 拉站点列表 | HTTP 204 登录成功，`dr-site` 完整回来（domains/root/enabled 均一致） |
+
+> 演练用的备份与坏库都已清理。建议每次大版本升级前照此跑一遍——
+> 没演练过的恢复流程，等于没有恢复流程。
 
 ## 6. 升级与卸载
 

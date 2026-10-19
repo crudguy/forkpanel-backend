@@ -319,6 +319,14 @@ fn run(cli: Cli) -> Result<()> {
                 std::fs::create_dir_all(layout.backup_dir()).ok();
                 layout.backup_dir().join(format!("panel-{ts}.db"))
             });
+            // `VACUUM INTO` 拒绝覆盖已存在的文件，报的是 "output file already
+            // exists"——用户看不出是该删还是该改名。显式说清楚。
+            if dest.exists() {
+                return Err(PanelError::Validation {
+                    field: "out".into(),
+                    reason: format!("目标已存在：{}（VACUUM INTO 不覆盖，请先删除或换个路径）", dest.display()),
+                });
+            }
             let conn = panel_db::open(&layout.sqlite_path(), detect_tier(&*os, &cfg))?;
             panel_db::backup_to(&conn, &dest)?;
             println!("备份完成：{}", dest.display());
