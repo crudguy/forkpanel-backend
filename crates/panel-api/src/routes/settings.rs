@@ -521,6 +521,29 @@ pub async fn test_llm(
 mod tests {
     use super::*;
 
+    /// 部署级键清单的契约：审计保留两项必须在册（PATCH 才能给出「部署级」精确拒绝，
+    /// 而非退化成「未知或预留键」），且 deployment 与 runtime 白名单不得重叠。
+    /// 68d0fc1 把这两项接入 deployment 展示，但当时未钉测试——一旦有人从
+    /// DEPLOYMENT_KEYS 删掉，PATCH 文案会静默降级，页面展示也与白名单脱节。
+    #[test]
+    fn deployment_keys_cover_audit_retention_and_stay_disjoint_from_runtime() {
+        for k in [
+            "read_only", "tier", "max_login_attempts", "session_idle",
+            "session_absolute", "audit_retention_days", "audit_max_rows",
+        ] {
+            assert!(DEPLOYMENT_KEYS.contains(&k), "deployment 白名单缺 `{k}`");
+        }
+        // 同一键不能既「可 PATCH 即生效」又「只读部署级」——语义自相矛盾
+        for k in RUNTIME_KEYS {
+            assert!(!DEPLOYMENT_KEYS.contains(&k), "`{k}` 不能同时属 runtime 与 deployment");
+        }
+        // 无重复（contains 判不出重复；重复会让清单本身失真）
+        let mut seen = std::collections::HashSet::new();
+        for k in DEPLOYMENT_KEYS {
+            assert!(seen.insert(k), "DEPLOYMENT_KEYS 重复项：{k}");
+        }
+    }
+
     #[test]
     fn endpoint_rule_is_shared_by_patch_and_probe() {
         // PATCH 与「测试连接」共用 valid_endpoint：任一处退化成自己的一份判断，
