@@ -84,6 +84,11 @@ enum Cmd {
     },
     /// 输出 systemd 单元文件
     SystemdUnit { #[arg(long)] install: bool },
+    /// 校验备份产物**真的能恢复**（解密 + 解压 +  integrity_check）
+    VerifyBackup {
+        /// 产物路径（.db / .tar.gz 及其 .enc 变体）
+        path: std::path::PathBuf,
+    },
     /// 安装/卸载外部探活（覆盖 Restart=on-failure 管不了的"活着但不服务"）
     Healthcheck {
         /// 安装探活脚本与 systemd service/timer
@@ -414,6 +419,27 @@ fn run(cli: Cli) -> Result<()> {
             } else {
                 println!("{unit}");
             }
+            Ok(())
+        }
+
+        Cmd::VerifyBackup { ref path } => {
+            // 产物校验是 panel-api 的能力（要同时用 panel-db 的 integrity_check 与
+            // panel-os 的解压/解密），CLI 侧只做参数与主密钥装配。
+            let layout0 = build_layout(&os, None);
+            let cfg = load_cfg(&cli, &layout0)?;
+            let layout = build_layout(&os, Some(&cfg));
+            let key = load_master_key(&layout.data_dir());
+            if panel_os::backup::is_encrypted_file(path) && key.is_none() {
+                return Err(PanelError::Internal(
+                    "产物已加密但读不到主密钥（data_dir/master.key）——没有它无法校验".into(),
+                ));
+            }
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| PanelError::Internal(format!("runtime: {e}")))?;
+            let note = rt.block_on(panel_api::routes::backups::verify_artifact_cli(
+                path, key.as_ref(), &layout.tmp_dir(),
+            ))?;
+            println!("✅ 产物可恢复：{note}");
             Ok(())
         }
 

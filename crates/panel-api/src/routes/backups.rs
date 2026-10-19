@@ -10,6 +10,12 @@
 //! 全程走任务中心（`TaskKind::Restore`，破坏性操作不自动重试）。
 //! `kind=panel` 保持诚实 501：面板库是自身运行中的库，在线覆盖会损坏 SQLite WAL。
 //!
+//! **产物可恢复性校验**（[`verify_artifact`]）：备份"生成成功"≠"能恢复"——
+//! VACUUM INTO 中途磁盘满、tar 管道被信号打断、加密写了一半，都会留下一个看起来
+//! 正常、恢复时才发现坏掉的文件。而备份的意义全在"恢复"那一刻，此前无人验证的话，
+//! 第一次发现坏通常正是最需要它的那次事故。故每次备份完成后**立刻读一遍**，
+//! 读不出来就让任务失败并通知，而不是等事故当天才发现。
+//!
 //! **远端副本**（`remote_*` 列，schema v7，见 `crate::remote_store`）：本地备份挡不住
 //! "整机没了"——磁盘故障、误删、机房事故会把备份一起带走。三条纪律：
 //! 1. 凭据加密存储（主密钥 AES-256-GCM），且**绝不下发**——列表只回 `remote_has_secret`；
@@ -489,6 +495,118 @@ async fn validate_target(
 
 // ─────────────── 执行（任务化） ───────────────
 
+/// 校验备份产物**真的可恢复**：解出来并实际读一遍，而非只看文件存在与大小。
+///
+/// 三种产物各自的读法：
+/// - `.db`：开连接跑 `PRAGMA integrity_check`（SQLite 官方的坏库检测）；
+/// - `.tar.gz`：真正解压到临时目录并数条目（只 `list_tar_entries` 能抓截断，
+///   但抓不到"条目内容损坏"，解压才是诚实的读法）；
+/// - 上述任一变体（`.enc`）：先解密到临时文件，验完即删——**绝不在盘上留明文**。
+///
+/// 返回人类可读摘要（条目数 / 完整性结论），写进任务输出供事后审计。
+async fn verify_artifact(
+    path: &std::path::Path,
+    key: Option<&panel_core::crypto::MasterKey>,
+    tmp_dir: &std::path::Path,
+) -> Result<String> {
+    let fname = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+
+    // 加密产物先解密到临时文件；明文随后必须删掉（不留双份，同加密那步的纪律）。
+    // `is_temp` 显式记录"这个文件是校验自己造的"，而非靠指针比较判断——
+    // `path.to_path_buf()` 的地址与 path 无必然关系，ptr::eq 会给出错误答案。
+    let mut is_temp = false;
+    let plain = if panel_os::backup::is_encrypted_file(path) {
+        let k = key.ok_or_else(|| PanelError::Internal(
+            format!("产物 {fname} 已加密，但没有主密钥可解密校验")
+        ))?;
+        std::fs::create_dir_all(tmp_dir)
+            .map_err(|e| PanelError::Internal(format!("create tmp: {e}")))?;
+        let p = tmp_dir.join(format!("verify-{}-{}", std::process::id(), fname.trim_end_matches(".enc")));
+        panel_os::backup::decrypt_file(path, &p, k).await?;
+        is_temp = true;
+        p
+    } else {
+        path.to_path_buf()
+    };
+    // 无论后面成功失败，临时明文都要清掉
+    let _guard = TempPlainGuard(plain.clone(), is_temp);
+
+    let ext = plain.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default();
+    let summary = match ext.as_str() {
+        "db" => {
+            let p = plain.clone();
+            // integrity_check 是同步阻塞调用（要读整个库文件），放 blocking 池
+            tokio::task::spawn_blocking(move || {
+                let conn = rusqlite::Connection::open(&p)
+                    .map_err(|e| PanelError::Database(format!("open backup: {e}")))?;
+                let r = panel_db::integrity_check(&conn)?;
+                if r != "ok" {
+                    return Err(PanelError::Internal(format!("SQLite 自检未通过: {r}")));
+                }
+                // 顺带确认它是个**面板库**而不是随便一个 sqlite 文件：
+                // 能查到 users 表才说明备份的是我们的库。
+                let n: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='users'",
+                    [], |r| r.get(0),
+                ).map_err(|e| PanelError::Database(format!("probe users: {e}")))?;
+                if n == 0 {
+                    return Err(PanelError::Internal("备份里没有 users 表，不像面板库".into()));
+                }
+                Ok::<String, PanelError>("SQLite integrity_check=ok，含 users 表".to_string())
+            })
+            .await
+            .map_err(|e| PanelError::Internal(format!("校验线程异常: {e}")))??
+        }
+        "gz" => {
+            let out = tmp_dir.join(format!("verify-untar-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&out);
+            panel_os::backup::untar_gz(&plain, &out).await?;
+            let n = walkdir_count(&out);
+            let _ = std::fs::remove_dir_all(&out);
+            if n == 0 {
+                return Err(PanelError::Internal("归档解出来是空的".into()));
+            }
+            format!("tar.gz 解压成功，{n} 个条目")
+        }
+        other => return Err(PanelError::Internal(format!("不认识的产物扩展名: {other}"))),
+    };
+    Ok(format!("{fname}: {summary}"))
+}
+
+/// CLI 入口（`panel verify-backup <path>`）：与 [`verify_artifact`] 同一实现，
+/// 单独包一层是为了让 panel-cli 不必接触 `routes::backups` 的私有内部。
+pub async fn verify_artifact_cli(
+    path: &std::path::Path,
+    key: Option<&panel_core::crypto::MasterKey>,
+    tmp_dir: &std::path::Path,
+) -> Result<String> {
+    verify_artifact(path, key, tmp_dir).await
+}
+
+/// 极简目录计数（校验用，不需要 walkdir 依赖）。
+fn walkdir_count(dir: &std::path::Path) -> usize {
+    let mut n = 0usize;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() { stack.push(p) } else { n += 1 }
+        }
+    }
+    n
+}
+
+/// 离开作用域时删掉临时明文（校验失败/提前返回都不会漏）。
+struct TempPlainGuard(std::path::PathBuf, bool);
+impl Drop for TempPlainGuard {
+    fn drop(&mut self) {
+        if self.1 {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+}
+
 struct BackupJob {
     id: i64,
     kind: String,
@@ -506,6 +624,8 @@ struct BackupJob {
     /// 主密钥。`encrypt=false` 时为 `None` —— **不为不加密的计划持有密钥**，
     /// 减少密钥在内存里的驻留面。
     master: Option<panel_core::crypto::MasterKey>,
+    /// 临时目录（产物校验时解压/解密用），来自 `PathLayout::tmp_dir()`
+    tmp_dir: PathBuf,
 }
 
 #[async_trait::async_trait]
@@ -615,6 +735,38 @@ impl BackupJob {
             out_path
         };
 
+        // ── 产物可恢复性校验：生成成功 ≠ 能恢复 ──
+        // 放在上传远端**之前**：本地这份就坏的话，传上去只是把垃圾复制到异地，
+        // 还多付一份流量。校验不过就让整个任务失败并通知，不等事故当天才发现。
+        progress.set(88, "校验产物").await;
+        let verify_note = match verify_artifact(&out_path, self.master.as_ref(), &self.tmp_dir).await {
+            Ok(note) => {
+                eprintln!("[panel] 备份计划 #{} 产物校验通过：{note}", self.id);
+                note
+            }
+            Err(e) => {
+                // 坏产物不能留在盘上冒充备份：删掉它，否则 keep_count 会把这个
+                // 永远恢复不出来的文件当成有效备份一直保留着。
+                let _ = std::fs::remove_file(&out_path);
+                crate::routes::notifications::push(
+                    &self.writer,
+                    crate::routes::notifications::NewNotification {
+                        level: "error",
+                        source: "backup",
+                        title: format!("备份计划 #{} 的产物校验失败，已删除该产物", self.id),
+                        body: Some(format!(
+                            "备份文件已生成但**读不回来**，已删除以免它冒充有效备份。\n\n产物：{}\n原因：{e}",
+                            out_path.display()
+                        )),
+                        // 按天去重：同一个坏盘不该每次调度都刷一条
+                        dedup_key: Some(format!("backup:{}:verify:{}", self.id, crate::now_unix() / 86_400)),
+                    },
+                )
+                .await;
+                return Err(PanelError::Internal(format!("产物校验失败（已删除）: {e}")));
+            }
+        };
+
         // 远端副本。**本地已成功，远端失败不把任务翻转为失败**——本地那份是真的；
         // 但也**不谎报 ok**：`partial` + warn 通知，否则"异地没有备份"会一直没人发现。
         let mut remote_err: Option<String> = None;
@@ -702,6 +854,9 @@ impl BackupJob {
             }
         }
 
+        // 校验摘要写进进度流：任务中心能看到"这份备份确实被读回来过"，
+        // 而不是只有一个孤零零的产物路径。
+        progress.log(&format!("产物校验：{verify_note}")).await;
         progress.set(100, "完成").await;
         Ok(panel_task::TaskOutcome {
             state: panel_task::TaskState::Ok,
@@ -749,6 +904,7 @@ pub async fn run(
         encrypt: plan.encrypt,
         master,
         remote,
+        tmp_dir: state.os.paths().tmp_dir(),
     };
     let (tid, _) = state
         .tasks
@@ -1221,6 +1377,7 @@ mod exec_tests {
             encrypt: false,
             remote: None,
             master: None,
+            tmp_dir: std::env::temp_dir(),
         };
         let bus = std::sync::Arc::new(ProgressBus::new());
         job.run(Progress::new(1, bus)).await.expect("备份任务应成功");
@@ -1241,5 +1398,120 @@ mod exec_tests {
         assert_eq!(users, 0, "备份库内容应与源库一致（刚迁移完 users 为空）");
 
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    // ── 产物可恢复性校验：备份"生成成功"≠"能恢复" ──
+
+    /// 好产物必须通过；且摘要里要能看出"真的读过"（条目数/自检结论），
+    /// 而不是一句空话——否则任务中心里这条校验等于没写。
+    #[tokio::test]
+    async fn verify_accepts_a_good_panel_db() {
+        let base = std::env::temp_dir().join(format!("panel-vf-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src.db");
+        std::fs::create_dir_all(&base).unwrap();
+        { let mut c = rusqlite::Connection::open(&src).unwrap(); panel_db::migrate::apply(&mut c).unwrap(); }
+        let good = base.join("good.db");
+        panel_db::backup_file(&src, &good).unwrap();
+
+        let note = verify_artifact(&good, None, &base).await.expect("好产物应通过校验");
+        assert!(note.contains("integrity_check=ok"), "摘要应含自检结论：{note}");
+        assert!(note.contains("users"), "摘要应确认这是面板库：{note}");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// **本条是整件事的意义所在**：坏产物必须被抓住。
+    /// 构造一个"文件存在、大小正常、但不是有效 sqlite"的产物——
+    /// 这正是磁盘写满/管道被打断时留下的东西，只 stat 是看不出来的。
+    #[tokio::test]
+    async fn verify_rejects_a_corrupt_db() {
+        let base = std::env::temp_dir().join(format!("panel-vf-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let bad = base.join("plan1-123.db");
+        // SQLite 头 16 字节是对的，后面全是垃圾：能过"是不是 sqlite"的粗检，
+        // 但 integrity_check 会炸——比纯随机字节更接近真实损坏。
+        let mut v = b"SQLite format 3\x00".to_vec();
+        v.extend(std::iter::repeat(0xABu8).take(64 * 1024));
+        std::fs::write(&bad, &v).unwrap();
+
+        let e = verify_artifact(&bad, None, &base).await.expect_err("坏库必须被拒");
+        let msg = e.to_string();
+        // 真实报错文案是 "database: file is not a database"（rusqlite 的
+        // SQLITE_NOTADB）。断言要覆盖**实际**会出现的说法，否则测试恒红。
+        assert!(
+            msg.contains("not a database") || msg.contains("自检未通过") || msg.contains("Database"),
+            "报错应指向 SQLite 读取失败：{msg}"
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// 不是面板库的 sqlite 文件也要拒：备份的意义是"恢复后面板能起来"，
+    /// 一个能打开但没有 users 表的库恢复回去也是死的。
+    #[tokio::test]
+    async fn verify_rejects_a_db_without_users_table() {
+        let base = std::env::temp_dir().join(format!("panel-vf-nousers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let f = base.join("plan1-1.db");
+        { let c = rusqlite::Connection::open(&f).unwrap();
+          c.execute("CREATE TABLE junk(x)", []).unwrap(); }
+
+        let e = verify_artifact(&f, None, &base).await.expect_err("缺 users 表必须被拒");
+        assert!(e.to_string().contains("users"), "报错应点名缺什么：{e}");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// 加密产物：校验时必须解密成临时明文，且**验完不留明文在盘上**。
+    /// 留了明文的话，"我加密了备份"只是错觉——和加密那步删明文是同一条纪律。
+    #[tokio::test]
+    async fn verify_decrypts_then_leaves_no_plaintext_behind() {
+        let base = std::env::temp_dir().join(format!("panel-vf-enc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let tmp = base.join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let src = base.join("src.db");
+        { let mut c = rusqlite::Connection::open(&src).unwrap(); panel_db::migrate::apply(&mut c).unwrap(); }
+        let good = base.join("good.db");
+        panel_db::backup_file(&src, &good).unwrap();
+
+        let key = panel_core::crypto::MasterKey::from_bytes(&[7u8; 32]).unwrap();
+        let enc = base.join("good.db.enc");
+        panel_os::backup::encrypt_file(&good, &enc, &key).await.unwrap();
+        std::fs::remove_file(&good).unwrap();
+
+        let before = ls_files(&tmp).len();
+        let note = verify_artifact(&enc, Some(&key), &tmp).await.expect("加密好产物应通过");
+        assert!(note.contains("integrity_check=ok"), "{note}");
+        let after = ls_files(&tmp);
+        assert_eq!(after.len(), before, "校验结束不得留下临时明文：{:?}", after);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// 加密产物但拿不到主密钥 → 明确报错，而不是"校验跳过"假装成功。
+    /// 静默跳过等于假绿：坏备份会一路混到事故那天。
+    #[tokio::test]
+    async fn verify_encrypted_without_key_fails_loudly() {
+        let base = std::env::temp_dir().join(format!("panel-vf-nokey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // 夹具必须是**真加密**的：写个假 .enc 的话 `is_encrypted_file` 认不出魔术头，
+        // 会走到"不认识的扩展名"分支，根本测不到无密钥那条路（实测踩过）。
+        let src = base.join("src.db");
+        { let mut c = rusqlite::Connection::open(&src).unwrap(); panel_db::migrate::apply(&mut c).unwrap(); }
+        let plain = base.join("plain.db");
+        panel_db::backup_file(&src, &plain).unwrap();
+        let key = panel_core::crypto::MasterKey::from_bytes(&[9u8; 32]).unwrap();
+        let enc = base.join("plain.db.enc");
+        panel_os::backup::encrypt_file(&plain, &enc, &key).await.unwrap();
+        std::fs::remove_file(&plain).unwrap();
+
+        let e = verify_artifact(&enc, None, &base).await.expect_err("无密钥必须报错");
+        assert!(e.to_string().contains("主密钥"), "{e}");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    fn ls_files(d: &std::path::Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(d).map(|rd| rd.flatten().map(|e| e.path()).collect()).unwrap_or_default()
     }
 }
