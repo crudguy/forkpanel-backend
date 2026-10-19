@@ -53,6 +53,11 @@ pub struct AppState {
     /// 也证明这两项已接线（曾硬编码 30m/12h、配置形同虚设，与 `read_only` 同类"假控制"）。
     pub session_idle: std::time::Duration,
     pub session_absolute: std::time::Duration,
+    /// 审计保留天数（来自 config.toml `[audit]`）。设置页 deployment 段只读展示用，
+    /// 也证明该项已接线——`main.rs` 的清理任务据此调用 `prune_audit` 强制落盘。
+    pub audit_retention_days: u32,
+    /// 审计单表行数上限（来自 config.toml `[audit]`）。同上，deployment 段只读展示。
+    pub audit_max_rows: u64,
     /// 首启引导令牌（一次性、只存内存）。serve 首启无 owner 时生成。
     pub bootstrap: Arc<crate::auth::BootstrapGuard>,
     /// 主密钥（32 字节，内存常驻，不落库）。为 None 时所有"写入真实秘密"的操作被拒绝。
@@ -83,13 +88,15 @@ impl AppState {
                metrics: Arc<std::sync::Mutex<panel_db::aggregator::Aggregator>>,
                tier: Tier, master_key: Option<MasterKey>, read_only: bool,
                max_login_attempts: usize,
-               session_idle: std::time::Duration, session_absolute: std::time::Duration) -> Self {
+               session_idle: std::time::Duration, session_absolute: std::time::Duration,
+               audit_retention_days: u32, audit_max_rows: u64) -> Self {
         let capabilities = os.capabilities();
         // 会话持久化：把写者交给 SessionCache（`sessions` 表 001 已定义、此前无人使用）。
         // 先 clone——下方 struct 字面量会把 db move 进字段。
         let sessions_db = db.clone();
         Self {
             os, db, pool, tasks, metrics, tier, capabilities, session_idle, session_absolute,
+            audit_retention_days, audit_max_rows,
             sessions: Arc::new(crate::auth::SessionCache::new_with_db(
                 session_idle,
                 session_absolute,

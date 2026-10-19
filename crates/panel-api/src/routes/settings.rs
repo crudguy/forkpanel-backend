@@ -3,7 +3,8 @@
 //! **诚实三段模型**——settings 表的 8 个种子行当前**全部是死数据**（无运行时
 //! 消费点），绝不能伪装成"可改即生效"：
 //! - `runtime`：真正可改且立即生效的键（当前 = AI 助手 LLM 三键）
-//! - `deployment`：部署级配置（read_only / tier），**只读展示**实际生效值，
+//! - `deployment`：部署级配置（read_only / tier / max_login_attempts / session_idle /
+//!   session_absolute / audit_retention_days / audit_max_rows），**只读展示**实际生效值，
 //!   修改必须走 config.toml / 环境变量并重启——PATCH 这类键返回 400
 //! - `reserved`：种子预留、尚未接线的键（audit/metrics retention 等），
 //!   展示表内值并标注 `wired:false`。⚠ 注意：审计保留**实际已通过 config.toml
@@ -32,8 +33,15 @@ const K_LLM_API_KEY: &str = "assistant.llm_api_key";
 const RUNTIME_KEYS: [&str; 3] = [K_LLM_ENDPOINT, K_LLM_MODEL, K_LLM_API_KEY];
 
 /// 部署级键：在 settings 表里只有死种子，实际生效值来自 config.toml/env。
-const DEPLOYMENT_KEYS: [&str; 5] =
-    ["read_only", "tier", "max_login_attempts", "session_idle", "session_absolute"];
+const DEPLOYMENT_KEYS: [&str; 7] = [
+    "read_only",
+    "tier",
+    "max_login_attempts",
+    "session_idle",
+    "session_absolute",
+    "audit_retention_days",
+    "audit_max_rows",
+];
 
 #[derive(Debug, Deserialize)]
 pub struct PatchReq {
@@ -122,7 +130,9 @@ pub async fn get(
         "max_login_attempts": state.logins.max_attempts(),
         "session_idle": fmt_dur(state.session_idle),
         "session_absolute": fmt_dur(state.session_absolute),
-        "hint": "部署级配置：config.toml [security] 的 read_only / max_login_attempts / session_idle / session_absolute 改后重启生效（此处 PATCH 会造成『改了却不生效』的谎言，故拒绝）",
+        "audit_retention_days": state.audit_retention_days,
+        "audit_max_rows": state.audit_max_rows,
+        "hint": "部署级配置：config.toml [security] 的 read_only / max_login_attempts / session_idle / session_absolute 与 [audit] 的 retention_days / max_rows 改后重启生效（此处 PATCH 会造成『改了却不生效』的谎言，故拒绝）",
     });
 
     // reserved：种子预留，值取表内（缺省回落种子字面量），一律 wired:false

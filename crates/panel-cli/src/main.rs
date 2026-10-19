@@ -275,9 +275,15 @@ fn run(cli: Cli) -> Result<()> {
                 // 登录最大尝试次数：config.toml 的 `[security] max_login_attempts`。
                 // 曾硬编码 5 于 LoginGuard::new()——配置项形同虚设（与 session_* 同类）。
                 let max_login_attempts = cfg.security.max_login_attempts;
+                // 审计保留：config.toml `[audit]`（部署级，强制清理见下方周期任务）。
+                // 这里读一次注入 AppState，设置页 deployment 段据此只读展示真实生效值，
+                // 避免页面只显示 reserved 段的死占位而让用户误以为保留策略「未实现」。
+                let audit_retention_days = cfg.audit.retention_days;
+                let audit_max_rows = cfg.audit.max_rows;
                 let state = Arc::new(panel_api::AppState::new(
                     os.clone(), writer.clone(), pool, tasks.clone(), metrics.clone(), tier,
-                    master_key, read_only, max_login_attempts, session_idle, session_absolute));
+                    master_key, read_only, max_login_attempts, session_idle, session_absolute,
+                    audit_retention_days, audit_max_rows));
 
                 // ── 内部周期任务 ──
                 register_internal_jobs(&sched_in, &os, writer.clone(), metrics.clone(), &layout, &cfg, tier, state.clone()).await;
