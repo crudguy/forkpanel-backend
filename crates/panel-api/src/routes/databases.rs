@@ -1,15 +1,16 @@
 //! 数据库管理（设计方案 §2.6）。
 //!
-//! # 范围克制：MVP 只做"备份/恢复 + 列表"，不做 Web SQL 终端
-//! 理由：
-//! - Web 里放 SQL 执行框 = 给 XSS/CSRF 一个高价值目标，且难以做资源隔离；
-//! - 慢查询会占住连接与 CPU，低配机器上直接拖垮面板；
-//! - 真要执行 SQL，用本地客户端更安全。
-//! 备份/恢复是运维刚需且可走任务队列，故优先实现。
+//! # 范围：备份/恢复 + 只读浏览 + **只读 SQL 控制台**
+//! Web SQL 终端曾因"怕变成任意写库入口"而整体不做。现在提供的版本把这个顾虑
+//! 拆开了：**写**依然完全不提供，**读**则靠服务端物理只读护栏兜底
+//! （SQLite 只读连接 / PG `default_transaction_read_only=on` 会话），
+//! 白名单只负责尽早给出可读错误。没有护栏的引擎（MySQL）诚实 501。
 //!
 //! # ⚠️ 安全说明
 //! 连接口令一律经 AES-256-GCM（主密钥来自 `master.key`）加密后写入 `password_enc`，
 //! 列表接口仅返回 `has_password` 布尔，绝不回显明文/密文。无主密钥时创建带口令的连接被拒绝。
+//! 外部客户端（psql/mysql/mysqldump）的口令经环境变量传递，**绝不进 argv**——
+//! argv 会被同机任意用户的 `ps` 看到，等于直接泄露数据库口令。
 
 use crate::{
     auth::perm,
@@ -40,6 +41,16 @@ pub struct ConnDto {
     /// 旧名 `available` 让人误读为「连接可用」，UI 据此渲染成绿色「可用」徽标，
     /// 用户点了「备份」却失败且无从归因（实证过一次）。命名必须诚实。
     pub client_ready: bool,
+    /// 该连接能否打开**只读 SQL 控制台**（UI 按钮门控的唯一依据）。
+    ///
+    /// ⚠️ 与 `client_ready` 不是同一个问题，也不能互相推导：
+    /// - `client_ready` 说「浏览/备份的客户端在不在」；
+    /// - 这个说「用户自己写 SQL 能不能跑」，判据是**有没有服务端物理只读护栏**
+    ///   （SQLite 只读连接 / PG `default_transaction_read_only` 会话）。
+    /// MySQL 装了客户端也依然是 false——没有护栏，开了就是任意写库入口。
+    /// 前端**不得**用 `engine === 'sqlite'` 自己猜这个值：后端加了护栏而前端
+    /// 没跟上，用户就白白用不上已能用的功能（置灰是前端单方面的承诺）。
+    pub readonly_sql: bool,
     /// 是否有口令（**绝不返回口令本身**）
     pub has_password: bool,
     /// 对象说明（备注，022）：这个库干嘛的、为何这样配置——手写意图
@@ -94,6 +105,10 @@ pub async fn list(
         };
         // 逐连接按引擎判定「是否已实装」：未实装的引擎（mysql/postgres）诚实置灰，不撒谎
         let available = state.os.databases().supports(eng);
+        // 只读 SQL 控制台的能力位同样逐引擎判定，但判据不同（见 ConnDto::readonly_sql）。
+        // 与 available 分开算而不是复用：两者回答的不是同一个问题，复用会让
+        // 「装了客户端」被误当成「能自己写 SQL」。
+        let readonly_sql = state.os.databases().readonly_sql(eng);
         dtos.push(ConnDto {
             id, name,
             engine: match eng { panel_os::DbEngine::MySql => "mysql",
@@ -101,6 +116,7 @@ pub async fn list(
                                 panel_os::DbEngine::Sqlite => "sqlite" },
             host, port, default_db,
             client_ready: available,
+            readonly_sql,
             has_password: pwd.is_some(),
             remark,
         });
@@ -767,8 +783,100 @@ pub struct QueryReq {
     pub limit: Option<usize>,
 }
 
-/// 只读 SQL 控制台。**只对 SQLite 开放**——只有它的读连接是物理只读的，
-/// 其它引擎没有这个保证，provider 层会诚实 501。
+/// SQL 控制台的引擎相关文案：默认语句 + 示例 + 边界提示。
+///
+/// **为什么放在后端**：这些文本是引擎知识（`sqlite_master` vs
+/// `information_schema` vs 只读护栏的残余风险）。放前端就等于把"哪个引擎长什么样"
+/// 复制一份到 UI 层，后端改口径时前端静默过期——正是单一事实源纪律要避免的漂移。
+/// 前端只负责渲染，不判断引擎（连 `engine === 'postgres'` 都不该出现）。
+///
+/// MySQL 返回空示例：控制台对它不开放（无服务端只读护栏），给了也点不开。
+fn sql_console_meta(engine: &str) -> (&'static str, Vec<(&'static str, &'static str)>, &'static str) {
+    // 边界提示按引擎给：**写的是这个引擎真实存在的边界**，不是通用免责声明。
+    // PG 那条尤其不能省——只读护栏拦不住 pg_reload_conf 这类配置函数，
+    // 如实写出来，用户才不会以为"面板说只读就绝对只读"。
+    let (default_sql, samples, note) = match engine {
+        "postgres" => (
+            "SELECT table_name FROM information_schema.tables \
+             WHERE table_schema = 'public' ORDER BY table_name",
+            vec![
+                ("表清单", "SELECT table_name FROM information_schema.tables \
+                            WHERE table_schema = 'public' ORDER BY table_name"),
+                ("列结构", "SELECT column_name, data_type, is_nullable FROM information_schema.columns \
+                            WHERE table_schema = 'public' AND table_name = 'sites' ORDER BY ordinal_position"),
+                ("库信息", "SELECT current_database() AS db, current_user AS usr, version() AS ver"),
+                ("活动连接", "SELECT count(*) AS conns FROM pg_stat_activity"),
+                ("表体积", "SELECT relname, pg_size_pretty(pg_total_relation_size(relid)) AS size \
+                            FROM pg_stat_user_tables ORDER BY pg_total_relation_size(relid) DESC LIMIT 20"),
+            ],
+            "会话以只读模式执行，写语句会被数据库拒绝；个别配置类函数（如 pg_reload_conf）不受此约束。",
+        ),
+        // SQLite：sqlite_master 是它的目录表；PRAGMA 是它的元数据入口
+        _ => (
+            "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
+            vec![
+                ("表清单", "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"),
+                ("表结构", "SELECT sql FROM sqlite_master WHERE type = 'table' ORDER BY name"),
+                ("索引", "SELECT name, tbl_name FROM sqlite_master WHERE type = 'index' ORDER BY tbl_name"),
+                ("库信息", "PRAGMA database_list"),
+                ("完整性", "PRAGMA integrity_check"),
+            ],
+            "连接以只读模式打开，写语句会直接失败。",
+        ),
+    };
+    (default_sql, samples, note)
+}
+
+/// 控制台元数据：能力位 + 默认语句 + 示例。
+///
+/// 单独一个端点而不是塞进 `ConnDto`：列表接口会被轮询/刷新，没必要每次都
+/// 带上五六条示例 SQL；控制台是**按需打开**的，一次请求正好。
+#[derive(Debug, Serialize)]
+pub struct SqlMetaDto {
+    pub engine: &'static str,
+    /// 与 `ConnDto.readonly_sql` 同源同值——打开控制台前再确认一次，
+    /// 避免列表数据过期导致"按钮亮着、内容说不能跑"。
+    pub readonly_sql: bool,
+    pub default_sql: String,
+    pub samples: Vec<SqlSample>,
+    /// 只读护栏的**诚实边界**（按引擎给）。前端原样展示，不自行判断引擎。
+    pub note: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SqlSample {
+    pub label: &'static str,
+    pub sql: &'static str,
+}
+
+pub async fn sql_meta(
+    State(state): State<Shared>, Auth(s): Auth,
+    AxPath(conn): AxPath<i64>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::DB_VIEW)?;
+    let t = load_target(&state, conn, None).await?;
+    let eng = match t.engine {
+        panel_os::DbEngine::MySql => "mysql",
+        panel_os::DbEngine::Postgres => "postgres",
+        panel_os::DbEngine::Sqlite => "sqlite",
+    };
+    let (default_sql, samples, note) = sql_console_meta(eng);
+    Ok(ok(serde_json::json!(SqlMetaDto {
+        engine: eng,
+        readonly_sql: state.os.databases().readonly_sql(t.engine),
+        default_sql: default_sql.to_string(),
+        samples: samples.into_iter().map(|(label, sql)| SqlSample { label, sql }).collect(),
+        note,
+    })))
+}
+
+/// 只读 SQL 控制台。
+///
+/// **开放范围**：SQLite 与 PostgreSQL。两者的"只读"都不靠本层的白名单兜底——
+/// SQLite 是只读连接（`SQLITE_OPEN_READ_ONLY`），PG 是只读会话
+/// （`default_transaction_read_only=on`），写语句在服务端**物理失败**。
+/// 白名单只是第一层：尽早给出可读的错误。MySQL 仍不开放（无护栏），
+/// provider 层会诚实 501。
 pub async fn query(
     State(state): State<Shared>, Auth(s): Auth,
     AxPath(conn): AxPath<i64>, Json(req): Json<QueryReq>,
@@ -800,13 +908,18 @@ const WRITE_KEYWORDS: &[&str] = &[
 
 /// 只读 SQL 校验。
 ///
-/// **这不是唯一防线**：SQLite 走只读连接打开，写语句物理上会失败。
-/// 这里做两件事：
-///   1. 尽早给出可读的错误（比引擎的 "attempt to write a readonly database" 好懂）；
-///   2. 对将来可能接入的其它引擎，这是**必须**拦住的地方。
+/// **这不是唯一防线，也不是最强的那道**：真正的兜底在 provider 层——
+/// SQLite 只读连接、PG 只读会话，写语句物理失败。这里做两件事：
+///   1. 尽早给出可读的错误（比引擎的 "cannot execute CREATE TABLE in a read-only transaction" 好懂）；
+///   2. 挡掉明显的越界，省掉一次无谓的进程启动。
 ///
 /// 判定不能只看首关键词——`WITH x AS (…) DELETE …` 的首词完全合法，
 /// 因此必须叠加写关键词黑名单。
+///
+/// ⚠️ 已知边界（诚实记录）：PG 的美元引用 `$$…$$` 里的分号会被当多语句计，
+/// 于是 `SELECT $$a;b$$` 会被误判成"一次只允许一条语句"。PG 的函数体
+/// （`CREATE FUNCTION … $$`）本来就该被黑名单拦下，故实际影响面很小；
+/// 后果是**可见的报错**而非静默放行，故记为已知边界而非缺陷。
 fn validate_read_only_sql(sql: &str) -> ApiResult<()> {
     if sql.len() > SQL_MAX_BYTES {
         return Err(ApiError::bad_request("sql", format!("语句过长（上限 {SQL_MAX_BYTES} 字节）")));
@@ -1109,7 +1222,7 @@ mod tests {
     fn password_is_never_returned() {
         // 列表接口只返回 has_password 布尔，不返回口令
         let dto = ConnDto { id: 1, name: "x".into(), engine: "mysql", host: None,
-            port: None, default_db: None, client_ready: true, has_password: true,
+            port: None, default_db: None, client_ready: true, readonly_sql: false, has_password: true,
             remark: String::new() };
         let v = serde_json::to_value(&dto).unwrap();
         assert!(!v.as_object().unwrap().contains_key("password"));
@@ -1153,5 +1266,72 @@ mod tests {
         assert_eq!(pick("with-pwd").6.as_deref(), Some(&[0xDEu8, 0xAD, 0xBE, 0xEF][..]));
         // 无口令：NULL 必须映射成 None，而不是报类型错
         assert!(pick("no-pwd").6.is_none(), "NULL 口令应映射为 None");
+    }
+
+    // ── SQL 控制台元数据：引擎文案不得串味 ──
+
+    /// PG 的默认语句与示例**一条 `sqlite_master` 都不能有**。
+    ///
+    /// 这条守的是这次改造最容易犯的错：控制台从"只对 SQLite 开放"扩到 PG，
+    /// 示例 SQL 却还是原来那五条 SQLite 专用句子。用户点开 PG 连接的控制台，
+    /// 第一眼看到的是 `SELECT name FROM sqlite_master …`，一执行就是
+    /// 「relation "sqlite_master" does not exist」——按钮是亮的、功能是废的。
+    /// 判据必须是**内容**，不是"示例列表非空"（非空对串味恒真）。
+    #[test]
+    fn pg_console_samples_contain_no_sqlite_artifacts() {
+        let (default_sql, samples, note) = sql_console_meta("postgres");
+        assert!(!default_sql.is_empty(), "默认语句不能空");
+        assert_eq!(samples.len(), 5, "示例条数应与 SQLite 对齐（5 条）");
+        for (label, sql) in &samples {
+            let low = sql.to_ascii_lowercase();
+            assert!(!low.contains("sqlite_master"),
+                "PG 示例不得出现 sqlite_master：{label} → {sql}");
+            assert!(!low.contains("pragma"),
+                "PG 没有 PRAGMA，示例不得出现：{label} → {sql}");
+        }
+        let low = default_sql.to_ascii_lowercase();
+        assert!(!low.contains("sqlite_master"), "默认语句不得出现 sqlite_master：{default_sql}");
+        assert!(low.contains("information_schema") || low.contains("pg_catalog"),
+            "PG 默认语句应指向它自己的目录表：{default_sql}");
+        // 边界提示必须讲 PG **真实存在**的残余风险，不能是空话
+        assert!(note.contains("pg_reload_conf"),
+            "PG 提示必须点出只读护栏拦不住的配置类函数：{note}");
+    }
+
+    /// SQLite 侧保持原样（这五条是既有行为，改造不得顺手改掉）。
+    /// 反向判据：PG 分支若漏写、落到 `_ =>` 分支上，这条不会红，
+    /// 所以真正确认"没串味"的是上一条；这条确认的是"没把 SQLite 弄丢"。
+    #[test]
+    fn sqlite_console_samples_stay_sqlite_native() {
+        let (default_sql, samples, note) = sql_console_meta("sqlite");
+        assert!(default_sql.to_ascii_lowercase().contains("sqlite_master"));
+        assert_eq!(samples.len(), 5);
+        // 表结构走 sqlite_master，而不是 PG 的 information_schema
+        let structure = samples.iter().find(|(l, _)| *l == "表结构").expect("缺表结构示例");
+        assert!(structure.1.to_ascii_lowercase().contains("sqlite_master"));
+        assert!(!note.is_empty(), "SQLite 的边界提示不能空");
+    }
+
+    /// 未知引擎走 SQLite 分支：前端只会传后端自己下发的 engine 串，
+    /// 但 `_ =>` 兜底必须是"能用的那一套"，而不是空列表让控制台开天窗。
+    #[test]
+    fn unknown_engine_falls_back_to_sqlite_samples_not_empty() {
+        let (default_sql, samples, note) = sql_console_meta("oracle");
+        assert!(!default_sql.is_empty());
+        assert!(!samples.is_empty(), "兜底分支不能给空示例");
+        assert!(!note.is_empty(), "兜底分支的边界提示不能空");
+    }
+
+    /// 控制台对 MySQL 不开放，但 `sql_console_meta` 仍返回兜底文案——
+    /// **这不矛盾**：门控在 `readonly_sql` 能力位上，meta 只提供内容。
+    /// 把两者混在一个判断里，就会出现"能力位说不能跑、示例却说能跑"的自相矛盾。
+    #[test]
+    fn mysql_meta_content_is_decoupled_from_the_capability_bit() {
+        // 内容：有兜底（不会被能力位卡住后开天窗）
+        let (default_sql, _, note) = sql_console_meta("mysql");
+        assert!(!default_sql.is_empty());
+        assert!(!note.is_empty());
+        // 能力：矩阵里恒 false（这才是真正的门控）
+        assert!(!panel_os::db_console_open(panel_os::DbEngine::MySql, true));
     }
 }

@@ -221,6 +221,10 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/db/{conn}/backup", post(databases::backup))
         .route("/api/v1/db/{conn}/query", post(databases::query))
         .route("/api/v1/db/{conn}/restore", post(databases::restore))
+        // 控制台元数据（能力位 + 引擎相关的默认语句/示例）。**必须在 `{conn}/query` 之外
+        // 单独成路径**：它回答"这个连接能不能自己写 SQL、该从哪句开始"，
+        // 与"执行一条 SQL"是两个不同的问题。
+        .route("/api/v1/db/{conn}/sql-meta", get(databases::sql_meta))
         // 数据库连接说明（对象备注，022）
         .route("/api/v1/db/{conn}/remark", patch(databases::update_remark));
 

@@ -433,6 +433,12 @@ impl DatabaseProvider for MockDatabases {
     fn engine(&self) -> DbEngine { DbEngine::Sqlite }
     async fn available(&self) -> Result<bool> { Ok(true) }
     fn supports(&self, e: DbEngine) -> bool { matches!(e, DbEngine::Sqlite) }
+    /// 与 Linux 实现共用同一份判定矩阵（`crate::traits::db_console_open`）：
+    /// mock 的 `supports()` 只认 SQLite，故 PG 在这里恒为 false——mock 不做前端联调时
+    /// 看不到 PG 控制台入口，与真机"没装 psql"时一致，不会给出假按钮。
+    fn readonly_sql(&self, e: DbEngine) -> bool {
+        crate::traits::db_console_open(e, self.supports(e))
+    }
     async fn databases(&self, _t: &DbTarget) -> Result<Vec<String>> { Ok(vec!["panel".into()]) }
     async fn schemas(&self, _t: &DbTarget, _db: &str) -> Result<Vec<DbNode>> {
         // 模拟 SQLite 的真实口径：面板连的是单文件，只有 main；**没有 schema 层**，

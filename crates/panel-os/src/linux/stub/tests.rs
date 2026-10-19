@@ -2,6 +2,128 @@ use super::*;
 
     use crate::traits::DatabaseProvider;
 
+    // ── PG 只读控制台：包裹与输出解析（纯函数，不连数据库） ──
+    //
+    // 这三条判据全部来自本机实测（psql 18.6）——不是"按理说应该"：
+    // 每条注释里的报错文案都是当时真实看到的。
+
+    /// 包裹的三个坑各有一条断言盯着。少处理任何一个，PG 侧就是语法错误，
+    /// 而错误信息指向的是包裹层（`) AS __panel_readonly`），用户根本看不出
+    /// 是自己的 SQL 有问题还是面板有问题。
+    #[test]
+    fn pg_wrap_readonly_handles_the_three_measured_pitfalls() {
+        // 坑 1：结尾分号。`SELECT * FROM (SELECT 1;) AS x` 实测报
+        // 「语法错误 在 ";" 或 ")" 附近」——必须先剥掉。
+        assert_eq!(
+            pg_wrap_readonly("SELECT 1;", 5),
+            "SELECT * FROM (SELECT 1\n) AS __panel_readonly LIMIT 5"
+        );
+        // 多个尾分号与前后空白一并吃掉
+        assert_eq!(
+            pg_wrap_readonly("  SELECT 1 ;  ", 5),
+            "SELECT * FROM (SELECT 1\n) AS __panel_readonly LIMIT 5"
+        );
+        // 坑 3：尾注释。不补换行时 `--` 会把 `) AS … LIMIT …` 一起吃到行尾，
+        // 实测报「语法错误 在输入的末尾」。补 `\n` 后注释在括号内闭合。
+        assert_eq!(
+            pg_wrap_readonly("SELECT 1 -- 只看一行", 5),
+            "SELECT * FROM (SELECT 1 -- 只看一行\n) AS __panel_readonly LIMIT 5"
+        );
+        // 坑 2：EXPLAIN 不能包。实测 `SELECT * FROM (EXPLAIN SELECT 1) AS x` 报
+        // 「语法错误 在 "SELECT" 或 "(" 附近」。它不返回数据行，原样放行。
+        assert_eq!(pg_wrap_readonly("EXPLAIN SELECT 1", 5), "EXPLAIN SELECT 1");
+        assert_eq!(pg_wrap_readonly("explain analyze select 1;", 5), "explain analyze select 1");
+        // 普通查询照常包裹，limit 原样落入（调用方传的是 limit+1）
+        assert_eq!(
+            pg_wrap_readonly("SELECT * FROM t", 201),
+            "SELECT * FROM (SELECT * FROM t\n) AS __panel_readonly LIMIT 201"
+        );
+    }
+
+    /// 尾分号剥离不能伸进引号里：`SELECT ';'` 的引号内分号是**数据**，
+    /// 剥掉了语句语义就变了（虽然这里仍是合法 SQL，但性质上属于静默改写用户输入）。
+    #[test]
+    fn pg_wrap_readonly_never_strips_a_semicolon_inside_quotes() {
+        let got = pg_wrap_readonly("SELECT ';'", 5);
+        assert!(got.contains("';'"), "引号内的分号必须原样保留：{got}");
+        // 分号在引号内 + 真尾分号在引号外 → 只剥外面那个
+        let got2 = pg_wrap_readonly("SELECT ';';", 5);
+        assert!(got2.contains("';'"), "引号内分号必须保留：{got2}");
+        assert!(!got2.trim_end().ends_with(';'), "引号外的尾分号必须剥掉：{got2}");
+    }
+
+    /// 状态行识别：认得出的才剥，认不出的**当数据留着**。
+    ///
+    /// 反向判据是这条测试的重点：一行内容恰好长得像 `(3 rows)` 的真实数据，
+    /// 不能被当状态行吃掉——静默丢数据比多留一行严重得多。
+    #[test]
+    fn pg_status_tag_recognition_is_conservative() {
+        // 该认的（`cmd::run` 固定 LC_ALL=C，故是英文形态）
+        assert!(is_pg_status_tag("(1 row)"));
+        assert!(is_pg_status_tag("(0 rows)"));
+        assert!(is_pg_status_tag("(2001 rows)"));
+        assert!(is_pg_status_tag("  (3 rows)  "), "首尾空白不影响");
+        // 不该认的
+        assert!(!is_pg_status_tag("(3 行)"), "locale 漂了也不该认——宁可多留一行");
+        assert!(!is_pg_status_tag("(3)"), "缺单位");
+        assert!(!is_pg_status_tag("(rows 3)"), "顺序反了");
+        assert!(!is_pg_status_tag("(3 rows extra)"), "多段");
+        assert!(!is_pg_status_tag("(abc rows)"), "行数不是数字");
+        assert!(!is_pg_status_tag("(3 rows"), "缺右括号");
+        assert!(!is_pg_status_tag(""), "空行");
+        assert!(!is_pg_status_tag("3 rows"), "缺括号");
+        // 一行**长得像**状态行的真实数据：宁可留错，不能吃掉
+        assert!(!is_pg_status_tag("(2 rows) -- 备注"), "带尾巴的不是状态行");
+    }
+
+    /// 只读控制台开放判定必须与「服务端只读护栏」对齐，且**与客户端在位性挂钩**。
+    ///
+    /// 本机装了 psql，故 `Postgres => true` 这一路只能在 traits 的纯函数矩阵里验
+    /// （见 `db_console_open_matrix_is_explicit_for_every_engine`）。这里补的是
+    /// **真实 provider 的接线**：矩阵喂进去的环境输入对不对。
+    ///
+    /// ⚠️ 实测过的盲区（负向对照 NC9）：把下面的 `self.supports(e)` 改成写死 `true`，
+    /// 本机这条**不会红**——因为本机 `supports(Postgres)` 本来就是 true。
+    /// 这不是测试偷懒，是"本机状态让两种写法等价"。真正钉住那一格的是
+    /// `db_console_open_matrix_is_explicit_for_every_engine` 里的
+    /// `assert!(!db_console_open(DbEngine::Postgres, false))`：
+    /// 它把 client_present 当参数喂进去，不依赖本机装没装 psql。
+    #[test]
+    fn linux_readonly_sql_wires_the_matrix_to_client_presence() {
+        let p = LinuxDatabases::default();
+        // SQLite：只读连接兜底，与本机装没装 psql 无关
+        assert!(p.readonly_sql(DbEngine::Sqlite), "SQLite 必须开放");
+        // MySQL：没有服务端只读护栏，恒关（这是最危险的一格）
+        assert!(!p.readonly_sql(DbEngine::MySql), "MySQL 必须关闭");
+        // PG：矩阵要求 client_present；本机若装了 psql 就该开，没装就该关——
+        // 两种情况都由 supports() 如实反映，不允许写死。
+        assert_eq!(
+            p.readonly_sql(DbEngine::Postgres),
+            p.supports(DbEngine::Postgres),
+            "PG 控制台出口是 psql：能力位必须随客户端在位性变化，\
+             写死 true 会在没装 psql 的机器上给出假按钮"
+        );
+    }
+
+    /// 能力位关闭的引擎，`query()` 必须**诚实 Unsupported**，而不是硬跑。
+    ///
+    /// 这条守的是"能力位与实现不能漂移"：按钮灰着（readonly_sql=false）但
+    /// 后端却能执行，用户从 API 直调就绕过了 UI 门控——那是能力位在撒谎。
+    #[tokio::test]
+    async fn mysql_query_is_unsupported_not_silently_executed() {
+        let t = DbTarget {
+            engine: DbEngine::MySql,
+            host: Some("127.0.0.1".into()), port: Some(3306),
+            user: Some("u".into()), password: None, database: Some("db".into()),
+        };
+        let prov: &dyn DatabaseProvider = &LinuxDatabases::default();
+        let r = prov.query(&t, "SELECT 1", 10).await;
+        assert!(
+            matches!(r, Err(panel_core::PanelError::Unsupported(_))),
+            "MySQL 无服务端只读护栏，query() 必须 Unsupported：{r:?}"
+        );
+    }
+
     #[test]
     fn service_unit_from_dpkg_list_picks_primary_unit() {
         // nginx 同时 shipping nginx.service 与 nginx-debug.service：必须选主单元 nginx.service，

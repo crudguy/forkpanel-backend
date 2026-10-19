@@ -4,7 +4,12 @@ use super::*;
 /// 内建 SQLite 浏览：**只读**打开 `.db` 文件 → 列库/表/行。
 ///
 /// 边界（诚实声明，不撒谎）：
-/// - 仅实装 SQLite（内建引擎，无需外部客户端）；mysql/postgres 需外部客户端，`supports()=false`；
+/// - SQLite 为内建引擎（浏览 + 只读 SQL 控制台均已实装，无需外部客户端）；
+/// - PostgreSQL 浏览与只读 SQL 控制台均已实装，但都经 `psql` 外部客户端，
+///   且**只读靠 `PGOPTIONS=default_transaction_read_only=on` 会话护栏**
+///   （见 `PG_READONLY_ENV` 的残余风险记录）；
+/// - MySQL 浏览已实装（经 `mysql` 客户端），但**只读 SQL 控制台未实装**——
+///   没有服务端物理只读护栏可用，见 `query()` 的 MySql 分支；
 /// - 一律以 `SQLITE_OPEN_READ_ONLY` 打开（浏览不该改库）；
 /// - 表名等不可参数化处一律双引号转义（`quote_ident`），LIMIT/OFFSET 走参数绑定；
 /// - rusqlite 是同步阻塞 API，全部经 `spawn_blocking` 执行，绝不阻塞 async 运行时。
@@ -16,8 +21,21 @@ impl LinuxDatabases {
     ///
     /// **凭据经环境变量传递**（`MYSQL_PWD` / `PGPASSWORD`），绝不放 argv——
     /// argv 会被同机任意用户的 `ps` 看到，等于直接泄露数据库口令。
-    /// 只用于只读浏览；面板不提供在线 SQL 编辑器（设计 §2.4 列为 M4 且默认关）。
+    /// 用于浏览路径（库/表/行数/列名）与 PG 只读控制台（后者另走
+    /// `sql_query_console`，要拿列名）。MySQL 的连接不是只读的，故不接控制台。
     pub(crate) async fn sql_query(t: &DbTarget, sql: &str) -> Result<Vec<Vec<String>>> {
+        Self::sql_query_env(t, sql, &[]).await
+    }
+
+    /// [`LinuxDatabases::sql_query`] 的可注入环境变量变体。
+    ///
+    /// 存在的唯一理由：PG 只读控制台要靠 `PGOPTIONS` 把**会话**设成只读
+    /// （见 `PG_READONLY_ENV`）。浏览路径一律传空切片，行为与从前逐字节一致。
+    pub(crate) async fn sql_query_env(
+        t: &DbTarget,
+        sql: &str,
+        extra_env: &[(&str, &str)],
+    ) -> Result<Vec<Vec<String>>> {
         let mut env: std::collections::HashMap<String, std::ffi::OsString> =
             std::collections::HashMap::new();
         let (bin, args): (crate::cmd::Bin, Vec<String>) = match t.engine {
@@ -63,6 +81,10 @@ impl LinuxDatabases {
                 return Err(panel_core::PanelError::Internal("SQLite 不走外部客户端".into()))
             }
         };
+        // extra_env 放在凭据之后：调用方传的护栏变量优先（当前只有 PGOPTIONS 一处）
+        for (k, v) in extra_env {
+            env.insert((*k).into(), std::ffi::OsString::from(v));
+        }
 
         let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let out = crate::cmd::run(
@@ -89,6 +111,94 @@ impl LinuxDatabases {
             .collect())
     }
 
+    /// PG 只读控制台专用：执行一条 SQL，**连列名一起取回**。
+    ///
+    /// 与 `sql_query` 的差别只有一处——不带 `--tuples-only`。psql 只有在
+    /// 非 tuples-only 模式下才打印表头，而表头正是列名的唯一来源
+    /// （`sql_query` 拿不到列名，浏览路径靠 `SHOW COLUMNS` 之类另查）。
+    ///
+    /// ⚠️ **不要为了省事加第二个 `-c "\echo 哨兵"`**：实测 psql 有多个 `-c` 时，
+    /// 前一条失败也照样 exit 0（最后一条 `\echo` 成功就把退出码洗干净了），
+    /// 错误只留在 stderr。单 `-c` 时退出码是可靠的（失败 → 非 0），
+    /// 所以这里只用一条，靠「末行是命令状态行」剥离，见 `is_pg_status_tag`。
+    pub(crate) async fn sql_query_console(
+        t: &DbTarget,
+        sql: &str,
+        extra_env: &[(&str, &str)],
+    ) -> Result<(Vec<String>, Vec<Vec<String>>)> {
+        let mut env: std::collections::HashMap<String, std::ffi::OsString> =
+            std::collections::HashMap::new();
+        if let Some(p) = &t.password {
+            env.insert("PGPASSWORD".into(), std::ffi::OsString::from(p));
+        }
+        for (k, v) in extra_env {
+            env.insert((*k).into(), std::ffi::OsString::from(v));
+        }
+        let mut a: Vec<String> = vec![
+            "--no-psqlrc".into(),
+            "--no-align".into(),
+            "--field-separator".into(),
+            "\t".into(),
+            "-h".into(),
+            t.host.clone().unwrap_or_else(|| "127.0.0.1".into()),
+        ];
+        if let Some(p) = t.port { a.push("-p".into()); a.push(p.to_string()); }
+        if let Some(u) = &t.user { a.push("-U".into()); a.push(u.clone()); }
+        if let Some(d) = &t.database { a.push("-d".into()); a.push(d.clone()); }
+        a.push("-c".into()); // ci-allow-layering[2]: 这是 `psql -c <sql>` 的客户端参数，与 shell 无关
+        a.push(sql.to_string());
+        let args: Vec<&str> = a.iter().map(|s| s.as_str()).collect();
+        let out = crate::cmd::run(
+            crate::cmd::Bin::Psql,
+            &args,
+            crate::cmd::CmdOpt {
+                timeout: std::time::Duration::from_secs(20),
+                // 控制台的 limit 最大 2000 行，宽行可能到几 MB；默认 1MB 会被
+                // 无声截断（`truncated` 只置位、不报错），那等于悄悄少给数据。
+                max_output: PG_CONSOLE_MAX_OUTPUT,
+                env,
+                ..Default::default()
+            },
+        )
+        .await?;
+        if out.code != Some(0) {
+            return Err(panel_core::PanelError::Command { bin: "psql".into(), detail: out.stderr });
+        }
+        if out.truncated {
+            return Err(panel_core::PanelError::Command {
+                bin: "psql".into(),
+                detail: format!(
+                    "结果超过 {PG_CONSOLE_MAX_OUTPUT} 字节上限而中断（可能少给了数据）。\
+                     请加 WHERE 条件或调小返回行数上限。"
+                ),
+            });
+        }
+        // 解析：第 1 行 = 列名；其后 = 数据行；最后一行 = 命令状态行 `(N rows)`。
+        // 状态行的文案随 locale 变（中文环境下是 `(3 行)`），不能按内容识别，
+        // 但 `cmd::run` 固定了 LC_ALL=C，且它**恒在**——用 `is_pg_status_tag`
+        // 校验后再剥。对不上就**当数据留着**：宁可多留一行，也不能吃掉真实数据。
+        let lines: Vec<&str> = out.stdout.lines().collect();
+        let Some((header, rest)) = lines.split_first() else {
+            return Err(panel_core::PanelError::Command {
+                bin: "psql".into(),
+                detail: "psql 无任何输出（既无列名行也无状态行）".into(),
+            });
+        };
+        let columns: Vec<String> = header.split('\t').map(|c| c.to_string()).collect();
+        let data = match rest.split_last() {
+            // 末行是状态行 → 剥掉
+            Some((last, head)) if is_pg_status_tag(last) => head,
+            // 没有状态行（不该发生）→ 全部当数据，不猜
+            _ => rest,
+        };
+        Ok((
+            columns,
+            data.iter()
+                .map(|l| l.split('\t').map(|c| c.to_string()).collect::<Vec<_>>())
+                .collect(),
+        ))
+    }
+
     /// 打开目标 SQLite 文件（只读）。SQLite 的“连接”就是一个文件路径（`database` 字段）。
     fn open_sqlite(t: &DbTarget) -> Result<rusqlite::Connection> {
         use rusqlite::OpenFlags;
@@ -108,6 +218,74 @@ pub(super) fn db_err(e: rusqlite::Error) -> PanelError { PanelError::Database(e.
 
 pub(super) fn join_err(e: tokio::task::JoinError) -> PanelError {
     PanelError::Internal(format!("db task join: {e}"))
+}
+
+/// PG 只读控制台的**会话护栏**：把默认事务设成只读。
+///
+/// 与 SQLite 的 `SQLITE_OPEN_READ_ONLY` 同性质——**服务端物理层面**拒绝写，
+/// 不依赖任何关键字名单。实测（PostgreSQL 18.6，本机 woaiyoulin 库）：
+/// - `CREATE TABLE` → 「不能在一个只读模式的事务中执行CREATE TABLE」
+/// - `UPDATE` → 同上（UPDATE）
+/// - `SELECT id INTO zz FROM app_user`（伪装成查询的建表）→ 同上（SELECT INTO）
+///
+/// ⚠️ **残余风险，诚实记录，不假装全拦**：超级用户函数照样执行——
+/// `SELECT pg_reload_conf()` 实测返回 `t`。它不写用户表，
+/// `default_transaction_read_only` 管不到这种"配置类"函数。要彻底封死需要
+/// `SET ROLE` 到非超级用户，那是账号侧决策，属后续工作（不是本功能的静默缺口）。
+///
+/// ⚠️ 经 `cmd::run` 注入（`env_clear()` 之后叠加），无法被 `PATH`/`LD_*` 覆盖。
+/// 但**别用 `sudo` 传它**：sudo 默认 `env_reset` 会把 PGOPTIONS 剥掉，
+/// 手动复验时已踩过一次（护栏看似失效，其实是变量没到 psql）。
+const PG_READONLY_ENV: &[(&str, &str)] = &[("PGOPTIONS", "-c default_transaction_read_only=on")];
+
+/// PG 控制台结果体积上限（字节）。
+///
+/// 必须显著大于 `cmd::run` 默认的 1MB：2000 行 × 宽行很容易超，而超限时
+/// `collect` 只是**无声截断**（置 `truncated`、不报错）——那等于悄悄少给数据。
+/// 放大上限 + 显式检查 `truncated` 报错，才是"要么给全、要么明说"。
+const PG_CONSOLE_MAX_OUTPUT: usize = 8 * 1024 * 1024;
+
+/// 把用户 SQL 包成「返回行数有界」的查询。
+///
+/// **为什么必须包**：不限行数的 `SELECT * FROM 大表` 会在面板截断之前
+/// 就产出几十 MB stdout，把面板内存吃穿。包一层 LIMIT 让**服务端**就停下。
+///
+/// 三个实测过的坑，少处理一个就是故障：
+/// 1. **结尾分号必须剥掉**：`SELECT * FROM (SELECT 1;) AS x` 在 PG 是语法错误；
+/// 2. **EXPLAIN 不能包**：`SELECT * FROM (EXPLAIN …)` 同样是语法错误
+///    （EXPLAIN 不是表子查询）。它不返回数据行，包它没有意义，直接放行；
+/// 3. **右括号前必须补换行**：用户 SQL 若以 `-- 注释` 收尾，不补换行的话
+///    `--` 会把包裹用的 `) AS … LIMIT …` 一起吃到行尾（实测过）。
+///
+/// **已知边界（诚实记录）**：`SELECT 1; -- 尾注释` 这种「分号后跟行注释」的写法
+/// 仍会因括号里残留分号而报 PG 语法错误。修它需要在 OS 层重写一份注释剥离，
+/// 与 panel-api 的 `scrub_sql` 重复——两处漂移比这一种罕见写法更危险。
+/// 后果是**可见的语法错误**，不是静默错数据，故记为已知边界而非缺陷。
+pub(super) fn pg_wrap_readonly(sql: &str, limit: usize) -> String {
+    let body = sql.trim().trim_end_matches(';').trim_end();
+    let first = body.split_whitespace().next().unwrap_or_default().to_ascii_lowercase();
+    if first == "explain" {
+        return body.to_string();
+    }
+    format!("SELECT * FROM ({body}\n) AS __panel_readonly LIMIT {limit}")
+}
+
+/// 是否 psql 的「命令状态行」——形如 `(3 rows)` / `(0 rows)` / `(1 row)`。
+///
+/// 只认这一种形态，且**不匹配就当它是数据**：宁可少剥一行，也绝不能把
+/// 真实数据行当状态行吃掉（后者是静默丢数据，比多留一行严重得多）。
+/// `cmd::run` 固定 `LC_ALL=C`，故英文形态是确定的；但即使 locale 漂了，
+/// 后果也只是多留一行无害文本，不会吃数据。
+pub(super) fn is_pg_status_tag(line: &str) -> bool {
+    let t = line.trim();
+    if !(t.starts_with('(') && t.ends_with(')') && t.len() >= 2) {
+        return false;
+    }
+    let inner = &t[1..t.len() - 1];
+    let mut p = inner.split_whitespace();
+    let n_ok = matches!(p.next(), Some(n) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    let unit_ok = matches!(p.next(), Some("row") | Some("rows"));
+    n_ok && unit_ok && p.next().is_none()
 }
 
 /// 标识符安全加引号（表名等不可参数化的位置）。双引号翻倍转义，杜绝注入。
@@ -138,6 +316,17 @@ impl DatabaseProvider for LinuxDatabases {
             DbEngine::MySql => crate::cmd::Bin::MySql.available(),
             DbEngine::Postgres => crate::cmd::Bin::Psql.available(),
         }
+    }
+
+    /// 只读 SQL 控制台开放判定。**判据必须是服务端只读护栏，不是客户端在不在**：
+    /// SQLite 有只读连接兜底；PG 有 `default_transaction_read_only` 会话护栏
+    /// （但出口是 psql，客户端不在仍开不了，故与 `supports()` 相与）；
+    /// MySQL 两者都没有 → 恒关。
+    ///
+    /// 判定矩阵本身在 `crate::traits::db_console_open`，两边共用同一份——
+    /// 这里只负责把「客户端在位性」这个环境输入喂进去。
+    fn readonly_sql(&self, e: DbEngine) -> bool {
+        crate::traits::db_console_open(e, self.supports(e))
     }
 
     async fn databases(&self, t: &DbTarget) -> Result<Vec<String>> {
@@ -424,12 +613,44 @@ impl DatabaseProvider for LinuxDatabases {
     }
 
     async fn query(&self, t: &DbTarget, sql: &str, limit: usize) -> Result<DbQueryResult> {
-        if !matches!(t.engine, DbEngine::Sqlite) {
-            // 刻意不实装 mysql/pg：它们的客户端连接**不是只读的**，白名单一旦被绕过
-            // （例如 `WITH x AS (...) DELETE ...` 这类以 WITH 开头的写语句），
-            // 语句会真的落到库里。SQLite 有只读连接兜底，这两个没有——
-            // 与其开一个"看起来能用"的口子，不如诚实拒绝。
-            return unsupported!("dbms.query: 仅 SQLite 已实装（mysql/pg 需只读账号支持）");
+        match t.engine {
+            DbEngine::Sqlite => {}
+            DbEngine::Postgres => {
+                // 三道防线，逐层递进（任一层被绕过，下一层还在）：
+                // 1. API 层 `validate_read_only_sql`：首关键词白名单 + 写关键字黑名单，
+                //    尽早给出可读错误；
+                // 2. 这里的 `pg_wrap_readonly`：让**返回行数有界**（服务端就停下，
+                //    不会先把几十 MB stdout 产出来再被面板截断）；
+                // 3. `PG_READONLY_ENV`：会话级只读，写语句在服务端**物理失败**
+                //    （实测 CREATE TABLE / UPDATE / SELECT INTO 全被拦）。
+                //
+                // 与 SQLite 的差别只在于兜底手段（只读连接 vs 只读会话），
+                // 安全性质相同：都不依赖关键字名单。
+                let wrapped = pg_wrap_readonly(sql, limit + 1);
+                let (columns, rows) =
+                    LinuxDatabases::sql_query_console(t, &wrapped, PG_READONLY_ENV).await?;
+                // 多取一行只为判截断：真有第 limit+1 行才说明"还有更多"。
+                // EXPLAIN 未包裹（没有服务端 LIMIT），同样靠这个客户端判定兜住。
+                let truncated = rows.len() > limit;
+                let mut rows = rows;
+                if truncated { rows.truncate(limit); }
+                return Ok(DbQueryResult {
+                    columns,
+                    rows: rows.into_iter().map(|r| r.into_iter().map(Some).collect()).collect(),
+                    truncated,
+                });
+            }
+            DbEngine::MySql => {
+                // MySQL 仍不开放，且理由与从前不同了（从前是"都没实现"）：
+                // 白名单与包裹都只是**关键字层**防护，PG 有
+                // `default_transaction_read_only` 这种服务端物理护栏，MySQL 客户端
+                // 没有等价物——只读账号是账号侧配置，不是面板能替用户做的决定。
+                // 本机也没有 mysql 客户端可验证，不写未测代码。
+                return unsupported!(
+                    "dbms.query: MySQL 未实装只读控制台（无服务端只读护栏可用；\
+                     PostgreSQL 与 SQLite 已开放）"
+                );
+            }
         }
         let t = t.clone();
         let sql = sql.to_string();

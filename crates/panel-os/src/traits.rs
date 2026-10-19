@@ -1391,6 +1391,27 @@ pub struct DbQueryResult {
     pub truncated: bool,
 }
 
+/// 「只读 SQL 控制台」是否对该引擎开放。
+///
+/// **与 [`DatabaseProvider::supports`] 回答的不是同一个问题**：
+/// `supports()` 说「浏览/备份所需的外部客户端在不在」，这个说
+/// 「用户能不能自己写 SQL 跑」。判据是**有没有服务端物理只读护栏**，
+/// 不是有没有客户端——关键字名单拦不住 `WITH x AS (…) DELETE …`：
+/// - SQLite：`SQLITE_OPEN_READ_ONLY` 只读连接兜底 → true（与客户端无关）；
+/// - PostgreSQL：`default_transaction_read_only=on` 会话护栏 → true（但出口是 psql，
+///   客户端不在仍开不了，故再与 `client_present` 相与）；
+/// - MySQL：两者都没有 → false（只读账号是账号侧配置，不是面板能替用户做的决定）。
+///
+/// **抽成纯函数**的原因：客户端在位性是唯一的环境输入，测试可以把两种值都喂进去，
+/// 不必依赖"本机装没装 psql"——依赖了就只能在一种机器上验一半，另一半恒绿。
+pub fn db_console_open(engine: DbEngine, client_present: bool) -> bool {
+    match engine {
+        DbEngine::Sqlite => true,
+        DbEngine::Postgres => client_present,
+        DbEngine::MySql => false,
+    }
+}
+
 #[async_trait]
 pub trait DatabaseProvider: Send + Sync {
     fn engine(&self) -> DbEngine;
@@ -1398,6 +1419,12 @@ pub trait DatabaseProvider: Send + Sync {
     async fn available(&self) -> Result<bool>;
     /// 该引擎是否**已实装**（用于逐连接可用性判定与能力位；未实装返回 false 而非撒谎）
     fn supports(&self, e: DbEngine) -> bool;
+    /// 只读 SQL 控制台是否对该引擎开放（前端按钮门控的唯一依据）。
+    ///
+    /// 默认 `false`：**新引擎不开放比开放安全**——漏开只是少个按钮，
+    /// 误开则是一个能写库的入口。实现覆盖时走 [`db_console_open`]，
+    /// 把「引擎 × 客户端在位」的判定矩阵收在一处。
+    fn readonly_sql(&self, e: DbEngine) -> bool { let _ = e; false }
     async fn databases(&self, t: &DbTarget) -> Result<Vec<String>>;
     /// 「库」的下一级对象（MySQL 没有这一层 → 空；PG → schema；SQLite → main/temp/…）。
     ///
@@ -1413,9 +1440,11 @@ pub trait DatabaseProvider: Send + Sync {
     async fn rows(&self, t: &DbTarget, table: &str, limit: usize, offset: usize) -> Result<DbRows>;
     /// **只读**任意查询（SQL 控制台）。SQL 由业务层白名单校验后传入。
     ///
-    /// 实现必须自己兜底只读：SQLite 用**只读连接**打开，即使上层校验被绕过
+    /// 实现必须自己兜底只读：SQLite 用**只读连接**打开，PG 用
+    /// `default_transaction_read_only=on` 把会话设成只读——即使上层校验被绕过
     /// 也物理写不进去（纵深防御）；没有只读保证的引擎应当直接返回 `Unsupported`，
     /// 而不是"先跑起来再说"——那等于给面板开了一个任意写库的口子。
+    /// 是否开放见 [`DatabaseProvider::readonly_sql`]，两者必须一致。
     async fn query(&self, t: &DbTarget, sql: &str, limit: usize) -> Result<DbQueryResult>;
     async fn backup(&self, t: &DbTarget, out: &SafePath,
                     on_line: Box<dyn Fn(String) + Send + Sync>) -> Result<()>;
@@ -1978,6 +2007,62 @@ mod tests {
         assert_eq!(TableKind::View.as_str(), "view");
         // 拼写像、但值不同就是另一个种类——不允许悄悄合并
         assert_ne!(TableKind::Table.as_str(), TableKind::View.as_str());
+    }
+
+    /// 只读控制台开放判定：**全矩阵**，不挑几条写。
+    ///
+    /// 为什么必须全矩阵：这个函数是前端按钮门控的唯一依据，写漏一格就是
+    /// 「按钮亮着但一点必失败」（psql 没装）或「按钮灭着但功能其实能用」
+    /// （后端加了护栏、矩阵没跟上）。逐格钉住，改任何一格都有对应断言看着。
+    ///
+    /// 负向对照（已逐条实测真红后还原）：
+    /// - `Sqlite => client_present` → 第 1 条红（SQLite 不依赖外部客户端）；
+    /// - `Postgres => true` → 第 4 条红（psql 缺失时按钮必须灭）；
+    /// - `MySql => false` 改 `true` → 第 6 条红（这是最危险的一格：
+    ///   没有服务端只读护栏，开了就是任意写库入口）。
+    #[test]
+    fn db_console_open_matrix_is_explicit_for_every_engine() {
+        // SQLite：护栏在只读连接里，与外部客户端无关
+        assert!(db_console_open(DbEngine::Sqlite, false),
+            "SQLite 用只读连接兜底，psql/mysql 装没装都不能影响它");
+        assert!(db_console_open(DbEngine::Sqlite, true));
+        // PostgreSQL：护栏在会话层，但出口是 psql——客户端不在就开不了口
+        assert!(db_console_open(DbEngine::Postgres, true),
+            "PG 有 default_transaction_read_only 会话护栏，psql 在位即应开放");
+        assert!(!db_console_open(DbEngine::Postgres, false),
+            "psql 缺失时按钮必须灭，否则点了必定失败");
+        // MySQL：**没有**服务端只读护栏，装不装客户端都不能开
+        assert!(!db_console_open(DbEngine::MySql, false));
+        assert!(!db_console_open(DbEngine::MySql, true),
+            "MySQL 关键字名单拦不住 WITH x AS (…) DELETE …，绝不能开");
+    }
+
+    /// trait 默认值必须是「不开」：新加 provider 忘记覆盖时，
+    /// 结果是少个按钮（安全），而不是多一个写库入口（灾难）。
+    #[test]
+    fn readonly_sql_defaults_to_closed_for_new_providers() {
+        struct Bare;
+        #[async_trait::async_trait]
+        impl DatabaseProvider for Bare {
+            fn engine(&self) -> DbEngine { DbEngine::Sqlite }
+            async fn available(&self) -> Result<bool> { Ok(true) }
+            fn supports(&self, _e: DbEngine) -> bool { false }
+            async fn databases(&self, _t: &DbTarget) -> Result<Vec<String>> { Ok(Vec::new()) }
+            async fn tables(&self, _t: &DbTarget) -> Result<Vec<DbTable>> { Ok(Vec::new()) }
+            async fn rows(&self, _t: &DbTarget, _tb: &str, _l: usize, _o: usize) -> Result<DbRows> {
+                Ok(DbRows { columns: vec![], rows: vec![], total: 0 })
+            }
+            async fn query(&self, _t: &DbTarget, _s: &str, _l: usize) -> Result<DbQueryResult> {
+                Ok(DbQueryResult { columns: vec![], rows: vec![], truncated: false })
+            }
+            async fn backup(&self, _t: &DbTarget, _o: &SafePath,
+                            _cb: Box<dyn Fn(String) + Send + Sync>) -> Result<()> { Ok(()) }
+            async fn restore(&self, _t: &DbTarget, _f: &SafePath) -> Result<()> { Ok(()) }
+        }
+        let b = Bare;
+        for e in [DbEngine::Sqlite, DbEngine::MySql, DbEngine::Postgres] {
+            assert!(!b.readonly_sql(e), "未覆盖 readonly_sql 的 provider 必须对所有引擎关闭");
+        }
     }
 
     #[test]

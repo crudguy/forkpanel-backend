@@ -836,8 +836,35 @@ components:
         default_db: { type: [string, "null"] }
         # 仅表示外部客户端（psql / mysqldump 等）是否已安装；不代表该连接可以连通
         client_ready: { type: boolean }
+        # 只读 SQL 控制台是否对该连接开放（UI 按钮门控的唯一依据）。
+        # 与 client_ready 不是同一个问题、也不能互相推导：判据是**有没有服务端物理
+        # 只读护栏**（SQLite 只读连接 / PG default_transaction_read_only 会话）。
+        # MySQL 装了客户端也依然是 false。前端不得用 engine 自行猜测此值。
+        readonly_sql: { type: boolean }
         tls_mode:   { type: string, enum: [disable, prefer, require], default: prefer }
         remark:     { type: string, description: "对象说明（备注，022）：这个库干嘛的、为何这样配置；无则为空串" }
+    # 只读 SQL 控制台的引擎相关文案（默认语句 + 示例）。
+    # 放在后端是为了让"哪个引擎长什么样"只有一份：放前端就会与后端口径漂移。
+    SqlConsoleMeta:
+      type: object
+      required: [engine, readonly_sql, default_sql, samples]
+      properties:
+        engine: { type: string, enum: [sqlite, mysql, postgres] }
+        readonly_sql:
+          type: boolean
+          description: "与 DbConnection.readonly_sql 同源同值；打开控制台前再确认一次，避免列表数据过期导致按钮亮着、内容说不能跑"
+        default_sql: { type: string }
+        samples:
+          type: array
+          items:
+            type: object
+            required: [label, sql]
+            properties:
+              label: { type: string }
+              sql:   { type: string }
+        note:
+          type: string
+          description: "只读护栏的诚实边界（按引擎给）：写语句会被服务端拒绝，但少数配置类函数（如 PG 的 pg_reload_conf）不受约束。前端原样展示"
     DbConnectionCreate:
       required: [name, engine]
       type: object
@@ -2563,14 +2590,23 @@ paths:
   /api/v1/db/{conn}/query:
     post:
       tags: [db]
-      summary: 只读 SQL 查询（仅 SQLite；单语句 + 写关键词黑名单拦截）
+      summary: 只读 SQL 查询（SQLite 与 PostgreSQL）
       description: |
         校验分两层：首关键词白名单（SELECT/WITH/EXPLAIN/PRAGMA/VALUES）
         + 写关键词黑名单（拦 `WITH … DELETE` 这类「首词合法、后面在写」的语句）。
         注释与引号串内的内容不参与判定（先 scrub 再判）。
-        **SQLite 另有物理兜底**：连接以只读模式打开，写语句必然失败。
-        mysql/pg 返回 501 —— 它们的客户端连接不是只读的，开任意 SQL 入口
-        等于给面板开一个写库的口子。
+
+        **白名单不是兜底**，物理兜底在 provider 层：
+        - SQLite：连接以只读模式打开（`SQLITE_OPEN_READ_ONLY`），写语句必然失败；
+        - PostgreSQL：会话设 `default_transaction_read_only=on`，写语句在服务端失败
+          （实测 CREATE TABLE / UPDATE / SELECT INTO 全被拦），并用
+          `SELECT * FROM (<sql>) AS __panel_readonly LIMIT n` 包裹以给出真实行数上界
+          （`EXPLAIN` 不可包裹，豁免）。残余风险：`pg_reload_conf()` 这类超级用户
+          函数照样执行，诚实记录、不假装全拦。
+        - MySQL：返回 501 —— 没有等价的服务端只读护栏，不写未测代码。
+
+        另有两处已知边界（均为**可见报错**而非静默错数据）：PG 美元引用 `$$…$$`
+        内的分号会被误判成多语句；`SELECT 1; -- 尾注释` 会因括号内残留分号报语法错误。
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: conn, in: path, required: true, schema: { type: integer } }]
       requestBody:
@@ -2590,7 +2626,23 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { columns: { type: array, items: { type: string } }, rows: { type: array, items: { type: array, items: { type: [string, 'null'] } } }, truncated: { type: boolean }, limit: { type: integer } } } } }
         '400': { description: 写操作 / 多语句 / 超长语句 }
-        '501': { description: 非 SQLite 引擎 }
+        '501': { description: MySQL（无服务端只读护栏） }
+  /api/v1/db/{conn}/sql-meta:
+    get:
+      tags: [db]
+      summary: SQL 控制台元数据（能力位 + 引擎相关的默认语句与示例）
+      description: |
+        与 `/query` 分开成两个路径：它回答「这个连接能不能自己写 SQL、该从哪句
+        开始」，后者回答「执行这一条」。示例 SQL 是引擎知识（`sqlite_master` vs
+        `information_schema`），由后端单点下发，前端不存任何引擎判断。
+      security: [cookieAuth]
+      parameters: [{ name: conn, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/SqlConsoleMeta' } } }
 
   /api/v1/db/{conn}/backup:
     post:
