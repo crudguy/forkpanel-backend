@@ -6,7 +6,11 @@
 //! - `deployment`：部署级配置（read_only / tier），**只读展示**实际生效值，
 //!   修改必须走 config.toml / 环境变量并重启——PATCH 这类键返回 400
 //! - `reserved`：种子预留、尚未接线的键（audit/metrics retention 等），
-//!   展示表内值并标注 `wired:false`，后续接线后挪入 runtime
+//!   展示表内值并标注 `wired:false`。⚠ 注意：审计保留**实际已通过 config.toml
+//!   `[audit]` 实现**（部署级，见 `main.rs` 的 `prune_audit`），指标保留为内置
+//!   默认（`aggregator::Retention::default()` = 7d/90d）；本表种子**不**是生效来源。
+//!   将来若把保留策略迁到设置页再消费这些键，务必移除 config.toml 那一路，
+//!   勿让两路并存造成双源冲突。
 //!
 //! 秘密纪律：`assistant.llm_api_key` 经主密钥 AES-GCM 加密，hex 编码存
 //! TEXT（`enc:<hex>` 前缀防呆）；GET **只回 set 布尔，绝不回明文**。
@@ -124,7 +128,7 @@ pub async fn get(
     // reserved：种子预留，值取表内（缺省回落种子字面量），一律 wired:false
     let reserved = json!({
         "wired": false,
-        "note": "种子预留键，运行时尚未消费（接线后将挪入 runtime）",
+        "note": "审计保留已由 config.toml [audit] 驱动（部署级，改后重启生效）；指标保留为内置默认(7d/90d)；二者均不读本表键。本键为将来迁入设置页的占位，请勿单独接线（会与部署配置双源冲突）",
         "values": {
             "audit_retention_days":      table.get("audit_retention_days").cloned().unwrap_or_else(|| "90".into()),
             "audit_max_rows":            table.get("audit_max_rows").cloned().unwrap_or_else(|| "50000".into()),
