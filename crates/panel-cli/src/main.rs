@@ -84,6 +84,13 @@ enum Cmd {
     },
     /// 输出 systemd 单元文件
     SystemdUnit { #[arg(long)] install: bool },
+    /// 安装/卸载外部探活（覆盖 Restart=on-failure 管不了的"活着但不服务"）
+    Healthcheck {
+        /// 安装探活脚本与 systemd service/timer
+        #[arg(long)] install: bool,
+        /// 卸载（删除脚本与两个单元文件）
+        #[arg(long)] uninstall: bool,
+    },
     /// 打印能力矩阵（供脚本判断环境）
     Capabilities,
 }
@@ -406,6 +413,57 @@ fn run(cli: Cli) -> Result<()> {
                 println!("已写入 {}（执行 systemctl daemon-reload && systemctl enable --now panel）", p.display());
             } else {
                 println!("{unit}");
+            }
+            Ok(())
+        }
+
+        Cmd::Healthcheck { install, uninstall } => {
+            let cfgp = cli.config.clone().unwrap_or_else(|| os.paths().config_dir().join("config.toml"));
+            let cfg = Config::load(&cfgp).unwrap_or_default();
+            let port = cfg.server.port;
+            let dir = os.paths().service_dir();
+            if dir.as_os_str().is_empty() {
+                return Err(PanelError::Unsupported("service_dir: 该平台无单元文件目录"));
+            }
+            let script = os.paths().script_dir().join("healthcheck.sh");
+            let (svc, timer) = bootstrap::healthcheck_units("panel", &script);
+
+            if uninstall {
+                let mut removed = 0;
+                for p in [dir.join("panel-healthcheck.service"), dir.join("panel-healthcheck.timer")] {
+                    if p.exists() { std::fs::remove_file(&p).ok(); removed += 1; }
+                }
+                let _ = std::fs::remove_file(&script);
+                println!("已移除探活（{removed} 个单元文件 + 脚本）；执行 systemctl daemon-reload");
+                return Ok(());
+            }
+
+            let sh = bootstrap::healthcheck_script("panel", port);
+            if !install && !uninstall {
+                // 与 `systemd-unit` 同纪律：缺省打印而非安装，便于不装 root 也能
+                // 审阅内容 / 抽出来单测行为（探活脚本的逻辑必须真机跑过才算数）。
+                print!("{sh}\n--- unit: panel-healthcheck.service ---\n{svc}\n--- unit: panel-healthcheck.timer ---\n{timer}");
+                return Ok(());
+            }
+            if install {
+                std::fs::create_dir_all(os.paths().script_dir())
+                    .map_err(|e| PanelError::Internal(format!("create script_dir: {e}")))?;
+                std::fs::write(&script, &sh)
+                    .map_err(|e| PanelError::Internal(format!("write script: {e}")))?;
+                // chmod 是平台专有能力，走 OS 抽象层（分层门禁第 4 条：业务层
+                // 不得出现平台条件编译）。0750 = 属主可写、组可读执行。
+                panel_os::fs::set_mode(&script, 0o750)?;
+                std::fs::create_dir_all(&dir).ok();
+                std::fs::write(dir.join("panel-healthcheck.service"), &svc)
+                    .map_err(|e| PanelError::Internal(format!("write unit: {e}")))?;
+                std::fs::write(dir.join("panel-healthcheck.timer"), &timer)
+                    .map_err(|e| PanelError::Internal(format!("write unit: {e}")))?;
+                println!("已安装探活：");
+                println!("  脚本  {}", script.display());
+                println!("  单元  {}/panel-healthcheck.{{service,timer}}", dir.display());
+                println!("下一步：systemctl daemon-reload && systemctl enable --now panel-healthcheck.timer");
+            } else {
+                print!("{svc}\n--- timer ---\n{timer}");
             }
             Ok(())
         }

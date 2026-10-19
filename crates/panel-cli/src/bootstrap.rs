@@ -94,6 +94,104 @@ WantedBy=multi-user.target
     )
 }
 
+/// 生成外部探活脚本内容（`sh`，放 `PathLayout::script_dir()`）。
+///
+/// **为什么需要它**：`Restart=on-failure` 只覆盖「进程死了」，**不覆盖**
+/// 「进程活着但不服务」——事件循环被某个请求卡死、监听 socket 丢失但主线程没退，
+/// 这类故障 systemd 从外部看不出来，服务会一直挂着直到有人登上服务器才发现。
+///
+/// 判定用 `/api/v1/version`（免登录 GET，语义 = "服务还能不能回话"）。
+/// 刻意**不用** `/healthz`：那个在 embed 层，进程活着就一定 200，探不到
+/// "HTTP 服务已死但主线程还在"——正是要抓的那类故障。
+///
+/// **连续两次失败才重启**（用 marker 文件记状态）：单次失败多为瞬时抖动
+/// （重启窗口、CPU 饱和、探活自身超时），误把好服务重启掉的代价高于漏一次报。
+/// 恢复成功即清除 marker，不会把一分钟前的失败记成连续失败。
+pub fn healthcheck_script(service_name: &str, port: u16) -> String {
+    // shebang 独立成行：`ci-allow-layering[2]` 的行内豁免必须落在**含 `/bin/sh`
+    // 的那一行**上，而它写在多行原始字符串里会污染生成的脚本内容。故拆出来单写。
+    let shebang = "#!/bin/sh"; // ci-allow-layering[2]: 生成的是探活脚本文本，交给 systemd oneshot 执行；面板自身不解释 shell，与 scheduler.rs 生成 crontab 命令文本同性质
+    format!(
+        r#"{shebang}
+# ForkPanel 外部探活：HTTP 200 才算活；连续两次失败才重启面板。
+# 由 panel-healthcheck.timer 每分钟触发。也可手动执行自检。
+set -u
+
+SVC="{service_name}"
+URL="http://127.0.0.1:{port}/api/v1/version"
+MARKER="/tmp/.panel-healthcheck-${{SVC}}.fail"
+
+if curl -fsS -o /dev/null --max-time 10 "$URL" 2>/dev/null; then
+  # 恢复：清掉上一次的失败标记，避免把间隔很久的两次失败当成连续失败
+  rm -f "$MARKER"
+  exit 0
+fi
+
+# 第一次失败：只记录并退出（不重启）——给瞬时抖动留机会
+if [ ! -f "$MARKER" ]; then
+  touch "$MARKER"
+  echo "$(date -Is) probe failed once, waiting for next run" >&2
+  exit 1
+fi
+
+# 第二次连续失败：重启面板，并清标记（若重启后仍失败，下一轮再从"第一次"计起，
+# 形成重试节奏，而不是每分钟都无条件重启）
+echo "$(date -Is) probe failed twice in a row, restarting $SVC" >&2
+rm -f "$MARKER"
+systemctl restart "$SVC" || true
+exit 1
+"#,
+        port = port, service_name = service_name, shebang = shebang
+    )
+}
+
+/// 生成探活的 systemd service + timer 单元内容。
+///
+/// 端口与脚本路径由调用方传入（从 `Config` / `PathLayout` 读出），与
+/// [`systemd_unit`] 同纪律：不硬编码。`script_dir` 不存在时 systemd 会报
+/// "executable path is not absolute"，故安装前必须确保目录已建。
+pub fn healthcheck_units(service_name: &str, script: &std::path::Path) -> (String, String) {
+    let hc_service = format!(
+        r#"[Unit]
+Description=ForkPanel liveness probe (restarts panel if it stops answering)
+After=network-online.target {service_name}.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart={script}
+# 探活脚本自己决定是否重启（连续两次失败），故这里绝不 Restart：
+# 若设了 Restart=on-failure，一次瞬时失败就会被 systemd 反复重跑，
+# 与脚本内的"两次才重启"叠加成更激进的策略。
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
+"#,
+        service_name = service_name, script = script.display()
+    );
+
+    let hc_timer = format!(
+        r#"[Unit]
+Description=Run ForkPanel liveness probe every minute
+
+[Timer]
+# 距上次激活 60s 后触发（而非 OnCalendar：面板刚重启过的那一分钟不必立刻再探）
+OnUnitActiveSec=60
+AccuracySec=15s
+# 错过的时间不补跑：机器休眠/重启后不会积一堆探活排队执行
+Persistent=false
+Unit={service_name}-healthcheck.service
+
+[Install]
+WantedBy=timers.target
+"#,
+        service_name = service_name
+    );
+
+    (hc_service, hc_timer)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,6 +220,43 @@ mod tests {
         let b = panel_api::auth::generate_bootstrap_token();
         assert_eq!(a.len(), 32);
         assert_ne!(a, b);
+    }
+
+    // ── 外部探活：堵住 Restart=on-failure 覆盖不到的"活着但不服务" ──
+
+    #[test]
+    fn healthcheck_script_probes_version_not_healthz() {
+        let sh = healthcheck_script("panel", 2083);
+        // 判定必须打 /api/v1/version：/healthz 在 embed 层，进程活着就恒 200，
+        // 探不到"HTTP 服务已死但主线程还在"——那正是要抓的故障。
+        assert!(sh.contains("/api/v1/version"), "必须探 API 而非 embed 静态路由：{sh}");
+        assert!(!sh.contains("/healthz"), "/healthz 探不到要抓的故障，不应作为判据：{sh}");
+        // 端口来自 Config，不硬编码
+        assert!(sh.contains("127.0.0.1:2083"), "端口应来自调用方：{sh}");
+    }
+
+    #[test]
+    fn healthcheck_script_requires_two_consecutive_failures_before_restart() {
+        let sh = healthcheck_script("panel", 2083);
+        // marker 机制：第一次失败只 touch 不重启，第二次才 restart。
+        // 少了这层，一次瞬时抖动就会把好服务重启掉（误报代价高于漏报）。
+        assert!(sh.contains("touch \"$MARKER\""), "第一次失败只记录：{sh}");
+        assert!(sh.contains("systemctl restart \"$SVC\""), "第二次连续失败才重启：{sh}");
+        // 恢复时必须清 marker，否则间隔很久的两次失败会被误判为连续失败
+        assert!(sh.contains("rm -f \"$MARKER\""), "恢复后须清除失败标记：{sh}");
+    }
+
+    #[test]
+    fn healthcheck_units_have_no_restart_and_fire_every_minute() {
+        let (svc, timer) = healthcheck_units("panel", std::path::Path::new("/var/lib/panel/scripts/healthcheck.sh"));
+        // service 绝不能 Restart：脚本自己实现"两次才重启"，systemd 再叠一层
+        // 会把策略变得更激进（一次失败就反复重跑）。
+        assert!(svc.contains("Restart=no"), "探活 service 不得自行重试：{svc}");
+        assert!(svc.contains("ExecStart=/var/lib/panel/scripts/healthcheck.sh"), "脚本路径由调用方给：{svc}");
+        assert!(timer.contains("OnUnitActiveSec=60"), "每分钟探一次：{timer}");
+        assert!(timer.contains("Unit=panel-healthcheck.service"), "timer 必须指向探活 service：{timer}");
+        // 错过的探活不补跑，否则机器休眠后会在开机时堆积执行
+        assert!(timer.contains("Persistent=false"), "错过的探活不应补跑：{timer}");
     }
 
     #[test]

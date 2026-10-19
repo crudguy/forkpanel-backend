@@ -128,8 +128,40 @@ sudo panel --config /etc/forkpanel/config.toml passwd admin --pass '<新口令>'
 | **sd_notify watchdog** | 单元加 `WatchdogSec=60`，应用侧周期性 `sd_notify(0, "WATCHDOG=1")` | 需引 `libsystemd`（或自己实现 `sd_notify` 的 datagram 协议），依赖预算当前 38/38 已满，需先决策 |
 | **Type=notify** | 同上，启动完成也走 sd_notify | 同上 |
 
-面板已具备探活所需的一切（`/api/v1/version` 与 `/healthz` 均为免登录 GET），
-所以只差「谁来定时打它」这一层，没有应用侧阻塞项。
+### 5.2 已提供：`panel healthcheck`（方案①的落地件）
+
+上面三个方案里，**方案①（外部探活）已由 `panel healthcheck` 子命令落地**，
+`deploy/install.sh` 默认装上：
+
+```bash
+panel healthcheck                       # 打印脚本 + 两个单元（审阅用，不安装）
+panel healthcheck --install             # 安装到 script_dir 与 systemd
+panel healthcheck --uninstall           # 移除
+```
+
+它每分钟打一次 `/api/v1/version`，**连续两次失败才重启**（用 marker 文件记状态）。
+为什么是两次：单次失败多为瞬时抖动（重启窗口、CPU 饱和、探活自身超时），
+误把好服务重启掉的代价高于漏一次报。恢复成功即清 marker，隔很久的两次失败
+不会被你误判成连续失败。
+
+两个刻意的设计选择：
+
+- **判定打 `/api/v1/version` 而非 `/healthz`**。后者在 embed 层，进程活着就
+  恒返 200，探不到「HTTP 服务已死但主线程还在」——那正是要抓的故障。
+- **探活 service 自身 `Restart=no`**。「两次才重启」由脚本实现，systemd 若再叠
+  一层 `Restart=on-failure`，会把策略变得更激进（一次失败就反复重跑）。
+
+```bash
+# 看探活是否在跑、上次结果
+systemctl list-timers panel-healthcheck.timer
+journalctl -u panel-healthcheck.service -n 20 --no-pager
+# 手动跑一次自检（不等 timer）
+/var/lib/forkpanel/scripts/healthcheck.sh
+```
+
+> 脚本路径取自 `PathLayout::script_dir()`、端口取自 `Config`，均不硬编码。
+> 该脚本的逻辑已真机四态验证（活着 / 挂一次 / 连续挂两次 / 恢复），
+> 单测见 `bootstrap::tests::healthcheck_*`。
 
 ---
 

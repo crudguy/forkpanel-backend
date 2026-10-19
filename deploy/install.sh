@@ -45,6 +45,15 @@ systemctl daemon-reload
 systemctl enable panel >/dev/null
 echo "· systemd 单元已安装并设为开机自启"
 
+# 外部探活：Restart=on-failure 只覆盖「进程死了」，不覆盖「活着但不服务」
+# （事件循环卡死、监听 socket 丢失但主线程没退）。每分钟探一次 /api/v1/version，
+# 连续两次失败才重启——给瞬时抖动留机会，避免误把好服务重启掉。
+# 不需要可删掉这两行 + 执行 panel healthcheck --uninstall。
+"$BIN_DST" --config "$CONF_FILE" healthcheck --install >/dev/null
+systemctl daemon-reload
+systemctl enable --now panel-healthcheck.timer >/dev/null
+echo "· 外部探活已安装（每分钟一次，连续两次失败才重启）"
+
 cat <<EOF
 
 安装完成。下一步：
