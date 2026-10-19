@@ -285,10 +285,12 @@ fn run(cli: Cli) -> Result<()> {
                 // 注入 AppState 供设置页 deployment 段只读展示。
                 let localhost_only = cfg.server.localhost_only;
                 let daily_backup = cfg.db.daily_backup;
+                let db_synchronous = cfg.db.synchronous.clone();
                 let state = Arc::new(panel_api::AppState::new(
                     os.clone(), writer.clone(), pool, tasks.clone(), metrics.clone(), tier,
                     master_key, read_only, max_login_attempts, session_idle, session_absolute,
-                    audit_retention_days, audit_max_rows, localhost_only, daily_backup));
+                    audit_retention_days, audit_max_rows, localhost_only, daily_backup,
+                    db_synchronous));
 
                 // ── 内部周期任务 ──
                 register_internal_jobs(&sched_in, &os, writer.clone(), metrics.clone(), &layout, &cfg, tier, state.clone()).await;

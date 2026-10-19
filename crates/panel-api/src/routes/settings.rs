@@ -5,7 +5,7 @@
 //! - `runtime`：真正可改且立即生效的键（当前 = AI 助手 LLM 三键）
 //! - `deployment`：部署级配置（read_only / tier / max_login_attempts / session_idle /
 //!   session_absolute / audit_retention_days / audit_max_rows / localhost_only /
-//!   db_daily_backup），**只读展示**实际生效值，
+//!   db_daily_backup / db_synchronous），**只读展示**实际生效值，
 //!   修改必须走 config.toml / 环境变量并重启——PATCH 这类键返回 400
 //! - `reserved`：种子预留、尚未接线的键（audit/metrics retention 等），
 //!   展示表内值并标注 `wired:false`。⚠ 注意：审计保留**实际已通过 config.toml
@@ -34,7 +34,7 @@ const K_LLM_API_KEY: &str = "assistant.llm_api_key";
 const RUNTIME_KEYS: [&str; 3] = [K_LLM_ENDPOINT, K_LLM_MODEL, K_LLM_API_KEY];
 
 /// 部署级键：在 settings 表里只有死种子，实际生效值来自 config.toml/env。
-const DEPLOYMENT_KEYS: [&str; 9] = [
+const DEPLOYMENT_KEYS: [&str; 10] = [
     "read_only",
     "tier",
     "max_login_attempts",
@@ -44,6 +44,7 @@ const DEPLOYMENT_KEYS: [&str; 9] = [
     "audit_max_rows",
     "localhost_only",
     "db_daily_backup",
+    "db_synchronous",
 ];
 
 #[derive(Debug, Deserialize)]
@@ -137,7 +138,8 @@ pub async fn get(
         "audit_max_rows": state.audit_max_rows,
         "localhost_only": state.localhost_only,
         "db_daily_backup": state.daily_backup,
-        "hint": "部署级配置：config.toml [security] 的 read_only / max_login_attempts / session_idle / session_absolute、[audit] 的 retention_days / max_rows、[server] 的 localhost_only、[db] 的 daily_backup 改后重启生效（此处 PATCH 会造成『改了却不生效』的谎言，故拒绝）",
+        "db_synchronous": state.db_synchronous,
+        "hint": "部署级配置：config.toml [security] 的 read_only / max_login_attempts / session_idle / session_absolute、[audit] 的 retention_days / max_rows、[server] 的 localhost_only、[db] 的 daily_backup / synchronous 改后重启生效（此处 PATCH 会造成『改了却不生效』的谎言，故拒绝）",
     });
 
     // reserved：种子预留，值取表内（缺省回落种子字面量），一律 wired:false
@@ -535,7 +537,7 @@ mod tests {
         for k in [
             "read_only", "tier", "max_login_attempts", "session_idle",
             "session_absolute", "audit_retention_days", "audit_max_rows",
-            "localhost_only", "db_daily_backup",
+            "localhost_only", "db_daily_backup", "db_synchronous",
         ] {
             assert!(DEPLOYMENT_KEYS.contains(&k), "deployment 白名单缺 `{k}`");
         }

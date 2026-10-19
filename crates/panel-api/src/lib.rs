@@ -65,6 +65,9 @@ pub struct AppState {
     /// 每日自动备份开关（来自 config.toml `[db] daily_backup`）。deployment 段展示用。
     /// **真实生效**：`main.rs` 的调度器据此注册每日备份任务（nano 档位除外）。
     pub daily_backup: bool,
+    /// SQLite 落盘同步档（来自 config.toml `[db] synchronous`，归一化后的大写值）。
+    /// **真实生效**：`panel_db::open` 据此设置 `PRAGMA synchronous`（非法值启动即报错）。
+    pub db_synchronous: String,
     /// 首启引导令牌（一次性、只存内存）。serve 首启无 owner 时生成。
     pub bootstrap: Arc<crate::auth::BootstrapGuard>,
     /// 主密钥（32 字节，内存常驻，不落库）。为 None 时所有"写入真实秘密"的操作被拒绝。
@@ -97,14 +100,14 @@ impl AppState {
                max_login_attempts: usize,
                session_idle: std::time::Duration, session_absolute: std::time::Duration,
                audit_retention_days: u32, audit_max_rows: u64,
-               localhost_only: bool, daily_backup: bool) -> Self {
+               localhost_only: bool, daily_backup: bool, db_synchronous: String) -> Self {
         let capabilities = os.capabilities();
         // 会话持久化：把写者交给 SessionCache（`sessions` 表 001 已定义、此前无人使用）。
         // 先 clone——下方 struct 字面量会把 db move 进字段。
         let sessions_db = db.clone();
         Self {
             os, db, pool, tasks, metrics, tier, capabilities, session_idle, session_absolute,
-            audit_retention_days, audit_max_rows, localhost_only, daily_backup,
+            audit_retention_days, audit_max_rows, localhost_only, daily_backup, db_synchronous,
             sessions: Arc::new(crate::auth::SessionCache::new_with_db(
                 session_idle,
                 session_absolute,
