@@ -132,7 +132,12 @@ pub struct RuntimeInfo {
     /// 面板包白名单里的系统包名；`null` = 面板不托管该运行时
     pub runtime_pkg: Option<&'static str>,
     pub default_exec: &'static str,
+    /// 典型框架（确认没选错）
     pub typical: &'static str,
+    /// 用途：这运行时跑的是什么（用户最先问的问题）
+    pub purpose: &'static str,
+    /// 什么情况下该选它（决策依据，不做性能排名）
+    pub choose_when: &'static str,
     pub build_hint: &'static str,
 }
 
@@ -150,6 +155,8 @@ pub async fn catalog(
             runtime_pkg: r.runtime_pkg(),
             default_exec: r.default_exec(),
             typical: r.typical(),
+            purpose: r.purpose(),
+            choose_when: r.choose_when(),
             build_hint: r.build_hint(),
         })
         .collect();

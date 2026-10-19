@@ -610,7 +610,9 @@ components:
         default_port:  { type: integer }
         runtime_pkg:   { type: [string, "null"], description: "面板包白名单里的系统包名；null = 面板不托管该运行时（前端据此不显示安装状态，不做「你没有 X」的断言）" }
         default_exec:  { type: string }
-        typical:       { type: string }
+        typical:       { type: string, description: 典型框架，帮用户确认没选错运行时 }
+        purpose:       { type: string, description: "用途：这个运行时是跑什么的（回答「Node 和 Python 我该选哪个」）" }
+        choose_when:   { type: string, description: "什么情况下该选它。刻意只给判断依据、不做性能排名——语言选型不该由面板替用户下结论" }
         build_hint:    { type: string, description: "构建步骤提示（纯文案，面板不执行构建）" }
     AppCreate:
       type: object

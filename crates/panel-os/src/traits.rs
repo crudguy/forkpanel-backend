@@ -907,8 +907,7 @@ impl AppRuntime {
     }
 
     /// 典型框架（帮用户确认没选错运行时）。
-    pub fn typical(&self) -> &'static str {
-        match self {
+    pub fn typical(&self) -> &'static str {        match self {
             AppRuntime::Node => "Express / NestJS / Next.js",
             AppRuntime::Go => "net/http / Gin / Echo",
             AppRuntime::Rust => "Axum / Actix Web / Rocket",
@@ -917,6 +916,41 @@ impl AppRuntime {
             AppRuntime::DotNet => "ASP.NET Core（Kestrel）",
             AppRuntime::Php => "Laravel / Symfony（php-fpm 常驻）",
             AppRuntime::Custom => "任意自托管服务",
+        }
+    }
+
+    /// 用途：一句话说清「这个运行时是用来跑什么的」。
+    ///
+    /// 与 `typical` / `build_hint` 的分工：`typical` 举具体框架（确认没选错），
+    /// `build_hint` 说构建步骤（怎么出包），本方法回答用户最先问的那个问题——
+    /// 「Node 和 Python 我该选哪个」。前端在新建应用选运行时时直接展示。
+    pub fn purpose(&self) -> &'static str {
+        match self {
+            AppRuntime::Node => "JavaScript / TypeScript 服务端运行时。",
+            AppRuntime::Go => "Go 编译出的静态二进制，单文件部署。",
+            AppRuntime::Rust => "Rust 编译出的原生二进制，单文件部署。",
+            AppRuntime::Java => "JVM 上跑的 Java 应用（常见是可执行 jar）。",
+            AppRuntime::Python => "Python Web 应用（WSGI / ASGI 常驻进程）。",
+            AppRuntime::DotNet => "ASP.NET Core 应用（Kestrel 自带 HTTP 服务）。",
+            AppRuntime::Php => "PHP 应用以 php-fpm 常驻方式运行。",
+            AppRuntime::Custom => "自备任意可执行文件或启动命令。",
+        }
+    }
+
+    /// 什么情况下该选它（帮用户做决策，而不是罗列特性）。
+    ///
+    /// 刻意的口径：只说「选它 / 别选它」的判断依据，不吹性能不排名——
+    /// 语言选型不该由面板替用户下结论，但「项目已经是这个栈」是最硬的依据。
+    pub fn choose_when(&self) -> &'static str {
+        match self {
+            AppRuntime::Node => "项目是 npm / pnpm 工程，或用了 Next.js、NestJS 等框架。",
+            AppRuntime::Go => "项目能用 go build 出单文件；机器上不必装 Go 也能跑已编译好的二进制。",
+            AppRuntime::Rust => "项目能用 cargo build --release 出二进制；运行不依赖工具链。",
+            AppRuntime::Java => "项目产出可执行 jar，或需要 JVM 生态与成熟的企业级依赖。",
+            AppRuntime::Python => "项目是 Django / Flask / FastAPI 等 WSGI / ASGI 应用。",
+            AppRuntime::DotNet => "项目是 ASP.NET Core；需要 .NET SDK 或运行时（面板不代装）。",
+            AppRuntime::Php => "项目是 Laravel / Symfony 等常驻型 PHP 应用；普通 PHP 建站请直接在「网站」页选 PHP。",
+            AppRuntime::Custom => "上面都不合适，或你想完全自己控制启动命令。",
         }
     }
 
@@ -1789,6 +1823,10 @@ mod tests {
             assert!(!r.label().is_empty(), "{} label 为空", r.key());
             assert!(!r.typical().is_empty(), "{} typical 为空", r.key());
             assert!(!r.build_hint().is_empty(), "{} build_hint 为空", r.key());
+            // 用途 / 选型依据：新建应用时前端直接展示，为空等于「选了运行时但不知道
+            // 它是什么」。新增运行时若只填了 key/label 就漏配，编译不报错（match 已穷尽）。
+            assert!(!r.purpose().is_empty(), "{} purpose 为空", r.key());
+            assert!(!r.choose_when().is_empty(), "{} choose_when 为空", r.key());
         }
 
         // Custom = 用户自备：无默认端口 / 无默认命令 / 不托管运行时
@@ -1807,6 +1845,37 @@ mod tests {
         assert_eq!(AppRuntime::from_key(""), None);
         // ⚠ runtime_pkg 的字符串必须存在于后端 ALLOWED_PACKAGES —— 该约束跨 crate
         //   （panel-os 不依赖 panel-api），故由 ci/check-pkg-whitelist.sh 的 [E] 项把守。
+    }
+
+    /// 选型说明必须能区分各个运行时——不能 8 个变体共用一句万能话。
+    ///
+    /// 现实风险：为了「凑够字段」给每条复制同一句「适用于各种 Web 应用」，
+    /// 非空断言照样通过，用户仍然不知道该选谁。故要求文本两两不同，
+    /// 且各自点出该栈的**特征词**（不排名性能，只给判断依据）。
+    #[test]
+    fn runtime_purpose_and_choose_when_are_distinct() {
+        let purposes: Vec<&str> = AppRuntime::ALL.iter().map(|r| r.purpose()).collect();
+        let mut uniq = purposes.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), purposes.len(), "purpose 有重复条目（等于没写）");
+
+        let chooses: Vec<&str> = AppRuntime::ALL.iter().map(|r| r.choose_when()).collect();
+        let mut uniq2 = chooses.clone();
+        uniq2.sort_unstable();
+        uniq2.dedup();
+        assert_eq!(uniq2.len(), chooses.len(), "choose_when 有重复条目（等于没写）");
+
+        // 抽查几条特征词：写错语言归属比不写更误导
+        assert!(AppRuntime::Node.choose_when().contains("npm"));
+        assert!(AppRuntime::Go.choose_when().contains("go build"));
+        assert!(AppRuntime::Rust.choose_when().contains("cargo"));
+        assert!(AppRuntime::Java.purpose().contains("JVM"));
+        assert!(AppRuntime::Python.choose_when().contains("Django"));
+        // PHP 必须点明与「网站页选 PHP 建站」的分工，否则用户会在两条入口间选错
+        assert!(AppRuntime::Php.choose_when().contains("「网站」页"));
+        // Custom 的文案不得假装有默认值
+        assert!(AppRuntime::Custom.purpose().contains("自备"));
     }
 
     // ── 日志 level 归一 / 筛选（A8） ──
