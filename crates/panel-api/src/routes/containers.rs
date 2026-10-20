@@ -19,6 +19,8 @@
 //!   （`docker network ls --no-trunc`，只读，需 container.view）、**卷列举**
 //!   （`docker volume ls`，只读，需 container.view）、**Compose 项目列举**
 //!   （`docker compose ls --all --format json`，只读，需 container.view）、
+//!   **Compose 生命周期动作**（up / stop / restart / down，需 container.manage；
+//!   down 需手输项目名确认、**永不传 `-v`**）、
 //!   一键安装 Docker、把面板运行用户加入 docker 组、容器备注。
 //!
 //! ## 不提供的能力
@@ -46,7 +48,7 @@ use axum::{
     Json,
 };
 use panel_core::{cap_keys, PanelError};
-use panel_os::{cmd, ContainerAction, ContainerCreateReq, ContainerProvider};
+use panel_os::{cmd, ComposeAction, ContainerAction, ContainerCreateReq, ContainerProvider};
 use serde::Deserialize;
 use std::time::Duration;
 use panel_task::{TaskRequest, TaskKind};
@@ -449,6 +451,98 @@ pub async fn compose_projects(
     Ok(ok(lines))
 }
 
+// ─────────────── Compose 生命周期写操作 ───────────────
+//
+// 危险度分级（用户 2026-10-20 拍板）：
+//   - up / stop / restart：**可逆、日常操作**，无需确认词，与容器 start/stop 同待遇；
+//   - down：**整项目停服**（服务全下线），必须手输项目名确认——不是随手点 OK 能过。
+//     ⚠ down **永不带 `-v`**（那会删命名卷=数据丢失），这是刻意的功能缺失。
+//
+// 权限统一 `container.manage`（与容器启停删除同级），不新增权限点。
+
+/// Compose 动作请求体。
+#[derive(Debug, Deserialize)]
+pub struct ComposeActReq {
+    /// 动作：up / stop / restart / down。故意用字符串而非枚举——便于给出
+    /// "未知动作"的明确报错，而不是让 serde 抛一句反序列化错误给用户看。
+    pub action: String,
+    /// 仅 `up` 需要：项目工作目录（compose 靠它找配置文件）。
+    pub working_dir: Option<String>,
+    /// 仅 `down` 需要：手输项目名作为二次确认词。
+    pub confirm_token: Option<String>,
+}
+
+/// 对 Compose 项目执行生命周期动作。
+///
+/// 项目名**必须已存在**：先查 `compose ls`，不在列表里直接 404。
+/// 这样即使有人构造请求，也只能操作真实存在的项目（而不是让 compose 去
+/// 用这个名字干点什么）。
+pub async fn compose_act(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    AxPath(project): AxPath<String>,
+    Json(req): Json<ComposeActReq>,
+) -> ApiResult<StatusCode> {
+    crate::auth::require(&s, perm::CONTAINER_MANAGE)?;
+    ensure_supported(&state)?;
+
+    let action = match req.action.trim() {
+        "up" => ComposeAction::Up,
+        "stop" => ComposeAction::Stop,
+        "restart" => ComposeAction::Restart,
+        "down" => ComposeAction::Down,
+        other => {
+            return Err(ApiError::bad_request(
+                "action",
+                &format!("未知动作 `{other}`（只支持 up / stop / restart / down）"),
+            ))
+        }
+    };
+
+    // 确认词：down 必须手输项目名。
+    // 用**项目名本身**而非固定词（如「删除」）作为确认词：固定词点两次就学会了，
+    // 而打对项目名要求用户真的看清自己在停哪个项目——这是防"停错项目"的关键。
+    if action == ComposeAction::Down {
+        let token = req.confirm_token.as_deref().unwrap_or("").trim();
+        if token != project {
+            return Err(ApiError::bad_request(
+                "confirm_token",
+                &format!("停止并删除项目容器需手输项目名 `{project}` 作为确认"),
+            ));
+        }
+    }
+
+    // 「项目必须真实存在」只对**操作已有容器**的动作成立（stop/restart/down）。
+    //
+    // ⚠ `up` 必须豁免：`down` 之后项目就从 `compose ls` 里消失了，而用户恰恰
+    // 需要 `up` 把它重新拉起来——按「必须存在于 ls」来卡，会让"down 完再也起不
+    // 来"变成一个死锁（真机实测：down 后 up 返回 404 compose 项目不存在）。
+    // up 的合法性由**工作目录里确实有 compose 文件**和 compose 自己的报错来保证。
+    if action != ComposeAction::Up {
+        let projects = state.os.containers().compose_projects_all().await?;
+        if !projects.iter().any(|p| p.name == project) {
+            return Err(ApiError::not_found(&format!("compose 项目不存在: {project}")));
+        }
+    }
+
+    state
+        .os
+        .containers()
+        .compose_act(action, &project, req.working_dir.as_deref())
+        .await?;
+
+    // 审计：记录动作 + 项目名（项目名是用户可控输入，但已过白名单校验）
+    let audit_action: &'static str = match action {
+        ComposeAction::Up => "container.compose.up",
+        ComposeAction::Stop => "container.compose.stop",
+        ComposeAction::Restart => "container.compose.restart",
+        ComposeAction::Down => "container.compose.down",
+    };
+    audit(&state, &s, audit_action, &project, "ok").await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+
 // ─────────────── 一键安装 Docker ───────────────
 
 /// 安装请求。**二次确认词** `confirm_token` 必须为「安装 Docker」——
@@ -641,5 +735,48 @@ mod tests {
         assert!(crate::auth::require(&sess(&[]), perm::CONTAINER_VIEW).is_err());
         // 有 view 但缺 manage → 仍可读（与 logs/stats/networks/volumes 同源，防越权误拒读）
         assert!(crate::auth::require(&sess(&[perm::CONTAINER_VIEW]), perm::CONTAINER_VIEW).is_ok());
+    }
+
+    /// ⭐⭐ **`up` 不得被"项目必须已存在"卡住**——否则 down 完再也起不来。
+    ///
+    /// 这是真机跑出来的死锁（不是推理）：`down` 之后项目从 `compose ls` 消失，
+    /// 若 `up` 也要求"在 ls 里能找到"，用户就永久失去从面板启动该项目的能力，
+    /// 只能去 CLI 救。判据用源码断言——这个分支在 handler 里、依赖真实 docker，
+    /// 单测无法驱动整个 handler。
+    ///
+    /// ⚠ 判据必须是**结构**而不是"文中出现过 Up"：
+    /// 第一版写成 `window.contains("action != ComposeAction::Up")`，
+    /// 负向对照（把条件改成 `... || true`，等价于永不豁免）**照样绿**——
+    /// 因为被改坏的文本里那个子串还在。这就是"断言恒绿"的典型形态。
+    /// 现在改为：存在性检查那几行必须**完整被包在** `if action != ComposeAction::Up {`
+    /// 里，即该行紧接在 `compose_projects_all()` 之前。
+    #[test]
+    fn compose_up_is_exempt_from_existence_check() {
+        let src = include_str!("containers.rs");
+        let code: Vec<&str> = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+        let joined = code.join("\n");
+
+        // 定位存在性检查（调用 compose_projects_all 做名字比对的唯一处）
+        let check_at = joined
+            .find("let projects = state.os.containers().compose_projects_all().await?;")
+            .expect("存在性检查必须存在");
+        // 它前面 200 字符内必须出现**精确的**豁免条件
+        let from = check_at.saturating_sub(200);
+        let before = &joined[from..check_at];
+        assert!(
+            before.contains("if action != ComposeAction::Up {"),
+            "存在性检查必须被 `if action != ComposeAction::Up {{` **精确**包裹\
+             （不是任何包含 Up 字样的表达式）。否则 down 之后无法再 up，形成死锁。\n\
+             检查前文：\n{before}"
+        );
+        // 再加一条负向：不得出现会抵消豁免的短路/恒真写法
+        assert!(
+            !before.contains("|| true") && !before.contains("&& false"),
+            "豁免条件不得被 || true / && false 之类的写法抵消（那等于没豁免）。\n\
+             检查前文：\n{before}"
+        );
     }
 }

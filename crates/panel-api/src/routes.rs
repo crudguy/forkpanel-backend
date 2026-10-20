@@ -312,7 +312,10 @@ pub fn build_router(state: Shared) -> Router {
         // 卷列举（只读）：docker volume ls（无 --no-trunc，卷名默认不截断），需 container.view
         .route("/api/v1/containers/volumes", get(containers::volumes))
         // Compose 项目列举（只读）：docker compose ls --all --format json，需 container.view
-        .route("/api/v1/containers/compose", get(containers::compose_projects));
+        .route("/api/v1/containers/compose", get(containers::compose_projects))
+        // Compose 生命周期动作（写）：up/stop/restart/down，需 container.manage。
+        // down 需手输项目名确认；down 永不带 -v（不删卷）。
+        .route("/api/v1/containers/compose/{project}/act", post(containers::compose_act));
 
     // ── 本机便签（025：多条，由 022 单例说明升级） ──
     let notes_r = Router::new()

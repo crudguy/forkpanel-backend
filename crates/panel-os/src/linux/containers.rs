@@ -92,6 +92,38 @@ impl LinuxContainers {
         })
     }
 
+    /// 探测 `docker compose` 子命令是否真的可用。
+    ///
+    /// 返回 `Some(reason)` 表示**能力缺失**（应报 501 而不是 502），`None` 表示可用。
+    /// 只在 `compose ls` 真的失败后调用——正常路径不额外付一次子进程开销。
+    ///
+    /// 为什么要单独探测，而不是看 socket 是否可达：`container.manage` 能力位只按
+    /// 守护进程 socket 可达性判定，**compose 是 Docker 的 CLI 插件**，与 daemon
+    /// 完全无关。宿主完全可能「docker 能用、compose 插件没装」（Debian 上
+    /// `docker.io` 包不带 compose 插件，需另装 `docker-compose-plugin`）。
+    ///
+    /// 判据 `docker compose version` 的退出码：插件缺失时 docker 回
+    /// `docker: unknown command: docker compose`（真机实测文案），退出码非 0；
+    /// 插件存在则打印版本号、退出码 0。**不比对 stderr 文案**——文案随 docker
+    /// 版本变化，只认退出码这个稳定契约（V1 独立二进制 `docker-compose` 不在
+    /// 本探测范围，本项目只用 `docker compose` 子命令形态）。
+    async fn compose_unavailable_reason(&self) -> Option<&'static str> {
+        let out = match crate::cmd::run(
+            Bin::Docker,
+            &["compose", "version"],
+            CmdOpt { timeout: LIST_TIMEOUT, ..Default::default() },
+        )
+        .await
+        {
+            Ok(o) => o,
+            // 探测命令本身跑不起来（二进制消失/超时）⇒ 无法证明 compose 可用。
+            // 返回 None 让后续 `compose ls` 自己去报错（那会给出真实 stderr），
+            // 而不是在这里武断地宣称"compose 不可用"——探测失败 ≠ 能力缺失。
+            Err(_) => return None,
+        };
+        compose_probe_verdict(out.code)
+    }
+
     /// 创建前的安全校验（固有方法，供 `create` 调用；非 trait 方法）。
     /// provider 层强制：业务层不得假设上游已校验。
     fn validate_create(&self, req: &ContainerCreateReq) -> Result<()> {
@@ -273,6 +305,10 @@ impl ContainerProvider for LinuxContainers {
             status: "Created".into(),
             ports: req.ports.join(","),
             created: String::new(),
+            // 面板 `docker create` 出来的容器没有 compose 标签——它不是 compose 创建的。
+            // 硬编码 None 而非去查标签：此刻容器刚建、`docker ps` 未必能立刻看到它。
+            compose_project: None,
+            compose_service: None,
         })
     }
     async fn pull(&self, image: &str) -> Result<ImageSummary> {
@@ -412,6 +448,14 @@ impl ContainerProvider for LinuxContainers {
 
     async fn compose_projects_all(&self) -> Result<Vec<ContainerComposeProjectLine>> {
         self.ensure_ready()?;
+        // ⚠ 先区分「compose 子命令不存在」与「有子命令但执行失败」：前者是**能力缺失**
+        // （诚实地报 Unsupported → 501，前端据此置灰并提示装插件），后者才是真错误。
+        // 修复前此处直接 `check()`：插件没装时 docker 回 "docker: unknown command"，
+        // 被包成 `PanelError::Command`（30000）→ **502 Bad Gateway**，前端只弹一条
+        // 带原始 stderr 的红条，与本模块「诚实 501 + 可行动 reason」的纪律相悖。
+        if let Some(reason) = self.compose_unavailable_reason().await {
+            return Err(PanelError::Unsupported(reason));
+        }
         // 只读列举：无参数 → 无参数注入面；format 值是编译期常量。
         // ⚠ compose 的 --format **只接受 table | json 两个字面量**（真机探活
         // v5.6.0：`--format '{{.Name}}\t…'` 直接被拒 "could not be parsed"），
@@ -428,6 +472,133 @@ impl ContainerProvider for LinuxContainers {
         .await?;
         LinuxContainers::check(&out, "docker compose ls")?;
         parse_compose_projects(&out.stdout)
+    }
+
+    async fn compose_act(
+        &self,
+        action: ComposeAction,
+        project: &str,
+        working_dir: Option<&str>,
+    ) -> Result<()> {
+        self.ensure_ready()?;
+        // ⚠ 项目名直接进 argv，必须严格校验：**禁止首字符 `-`**（否则 `--all` 之类
+        // 会被 CLI 当选项）、禁止空白与 shell 元字符。这与 `is_valid_container_ref`
+        // 是同一条纪律——compose 项目名的合法字符集更窄（docker 自己要求
+        // `[a-z0-9][a-z0-9_-]*`），但这里只做"安全"下限校验，不越权替用户判合法性。
+        validate_compose_project(project)?;
+
+        if action.needs_working_dir() && working_dir.map(str::trim).unwrap_or("").is_empty() {
+            return Err(PanelError::Validation {
+                field: "working_dir",
+                reason: "up 需要项目工作目录（compose 靠目录里的配置文件决定启动什么）".into(),
+            });
+        }
+        if let Some(dir) = working_dir {
+            validate_compose_working_dir(dir)?;
+        }
+
+        if let Some(reason) = self.compose_unavailable_reason().await {
+            return Err(PanelError::Unsupported(reason));
+        }
+
+        // argv 逐段构造，项目名/目录只作为**独立参数**，绝不做字符串拼接。
+        let mut args: Vec<&str> = vec!["compose"];
+        if let Some(dir) = working_dir.map(str::trim).filter(|d| !d.is_empty()) {
+            args.push("--project-directory");
+            args.push(dir);
+        }
+        args.push("-p");
+        args.push(project);
+        match action {
+            ComposeAction::Up => args.extend(["up", "-d"]),
+            ComposeAction::Stop => args.push("stop"),
+            ComposeAction::Restart => args.push("restart"),
+            // ⚠ 绝不追加 `-v`：那会删掉命名卷（数据丢失）。见 ComposeAction::Down 注释。
+            ComposeAction::Down => args.push("down"),
+        }
+
+        let out = crate::cmd::run(
+            Bin::Docker,
+            &args,
+            CmdOpt { timeout: ACT_TIMEOUT, ..Default::default() },
+        )
+        .await?;
+        LinuxContainers::check(&out, "docker compose")?;
+        Ok(())
+    }
+}
+
+/// Compose 项目名安全校验（进 argv 白名单）。返回 `Err` 时附可读原因。
+///
+/// 允许的字符集：字母数字 `_` `-` `.`，**且不得以 `-` 开头**。
+/// 不允许 `--`/空格/引号/`;`/`|`/`$` 等——项目名是用户可控输入，
+/// 任何一项漏过都能变成参数注入或（若将来改成 shell 调用）命令注入。
+pub fn validate_compose_project(project: &str) -> Result<()> {
+    let p = project.trim();
+    if p.is_empty() {
+        return Err(PanelError::Validation { field: "project", reason: "项目名不能为空".into() });
+    }
+    if p.starts_with('-') {
+        return Err(PanelError::Validation {
+            field: "project",
+            reason: "项目名不得以 - 开头（会被 docker 当作选项解析）".into(),
+        });
+    }
+    if !p.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')) {
+        return Err(PanelError::Validation {
+            field: "project",
+            reason: "项目名只能包含字母、数字、下划线、连字符与点".into(),
+        });
+    }
+    Ok(())
+}
+
+/// Compose 工作目录校验：必须是绝对路径、不得含 `..`（路径穿越）。
+///
+/// 为什么不校验"目录里真的有 compose 文件"：那是 compose 自己的职责，
+/// 它的报错（`no configuration file provided`）比我们猜的准确；这里只拦
+/// **安全**问题（相对路径 / 穿越 / 控制字符），不越权做业务判断。
+pub fn validate_compose_working_dir(dir: &str) -> Result<()> {
+    let d = dir.trim();
+    if d.is_empty() {
+        return Ok(());
+    }
+    if !d.starts_with('/') {
+        return Err(PanelError::Validation {
+            field: "working_dir",
+            reason: "工作目录必须是绝对路径".into(),
+        });
+    }
+    // 逐段检查而不是字符串 `contains("..")`：后者会把合法的 `..foo` 目录误杀。
+    if d.split('/').any(|seg| seg == "..") {
+        return Err(PanelError::Validation {
+            field: "working_dir",
+            reason: "工作目录不得包含 ..（路径穿越）".into(),
+        });
+    }
+    if d.chars().any(|c| c.is_control()) {
+        return Err(PanelError::Validation {
+            field: "working_dir",
+            reason: "工作目录不得包含控制字符".into(),
+        });
+    }
+    Ok(())
+}
+
+/// 判定 `docker compose version` 的结果是否代表「compose 能力缺失」。
+///
+/// 抽出成纯函数是为了能单测——`cmd::run` 走固定绝对路径解析，单测里无法注入替身，
+/// 而这条判定的正确与否直接决定用户拿到的是「可行动的 501」还是「莫名其妙的 502」。
+///
+/// - `Some(0)`：插件在，可用 → `None`
+/// - 其他退出码：插件缺失或无法执行 → `Some("compose_unavailable")`
+/// - `None`（被信号杀死、未拿到退出码）：**不归因为能力缺失**，返回 `None`
+///   让调用方把原始错误抛出去。宁可报一个真实错误，也不要错误地宣称"没装插件"。
+fn compose_probe_verdict(code: Option<i32>) -> Option<&'static str> {
+    match code {
+        Some(0) => None,
+        Some(_) => Some("compose_unavailable"),
+        None => None,
     }
 }
 
@@ -645,21 +816,67 @@ fn jstr(v: &serde_json::Value, key: &str) -> String {
 
 /// 解析 `docker ps -a --format '{{json .}}'`：每行一个 JSON 对象。
 /// 非 `{` 开头的行（CLI 警告等）直接跳过，不使整个列表失败。
+/// 从 `docker ps` 的 `Labels` 字段里取出某个标签值。
+///
+/// ⚠⚠ **必须按键精确匹配，绝不能用 `contains`**。真机实测的标签串里存在
+/// **前缀重叠**：
+/// ```text
+/// com.docker.compose.project=forkpanel-labelprobe
+/// com.docker.compose.project.config_files=/tmp/cprobe/docker-compose.yml
+/// com.docker.compose.project.working_dir=/tmp/cprobe
+/// ```
+/// 用 `contains("com.docker.compose.project")` 会同时命中三条，取到的可能是
+/// 配置文件路径而不是项目名（且首条命中顺序取决于 docker 输出顺序，不稳定）。
+///
+/// `Labels` 是**逗号分隔的 `k=v` 扁平串**（不是 JSON 数组、不是 map）——
+/// 真机 `docker ps --format '{{json .}}'` 实测确认。值里可能含 `=`（如 URL 查询
+/// 串），故只在**第一个** `=` 处切分。
+fn label_value(labels: &str, key: &str) -> Option<String> {
+    for kv in labels.split(',') {
+        // ⚠ 用 `let ... else { continue }` 而不是 `?`：`?` 会在遇到第一个不含
+        // `=` 的片段时**直接让整个函数返回 None**，从而漏掉后面真正的目标标签。
+        let Some((k, v)) = kv.split_once('=') else {
+            continue;
+        };
+        if k.trim() == key {
+            let v = v.trim();
+            // 空值按"没有这个标签"处理：compose 不会写空项目名，出现空值宁可当无。
+            return if v.is_empty() { None } else { Some(v.to_string()) };
+        }
+    }
+    None
+}
+
+/// `Labels` 串 → (compose 项目名, compose 服务名)。两者都没有则均为 None。
+fn compose_identity(labels: &str) -> (Option<String>, Option<String>) {
+    (
+        label_value(labels, "com.docker.compose.project"),
+        label_value(labels, "com.docker.compose.service"),
+    )
+}
+
+/// 解析 `docker ps -a --no-trunc --format '{{json .}}'` 输出：每行一个 JSON 对象。
+/// 非 JSON 行（CLI 警告、空行）直接跳过——与 `docker ps` 混入警告时的容错一致。
 fn parse_ps(stdout: &str) -> Vec<ContainerSummary> {
     stdout
         .lines()
         .map(str::trim)
         .filter(|l| l.starts_with('{'))
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .map(|v| ContainerSummary {
-            id: jstr(&v, "ID"),
-            name: jstr(&v, "Names"),
-            image: jstr(&v, "Image"),
-            state: jstr(&v, "State"),
-            status: jstr(&v, "Status"),
-            ports: jstr(&v, "Ports"),
-            // 用绝对时间而非 `RunningFor`（"3 hours ago"）：后者对已退出容器语义不明确
-            created: jstr(&v, "CreatedAt"),
+        .map(|v| {
+            let (compose_project, compose_service) = compose_identity(&jstr(&v, "Labels"));
+            ContainerSummary {
+                id: jstr(&v, "ID"),
+                name: jstr(&v, "Names"),
+                image: jstr(&v, "Image"),
+                state: jstr(&v, "State"),
+                status: jstr(&v, "Status"),
+                ports: jstr(&v, "Ports"),
+                // 用绝对时间而非 `RunningFor`（"3 hours ago"）：后者对已退出容器语义不明确
+                created: jstr(&v, "CreatedAt"),
+                compose_project,
+                compose_service,
+            }
         })
         .collect()
 }
@@ -1008,5 +1225,188 @@ mod tests {
             parse_compose_projects(json).is_err(),
             "缺字段的 JSON 不得被部分接受"
         );
+    }
+
+    /// **诚实性守卫**：compose 插件缺失必须被判成「能力缺失」（→501），    /// 而不是让它掉进 `check()` 变成 502 Bad Gateway。
+    ///
+    /// 回归场景（本测试要抓的）：把 `compose_projects_all` 里那段
+    /// `compose_unavailable_reason` 预检删掉，`docker compose ls` 就会以非 0 退出，
+    /// 被包成 `PanelError::Command`（30000）→ HTTP 502，前端弹原始 stderr 红条，
+    /// 而用户真正需要的是"请安装 docker-compose-plugin"这句可行动提示。
+    #[test]
+    fn compose_probe_verdict_flags_missing_plugin() {
+        // 插件存在：`docker compose version` 退出码 0
+        assert_eq!(compose_probe_verdict(Some(0)), None, "插件可用时不得报能力缺失");
+
+        // 插件缺失：docker 回 `docker: unknown command: docker compose`，退出码 1
+        // （真机实测文案见注释；这里只认退出码，不比对文案）
+        assert_eq!(
+            compose_probe_verdict(Some(1)),
+            Some("compose_unavailable"),
+            "非 0 退出码必须判为能力缺失，否则会退化成 502"
+        );
+
+        // 未拿到退出码（被信号杀死）≠ 能力缺失：不得武断宣称没装插件
+        assert_eq!(
+            compose_probe_verdict(None),
+            None,
+            "拿不到退出码时应让原始错误上抛，不归因为能力缺失"
+        );
+    }
+
+    /// ⚠⚠ **前缀重叠陷阱**（真机实测的标签串，逐字取自 docker 输出）。
+    ///
+    /// `com.docker.compose.project` 同时是
+    /// `com.docker.compose.project.config_files` 与 `...project.working_dir` 的
+    /// **真前缀**。用 `contains` 实现会命中三条中的任意一条，取到的可能是配置文件
+    /// 路径。本测试把 config_files 与 working_dir 放在**前面**，确保实现若用
+    /// `contains` 会先命中它们而失败。
+    #[test]
+    fn compose_identity_does_not_confuse_project_with_config_files() {
+        let labels = "com.docker.compose.project.config_files=/tmp/cprobe/docker-compose.yml,\
+com.docker.compose.project.working_dir=/tmp/cprobe,\
+com.docker.compose.project=forkpanel-labelprobe,\
+com.docker.compose.service=web";
+        let (project, service) = compose_identity(labels);
+        assert_eq!(
+            project.as_deref(),
+            Some("forkpanel-labelprobe"),
+            "必须取到项目名，而不是 config_files/working_dir 的路径"
+        );
+        assert_eq!(service.as_deref(), Some("web"));
+    }
+
+    #[test]
+    fn compose_identity_is_none_for_plain_container() {
+        // 非 compose 创建的容器（如 `docker run` / 面板 `docker create`）没有这些标签
+        let labels = "maintainer=nginx@gmail.com,org.opencontainers.image.version=1.27";
+        assert_eq!(compose_identity(labels), (None, None));
+        // 空 Labels 是常态（无标签容器），不得 panic
+        assert_eq!(compose_identity(""), (None, None));
+    }
+
+    #[test]
+    fn compose_identity_tolerates_junk_segments() {
+        // 片段里没有 `=` 时不能整体放弃（`split_once(...)?` 会提前返回 None，
+        // 从而漏掉后面真正的标签——这是本函数写错过一次的 bug）
+        let labels = "noequals,\
+com.docker.compose.project=proj";
+        let (project, _) = compose_identity(labels);
+        assert_eq!(project.as_deref(), Some("proj"), "无 `=` 的片段应跳过而非终止解析");
+    }
+
+    #[test]
+    fn compose_identity_treats_empty_value_as_absent() {
+        // 值为空 ⇒ 视为没有该标签（compose 不会写空项目名）
+        let (project, service) = compose_identity("com.docker.compose.project=,com.docker.compose.service=");
+        assert_eq!(project, None);
+        assert_eq!(service, None);
+    }
+
+    /// 端到端：`docker ps` 的真实 JSON 行 → `ContainerSummary` 带上 compose 身份。
+    /// 用真机抓到的字段集合（含 Labels）构造，确保 parse_ps 的接线不会漏。
+    #[test]
+    fn parse_ps_extracts_compose_identity() {
+        let line = r#"{"ID":"abc123","Names":"forkpanel-labelprobe-web-1","Image":"alpine:3.20","State":"running","Status":"Up 2 minutes","Ports":"","CreatedAt":"2026-10-20 16:53:00 +0800 CST","Labels":"com.docker.compose.project.config_files=/tmp/cprobe/docker-compose.yml,com.docker.compose.project=forkpanel-labelprobe,com.docker.compose.service=web"}"#;
+        let v = parse_ps(line);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].compose_project.as_deref(), Some("forkpanel-labelprobe"));
+        assert_eq!(v[0].compose_service.as_deref(), Some("web"));
+    }
+
+    // ── Compose 写操作的安全不变量 ──
+
+    /// ⭐⭐ **`down` 绝不能带 `-v`**：`-v` 会删除项目的命名卷（数据丢失）。
+    ///
+    /// 这是本模块最重要的单条不变量。判据直接从**源码**取 `compose_act` 的
+    /// argv 构造段，断言 `Down` 分支只 push `"down"`，不含 `-v`/`--volumes`。
+    ///
+    /// 为什么用源码断言而不是行为测试：`compose_act` 会真的调用 docker，
+    /// 单测里跑不起来；而这条规则的失效后果（用户以为只是停服务，实际数据没了）
+    /// 严重到不能只靠人工 review。⚠ 断言前必须剔除注释行——注释里明明白白
+    /// 写着「绝不追加 -v」，不剔除会恒绿。
+    #[test]
+    fn compose_down_never_passes_volumes_flag() {
+        let src = include_str!("containers.rs");
+        // 只取 argv 构造的那几行（从 `match action {` 到 `};` 之后的 run 调用前）
+        let code: Vec<&str> = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+        let joined = code.join("\n");
+        let start = joined
+            .find("ComposeAction::Up => args.extend([\"up\", \"-d\"]),")
+            .expect("argv 构造段必须存在");
+        let end = joined[start..]
+            .find("let out = crate::cmd::run(")
+            .expect("argv 构造段必须以 run 调用结束");
+        let block = &joined[start..start + end];
+        assert!(
+            block.contains("\"down\""),
+            "Down 分支必须存在。当前块：\n{block}"
+        );
+        assert!(
+            !block.contains("\"-v\"") && !block.contains("\"--volumes\"") && !block.contains("-v "),
+            "down 绝不能带 -v/--volumes（会删除命名卷 = 数据丢失）。\n\
+             这是有意的功能缺失，不是遗漏。当前块：\n{block}"
+        );
+    }
+
+    /// 项目名白名单：首字符 `-` 必须被拒（否则 `--all` 之类会被 docker 当选项）。
+    #[test]
+    fn compose_project_rejects_leading_dash() {
+        assert!(validate_compose_project("--all").is_err(), "首字符 - 是参数注入");
+        assert!(validate_compose_project("-p").is_err());
+        assert!(validate_compose_project("").is_err());
+        assert!(validate_compose_project("   ").is_err());
+    }
+
+    /// 项目名白名单：shell 元字符与空白一律拒绝。
+    #[test]
+    fn compose_project_rejects_metacharacters() {
+        for bad in ["a b", "a;b", "a|b", "a$(id)", "a`id`", "a/b", "a&&b", "a'b"] {
+            assert!(
+                validate_compose_project(bad).is_err(),
+                "`{bad}` 含危险字符，必须被拒"
+            );
+        }
+        // 合法项目名必须放行（别把正常用法一起拦了）
+        for good in ["web-stack", "my_app", "app.v2", "Web123"] {
+            assert!(
+                validate_compose_project(good).is_ok(),
+                "`{good}` 是合法项目名，不应被拒"
+            );
+        }
+    }
+
+    /// 工作目录：必须绝对路径、不得 `..` 穿越。
+    #[test]
+    fn compose_working_dir_rejects_relative_and_traversal() {
+        assert!(validate_compose_working_dir("/srv/web").is_ok());
+        assert!(validate_compose_working_dir("").is_ok(), "空表示不提供");
+        assert!(validate_compose_working_dir("srv/web").is_err(), "相对路径必须被拒");
+        assert!(
+            validate_compose_working_dir("/srv/../../etc").is_err(),
+            "路径穿越必须被拒"
+        );
+        // ⚠ 目录名里含 `..` 但不是穿越段（如 `..foo`）应当放行——
+        // 用 `contains("..")` 实现会误杀，本断言专门钉这一点。
+        assert!(
+            validate_compose_working_dir("/srv/..foo").is_ok(),
+            "`..foo` 是合法目录名，不是路径穿越"
+        );
+    }
+
+    /// 只有 `up` 需要工作目录（真机实测：`-p` 无法定位配置文件）。
+    #[test]
+    fn compose_only_up_needs_working_dir() {
+        assert!(ComposeAction::Up.needs_working_dir());
+        for a in [ComposeAction::Stop, ComposeAction::Restart, ComposeAction::Down] {
+            assert!(
+                !a.needs_working_dir(),
+                "{} 只操作已有容器，靠 -p 就够，不该强制要求目录",
+                a.as_str()
+            );
+        }
     }
 }

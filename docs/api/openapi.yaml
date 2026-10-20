@@ -1021,6 +1021,8 @@ components:
         ports:   { type: string, example: "0.0.0.0:80->80/tcp" }
         created: { type: string, description: 容器创建时间（CLI 原始格式，不做本地化推算） }
         remark:  { type: string, description: "对象说明（备注，022）：容器不入库，备注存 container_remarks 引用表；列表端点一次性联查挂载，无则为空串" }
+        compose_project: { type: ["string", "null"], description: "所属 Compose 项目名（读 com.docker.compose.project 标签）；非 compose 创建的容器为 null（不是空串——空串无法与「项目名就是空」区分）" }
+        compose_service: { type: ["string", "null"], description: "所属 Compose 服务名（com.docker.compose.service 标签）；与 compose_project 同生共死" }
     ContainerImage:
       type: object
       description: 等价 `docker images` 的一行（含悬空镜像 `<none>`）
@@ -3007,7 +3009,7 @@ paths:
         '200':
           description: ok，返回每项目一行（data 为 [name, status, config_files]；status 为组合语义串如 running(1) / exited(1)，config_files 为配置文件绝对路径）
           content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { type: object, properties: { name: { type: string }, status: { type: string }, config_files: { type: string } } } } } } } }
-        '501': { description: 容器能力不可用 }
+        '501': { description: "容器能力不可用，或 Compose 插件缺失（detail.reason：binary_missing / daemon_unreachable / compose_unavailable）。⚠ compose 是 CLI 插件，与 daemon 可达性无关：docker 可用但没装 docker-compose-plugin 时会返回 compose_unavailable（而非 502）" }
   /api/v1/containers/join-docker-group:
     post:
       tags: [containers]

@@ -1536,6 +1536,13 @@ pub struct ContainerSummary {
     pub status: String,
     pub ports: String,
     pub created: String,
+    /// 所属 Compose 项目名（读 `com.docker.compose.project` 标签）。
+    /// 非 compose 创建的容器为 `None`——**不是空串**：空串会让"无项目"与
+    /// "项目名就叫空"无法区分，前端也就无从判断该不该显示下钻入口。
+    pub compose_project: Option<String>,
+    /// 所属 Compose 服务名（读 `com.docker.compose.service` 标签）。
+    /// 与 `compose_project` 同生共死：compose 创建的容器两者都有。
+    pub compose_service: Option<String>,
 }
 
 /// 镜像摘要（等价 `docker images`）。
@@ -1722,8 +1729,58 @@ pub trait ContainerProvider: Send + Sync {
 
     /// 列举 Docker Compose 项目（等价 `docker compose ls --all`）。只读，需
     /// container.view。无 id 参数（一次返回所有项目），故无参数注入面。
-    /// **只列举**：up/down/restart/logs 等生命周期写操作未实现。
     async fn compose_projects_all(&self) -> Result<Vec<ContainerComposeProjectLine>>;
+
+    /// 对某个 Compose 项目执行生命周期动作（需 container.manage）。
+    ///
+    /// `project` 必须是**已存在**的项目名（调用方先从 `compose_projects_all`
+    /// 取到，再回传），实现侧必须再校验字符集——不假设上游已校验。
+    /// `working_dir` 仅 `Up` 需要（见 [`ComposeAction`] 的说明）。
+    async fn compose_act(
+        &self,
+        action: ComposeAction,
+        project: &str,
+        working_dir: Option<&str>,
+    ) -> Result<()>;
+}
+
+/// Compose 项目的生命周期动作。与 [`ContainerAction`] 同纪律：**声明式**，
+/// 由平台实现翻译成固定 CLI argv，业务层不出现命令字面量。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComposeAction {
+    /// `docker compose -p <name> up -d`（需要工作目录：compose 靠它找配置文件）
+    Up,
+    /// `docker compose -p <name> stop`
+    Stop,
+    /// `docker compose -p <name> restart`
+    Restart,
+    /// `docker compose -p <name> down`
+    ///
+    /// ⚠ **永不传 `-v`**：`-v` 会删除该项目的命名卷，即数据丢失。这是刻意的
+    /// 功能缺失（与「不开放镜像删除 / 不开放卷删除」同一纪律），不是遗漏——
+    /// 真要删卷请用 CLI，并且那时用户能看见自己在打 `-v`。
+    Down,
+}
+
+impl ComposeAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ComposeAction::Up => "up",
+            ComposeAction::Stop => "stop",
+            ComposeAction::Restart => "restart",
+            ComposeAction::Down => "down",
+        }
+    }
+
+    /// 该动作是否必须提供工作目录。
+    ///
+    /// 真机实测：`docker compose -p <name> up -d` 在任意目录下都会报
+    /// `no configuration file provided: not found`——compose 靠**工作目录**
+    /// 里的 `compose.y*ml` 决定"要启动什么"，`-p` 只决定项目名。
+    /// 其余动作（stop/restart/down）只操作已存在的容器，靠 `-p` 就够了。
+    pub fn needs_working_dir(self) -> bool {
+        matches!(self, ComposeAction::Up)
+    }
 }
 
 // ═══════════════════════════ 终端 ═══════════════════════════

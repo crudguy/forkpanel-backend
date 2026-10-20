@@ -493,6 +493,10 @@ impl ContainerProvider for MockContainers {
             status: "Up 9 days".into(),
             ports: "0.0.0.0:80->80/tcp".into(),
             created: "2026-09-20 08:12:33 +0800 CST".into(),
+            // 与下方 compose_projects_all mock 的 `web-stack` 项目对齐：让前端在
+            // 联调时能真实走到"从项目下钻到容器"这条路径，而不是永远看到空。
+            compose_project: Some("web-stack".into()),
+            compose_service: Some("web".into()),
         }])
     }
 
@@ -518,6 +522,9 @@ impl ContainerProvider for MockContainers {
             status: "Created".into(),
             ports: req.ports.join(","),
             created: String::new(),
+            // mock 的 create 不模拟 compose 标签（与真实 `docker create` 一致：无标签）
+            compose_project: None,
+            compose_service: None,
         })
     }
 
@@ -627,6 +634,23 @@ impl ContainerProvider for MockContainers {
                 config_files: "/srv/legacy/docker-compose.yml".into(),
             },
         ])
+    }
+
+    async fn compose_act(
+        &self,
+        action: ComposeAction,
+        project: &str,
+        _working_dir: Option<&str>,
+    ) -> Result<()> {
+        // mock 不真正调用 docker。但**仍要跑项目名校验**：否则 mock 下能过的输入
+        // 在真机会被拒，前端联调会得出错误结论（安全校验必须在两种实现下同口径）。
+        crate::linux::containers::validate_compose_project(project)?;
+        // 未知项目按"未找到"处理，让前端能联调错误分支
+        if !matches!(project, "web-stack" | "legacy-db") {
+            return Err(PanelError::NotFound(format!("compose 项目不存在: {project}")));
+        }
+        let _ = action;
+        Ok(())
     }
 }
 
