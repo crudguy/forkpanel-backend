@@ -8,7 +8,7 @@
 # （恒绿比没门禁更危险）。故 audit 单独成一个目标，CI 里单独一个 job——
 # advisory-db 托管在 GitHub，网络抖动时不该连带拖红主门禁。
 
-.PHONY: check guards audit test embed-fresh
+.PHONY: check guards audit test embed-fresh e2e-files
 
 # 主门禁：静态守卫 + 全量测试（离线可跑，确定性高）
 check: guards embed-fresh test
@@ -31,6 +31,15 @@ embed-fresh:
 # 依赖安全审计（需 cargo-audit，且要联网拉 RustSec advisory-db）
 audit:
 	bash ci/check-audit.sh
+
+# 文件管理器 E2E：需要**运行中的 dev 后端**（默认 127.0.0.1:2083）。
+#
+# 刻意**不进 `check`**：CI 里没有服务，脚本只会走 [skip] 分支——那是恒绿，
+# 比没有门禁更危险（会让人以为覆盖到了）。它要求人工在真机跑，输出 61 条断言。
+#   make e2e-files
+#   make e2e-files BASE=http://127.0.0.1:2084
+e2e-files:
+	bash ci/e2e-files.sh "$(BASE)"
 
 test:
 	cargo test --workspace
