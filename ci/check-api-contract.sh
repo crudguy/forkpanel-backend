@@ -122,7 +122,7 @@ if [ -f ci/check_openapi.py ]; then
      python3 ci/check_openapi.py "$ROOT"; then
     pass "契约结构合法且前后端副本一致"
   else
-    fail "契约结构或副本一致性检查未通过（详见上方 [E1]~[E4]）"
+    fail "契约结构或副本一致性检查未通过（详见上方 [E1]~[E5]）"
   fi
 else
   fail "缺少 ci/check_openapi.py"

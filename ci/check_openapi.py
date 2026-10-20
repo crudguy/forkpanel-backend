@@ -17,15 +17,18 @@
 并没有这样的读取方，属于**完全没有守卫**。结构错位（第 4 项）更隐蔽：
 PyYAML 都能"解析成功"，只有按语义消费契约的读取方才拿得到错误结构。
 
-本脚本做五件事（都不依赖 PyYAML，避免 CI 环境装依赖）：
+本脚本做六件事（都不依赖 PyYAML，避免 CI 环境装依赖）：
 1. flow mapping 语法体检：未加引号的 plain scalar 里出现 `{`/`[`/`}`/`]`
    即报错（附行号与出错片段）。
 2. 冒烟解析：若运行环境恰好有 PyYAML，则真解析一次兜住逗号等其它错法；
    没有则跳过并说明（不算失败）。
 3. 两份副本逐字节比对：后端事实源 vs 前端副本，不一致即失败。
 4. 结构体检（[E4]，零依赖）：同级重复键 / `$ref` 目标存在性 / schemas
-   直系缩进——缩进错位的定义块（曾真实发生：`SiteRoute:` 多缩进 4 格、
-   `App:` 顶格）不会让第 1/2 项报错，只在语义上把 schema 顶替或丢失。
+   直系缩进 / **路径键落点**——缩进错位的定义块（曾真实发生：`SiteRoute:`
+   多缩进 4 格、`App:` 顶格）不会让第 1/2 项报错，只在语义上把 schema
+   顶替或丢失；路径键掉出 `paths:` 块（曾真实发生：`join-docker-group`
+   顶格写成顶层键，其后一批路径全被错位吞掉，PyYAML 一读即 ParserError，
+   无 PyYAML 的门禁环境里 [E1]/[E3]/[E4]/[E5] 却全绿）同属静默结构错位。
 5. 行级括号平衡（[E5]，零依赖）：行尾多/少一个 `}`（曾真实发生：
    system/users 响应 schema 行 10 开 11 闭，整份文件从该行起不可解析）
    ——第 1 项只看非法位置的开括号，PyYAML 缺席时第 2 项跳过，第 3/4 项
@@ -182,8 +185,22 @@ def smoke_parse(path):
     return ''
 
 
+def is_misplaced_path(key: str, container: str, ind: int) -> bool:
+    """API 路径键（`/api/v1/...` 形态）必须是顶层 `paths:` 的直属子级（缩进 2）。
+
+    为什么需要
+    ----------
+    曾真实发生：`/api/v1/containers/join-docker-group:` 顶格（0 缩进）写成了
+    顶层键，从它下一行起所有路径都被错位吞进它的块内——PyYAML 直接
+    ParserError（整份契约不可读），而 [E1] 括号/标量体检、[E3] 副本比对、
+    [E4] 原三项、[E5] 行级括号平衡**全部报绿**（[E2] 冒烟解析在无 PyYAML
+    的环境跳过）。零依赖环境下唯一能抓住它的就是本条按缩进的落点断言。
+    """
+    return key.startswith('/') and not (container == 'paths' and ind == 2)
+
+
 def scan_structure(path):
-    """按缩进解析键路径，做三项结构体检（零依赖，不用 YAML 解析器）。
+    """按缩进解析键路径，做四项结构体检（零依赖，不用 YAML 解析器）。
 
     为什么需要
     ----------
@@ -193,10 +210,13 @@ def scan_structure(path):
     SiteRoute 从 components.schemas 里消失）。曾真实发生：`SiteRoute:` 多缩进 4 格 +
     `App:` 顶格，横跨 3 个提交无人发现——唯一可靠信号就是这份结构体检。
 
-    返回 (dups, paths, bad_schema_children)：
+    返回 (dups, paths, bad_schema_children, misplaced_paths, ok_paths)：
     - dups: [(行号, 键, 容器路径)] 同级重复键——YAML 语义上不允许，出现即结构错位；
     - paths: 所有键的完整路径集合（供 $ref 目标存在性检查）；
-    - bad_schema_children: components/schemas 直系子级中缩进非 4 空格的行。
+    - bad_schema_children: components/schemas 直系子级中缩进非 4 空格的行；
+    - misplaced_paths: [(行号, 键, 容器, 缩进)] 长得像 API 路径（`/` 开头）却不在
+      顶层 `paths:` 直属子级（缩进 2）上的键——掉出 paths 块的结构错位；
+    - ok_paths: 正确挂在 paths 直属子级上的路径键（供前提断言数「真提取到了」）。
 
     与书写风格的耦合（改风格须同步升级本函数）：
     - 块标量（`|` / `>`）内容按缩进跳过，否则描述文本里的 `xx:` 会被当成键；
@@ -206,7 +226,7 @@ def scan_structure(path):
     - 描述值均单行内联、flow 不跨行——若未来出现跨行 flow，需扩展本解析。
     """
     lines = open(path, encoding='utf-8').read().splitlines()
-    dups, paths, bad = [], set(), []
+    dups, paths, bad, misplaced, ok_paths = [], set(), [], [], []
     stack = []              # [(indent, path)] 键路径栈
     seen = {}               # (container_path, indent) -> set(keys) 同级键去重表
     skip_to = -1            # 块标量内容的跳过终止行
@@ -233,6 +253,8 @@ def scan_structure(path):
                     key = m_k.group(1).strip()
                     full = item_id + '/' + key
                     paths.add(full)
+                    if is_misplaced_path(key, item_id, ind):
+                        misplaced.append((i + 1, key, item_id, ind))
                     bucket = seen.setdefault((item_id, ind + 2), set())
                     if key in bucket:
                         dups.append((i + 1, key, item_id))
@@ -254,6 +276,10 @@ def scan_structure(path):
         container = stack[-1][1] if stack else ''
         full = (container + '/' + key) if container else key
         paths.add(full)
+        if is_misplaced_path(key, container, ind):
+            misplaced.append((i + 1, key, container, ind))
+        elif key.startswith('/'):
+            ok_paths.append(key)
         bucket = seen.setdefault((container, ind), set())
         if key in bucket:
             dups.append((i + 1, key, container or '<root>'))
@@ -268,7 +294,7 @@ def scan_structure(path):
                 j += 1
             skip_to = j
         i += 1
-    return dups, paths, bad
+    return dups, paths, bad, misplaced, ok_paths
 
 
 def collect_refs(text):
@@ -335,8 +361,8 @@ def main():
             fails.append("前后端契约副本不一致")
 
     # ── 4. 结构体检：同级重复键 / $ref 目标存在 / schemas 直系缩进 ──
-    print("== [E4] 契约结构（同级重复键 / $ref 目标存在）==")
-    dups, paths, bad_children = scan_structure(backend)
+    print("== [E4] 契约结构（同级重复键 / $ref 目标存在 / 路径键落点）==")
+    dups, paths, bad_children, misplaced, ok_paths = scan_structure(backend)
     refs = collect_refs(open(backend, encoding='utf-8').read())
     # 前提断言：提取结果异常少 = 解析器自己失效（或文件被大改）。
     # 绝不能因为「没扫到东西」而报绿——恒绿的门禁比没有门禁更危险。
@@ -368,6 +394,23 @@ def main():
                 print(f"  ✗ {BACKEND_REL}:{lineno} schemas 直系子级缩进 {ind}"
                       f"（应为 4）：{text.strip()[:60]}")
             fails.append(f"{len(bad_children)} 处 schemas 子级缩进异常")
+        # 路径键落点：API 路径键必须全部是 paths 的直属子级（缩进 2）。
+        # 前提断言同上面两项——扫到的 paths 子级路径键过少 = 解析器失效，
+        # 绝不因「没扫到」而报绿。
+        if len(ok_paths) < 50:
+            print(f"  ✗ 提取异常：paths 下仅扫到 {len(ok_paths)} 个路径键——解析前提不成立")
+            print("      修法：先确认契约文件未被截断；若 paths 数量合法地降到 50 以下，"
+                  "同步调整本阈值")
+            fails.append("paths 提取前提不成立（检查器需维护）")
+        elif misplaced:
+            for lineno, key, container, ind in misplaced[:10]:
+                print(f"  ✗ {BACKEND_REL}:{lineno} 路径键 '{key}' 不在 paths 块内"
+                      f"（所在容器：{container or '<root>'}，缩进 {ind}，应为 paths 下 2）")
+            print("      修法：paths 直属子级统一 2 空格缩进；顶格/多缩进都会让路径"
+                  "掉出 paths 块——文件随即无法被任何 YAML 解析器读取")
+            fails.append(f"{len(misplaced)} 个路径键掉出 paths 块")
+        else:
+            print(f"  ✓ {len(ok_paths)} 个路径键全部挂在 paths 块内（缩进 2）")
 
     # ── 5. 行内括号平衡（零依赖，兜住「行尾多/少一个闭括号」）──
     print("== [E5] flow 括号平衡（行级）==")
