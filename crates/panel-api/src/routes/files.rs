@@ -264,7 +264,12 @@ pub async fn write(
     Json(req): Json<WriteReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FILE_WRITE)?;
-    let p = resolve(&state, &s, &req.path)?;
+    // 写目标**可能尚不存在**（新建文件）。必须走 resolve_new(create=true)：
+    // resolve 会 canonicalize 目标本身并要求它已存在，否则写新文件一律
+    // NotFound(10004)。这与 mkdir/上传一致——覆盖已存在文件时 resolve_new 同样正确。
+    // 此前 write 误用 resolve，导致「写新文件」100% 失败（错误信息为
+    // "not found: <相对路径形态>"，因 relativize 已把前导 / 转成相对根的形式）。
+    let p = resolve_new(&state, &s, &req.path)?;
     ensure_not_sensitive(&state, &p)?;
 
     // 乐观锁：先读 mtime 再比较。这个检查不是并发安全的（TOCTOU），
@@ -910,6 +915,37 @@ mod tests {
         assert_eq!(sp.as_path(), std::fs::canonicalize(&f).unwrap());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 回归守卫：写**新文件**的目标路径必须经 `resolve_within_for_create` 解析，
+    /// 而非 `resolve_within`（后者要求目标已存在，会把「写新文件」判为 NotFound）。
+    ///
+    /// 这正是 `write` handler 的修复点：此前误用 `resolve`（=resolve_impl(..., create=false)），
+    /// 导致 owner + 空 allowed_roots 下写 `/tmp/x/new.txt` 报
+    /// "not found: tmp/x/new.txt"（前导 / 被 relativize 转成相对根的形态）。
+    ///
+    /// 这里直接复现 owner 分支的归一化链路：relativize(root="/", abs) → 相对路径 → 沙箱。
+    /// 断言：for_create 接受「不存在的目标」，而 resolve_within 拒绝之（负向对照）。
+    #[test]
+    fn write_new_file_target_resolves_via_for_create_not_resolve_within() {
+        let root = Path::new("/");
+        let abs = "/tmp/forkpanel-fm-e2e-guard/hello.txt";
+        // 确保不是本机真实存在的文件，纯粹测「不存在目标」的解析语义
+        let _ = std::fs::remove_file(abs);
+
+        let rel = relativize(root, abs)
+            .unwrap_or_else(|e| panic!("owner 下绝对路径必须被归一化: {abs} -> {e}"));
+        // relativize 把前导 / 去掉 → 相对根的形式
+        assert_eq!(rel, "tmp/forkpanel-fm-e2e-guard/hello.txt");
+
+        // 修复后的链路：for_create 接受尚不存在的目标
+        let sp = panel_os::paths::resolve_within_for_create(root, &rel)
+            .expect("写新文件目标必须可解析（修复后应走 for_create）");
+        assert_eq!(sp.as_path(), std::path::Path::new("/tmp/forkpanel-fm-e2e-guard/hello.txt"));
+
+        // 负向对照：旧链路 resolve_within 会拒绝（目标不存在 → NotFound）
+        let old = panel_os::paths::resolve_within(root, &rel);
+        assert!(old.is_err(), "旧 write 链路（resolve_within）对不存在目标必须失败，否则修复无效");
     }
 
     #[test]
