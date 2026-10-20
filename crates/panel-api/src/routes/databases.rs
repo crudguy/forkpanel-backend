@@ -18,8 +18,12 @@ use crate::{
     routes::{audit, Auth, Shared},
 };
 // Path 与 std::path::PathBuf 同名，按全仓约定别名成 AxPath
-use axum::{extract::{Path as AxPath, Query, State}, Json};
-use axum::http::StatusCode;
+use axum::{
+    extract::{Path as AxPath, Query, State},
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
+    Json,
+};
 use panel_core::{PanelError, Result, SafePath};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
@@ -768,6 +772,128 @@ pub async fn rows(
     })))
 }
 
+// ─────────────── CSV 导出（只读） ───────────────
+
+/// 单次导出上限。**刻意不提供"更大"的选项**：导出要把整个结果集拼成一个
+/// 字符串再交给 axum，行数无上限就等于让一个请求决定面板吃掉多少内存
+/// （与 `QUERY_MAX_LIMIT` 同一个理由，量级更大只因导出是一次性交付、
+/// 不是交互式翻页）。
+const EXPORT_MAX_ROWS: usize = 20_000;
+
+/// GET /api/v1/db/{conn}/{db}/{table}/export —— 全量表数据导出为 CSV（只读）。
+///
+/// **为什么由后端生成、不是前端拿当前页拼**：前端只拿得到一页（≤200 行），
+/// 而"导出这张表"在用户语义里是全量；且转义规则必须全仓只有一份实现——
+/// 放前端就意味着每个视图各写一遍，必然漂移。
+///
+/// **为什么超限时拒绝而不是截断**：多取一行作哨兵，真有第 N+1 行就整体报错。
+/// 静默给一个"看起来完整"的前 N 行文件，比明确失败危险得多——用户会拿它对账、
+/// 导入，而缺了哪几行无从得知。拒绝时给出可执行的下一步（SQL 控制台加 WHERE）。
+pub async fn export_csv(
+    State(state): State<Shared>, Auth(s): Auth,
+    AxPath((conn, db, table)): AxPath<(i64, String, String)>,
+) -> ApiResult<Response> {
+    crate::auth::require(&s, perm::DB_VIEW)?;
+    validate_ident(&db, "db")?;
+    validate_ident(&table, "table")?;
+    let t = load_target(&state, conn, Some(&db)).await?;
+    // +1 是哨兵行：真有第 N+1 行才说明"还有更多"
+    let d = state.os.databases()
+        .rows(&t, &table, EXPORT_MAX_ROWS + 1, 0)
+        .await
+        .map_err(map_db_err)?;
+    if d.rows.len() > EXPORT_MAX_ROWS {
+        return Err(ApiError::bad_request(
+            "table",
+            format!(
+                "「{table}」超过 {EXPORT_MAX_ROWS} 行，已拒绝导出：宁可明确失败，\
+                 也不给一个看似完整的前 {EXPORT_MAX_ROWS} 行文件。\
+                 请用 SQL 控制台加 WHERE 条件收窄后重试，或用数据库客户端导出。"
+            ),
+        ));
+    }
+    let body = to_csv(&d.columns, &d.rows);
+    audit(
+        &state,
+        &s,
+        "db.export",
+        &format!("conn={conn} db={db} table={table} rows={}", d.rows.len()),
+        "ok",
+    )
+    .await;
+
+    // 文件名沿用日志下载同一套净化：`table` 虽过 validate_ident（它不禁非 ASCII），
+    // 而 SQLite 的表名可能来自文件路径，仍可能含引号/反斜杠/换行。
+    // 非 [A-Za-z0-9._-] 一律换 _，从源头掐掉 Content-Disposition 注入。
+    let safe: String = table
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+        .collect();
+    let safe = if safe.is_empty() { "export".to_string() } else { safe };
+    let headers = [
+        (header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()),
+        (
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{safe}.csv\""),
+        ),
+    ];
+    Ok((headers, body).into_response())
+}
+
+/// 结果集 → CSV 文本。**纯函数**：不碰 IO，可喂任意列名/取值组合单测。
+///
+/// 三个刻意的决定，都与"用户会拿什么软件打开这个文件"有关：
+/// 1. **带 UTF-8 BOM**（`\u{feff}`）：Excel / WPS 在 Windows 上按本地代码页
+///    猜编码，无 BOM 的 UTF-8 中文会变乱码。这是本面板用户的实际打开方式，
+///    不是理论洁癖。
+/// 2. **CRLF 行尾**（RFC 4180）：Excel 对裸 LF 的兼容历来不稳定。
+/// 3. **公式注入防护**：以 `=` `+` `@` 或制表符开头的字段加 `'` 前缀，
+///    否则表格软件会把单元格内容当公式执行（CSV 注入，OWASP 有专条）。
+///
+/// ⚠️ `-` **刻意不防**：`-12.5` 这类负数远比 `-1+1` 这类公式常见，一刀切
+/// 前缀会把正常负数全变成文本。这个取舍如实记录，不装作完备——真被
+/// `-` 开头的公式打到，前提是攻击者能往这个库里写数据。
+///
+/// NULL 渲染为空串：客户端模式下 NULL 与空串本就无法区分（见 `rows` 的注释），
+/// 这里不伪造第三种表示。
+pub(super) fn to_csv(columns: &[String], rows: &[Vec<Option<String>>]) -> String {
+    let mut out = String::from("\u{feff}");
+    out.push_str(&csv_row(columns.iter().map(String::as_str)));
+    for r in rows {
+        out.push_str(&csv_row(r.iter().map(|c| c.as_deref().unwrap_or(""))));
+    }
+    out
+}
+
+/// 一行 CSV（含结尾 CRLF）。
+fn csv_row<'a>(fields: impl Iterator<Item = &'a str>) -> String {
+    let mut line = String::new();
+    for (i, f) in fields.enumerate() {
+        if i > 0 {
+            line.push(',');
+        }
+        line.push_str(&csv_field(f));
+    }
+    line.push_str("\r\n");
+    line
+}
+
+/// 单个字段：先按 RFC 4180 加引号，再按需加公式注入前缀。
+///
+/// 顺序有意义：`'` 前缀放在引号**外**（字段首字符），Excel 解析带引号字段时
+/// 仍会把开头的 `'` 当"按文本处理"标记；放引号里面则变成数据的一部分。
+fn csv_field(s: &str) -> String {
+    let quoted = if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    };
+    match s.as_bytes().first() {
+        Some(b'=') | Some(b'+') | Some(b'@') | Some(b'\t') | Some(b'\r') => format!("'{quoted}"),
+        _ => quoted,
+    }
+}
+
 // ─────────────── 只读 SQL 控制台 ───────────────
 
 /// 默认返回行数 / 硬上限。**上限不是"建议"**：任意 SQL 可能扫全表，
@@ -1040,6 +1166,92 @@ fn scrub_sql(sql: &str) -> (String, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─────────────── CSV 导出 ───────────────
+    //
+    // 这一组盯的是"用户拿 Excel/WPS 打开时看到什么"。转义写错的后果不是
+    // 报错，是**静默错位**（整列漂移、数字变文本、中文乱码），所以每条都
+    // 断言到字符级，而不是"包含某字段"就完。
+
+    #[test]
+    fn to_csv_writes_bom_header_and_crlf() {
+        let cols = vec!["id".to_string(), "name".to_string()];
+        let rows = vec![vec![Some("1".to_string()), Some("张三".to_string())]];
+        let out = to_csv(&cols, &rows);
+        // BOM：无它 Excel 按本地代码页猜，中文直接乱码
+        assert!(out.starts_with('\u{feff}'), "必须带 UTF-8 BOM");
+        // CRLF：RFC 4180，且 Excel 对裸 LF 兼容不稳定
+        assert!(out.contains("id,name\r\n"), "表头行");
+        assert!(out.contains("1,张三\r\n"), "数据行");
+        assert!(out.ends_with("\r\n"), "末行也要有行尾");
+        // 只有两行：表头 + 一条数据，不多不少
+        assert_eq!(out.matches("\r\n").count(), 2);
+    }
+
+    #[test]
+    fn to_csv_quotes_fields_with_comma_quote_or_newline() {
+        let cols = vec!["a".to_string()];
+        let rows = vec![
+            vec![Some("x,y".to_string())],
+            vec![Some("he said \"hi\"".to_string())],
+            vec![Some("line1\nline2".to_string())],
+        ];
+        let out = to_csv(&cols, &rows);
+        assert!(out.contains("\"x,y\""), "含逗号必须加引号");
+        // 内部引号按 RFC 4180  doubling
+        assert!(out.contains("\"he said \"\"hi\"\"\""), "内部引号必须双写");
+        assert!(out.contains("\"line1\nline2\""), "含换行必须加引号");
+    }
+
+    #[test]
+    fn to_csv_renders_null_as_empty_field() {
+        // NULL → 空串，不伪造引号或字面量 "NULL"（客户端模式本就无法区分两者）
+        let out = to_csv(
+            &["a".to_string(), "b".to_string()],
+            &[vec![None, Some("v".to_string())]],
+        );
+        assert!(out.contains(",v\r\n"));
+        assert!(!out.contains("NULL"), "不得把 NULL 写成字面量");
+    }
+
+    #[test]
+    fn to_csv_prefixes_formula_leading_fields() {
+        // = + @ 与制表符开头的字段会被表格软件当公式执行（CSV 注入）
+        let rows = vec![
+            vec![Some("=SUM(A1:A9)".to_string())],
+            vec![Some("+1234".to_string())],
+            vec![Some("@channel".to_string())],
+            vec![Some("\tx".to_string())],
+        ];
+        let out = to_csv(&["c".to_string()], &rows);
+        for pat in ["'=SUM(A1:A9)", "'+1234", "'@channel", "'\tx"] {
+            assert!(out.contains(pat), "缺少公式注入前缀：{pat:?}");
+        }
+    }
+
+    #[test]
+    fn to_csv_guard_prefix_sits_outside_the_quotes() {
+        // 既需要引号又需要前缀：' 必须在引号外，否则变成数据的一部分，
+        // Excel 不再把它当"按文本处理"的标记。
+        let out = to_csv(&["c".to_string()], &[vec![Some("=a,b".to_string())]]);
+        assert!(out.contains("'\"=a,b\""), "前缀必须包在引号外面，实际：{out:?}");
+    }
+
+    #[test]
+    fn to_csv_leaves_negative_numbers_alone() {
+        // 把取舍钉住：- 刻意不防（见 csv_field 注释）。
+        // 将来若改成连 - 一起防，这条会红——那是有意变更，
+        // 需连同注释与契约里的说明一起改，不要单独让测试"迁就"。
+        let out = to_csv(&["n".to_string()], &[vec![Some("-12.5".to_string())]]);
+        assert!(out.contains("-12.5"), "负数必须原样导出");
+        assert!(!out.contains("'-12.5"), "负数不得被加公式注入前缀");
+    }
+
+    #[test]
+    fn to_csv_of_empty_result_is_header_only() {
+        let out = to_csv(&["a".to_string(), "b".to_string()], &[]);
+        assert_eq!(out, "\u{feff}a,b\r\n");
+    }
 
     /// 构造会话：只填 resolve_out 会读到的字段。
     fn sess(role: &str, roots: &[&str]) -> crate::auth::Session {

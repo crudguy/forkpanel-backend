@@ -218,6 +218,10 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/db/{conn}/{db}/schemas", get(databases::schemas))
         .route("/api/v1/db/{conn}/{db}/tables", get(databases::tables))
         .route("/api/v1/db/{conn}/{db}/{table}/rows", get(databases::rows))
+        // 全量表导出 CSV。与 rows 分开成路径而不是加 `?format=csv`：
+        // 响应体一个 JSON 一个 text/csv，混在一个端点上契约说不清，
+        // 且前端下载走 window.open（GET），与 POST 的 query 也不同。
+        .route("/api/v1/db/{conn}/{db}/{table}/export", get(databases::export_csv))
         .route("/api/v1/db/{conn}/backup", post(databases::backup))
         .route("/api/v1/db/{conn}/query", post(databases::query))
         .route("/api/v1/db/{conn}/restore", post(databases::restore))

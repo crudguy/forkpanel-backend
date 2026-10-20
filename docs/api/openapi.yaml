@@ -2592,6 +2592,40 @@ paths:
         - { $ref: '#/components/parameters/Page' }
         - { $ref: '#/components/parameters/PageSize' }
       responses: { '200': { description: ok } }
+  /api/v1/db/{conn}/{db}/{table}/export:
+    get:
+      tags: [db]
+      summary: 全量表数据导出为 CSV（只读）
+      description: |
+        与 `rows` 分开成路径而不是加 `?format=csv`：两者响应体一个 JSON 一个
+        text/csv，混在一个端点上契约说不清。
+
+        三个刻意的编码决定，都与"用户拿什么软件打开"有关：
+        - **UTF-8 BOM**：Excel / WPS 在 Windows 上按本地代码页猜编码，无 BOM 的
+          UTF-8 中文会变乱码；
+        - **CRLF 行尾**（RFC 4180）：Excel 对裸 LF 的兼容历来不稳定；
+        - **公式注入防护**：以 `=` `+` `@` 或制表符开头的字段加 `'` 前缀，
+          否则表格软件会把单元格当公式执行。`-` 刻意不防——`-12.5` 这类负数远比
+          `-1+1` 这类公式常见，一刀切会把正常负数全变成文本。
+
+        NULL 渲染为空串：客户端模式下 NULL 与空串本就无法区分（见 `rows`），
+        这里不伪造第三种表示。
+
+        **超限时拒绝而非截断**：上限 20000 行，多取一行作哨兵，真有第 N+1 行
+        就整体 400。静默给一个"看起来完整"的前 N 行文件比明确失败危险得多——
+        用户会拿它对账、导入，而缺了哪几行无从得知。请用 SQL 控制台加 WHERE
+        收窄，或用数据库客户端导出。
+      parameters:
+        - { name: conn, in: path, required: true, schema: { type: integer } }
+        - { name: db, in: path, required: true, schema: { type: string } }
+        - { name: table, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: CSV 文件（text/csv，带 UTF-8 BOM 与 CRLF 行尾）
+          content:
+            text/csv:
+              schema: { type: string }
+        '400': { description: 超过 20000 行导出上限，或标识符非法 }
   /api/v1/db/{conn}/query:
     post:
       tags: [db]
