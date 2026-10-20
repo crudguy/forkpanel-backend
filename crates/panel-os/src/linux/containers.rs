@@ -14,11 +14,12 @@
 //!
 //! ## 已提供与边界
 //! 已实现：列举 / 镜像 / `create`（= `docker create`，**默认不启动**而非 `docker run`）
-//! / `pull` / 生命周期（start/stop/restart/rm/rm -f）/ 安装 / 加组。
+//! / `pull` / 生命周期（start/stop/restart/rm/rm -f）/ 安装 / 加组 / **日志查看**
+//! （`docker logs`，只读最近 N 行快照，不带 --follow）。
 //! `create` 的宿主机任意代码执行风险由 `validate_create` 强制拦截：禁 `--privileged`、
 //! 禁挂载 `/` `/etc` `/proc` `/sys` `/var/run/docker.sock`，且路由层需二次确认词
 //! 「创建容器」。
-//! **未提供**：镜像删除（磁盘回收风险，刻意不开放）；`docker logs` / `exec` / `stats`、
+//! **未提供**：镜像删除（磁盘回收风险，刻意不开放）；`docker exec` / `stats`、
 //! 网络 / 卷管理、compose / stack 暂未实现（非安全刻意排除，后续可补）。
 
 use crate::cmd::{Bin, CmdOpt};
@@ -291,6 +292,53 @@ impl ContainerProvider for LinuxContainers {
                 created: String::new(),
             }))
     }
+
+    async fn logs(&self, id: &str, opts: ContainerLogsOpts) -> Result<Vec<ContainerLogLine>> {
+        self.ensure_ready()?;
+        // 参数注入防线：与 `act` 同源——id 直接进 argv，先校验字符集。
+        if !panel_core::rules::is_valid_container_ref(id) {
+            return Err(PanelError::Validation {
+                field: "id",
+                reason: "容器 ID/名称含非法字符（仅允许字母数字与 . _ -，且不得以 - 开头）".into(),
+            });
+        }
+        // 所有动态值先落 owned buffer 再借 &str：id 不会被任何用户输入以整体串拼进 argv。
+        // 不带 `--follow`：实时跟随会挂住 CLI（stdout 不 EOF），面板只回显最近 N 行快照。
+        let tail_s = opts.tail.to_string();
+        let mut owned: Vec<String> = vec!["logs".into(), "--tail".into(), tail_s];
+        if opts.timestamps {
+            owned.push("--timestamps".into());
+        }
+        owned.push(id.to_string());
+        let args: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+        let out = crate::cmd::run(
+            Bin::Docker,
+            &args,
+            CmdOpt { timeout: Duration::from_secs(20), ..Default::default() },
+        ).await?;
+        LinuxContainers::check(&out, "docker logs")?;
+        Ok(parse_logs(&out.stdout, opts.timestamps))
+    }
+}
+
+/// 解析 `docker logs` 输出（不带 --follow）：每行一条，stdout/stderr 已合并。
+/// 带 `--timestamps` 时每行前缀为 RFC3339 时间戳 + 空格，拆出作为 `ts`；
+/// 不带则为纯日志文本（`ts` 为 None）。
+fn parse_logs(stdout: &str, with_ts: bool) -> Vec<ContainerLogLine> {
+    stdout
+        .lines()
+        .map(|l| {
+            if with_ts {
+                if let Some((ts, rest)) = l.split_once(' ') {
+                    ContainerLogLine { ts: Some(ts.to_string()), text: rest.to_string() }
+                } else {
+                    ContainerLogLine { ts: None, text: l.to_string() }
+                }
+            } else {
+                ContainerLogLine { ts: None, text: l.to_string() }
+            }
+        })
+        .collect()
 }
 
 // ─────────────── 创建安全校验（纯函数，可离线单测） ───────────────
@@ -578,5 +626,34 @@ mod tests {
         assert!(!mem_limit_is_safe(""));
         assert!(!mem_limit_is_safe("big"));
         assert!(!mem_limit_is_safe("512x"));
+    }
+
+    #[test]
+    fn parse_logs_plain() {
+        // 不带时间戳：整行即文本，ts 为 None
+        let v = parse_logs("hello world\nwarn: low disk\n", false);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].ts, None);
+        assert_eq!(v[0].text, "hello world");
+        assert_eq!(v[1].text, "warn: low disk");
+    }
+
+    #[test]
+    fn parse_logs_with_timestamps() {
+        // 带时间戳：前缀 RFC3339 + 空格拆出；空格后可能含冒号（级别），整体归 text。
+        let line = "2026-10-20T08:00:00.123456789Z INFO started ok";
+        let v = parse_logs(line, true);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].ts.as_deref(), Some("2026-10-20T08:00:00.123456789Z"));
+        assert_eq!(v[0].text, "INFO started ok");
+    }
+
+    #[test]
+    fn parse_logs_timestamps_without_space_falls_back() {
+        // 理论上 docker 带 --timestamps 必有空格，但容错：没空格时 ts=None、整行归 text
+        let v = parse_logs("2026-10-20T08:00:00Z-no-space", true);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].ts, None);
+        assert_eq!(v[0].text, "2026-10-20T08:00:00Z-no-space");
     }
 }

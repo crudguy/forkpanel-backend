@@ -2956,7 +2956,23 @@ paths:
       parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID；表按名称索引（ID 随重建变化，名称通常保留），不强制 Docker 可达" }]
       requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { remark: { type: string, description: 备注内容，≤500 字 } } } } } }
       responses: { '204': { description: ok } }
-  /api/v1/containers/join-docker-group:
+
+  /api/v1/containers/{id}/logs:
+    get:
+      tags: [containers]
+      summary: 读取容器日志（docker logs，只读最近 N 行快照，不带 --follow 避免阻塞）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID；白名单校验，禁止以 `-` 开头（防参数注入）" }
+        - { name: tail, in: query, schema: { type: integer }, description: "回显最近 N 行；默认 200，上限 2000" }
+        - { name: timestamps, in: query, schema: { type: boolean }, description: "是否带 RFC3339 时间戳前缀（默认 false）" }
+      responses:
+        '200':
+          description: ok，返回日志行数组（data 为 [{ ts?, text }]）
+          content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { type: object, properties: { ts: { type: string, nullable: true, description: "RFC3339 时间戳，仅 timestamps=true 时存在" }, text: { type: string } } } } } } } }
+        '400': { description: ID/名称非法 }
+        '501': { description: 容器能力不可用 }
+
+/api/v1/containers/join-docker-group:
     post:
       tags: [containers]
       summary: 把面板进程用户加入 docker 组（修复 daemon_unreachable）

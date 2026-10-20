@@ -536,6 +536,20 @@ impl ContainerProvider for MockContainers {
             created: String::new(),
         })
     }
+
+    async fn logs(&self, _id: &str, opts: ContainerLogsOpts) -> Result<Vec<ContainerLogLine>> {
+        // mock 不真正调用 docker：生成样例日志行，便于前端联调日志查看对话框。
+        // 上限 20 行，避免 mock 造出与 tail 等量的无意义数据。
+        let n = (opts.tail as usize).min(20);
+        let ts = if opts.timestamps { Some("2026-10-20T08:00:00.000000000Z".to_string()) } else { None };
+        let lines: Vec<ContainerLogLine> = (0..n)
+            .map(|i| ContainerLogLine {
+                ts: ts.clone(),
+                text: format!("[mock] container log line {i}"),
+            })
+            .collect();
+        Ok(lines)
+    }
 }
 
 #[async_trait]

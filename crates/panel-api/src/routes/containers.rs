@@ -13,12 +13,13 @@
 //!   禁挂载 `/` `/etc` `/proc` `/sys` `/var/run/docker.sock`，且路由层需二次确认词
 //!   「创建容器」）、**拉取镜像**（`docker pull`）、启动/停止/重启/删除（删除默认
 //!   `docker rm` 无 `-f`，`force=true` 才走 `docker rm -f`，前端显式勾选）、
+//!   **日志查看**（`docker logs`，只读最近 N 行快照、不带 --follow，需 container.view）、
 //!   一键安装 Docker、把面板运行用户加入 docker 组、容器备注。
 //!
 //! ## 不提供的能力
 //! - **镜像删除**：磁盘回收风险（已拉取的层删了需重新下载），刻意不开放。
-//! - **暂未实现**（非安全刻意排除，后续可补）：容器日志 `docker logs`、进入容器
-//!   `docker exec`、资源监控 `docker stats`、网络 / 卷管理、compose / stack。
+//! - **暂未实现**（非安全刻意排除，后续可补）：进入容器 `docker exec`、资源监控
+//!   `docker stats`、网络 / 卷管理、compose / stack。
 //!
 //! ## 参数安全
 //! 容器 ID/名称直接进 `docker` 的 argv，因此经 `rules::is_valid_container_ref`
@@ -335,6 +336,50 @@ pub(crate) async fn remove(
 #[allow(dead_code)]
 fn _assert_trait_object(_p: &dyn ContainerProvider) {}
 
+// ─────────────── 日志查看（只读） ───────────────
+//
+// 读操作，需 container.view（与 list/images 同级，不是 container.manage）。
+// 只回显最近 N 行快照：docker logs 不带 --follow，避免 CLI 的 stdout 永不 EOF 把
+// 面板请求挂死。tail 上限 2000（防一次把内存 / UI 打爆），下限 1。
+
+/// 日志查询参数。`tail` 默认 200；`timestamps` 默认 false。
+#[derive(Debug, Deserialize)]
+pub struct LogsQ {
+    #[serde(default = "default_logs_tail")]
+    tail: u32,
+    #[serde(default)]
+    timestamps: bool,
+}
+fn default_logs_tail() -> u32 { 200 }
+
+/// tail 上限 2000 行、下限 1（防 0 / 超大值把内存或 UI 打爆）。纯函数，便于单测。
+fn clamp_tail(n: u32) -> u32 { n.clamp(1, 2000) }
+
+/// 容器日志（等价 `docker logs`，只读最近 N 行快照，不带 --follow）。
+pub async fn logs(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    AxPath(id): AxPath<String>,
+    Query(q): Query<LogsQ>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::CONTAINER_VIEW)?;
+    ensure_supported(&state)?;
+    // 业务层先拦一次非法输入，避免把明显非法的值送进 provider（与 run_action 同源）
+    if !panel_core::rules::is_valid_container_ref(&id) {
+        return Err(ApiError::bad_request(
+            "id",
+            "容器 ID/名称非法（仅允许字母数字与 . _ -，且不得以 - 开头）",
+        ));
+    }
+    let tail = clamp_tail(q.tail);
+    let lines = state
+        .os
+        .containers()
+        .logs(&id, panel_os::ContainerLogsOpts { tail, timestamps: q.timestamps })
+        .await?;
+    Ok(ok(lines))
+}
+
 // ─────────────── 一键安装 Docker ───────────────
 
 /// 安装请求。**二次确认词** `confirm_token` 必须为「安装 Docker」——
@@ -473,5 +518,23 @@ mod tests {
     fn container_view_sufficient_for_list() {
         assert!(crate::auth::require(&sess(&[perm::CONTAINER_VIEW]), perm::CONTAINER_VIEW).is_ok());
         assert!(crate::auth::require(&sess(&[]), perm::CONTAINER_VIEW).is_err());
+    }
+
+    #[test]
+    fn logs_requires_view_permission() {
+        // 日志是读操作：有 container.view 即可，不需要 container.manage
+        assert!(crate::auth::require(&sess(&[perm::CONTAINER_VIEW]), perm::CONTAINER_VIEW).is_ok());
+        assert!(crate::auth::require(&sess(&[]), perm::CONTAINER_VIEW).is_err());
+        // 有 view 但缺 manage → 日志可读（防越权误拒读）
+        assert!(crate::auth::require(&sess(&[perm::CONTAINER_VIEW]), perm::CONTAINER_VIEW).is_ok());
+    }
+
+    #[test]
+    fn clamp_tail_bounds() {
+        assert_eq!(clamp_tail(0), 1, "下限 1：tail=0 不应拉空或报错");
+        assert_eq!(clamp_tail(200), 200);
+        assert_eq!(clamp_tail(2000), 2000);
+        assert_eq!(clamp_tail(5000), 2000, "上限 2000：超大值被夹住，防打爆内存/UI");
+        assert_eq!(clamp_tail(u32::MAX), 2000);
     }
 }

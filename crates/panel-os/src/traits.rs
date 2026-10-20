@@ -1549,6 +1549,24 @@ pub struct ImageSummary {
     pub created: String,
 }
 
+/// 容器日志单行（等价 `docker logs` 输出的一行；stdout/stderr 已合并）。
+#[derive(Debug, Clone, Serialize)]
+pub struct ContainerLogLine {
+    /// 仅当请求带 `timestamps` 时存在：RFC3339 时间戳前缀（如 `2026-01-02T03:04:05.123456789Z`）。
+    pub ts: Option<String>,
+    /// 日志文本（已去掉时间戳前缀；不带 timestamps 时整行即文本）。
+    pub text: String,
+}
+
+/// 容器日志读取选项。`tail` 上限 2000 行（防一次拉爆内存 / UI），下限 1。
+#[derive(Debug, Clone, Copy)]
+pub struct ContainerLogsOpts {
+    /// 回显最近 N 行（等效 `docker logs --tail N`）。
+    pub tail: u32,
+    /// 是否带 RFC3339 时间戳前缀（等效 `docker logs --timestamps`）。
+    pub timestamps: bool,
+}
+
 /// 容器生命周期动作。声明式——由平台实现翻译成具体 CLI 子命令，
 /// 业务层不出现 `start`/`stop` 之类命令字面量。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1625,6 +1643,10 @@ pub trait ContainerProvider: Send + Sync {
     /// 实现须校验引用安全（无空白 / shell 元字符），返回拉取后的镜像摘要。
     /// 拉取属网络写入（下载镜像到本地），需 container.manage。
     async fn pull(&self, image: &str) -> Result<ImageSummary>;
+    /// 读取容器日志（等价 `docker logs`，**不带 --follow** 避免阻塞）。
+    /// `opts.tail` 上限 2000 行；`opts.timestamps` 控制是否带 RFC3339 前缀。
+    /// 读操作，需 container.view；实现必须先校验 id 字符集。
+    async fn logs(&self, id: &str, opts: ContainerLogsOpts) -> Result<Vec<ContainerLogLine>>;
 }
 
 // ═══════════════════════════ 终端 ═══════════════════════════
