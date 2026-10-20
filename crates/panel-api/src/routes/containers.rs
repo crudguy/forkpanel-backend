@@ -16,13 +16,15 @@
 //!   **日志查看**（`docker logs`，只读最近 N 行快照、不带 --follow，需 container.view）、
 //!   **资源用量快照**（`docker stats --no-stream --all`，一次性快照、非流式，需
 //!   container.view；实时感由前端 3s 轮询近似）、**网络列举**
-//!   （`docker network ls --no-trunc`，只读，需 container.view）、
+//!   （`docker network ls --no-trunc`，只读，需 container.view）、**卷列举**
+//!   （`docker volume ls`，只读，需 container.view）、
 //!   一键安装 Docker、把面板运行用户加入 docker 组、容器备注。
 //!
 //! ## 不提供的能力
 //! - **镜像删除**：磁盘回收风险（已拉取的层删了需重新下载），刻意不开放。
 //! - **暂未实现**（非安全刻意排除，后续可补）：进入容器 `docker exec`、
-//!   网络的创建/删除与容器接入/断开（**只读列举已开放**）、卷管理、compose / stack。
+//!   网络的创建/删除与容器接入/断开（**只读列举已开放**）、卷的创建/删除
+//!   （**只读列举已开放**；删除卷=数据丢失，与镜像删除同理）、compose / stack。
 //!
 //! ## 参数安全
 //! 容器 ID/名称直接进 `docker` 的 argv，因此经 `rules::is_valid_container_ref`
@@ -412,6 +414,20 @@ pub async fn networks(State(state): State<Shared>, Auth(s): Auth) -> ApiResult<J
     Ok(ok(lines))
 }
 
+// ─────────────── 卷列举（只读） ───────────────
+//
+// 读操作，需 container.view。与 stats/logs/networks 同理：无 id 参数 →
+// 无参数注入面。刻意只读：创建/删除卷未实现（删除卷=数据丢失，与镜像
+// 删除同理，交由 docker CLI 手动执行）——前端「卷」Tab 同理不提供写入口。
+
+/// 列举 Docker 卷（等价 `docker volume ls`）。
+pub async fn volumes(State(state): State<Shared>, Auth(s): Auth) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::CONTAINER_VIEW)?;
+    ensure_supported(&state)?;
+    let lines = state.os.containers().volumes_all().await?;
+    Ok(ok(lines))
+}
+
 // ─────────────── 一键安装 Docker ───────────────
 
 /// 安装请求。**二次确认词** `confirm_token` 必须为「安装 Docker」——
@@ -585,6 +601,15 @@ mod tests {
         assert!(crate::auth::require(&sess(&[perm::CONTAINER_VIEW]), perm::CONTAINER_VIEW).is_ok());
         assert!(crate::auth::require(&sess(&[]), perm::CONTAINER_VIEW).is_err());
         // 有 view 但缺 manage → 仍可读（与 logs/stats 同源，防越权误拒读）
+        assert!(crate::auth::require(&sess(&[perm::CONTAINER_VIEW]), perm::CONTAINER_VIEW).is_ok());
+    }
+
+    #[test]
+    fn volumes_requires_view_permission() {
+        // 卷列举是读操作：有 container.view 即可，不需要 container.manage
+        assert!(crate::auth::require(&sess(&[perm::CONTAINER_VIEW]), perm::CONTAINER_VIEW).is_ok());
+        assert!(crate::auth::require(&sess(&[]), perm::CONTAINER_VIEW).is_err());
+        // 有 view 但缺 manage → 仍可读（与 logs/stats/networks 同源，防越权误拒读）
         assert!(crate::auth::require(&sess(&[perm::CONTAINER_VIEW]), perm::CONTAINER_VIEW).is_ok());
     }
 }

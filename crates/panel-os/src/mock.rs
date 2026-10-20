@@ -594,6 +594,23 @@ impl ContainerProvider for MockContainers {
             },
         ])
     }
+
+    async fn volumes_all(&self) -> Result<Vec<ContainerVolumeLine>> {
+        // mock 不真正调用 docker：造两条样例卷（local 驱动 + 宿主机挂载路径），
+        // 便于前端联调「卷」Tab。
+        Ok(vec![
+            ContainerVolumeLine {
+                name: "web-data".into(),
+                driver: "local".into(),
+                mountpoint: "/var/lib/docker/volumes/web-data/_data".into(),
+            },
+            ContainerVolumeLine {
+                name: "db-data".into(),
+                driver: "local".into(),
+                mountpoint: "/var/lib/docker/volumes/db-data/_data".into(),
+            },
+        ])
+    }
 }
 
 #[async_trait]

@@ -1602,6 +1602,15 @@ pub struct ContainerNetworkLine {
     pub id: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ContainerVolumeLine {
+    pub name: String,
+    /// 驱动类型，如 `local` / `nfs`。
+    pub driver: String,
+    /// 宿主机挂载路径（`/var/lib/docker/volumes/<name>/_data`）。
+    pub mountpoint: String,
+}
+
 /// 容器生命周期动作。声明式——由平台实现翻译成具体 CLI 子命令，
 /// 业务层不出现 `start`/`stop` 之类命令字面量。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1690,6 +1699,12 @@ pub trait ContainerProvider: Send + Sync {
     /// container.view。无 id 参数（一次返回所有网络），故无参数注入面。
     /// **只列举**：创建/删除网络、容器接入/断开网络等写操作未实现。
     async fn networks_all(&self) -> Result<Vec<ContainerNetworkLine>>;
+
+    /// 列举 Docker 卷（等价 `docker volume ls`，只读）。需 container.view。
+    /// 无 id 参数（一次返回所有卷），故无参数注入面。
+    /// **只列举**：创建/删除卷未实现（删除卷=数据丢失，与镜像删除同理刻意
+    /// 不开放，交由 `docker` CLI 手动执行）。
+    async fn volumes_all(&self) -> Result<Vec<ContainerVolumeLine>>;
 }
 
 // ═══════════════════════════ 终端 ═══════════════════════════

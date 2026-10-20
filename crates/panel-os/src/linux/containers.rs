@@ -17,14 +17,19 @@
 //! / `pull` / 生命周期（start/stop/restart/rm/rm -f）/ 安装 / 加组 / **日志查看**
 //! （`docker logs`，只读最近 N 行快照，不带 --follow）/ **资源用量快照**
 //! （`docker stats --no-stream --all`，只读一次性快照，不带流式否则阻塞）/
-//! **网络列举**（`docker network ls --no-trunc`，只读）。
+//! **网络列举**（`docker network ls --no-trunc`，只读）/ **卷列举**
+//! （`docker volume ls`，只读；⚠ volume ls 无 --no-trunc，卷名是用户定义
+//! 名称而非哈希、默认不截断）。
 //! `create` 的宿主机任意代码执行风险由 `validate_create` 强制拦截：禁 `--privileged`、
 //! 禁挂载 `/` `/etc` `/proc` `/sys` `/var/run/docker.sock`，且路由层需二次确认词
 //! 「创建容器」。
 //! **未提供**：镜像删除（磁盘回收风险，刻意不开放）；`docker exec`、
-//! 卷管理、compose / stack 暂未实现（非安全刻意排除，后续可补）。
+//! 卷的创建/删除（**只读列举已开放**；删除卷=数据丢失，与镜像删除同理）、
+//! compose / stack 暂未实现（非安全刻意排除，后续可补）。
 //! 网络侧刻意**只读列举**：创建/删除网络、容器接入/断开网络等写操作未实现
 //! （改网络连通性影响面大，交由 `docker` CLI 手动执行）。
+//! 卷侧刻意**只读列举**：创建/删除卷未实现（删除卷有数据丢失风险，
+//! 交由 `docker` CLI 手动执行）。
 
 use crate::cmd::{Bin, CmdOpt};
 use crate::paths::{LinuxPathLayout, PathLayout};
@@ -373,6 +378,31 @@ impl ContainerProvider for LinuxContainers {
         LinuxContainers::check(&out, "docker network ls")?;
         Ok(parse_networks(&out.stdout))
     }
+
+    async fn volumes_all(&self) -> Result<Vec<ContainerVolumeLine>> {
+        self.ensure_ready()?;
+        // 只读列举：无参数 → 无参数注入面；format 字段名是编译期常量。
+        // ⚠ volume ls **没有** --no-trunc（真机探活：带该 flag 直接
+        // unknown flag）——卷名是用户定义的名称而非哈希，默认不截断，
+        // 与 network ls 的命令形态不同，勿照抄。
+        let args = [
+            "volume",
+            "ls",
+            "--format",
+            // 字段间 Tab 分隔，与 stats/networks 同纪律：默认表格仅两列
+            // （空格填充），按 Tab 拆每行只有 1 段 → 整表被解析器拒绝，
+            // 而不是把表头行当成一条合法卷。
+            "{{.Name}}	{{.Driver}}	{{.Mountpoint}}",
+        ];
+        let out = crate::cmd::run(
+            Bin::Docker,
+            &args,
+            CmdOpt { timeout: LIST_TIMEOUT, ..Default::default() },
+        )
+        .await?;
+        LinuxContainers::check(&out, "docker volume ls")?;
+        Ok(parse_volumes(&out.stdout))
+    }
 }
 
 /// 解析 `docker logs` 输出（不带 --follow）：每行一条，stdout/stderr 已合并。
@@ -436,6 +466,27 @@ fn parse_networks(stdout: &str) -> Vec<ContainerNetworkLine> {
                 driver: f[1].to_string(),
                 scope: f[2].to_string(),
                 id: f[3].to_string(),
+            })
+        })
+        .collect()
+}
+
+/// 解析 `docker volume ls --format` 输出：每行一条，按 Tab 拆 3 段。
+/// 字段不足的行直接跳过（不做臆测填充——宁可少一行，也不要造一个假卷）。
+/// 该解析同时是「必须带 `--format`」的契约：默认表格输出（表头 + 空格填充列）
+/// 按 Tab 拆每行只有 1 段、整表被拒，绝不会把表头误当数据行。
+fn parse_volumes(stdout: &str) -> Vec<ContainerVolumeLine> {
+    stdout
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            if f.len() != 3 {
+                return None;
+            }
+            Some(ContainerVolumeLine {
+                name: f[0].to_string(),
+                driver: f[1].to_string(),
+                mountpoint: f[2].to_string(),
             })
         })
         .collect()
@@ -820,5 +871,34 @@ mod tests {
         // 防止将来有人删掉 --format 还以为能跑。
         let table = "NETWORK ID     NAME      DRIVER    SCOPE\nc1e0dbe7f933   bridge    bridge    local\n5391e507e83a   host      host      local\n";
         assert!(parse_networks(table).is_empty(), "默认表格输出不得被解析成合法行");
+    }
+
+    #[test]
+    fn parse_volumes_plain() {
+        // 真机样本（docker 29.9.1，临时卷 forkpanel-e2e-probe 实测输出）
+        let line = "forkpanel-e2e-probe\tlocal\t/var/lib/docker/volumes/forkpanel-e2e-probe/_data";
+        let v = parse_volumes(&format!("{line}\n"));
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].name, "forkpanel-e2e-probe");
+        assert_eq!(v[0].driver, "local");
+        assert_eq!(v[0].mountpoint, "/var/lib/docker/volumes/forkpanel-e2e-probe/_data");
+    }
+
+    #[test]
+    fn parse_volumes_skips_short_and_empty_lines() {
+        // 空行 / 字段不足的行跳过，不造数据（与 parse_networks 同纪律）
+        let raw = "web-data\tlocal\t/var/lib/docker/volumes/web-data/_data\n\ndb-data\tlocal\n";
+        let v = parse_volumes(raw);
+        assert_eq!(v.len(), 1, "只保留一行完整数据，空行与短行被跳过");
+        assert_eq!(v[0].name, "web-data");
+    }
+
+    #[test]
+    fn parse_volumes_rejects_default_table_output() {
+        // 负向对照：若实现漏写 --format，docker 输出默认表格（表头 + 空格
+        // 填充列，真机样本：仅 DRIVER / VOLUME NAME 两列）。按 Tab 拆每行
+        // 只有 1 段 → 整表被拒、返回空，而不是把表头当成一条合法卷。
+        let table = "DRIVER    VOLUME NAME\nlocal     forkpanel-e2e-probe\n";
+        assert!(parse_volumes(table).is_empty(), "默认表格输出不得被解析成合法行");
     }
 }
