@@ -33,7 +33,7 @@ tags:
   - { name: logs,        description: 统一日志浏览器 }
   - { name: backups,     description: 备份计划与产物（本地） }
   - { name: assistant,   description: AI 运维助手（内置规则诊断，只读） }
-  - { name: containers,  description: 容器（Docker）只读列举与生命周期 }
+  - { name: containers,  description: 容器（Docker）列举 / 镜像 / 创建 / 生命周期 / 安装 / 加组 / 备注 }
   - { name: tasks,       description: 异步任务中心 }
   - { name: settings,    description: 面板设置 }
   - { name: users,       description: 用户与角色 }

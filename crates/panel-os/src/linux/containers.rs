@@ -12,11 +12,14 @@
 //! 可直接行动的 reason（`binary_missing` / `daemon_unreachable`），
 //! 前端据此置灰并提示"把面板用户加入 docker 组"，而不是给一个点了就报错的假按钮。
 //!
-//! ## 未提供的能力
-//! **不提供 `docker run`（创建容器）**：它等价于宿主机任意代码执行
-//! （镜像 + 挂载 `/` + `--privileged` + 端口），必须配套独立的风险设计
-//! （镜像白名单、禁止特权/宿主挂载、配额）与二次确认，不能顺手加个接口。
-//! 详见 #47 的范围说明。
+//! ## 已提供与边界
+//! 已实现：列举 / 镜像 / `create`（= `docker create`，**默认不启动**而非 `docker run`）
+//! / `pull` / 生命周期（start/stop/restart/rm/rm -f）/ 安装 / 加组。
+//! `create` 的宿主机任意代码执行风险由 `validate_create` 强制拦截：禁 `--privileged`、
+//! 禁挂载 `/` `/etc` `/proc` `/sys` `/var/run/docker.sock`，且路由层需二次确认词
+//! 「创建容器」。
+//! **未提供**：镜像删除（磁盘回收风险，刻意不开放）；`docker logs` / `exec` / `stats`、
+//! 网络 / 卷管理、compose / stack 暂未实现（非安全刻意排除，后续可补）。
 
 use crate::cmd::{Bin, CmdOpt};
 use crate::paths::{LinuxPathLayout, PathLayout};

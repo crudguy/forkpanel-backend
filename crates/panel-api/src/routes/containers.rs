@@ -1,4 +1,4 @@
-//! 容器管理（Docker）——**只读列举 + 生命周期**。
+//! 容器管理（Docker）——列举 / 镜像 / 创建 / 生命周期 / 安装 / 加组 / 备注。
 //!
 //! ## 能力门禁（本模块的核心纪律）
 //! `container.manage` 能力位由 `panel-os` 按 **daemon socket 可达性** 判定
@@ -7,11 +7,18 @@
 //! （`binary_missing` → 装 Docker；`daemon_unreachable` → 启动 daemon 或把面板
 //! 用户加入 `docker` 组），而不是笼统的"不支持"。
 //!
-//! ## 不提供的能力（刻意）
-//! - **创建容器（`docker run`）**：等价宿主机任意代码执行（镜像 / 挂载宿主 / 特权 / 端口），
-//!   必须配套独立的镜像白名单、禁止特权与宿主挂载、资源配额设计，以及二次确认。
-//!   顺手加一个 `run` 接口是**安全债**，故不在本期范围。
-//! - **镜像删除 / 拉取**：写操作面（含 registry 凭据与磁盘占用），后续单列。
+//! ## 已提供
+//! - 列举容器 / 镜像、**创建容器**（`docker create`，默认不启动；等价 `docker run`
+//!   的特权/宿主挂载风险已由 provider `validate_create` 强制拦截：禁 `--privileged`、
+//!   禁挂载 `/` `/etc` `/proc` `/sys` `/var/run/docker.sock`，且路由层需二次确认词
+//!   「创建容器」）、**拉取镜像**（`docker pull`）、启动/停止/重启/删除（删除默认
+//!   `docker rm` 无 `-f`，`force=true` 才走 `docker rm -f`，前端显式勾选）、
+//!   一键安装 Docker、把面板运行用户加入 docker 组、容器备注。
+//!
+//! ## 不提供的能力
+//! - **镜像删除**：磁盘回收风险（已拉取的层删了需重新下载），刻意不开放。
+//! - **暂未实现**（非安全刻意排除，后续可补）：容器日志 `docker logs`、进入容器
+//!   `docker exec`、资源监控 `docker stats`、网络 / 卷管理、compose / stack。
 //!
 //! ## 参数安全
 //! 容器 ID/名称直接进 `docker` 的 argv，因此经 `rules::is_valid_container_ref`
