@@ -114,6 +114,23 @@ fn resolve_impl(
     Err(last_err.unwrap_or_else(|| PanelError::PathEscape(input.to_string())))
 }
 
+/// 把平台给出的 mode 渲染成**契约规定的八进制串**（如 "644"）。
+///
+/// ## 为什么必须掩掉类型位
+/// Linux 的 `st_mode` 含文件类型位（`S_IFREG`=0o100000、`S_IFDIR`=0o040000、
+/// `S_IFLNK`=0o120000）。直接 `format!("{m:o}")` 会让普通文件渲染成 `"100644"`，
+/// 而契约 `FileStatOut.mode` 写的是「八进制串（如 644）」。
+///
+/// 此前 `list` 用了 `m & 0o777`、`stat` 却没有，**同一个字段两个端点语义不同**——
+/// 任何按 `stat.mode` 判权的调用方都会算错。当前 UI 只消费 list 的 mode，故该
+/// bug 长期静默，直到 2026-10-20 真机 E2E 抓出。
+///
+/// 抽成单一函数是刻意的：测试只能钉住**被生产代码真正调用**的实现，
+/// 若测试自己写一份格式化闭包，把 handler 改坏测试照样绿（已实测）。
+pub(crate) fn perm_octal(m: u32) -> String {
+    format!("{:o}", m & 0o777)
+}
+
 /// 敏感文件兜底检查
 pub(crate) fn ensure_not_sensitive(state: &Shared, p: &SafePath) -> Result<()> {
     if state.os.files().is_sensitive(p) {
@@ -178,7 +195,7 @@ pub async fn list(
                                  panel_os::EntryKind::Symlink => "symlink",
                                  _ => "other" },
             size: e.size,
-            mode: e.mode.map(|m| format!("{:o}", m & 0o777)),
+            mode: e.mode.map(perm_octal),
             owner: e.owner,
             modified: e.modified_unix,
             sensitive: e.sensitive,
@@ -639,7 +656,12 @@ pub async fn stat(
         "path": q.path,
         "kind": match st.kind { EntryKind::Dir => "dir", EntryKind::File => "file", EntryKind::Symlink => "symlink", EntryKind::Other => "other" },
         "size": st.size,
-        "mode": st.mode.map(|m| format!("{m:o}")),
+        // 必须掩掉文件类型位（`m & 0o777`），与 list 的 EntryDto.mode 保持同一语义。
+        // 此前直接用 `{m:o}`，Linux 的 mode 含 S_IFREG(0o100000)，输出 "100644"，
+        // 而契约 FileStatOut.mode 明写「八进制串（如 644）」——同一个字段在两个端点
+        // 语义不同，任何按 stat.mode 判权的调用方都会算错（当前 UI 只用 list 的 mode，
+        // 故未暴露）。判据：stat 对 644 文件必须回 "644" 而非 "100644"。
+        "mode": st.mode.map(perm_octal),
         "owner": st.owner,
         "modified_at": st.modified_unix,
     })))
@@ -956,6 +978,29 @@ mod tests {
         assert_eq!(parse("0o600"), Some(0o600));
         assert_eq!(parse("abc"), None, "非八进制必须拒绝");
         assert_eq!(parse("u+x"), None, "符号模式不支持");
+    }
+
+    /// 守卫：`stat` 与 `list` 的 mode 必须是**同一语义**（权限位，掩掉文件类型位）。
+    ///
+    /// 契约 `FileStatOut.mode` 写的是「八进制串（如 644）」；若直接 `format!("{m:o}")`，
+    /// Linux 的 mode 含 `S_IFREG`(0o100000)，stat 会回 `"100644"` 而 list 回 `"644"`。
+    /// 同一字段两个端点含义不同 ⇒ 任何按 `stat.mode` 判权的调用方都算错。
+    /// 当前 UI 只消费 list 的 mode，故该 bug 长期静默（真机实测 2026-10-20 发现）。
+    #[test]
+    fn stat_and_list_report_the_same_mode_semantics() {
+        // 直接测**生产代码里真正被 handler 调用的那个函数**。
+        // 早期版本在这里写了一个本地 `perm` 闭包，结果把 stat 改回 `{m:o}` 测试照样绿
+        // ——恒绿守卫已实测过，故改为调用 perm_octal 本身。
+        // raw 值取自真机 stat：普通文件 / chmod 后 / 目录 / 符号链接
+        assert_eq!(perm_octal(0o100644), "644", "普通 644 文件不得渲染成 100644");
+        assert_eq!(perm_octal(0o100600), "600", "chmod 600 之后");
+        assert_eq!(perm_octal(0o040755), "755", "目录只取权限位");
+        assert_eq!(perm_octal(0o120777), "777", "符号链接只取权限位");
+        // 断言活性：若 perm_octal 退化成不带掩码的 `{m:o}`，下面必红
+        for raw in [0o100644u32, 0o100600, 0o040755, 0o120777] {
+            assert_ne!(format!("{raw:o}"), perm_octal(raw),
+                "perm_octal 必须与裸 {{m:o}} 有差异，否则说明掩码没生效: {raw:o}");
+        }
     }
 
     #[test]
