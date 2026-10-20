@@ -475,13 +475,23 @@ impl LoginGuard {
     /// `reset` 移除 ⇒ 未授权请求就能把 map 撑到 OOM。现在没有记录就直接放行，插入
     /// 只发生在 [`Self::record_failure`]。
     ///
-    /// ⚠ **被本函数拦下的尝试不计入 `attempts`**（计数只在真正走完校验的失败上发生，
-    /// 见 `routes/auth.rs`）。这条决定了防暴力的**实际强度**，真机压测实测：
-    /// - 快速连点（不等退避）：`n` 停在 `max_attempts`，每次都拿 `retry_after=1` 的
-    ///   429——实际效果是「1 次/秒」的软限速，**永远到不了 `lock_after` 的 15 分钟锁定**。
-    /// - 老实等满退避的尝试才推进 `n`：退避按 1→2→4→…→64s 递增，累计约 5 分钟才进锁定。
-    /// 即「15 次失败锁 15 分钟」只对**有耐心**的攻击者成立。改动前请先读
-    /// `blocked_attempts_do_not_advance_the_counter` 上的说明——它是有意保留的行为。
+    /// ⚠ **被本函数拦下的尝试同样计入 `attempts`**（P2-11，2026-10-20 决定；计数由
+    /// 调用方在 `routes/auth.rs` 的 429 分支里 `record_failure`）。这条改过，历史动因
+    /// 值得留档——它决定了防暴力的**实际强度**：
+    ///
+    /// 旧行为（闸门不计数）：快速连点会冻结在 `max_attempts`，每次都拿
+    /// `retry_after=1` 的 429 ⇒ 实际只有「1 次/秒」的软限速，**永远到不了
+    /// `lock_after` 的 15 分钟锁定**；真机压测实测攻击者保持 1 req/s 可在 2 小时内
+    /// 试约 7200 个口令。而面板以 root 运行，弱口令场景下这个速率偏危险。
+    ///
+    /// 现行为（闸门也计数），用真实 `LoginGuard` 实测：
+    /// - 攻击者连点：第 **11** 次即进 15 分钟锁定，2 小时内最多 10 次有效尝试；
+    /// - 正常用户手快连错：第 **16** 次被锁 15 分钟。
+    /// 退避仍按 1→2→4→…→64s 递增，只是不再「卡死在下界」。
+    ///
+    /// 行为由 `blocked_attempts_still_advance_the_counter` 钉住（旧的反向断言
+    /// `blocked_attempts_do_not_advance_the_counter` 已随之改写——若它还在且为绿，
+    /// 说明计数没接上）。
     pub fn check(&self, key: &str) -> Option<u64> {
         let mut m = self.attempts.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
@@ -495,11 +505,21 @@ impl LoginGuard {
         }
         let n = v.len();
         if n >= self.lock_after {
-            let last = v.last().copied().unwrap_or(now);
-            let elapsed = now.duration_since(last);
-            return Some(self.lock_duration.as_secs().saturating_sub(elapsed.as_secs()));
-        }
-        if n >= self.max_attempts {
+            // 锁定期从**进入锁定的那一刻**算起，而不是「最后一条失败」。
+            //
+            // ⚠ 这里踩过一个真实坑（P2-11 启用「429 也计数」后才暴露）：原实现取
+            // `v.last()` 当基准，而锁定期内被拦下的请求现在也会写一条新记录 ⇒ 基准
+            // 被不断推后 ⇒ `retry_after` 永远接近满额、**锁定被无限续期**。
+            // 后果是攻击者持续发请求即可让某个账号**永久无法登录**（拒绝服务），
+            // 比「锁 15 分钟」严重得多。真机实测：锁定后每 2 秒打一次，
+            // retry_after 稳定停在 898 而不再递减。
+            //
+            // 正确基准是 `v[lock_after - 1]`：窗口内第 lock_after 条失败的时刻，
+            // 即「跨过阈值的那一次」。之后无论再来多少次，到期时间都不再移动。
+            let locked_at = v.get(self.lock_after - 1).copied().unwrap_or(now);
+            let elapsed = now.duration_since(locked_at).as_secs();
+            return Some(self.lock_duration.as_secs().saturating_sub(elapsed));
+        } else if n >= self.max_attempts {
             // 指数退避：2^(n - max_attempts) 秒
             let backoff = 1u64 << (n - self.max_attempts).min(6);
             let last = v.last().copied().unwrap_or(now);
@@ -898,29 +918,75 @@ mod tests {
         assert_eq!(g.max_attempts(), 3, "getter 必须回传入值");
     }
 
-    /// **特性测试**：把「被 `check` 拦下的尝试不推进计数」这一**当前行为**钉住。
+    /// **特性测试**：把「被 `check` 拦下的尝试**也**推进计数」这一行为钉住（P2-11）。
     ///
-    /// 真机压测（7.2 万次失败登录）实测出来的实际防暴力强度：
-    /// - 快速连点：第 6 次起恒为 `retry_after=1` 的 429，`n` 冻结在 `max_attempts`，
-    ///   于是退化成「1 次/秒」软限速，**永远进不了 15 分钟锁定**。
-    /// - 等满退避的尝试才推进 `n`（1→2→4→…→64s），累计约 5 分钟后才锁定。
+    /// 历史：旧行为是「闸门不计数」，快速连点会冻结在 `retry_after=1` 的软限速上，
+    /// **永远进不了 15 分钟锁定**——真机压测实测攻击者 1 req/s 可在 2 小时内试约
+    /// 7200 个口令。2026-10-20 决定改为「429 也计数」，本测试随之从
+    /// `blocked_attempts_do_not_advance_the_counter` 改写为**反向断言**。
     ///
-    /// ⚠ 这条不是在说"现在这样最好"——它记录的是**现状**。若将来改成「429 也计数」
-    /// （防暴力强度大幅提升，但连点的正常用户会更快撞上 15 分钟锁定），本测试会变红；
-    /// 那是**有意的行为变更**，请连同上面 `check` 的注释、`docs/` 与审计报告一起改，
-    /// 别只改代码让测试"绿回来"。
+    /// ⚠ 本测试只驱动 `LoginGuard` 本身。**真正的接线点在 `routes/auth.rs` 的 429
+    /// 分支里那次 `record_failure`**——那行才是"拦下也计数"的实现。把它删掉时
+    /// 这个测试仍然会绿（因为本测试自己调用 record_failure），所以另有一条
+    /// `login_429_branch_records_the_failure` 用源码级断言守住接线（见 routes/tests）。
     #[test]
-    fn blocked_attempts_do_not_advance_the_counter() {
+    fn blocked_attempts_still_advance_the_counter() {
         let g = LoginGuard::new(5);
         for _ in 0..5 { g.record_failure("admin"); }   // n = max_attempts = 5
-        // 连点 30 次：每次都被拦下，但计数不动 ⇒ 退避恒为 2^0 = 1s
-        for _ in 0..30 {
-            let w = g.check("admin").expect("n>=max_attempts 应持续被拦下");
-            assert_eq!(w, 1, "n 未增长 ⇒ 退避停在下界 1s，而不是一路涨上去");
+
+        // 模拟「每次被拦下也计数」：连点 12 次，退避逐级抬升（不再卡在 1s）
+        let mut waits = Vec::new();
+        for _ in 0..12 {
+            if let Some(w) = g.check("admin") { waits.push(w); }
+            g.record_failure("admin");
         }
-        // 关键：仍远未到 lock_after（15），因而不该返回 ~900s 的 15 分钟锁定
-        let w = g.check("admin").unwrap();
-        assert!(w < 900, "快速连点不应进入 15 分钟锁定：{w}");
+        // n 从 5 一路涨到 17 ⇒ 前几次退避 1,2,4,8,16,32,64，之后进入 lock_after(15) 的锁定
+        assert!(waits.iter().any(|&w| w > 1), "退避必须能抬升，不能恒为 1s：{waits:?}");
+        let last = *waits.last().expect("至少被拦下若干次");
+        assert!(last >= 900, "连点 12 次后必须进入 15 分钟锁定区间，实际 retry_after={last}");
+
+        // 明确把"旧行为"作为负向对照写下来：不计数就永远到不了锁定。
+        let old = LoginGuard::new(5);
+        for _ in 0..5 { old.record_failure("admin"); }
+        // 不 record_failure（= 旧行为），连点 60 次都只拿 1s
+        for _ in 0..60 {
+            assert_eq!(old.check("admin"), Some(1), "旧行为下恒为 1s——这正是被修掉的软限速");
+        }
+        assert!(old.check("admin").unwrap() < 900, "旧行为永远进不了锁定（负向对照）");
+    }
+
+    /// ⭐⭐ **锁定到期时间不得被后续尝试续期**（P2-11 引入「429 也计数」后暴露的真 bug）。
+    ///
+    /// 复现要点：进入锁定后**继续** record_failure（这是「429 也计数」的必然结果），
+    /// 然后断言 `retry_after` 只随真实时间**递减**，不会因为又来了几次请求而回涨。
+    ///
+    /// 旧实现取 `v.last()` 当基准 ⇒ 每来一次请求，基准后移 ⇒ retry_after 永远接近
+    /// 满额，攻击者持续发请求即可让账号**永久无法登录**（真机实测：锁定后每 2 秒
+    /// 打一次，retry 稳定停在 898 不降）。这是拒绝服务，比「锁 15 分钟」严重。
+    #[test]
+    fn lock_deadline_is_not_extended_by_further_attempts() {
+        use std::thread::sleep;
+        let g = LoginGuard::new(5);
+        // 攒到 lock_after(15)：前 14 次纯记录，第 15 次跨过阈值
+        for _ in 0..15 { g.record_failure("admin"); }
+        let first = g.check("admin").expect("已过 lock_after，必须锁定");
+        assert!(first >= 895 && first <= 900, "刚进入锁定应接近满额 900s，实际 {first}");
+
+        // 关键：锁定期间"继续尝试"（429 也计数 ⇒ 每次都会 record_failure）
+        sleep(Duration::from_millis(1100));
+        for _ in 0..5 { g.record_failure("admin"); }
+        let after = g.check("admin").expect("仍在锁定中");
+        assert!(
+            after < first,
+            "锁定期间又来了 5 次请求，剩余时间必须**继续递减**而不是被续期满额：\
+             首测 {first}s，之后 {after}s"
+        );
+
+        // 再等一会儿、再打几次，仍然只能递减
+        sleep(Duration::from_millis(1100));
+        for _ in 0..3 { g.record_failure("admin"); }
+        let later = g.check("admin").expect("仍在锁定中");
+        assert!(later < after, "续期判定：应 {later} < {after}");
     }
 
     #[test]

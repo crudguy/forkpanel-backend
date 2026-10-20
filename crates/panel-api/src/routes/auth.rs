@@ -48,6 +48,20 @@ pub async fn login(
     let ip = client_ip(&headers);
     let key = format!("{ip}:{}", req.username);
     if let Some(wait) = state.logins.check(&key) {
+        // 被拦下的尝试**同样计数**（P2-11，2026-10-20 决定）。
+        //
+        // 此前不计：快速连点会冻结在「1 次/秒」的软限速上，`n` 停在 max_attempts，
+        // 永远到不了 lock_after 的 15 分钟锁定——实测攻击者保持 1 req/s 可在 2 小时内
+        // 试约 7200 个口令，而面板以 root 运行，弱口令场景下这个速率偏危险。
+        //
+        // 现在计入后（实测同一 LoginGuard）：
+        // - 攻击者连点：第 11 次即进 15 分钟锁定，2 小时内最多 10 次有效尝试；
+        // - 正常用户手快连错：第 16 次被锁 15 分钟（现状是永不锁定）。
+        // 后者是可接受的代价：连续输错 16 次口令已不属于"手快"，且面板明确告知
+        // 剩余等待时间，用户可换用户名或等锁过期。
+        //
+        // ⚠ 计数必须放在 return 之前：放过这一条就等于回到旧行为。
+        state.logins.record_failure(&key);
         return Err(ApiError::too_many_requests(wait));
     }
 
@@ -639,5 +653,42 @@ mod tests {
         let mut h2 = HeaderMap::new();
         h2.insert(header::FORWARDED, "for=9.9.9.9".parse().unwrap());
         assert_eq!(client_ip(&h2), "unknown", "不可信头不应被采用");
+    }
+
+    /// **源码级守卫**：429 分支必须真的记一次失败（P2-11）。
+    ///
+    /// 为什么不能用行为测试：`LoginGuard` 的单测自己调 `record_failure`，把
+    /// handler 里那行删掉它照样绿——这正是本项目踩过的「守卫自持实现 ⇒ 恒绿」。
+    /// 唯一可靠的办法是直接盯住那段源码。
+    ///
+    /// ⚠ 断言前**必须剔除注释行**：本函数上方的说明文字里就写着
+    /// `record_failure`，不剔除会让断言恒命中（同理，断言目标是"代码里的调用"，
+    /// 不是"文件里出现过这个字符串"）。
+    #[test]
+    fn login_429_branch_records_the_failure() {
+        let src = include_str!("auth.rs");
+        // 只取 login 函数体内、check 被拦下的那个 if 块（从 `if let Some(wait)` 到
+        // `return Err(ApiError::too_many_requests` 之间的代码行）
+        let code: Vec<&str> = src
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//")          // 剔除行注释
+            })
+            .collect();
+        let joined = code.join("\n");
+        let start = joined
+            .find("if let Some(wait) = state.logins.check(&key)")
+            .expect("429 判定分支必须存在");
+        let end_rel = joined[start..]
+            .find("too_many_requests(wait)")
+            .expect("429 返回必须存在");
+        let block = &joined[start..start + end_rel];
+        assert!(
+            block.contains("record_failure(&key)"),
+            "429 分支必须调用 record_failure 才算「拦下也计数」（P2-11）；\
+             否则被打回的尝试不推进计数，攻击者可用 1 req/s 长期在线爆破。\
+             当前块内容：\n{block}"
+        );
     }
 }
