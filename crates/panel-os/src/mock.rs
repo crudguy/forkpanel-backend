@@ -575,6 +575,25 @@ impl ContainerProvider for MockContainers {
             },
         ])
     }
+
+    async fn networks_all(&self) -> Result<Vec<ContainerNetworkLine>> {
+        // mock 不真正调用 docker：造三条样例网络（与真机默认三网络对齐：
+        // bridge/host/none），便于前端联调「网络」Tab。
+        Ok(vec![
+            ContainerNetworkLine {
+                name: "bridge".into(), driver: "bridge".into(), scope: "local".into(),
+                id: "c1e0dbe7f933cad0ac2c639d9f78afe63e0b54c7671948123324b6068ef1cc0e".into(),
+            },
+            ContainerNetworkLine {
+                name: "host".into(), driver: "host".into(), scope: "local".into(),
+                id: "5391e507e83ac7a70b94f432df6da9362a7855eee42fbddfedf06d9ceb3939dc".into(),
+            },
+            ContainerNetworkLine {
+                name: "none".into(), driver: "null".into(), scope: "local".into(),
+                id: "73806332ac70215adccbe461efe5b6e165b4819459b4a2b8373ecf2eb4d10689".into(),
+            },
+        ])
+    }
 }
 
 #[async_trait]

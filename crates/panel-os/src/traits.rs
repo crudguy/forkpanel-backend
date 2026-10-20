@@ -1588,6 +1588,20 @@ pub struct ContainerStatsLine {
     pub pids: String,
 }
 
+/// 单条 Docker 网络（等价 `docker network ls` 的一行）。
+/// 字段一律用字符串回传：docker 的输出本就是格式化串（驱动/作用域是受限
+/// 枚举值的字面量），后端不做二次解析——与 `ContainerStatsLine` 同纪律。
+#[derive(Debug, Clone, Serialize)]
+pub struct ContainerNetworkLine {
+    pub name: String,
+    /// 驱动类型，如 `bridge` / `host` / `overlay` / `macvlan`。
+    pub driver: String,
+    /// 作用范围，如 `local` / `swarm` / `global`。
+    pub scope: String,
+    /// 网络 ID（`--no-trunc` 全量 64 位；UI 展示可裁剪，完整值供核对）。
+    pub id: String,
+}
+
 /// 容器生命周期动作。声明式——由平台实现翻译成具体 CLI 子命令，
 /// 业务层不出现 `start`/`stop` 之类命令字面量。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1672,6 +1686,10 @@ pub trait ContainerProvider: Send + Sync {
     /// 只读、一次性快照（不带流式 `--follow`，否则阻塞）；读操作需 container.view。
     /// 无 id 参数（一次返回所有容器），故无参数注入面。
     async fn stats_all(&self) -> Result<Vec<ContainerStatsLine>>;
+    /// 列举 Docker 网络（等价 `docker network ls --no-trunc`）。只读，需
+    /// container.view。无 id 参数（一次返回所有网络），故无参数注入面。
+    /// **只列举**：创建/删除网络、容器接入/断开网络等写操作未实现。
+    async fn networks_all(&self) -> Result<Vec<ContainerNetworkLine>>;
 }
 
 // ═══════════════════════════ 终端 ═══════════════════════════

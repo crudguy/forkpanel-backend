@@ -306,7 +306,9 @@ pub fn build_router(state: Shared) -> Router {
         // 容器备注（022）：容器不入库，存 container_remarks 引用表；读写不强制 Docker 可达
         .route("/api/v1/containers/{id}/remark", get(containers::get_remark).patch(containers::update_remark))
         .route("/api/v1/containers/{id}/logs", get(containers::logs))
-        .route("/api/v1/containers/stats", get(containers::stats));
+        .route("/api/v1/containers/stats", get(containers::stats))
+        // 网络列举（只读）：docker network ls --no-trunc，需 container.view
+        .route("/api/v1/containers/networks", get(containers::networks));
 
     // ── 本机便签（025：多条，由 022 单例说明升级） ──
     let notes_r = Router::new()

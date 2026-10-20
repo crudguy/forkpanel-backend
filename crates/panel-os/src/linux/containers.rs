@@ -16,12 +16,15 @@
 //! 已实现：列举 / 镜像 / `create`（= `docker create`，**默认不启动**而非 `docker run`）
 //! / `pull` / 生命周期（start/stop/restart/rm/rm -f）/ 安装 / 加组 / **日志查看**
 //! （`docker logs`，只读最近 N 行快照，不带 --follow）/ **资源用量快照**
-//! （`docker stats --no-stream --all`，只读一次性快照，不带流式否则阻塞）。
+//! （`docker stats --no-stream --all`，只读一次性快照，不带流式否则阻塞）/
+//! **网络列举**（`docker network ls --no-trunc`，只读）。
 //! `create` 的宿主机任意代码执行风险由 `validate_create` 强制拦截：禁 `--privileged`、
 //! 禁挂载 `/` `/etc` `/proc` `/sys` `/var/run/docker.sock`，且路由层需二次确认词
 //! 「创建容器」。
 //! **未提供**：镜像删除（磁盘回收风险，刻意不开放）；`docker exec`、
-//! 网络 / 卷管理、compose / stack 暂未实现（非安全刻意排除，后续可补）。
+//! 卷管理、compose / stack 暂未实现（非安全刻意排除，后续可补）。
+//! 网络侧刻意**只读列举**：创建/删除网络、容器接入/断开网络等写操作未实现
+//! （改网络连通性影响面大，交由 `docker` CLI 手动执行）。
 
 use crate::cmd::{Bin, CmdOpt};
 use crate::paths::{LinuxPathLayout, PathLayout};
@@ -345,6 +348,31 @@ impl ContainerProvider for LinuxContainers {
         LinuxContainers::check(&out, "docker stats")?;
         Ok(parse_stats(&out.stdout))
     }
+
+    async fn networks_all(&self) -> Result<Vec<ContainerNetworkLine>> {
+        self.ensure_ready()?;
+        // 只读列举：无 id/名称参数 → 无参数注入面；format 里的字段名是编译期
+        // 常量，不经用户输入。`--no-trunc` 保留完整 ID（UI 展示可裁剪），
+        // 与 list/images 同口径。
+        let args = [
+            "network",
+            "ls",
+            "--no-trunc",
+            "--format",
+            // 字段间用 Tab 分隔，与 stats 同纪律：网络四字段本身不含空格，但
+            // 统一 Tab 可让「漏写 --format 时的默认表格输出」被解析器拒绝
+            // （表格行按 Tab 拆只有 1 段），而不是把表头行当成数据行。
+            "{{.Name}}\t{{.Driver}}\t{{.Scope}}\t{{.ID}}",
+        ];
+        let out = crate::cmd::run(
+            Bin::Docker,
+            &args,
+            CmdOpt { timeout: LIST_TIMEOUT, ..Default::default() },
+        )
+        .await?;
+        LinuxContainers::check(&out, "docker network ls")?;
+        Ok(parse_networks(&out.stdout))
+    }
 }
 
 /// 解析 `docker logs` 输出（不带 --follow）：每行一条，stdout/stderr 已合并。
@@ -386,6 +414,28 @@ fn parse_stats(stdout: &str) -> Vec<ContainerStatsLine> {
                 net_io: f[4].to_string(),
                 block_io: f[5].to_string(),
                 pids: f[6].to_string(),
+            })
+        })
+        .collect()
+}
+
+/// 解析 `docker network ls --no-trunc --format` 输出：每行一条，按 Tab 拆 4 段。
+/// 字段不足的行直接跳过（不做臆测填充——宁可少一行，也不要造一个假网络）。
+/// 该解析同时是「必须带 `--format`」的契约：默认表格输出（表头 + 空格填充列）
+/// 按 Tab 拆每行只有 1 段、整表被拒，绝不会把表头误当数据行。
+fn parse_networks(stdout: &str) -> Vec<ContainerNetworkLine> {
+    stdout
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            if f.len() != 4 {
+                return None;
+            }
+            Some(ContainerNetworkLine {
+                name: f[0].to_string(),
+                driver: f[1].to_string(),
+                scope: f[2].to_string(),
+                id: f[3].to_string(),
             })
         })
         .collect()
@@ -738,5 +788,37 @@ mod tests {
         // 断言「撕裂的行进不来」，防止将来有人把分隔符从 Tab 改成空格。
         let bad = "web 1.52% 12.5MiB / 2GiB 0.61% 1.2MB / 800kB 50MB / 0B 8";
         assert!(parse_stats(bad).is_empty(), "空格分隔不得被解析成合法行");
+    }
+
+    #[test]
+    fn parse_networks_plain() {
+        // 真机样本（docker 29.9.1，--no-trunc）：ID 为完整 64 位
+        let line = "bridge\tbridge\tlocal\tc1e0dbe7f933cad0ac2c639d9f78afe63e0b54c7671948123324b6068ef1cc0e";
+        let v = parse_networks(&format!("{line}\n"));
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].name, "bridge");
+        assert_eq!(v[0].driver, "bridge");
+        assert_eq!(v[0].scope, "local");
+        assert_eq!(v[0].id.len(), 64, "应保留完整 ID（--no-trunc）");
+    }
+
+    #[test]
+    fn parse_networks_skips_short_and_empty_lines() {
+        // 空行 / 字段不足的行跳过，不造数据（与 parse_stats 同纪律）
+        let raw = "bridge\tbridge\tlocal\tc1e0\n\nhost\thost\nnone\tnull\tlocal\t7380\n";
+        let v = parse_networks(raw);
+        assert_eq!(v.len(), 2, "只保留两行完整数据，空行与短行被跳过");
+        assert_eq!(v[0].name, "bridge");
+        assert_eq!(v[1].name, "none");
+    }
+
+    #[test]
+    fn parse_networks_rejects_default_table_output() {
+        // 负向对照：若实现漏写 --format，docker 输出默认表格（表头 + 空格填充列，
+        // 真机样本）。按 Tab 拆每行只有 1 段 → 整表被拒、返回空，
+        // 而不是把表头行当成一条合法网络。断言「默认表格形态进不来」，
+        // 防止将来有人删掉 --format 还以为能跑。
+        let table = "NETWORK ID     NAME      DRIVER    SCOPE\nc1e0dbe7f933   bridge    bridge    local\n5391e507e83a   host      host      local\n";
+        assert!(parse_networks(table).is_empty(), "默认表格输出不得被解析成合法行");
     }
 }
