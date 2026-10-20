@@ -611,6 +611,23 @@ impl ContainerProvider for MockContainers {
             },
         ])
     }
+
+    async fn compose_projects_all(&self) -> Result<Vec<ContainerComposeProjectLine>> {
+        // mock 不真正调用 docker：造一运行一停止两条样例项目（status 形态与
+        // 真机一致：running(1) / exited(1)），便于前端联调「Compose」Tab。
+        Ok(vec![
+            ContainerComposeProjectLine {
+                name: "web-stack".into(),
+                status: "running(1)".into(),
+                config_files: "/srv/web-stack/docker-compose.yml".into(),
+            },
+            ContainerComposeProjectLine {
+                name: "legacy-db".into(),
+                status: "exited(1)".into(),
+                config_files: "/srv/legacy/docker-compose.yml".into(),
+            },
+        ])
+    }
 }
 
 #[async_trait]

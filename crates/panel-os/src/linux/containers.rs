@@ -19,13 +19,18 @@
 //! （`docker stats --no-stream --all`，只读一次性快照，不带流式否则阻塞）/
 //! **网络列举**（`docker network ls --no-trunc`，只读）/ **卷列举**
 //! （`docker volume ls`，只读；⚠ volume ls 无 --no-trunc，卷名是用户定义
-//! 名称而非哈希、默认不截断）。
+//! 名称而非哈希、默认不截断）/ **Compose 项目列举**
+//! （`docker compose ls --all --format json`，只读；⚠ compose 的 --format
+//! 只接受 `table` / `json` 两个字面量，Go 模板形态会被拒——与 network/volume
+//! 的命令形态不同，勿照抄，故走 JSON 解析）。
 //! `create` 的宿主机任意代码执行风险由 `validate_create` 强制拦截：禁 `--privileged`、
 //! 禁挂载 `/` `/etc` `/proc` `/sys` `/var/run/docker.sock`，且路由层需二次确认词
 //! 「创建容器」。
 //! **未提供**：镜像删除（磁盘回收风险，刻意不开放）；`docker exec`、
 //! 卷的创建/删除（**只读列举已开放**；删除卷=数据丢失，与镜像删除同理）、
-//! compose / stack 暂未实现（非安全刻意排除，后续可补）。
+//! compose 生命周期写操作（up/down/restart/logs 等；**只读列举已开放**，
+//! 写操作影响面大，交由 `docker compose` CLI 手动执行）、
+//! stack 暂未实现（非安全刻意排除，后续可补）。
 //! 网络侧刻意**只读列举**：创建/删除网络、容器接入/断开网络等写操作未实现
 //! （改网络连通性影响面大，交由 `docker` CLI 手动执行）。
 //! 卷侧刻意**只读列举**：创建/删除卷未实现（删除卷有数据丢失风险，
@@ -36,6 +41,7 @@ use crate::paths::{LinuxPathLayout, PathLayout};
 use crate::traits::*;
 use async_trait::async_trait;
 use panel_core::{PanelError, Result};
+use serde::Deserialize;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -403,6 +409,26 @@ impl ContainerProvider for LinuxContainers {
         LinuxContainers::check(&out, "docker volume ls")?;
         Ok(parse_volumes(&out.stdout))
     }
+
+    async fn compose_projects_all(&self) -> Result<Vec<ContainerComposeProjectLine>> {
+        self.ensure_ready()?;
+        // 只读列举：无参数 → 无参数注入面；format 值是编译期常量。
+        // ⚠ compose 的 --format **只接受 table | json 两个字面量**（真机探活
+        // v5.6.0：`--format '{{.Name}}\t…'` 直接被拒 "could not be parsed"），
+        // 与 network/volume 的 Go 模板形态不同，勿照抄——故走 JSON 解析
+        // （serde_json 已是本 crate 依赖，journalctl -o json 在用）。
+        // `--all` 含已停止项目，与 list() 的 `docker ps -a` 同口径；不带则
+        // 只列 running（真机探活：停止项目被隐藏）。
+        let args = ["compose", "ls", "--all", "--format", "json"];
+        let out = crate::cmd::run(
+            Bin::Docker,
+            &args,
+            CmdOpt { timeout: LIST_TIMEOUT, ..Default::default() },
+        )
+        .await?;
+        LinuxContainers::check(&out, "docker compose ls")?;
+        parse_compose_projects(&out.stdout)
+    }
 }
 
 /// 解析 `docker logs` 输出（不带 --follow）：每行一条，stdout/stderr 已合并。
@@ -490,6 +516,47 @@ fn parse_volumes(stdout: &str) -> Vec<ContainerVolumeLine> {
             })
         })
         .collect()
+}
+
+/// `docker compose ls --all --format json` 的数组元素原始结构。
+/// 字段经 `rename` 与 compose 的 PascalCase JSON 键逐字对齐；刻意**不用**
+/// `#[serde(default)]`：缺字段即解析失败并上抛，绝不臆测填充——
+/// 宁可整表报错，也不造一个假项目。
+#[derive(Debug, Deserialize)]
+struct RawComposeProject {
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Status")]
+    status: String,
+    #[serde(rename = "ConfigFiles")]
+    config_files: String,
+}
+
+/// 解析 `docker compose ls --all --format json` 输出（JSON 数组）。
+/// **必须带 `--format json`** 是该解析的契约：漏写时 docker 输出人类表格
+/// （表头 `NAME STATUS CONFIG FILES` + 空格填充列），serde_json 解析失败
+/// 并上抛错误，绝不会把表头当成一条合法项目——与 stats/networks/volumes
+/// 的 Tab 纪律同向：解析器天然拒绝非契约输出，而非静默吞掉。
+/// 空串按空表处理（不同 compose 版本对 0 项目的输出可能是 `[]` 或空串，
+/// 二者都不含项目信息）；其余非法形态一律报错。
+fn parse_compose_projects(stdout: &str) -> Result<Vec<ContainerComposeProjectLine>> {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let raw: Vec<RawComposeProject> = serde_json::from_str(trimmed).map_err(|e| {
+        PanelError::Internal(format!(
+            "docker compose ls 输出不是合法 JSON（--format json 未生效？）: {e}"
+        ))
+    })?;
+    Ok(raw
+        .into_iter()
+        .map(|p| ContainerComposeProjectLine {
+            name: p.name,
+            status: p.status,
+            config_files: p.config_files,
+        })
+        .collect())
 }
 
 // ─────────────── 创建安全校验（纯函数，可离线单测） ───────────────
@@ -900,5 +967,46 @@ mod tests {
         // 只有 1 段 → 整表被拒、返回空，而不是把表头当成一条合法卷。
         let table = "DRIVER    VOLUME NAME\nlocal     forkpanel-e2e-probe\n";
         assert!(parse_volumes(table).is_empty(), "默认表格输出不得被解析成合法行");
+    }
+
+    #[test]
+    fn parse_compose_projects_real_probe() {
+        // 真机样本（docker compose v5.6.0，临时项目 forkpanel-compose-probe
+        // 实测输出：--all --format json）
+        let json = r#"[{"Name":"forkpanel-compose-probe","Status":"running(1)","ConfigFiles":"/tmp/forkpanel-compose-probe/docker-compose.yml"}]"#;
+        let v = parse_compose_projects(json).expect("真机 JSON 样本必须解析成功");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].name, "forkpanel-compose-probe");
+        assert_eq!(v[0].status, "running(1)");
+        assert_eq!(v[0].config_files, "/tmp/forkpanel-compose-probe/docker-compose.yml");
+    }
+
+    #[test]
+    fn parse_compose_projects_empty_array() {
+        // 真机 0 项目输出即 `[]`（探针实测）→ 空表，不是错误
+        let v = parse_compose_projects("[]").expect("空数组必须解析为空表");
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn parse_compose_projects_rejects_default_table_output() {
+        // 负向对照：若实现漏写 --format json，docker 输出人类表格（真机样本）。
+        // serde_json 解析失败并上抛错误——绝不会把表头当成一条合法项目
+        // （与 parse_networks / parse_volumes 的 Tab 纪律同向）。
+        let table = "NAME                      STATUS              CONFIG FILES\nforkpanel-compose-probe   running(1)          /tmp/forkpanel-compose-probe/docker-compose.yml\n";
+        assert!(
+            parse_compose_projects(table).is_err(),
+            "默认表格输出不得被解析成合法项目"
+        );
+    }
+
+    #[test]
+    fn parse_compose_projects_rejects_missing_field() {
+        // 缺字段（如旧版 compose 不带 ConfigFiles）→ 整表报错，不臆测填充
+        let json = r#"[{"Name":"x","Status":"running(1)"}]"#;
+        assert!(
+            parse_compose_projects(json).is_err(),
+            "缺字段的 JSON 不得被部分接受"
+        );
     }
 }

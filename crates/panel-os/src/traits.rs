@@ -1611,6 +1611,20 @@ pub struct ContainerVolumeLine {
     pub mountpoint: String,
 }
 
+/// 单条 Docker Compose 项目（等价 `docker compose ls --all` 的一行）。
+/// 字段一律用字符串回传：`status` 是组合语义串（如 `running(1)` /
+/// `exited(2)`，括号内为容器数），由 UI 自行映射展示，后端不做二次解析——
+/// 与 `ContainerStatsLine` / `ContainerNetworkLine` 同纪律。
+#[derive(Debug, Clone, Serialize)]
+pub struct ContainerComposeProjectLine {
+    /// 项目名（默认取 compose 文件所在目录名，可被 `name:` 覆盖）。
+    pub name: String,
+    /// 运行状态汇总，如 `running(1)` / `exited(2)`。
+    pub status: String,
+    /// compose 配置文件绝对路径；多 `-f` 文件时为逗号分隔串（原样回传）。
+    pub config_files: String,
+}
+
 /// 容器生命周期动作。声明式——由平台实现翻译成具体 CLI 子命令，
 /// 业务层不出现 `start`/`stop` 之类命令字面量。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1705,6 +1719,11 @@ pub trait ContainerProvider: Send + Sync {
     /// **只列举**：创建/删除卷未实现（删除卷=数据丢失，与镜像删除同理刻意
     /// 不开放，交由 `docker` CLI 手动执行）。
     async fn volumes_all(&self) -> Result<Vec<ContainerVolumeLine>>;
+
+    /// 列举 Docker Compose 项目（等价 `docker compose ls --all`）。只读，需
+    /// container.view。无 id 参数（一次返回所有项目），故无参数注入面。
+    /// **只列举**：up/down/restart/logs 等生命周期写操作未实现。
+    async fn compose_projects_all(&self) -> Result<Vec<ContainerComposeProjectLine>>;
 }
 
 // ═══════════════════════════ 终端 ═══════════════════════════

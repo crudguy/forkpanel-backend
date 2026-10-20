@@ -310,7 +310,9 @@ pub fn build_router(state: Shared) -> Router {
         // 网络列举（只读）：docker network ls --no-trunc，需 container.view
         .route("/api/v1/containers/networks", get(containers::networks))
         // 卷列举（只读）：docker volume ls（无 --no-trunc，卷名默认不截断），需 container.view
-        .route("/api/v1/containers/volumes", get(containers::volumes));
+        .route("/api/v1/containers/volumes", get(containers::volumes))
+        // Compose 项目列举（只读）：docker compose ls --all --format json，需 container.view
+        .route("/api/v1/containers/compose", get(containers::compose_projects));
 
     // ── 本机便签（025：多条，由 022 单例说明升级） ──
     let notes_r = Router::new()

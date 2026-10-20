@@ -2999,6 +2999,15 @@ paths:
           description: ok，返回每卷一行（data 为 [name, driver, mountpoint]，均为 docker 原始串；mountpoint 为宿主机路径）
           content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { type: object, properties: { name: { type: string }, driver: { type: string }, mountpoint: { type: string } } } } } } } }
         '501': { description: 容器能力不可用 }
+  /api/v1/containers/compose:
+    get:
+      tags: [containers]
+      summary: 列举 Docker Compose 项目（docker compose ls --all --format json，只读）
+      responses:
+        '200':
+          description: ok，返回每项目一行（data 为 [name, status, config_files]；status 为组合语义串如 running(1) / exited(1)，config_files 为配置文件绝对路径）
+          content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { type: object, properties: { name: { type: string }, status: { type: string }, config_files: { type: string } } } } } } } }
+        '501': { description: 容器能力不可用 }
   /api/v1/containers/join-docker-group:
     post:
       tags: [containers]
