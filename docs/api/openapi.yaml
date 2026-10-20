@@ -2981,7 +2981,7 @@ paths:
           description: ok，返回每容器一行用量快照（data 为 [name, cpu_perc, mem_usage, mem_perc, net_io, block_io, pids]，均为 docker 格式化串）
           content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { type: object, properties: { name: { type: string }, cpu_perc: { type: string }, mem_usage: { type: string }, mem_perc: { type: string }, net_io: { type: string }, block_io: { type: string }, pids: { type: string } } } } } } } }
         '501': { description: 容器能力不可用 }
-/api/v1/containers/join-docker-group:
+  /api/v1/containers/join-docker-group:
     post:
       tags: [containers]
       summary: 把面板进程用户加入 docker 组（修复 daemon_unreachable）
