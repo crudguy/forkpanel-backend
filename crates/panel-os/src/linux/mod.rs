@@ -5,6 +5,8 @@
 //! 能力矩阵能正确置灰 UI，也给出清晰的接入清单（对应里程碑 M2~M5）。
 
 pub mod containers;
+/// 面板编排（Compose stack）的存储与渲染：JSON 单一事实源 + 生成 compose.yaml。
+pub mod compose_stack;
 pub mod files;
 /// 第三方官方 apt 源注入（方案1：加官方源；含 GPG 指纹校验）。
 pub mod repo;

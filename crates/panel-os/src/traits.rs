@@ -8,7 +8,7 @@
 //! 4. 不支持的能力返回 `PanelError::Unsupported`，**绝不能 panic 或返回空数据假装成功**。
 
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use panel_core::{
     Capability, FirewallBackend, InitSystem, LogBackend, PlatformInfo, Result, SafePath,
     UnitName,
@@ -1686,6 +1686,60 @@ pub struct ContainerCreateReq {
     pub privileged: bool,
 }
 
+/// 面板编排的服务定义。
+///
+/// ⚠⚠ **这是一个"类型层面的白名单"**：只有这里列出的字段会被渲染进
+/// `compose.yaml`。`privileged` / `cap_add` / `pid` / `network_mode` /
+/// `user` / `devices` 这些等价宿主 root 的字段**在类型上就不存在**，
+/// 所以它们不可能被写进文件——不依赖运行时黑名单去拦截。
+///
+/// 为什么这很重要：compose 的字段空间随版本不断增长（还有 `x-` 扩展字段、
+/// YAML merge key、锚点），任何"先允许自由写、再检查危险字段"的方案都会被绕开。
+/// 用类型封死是唯一能证明"生成的文件里没有特权字段"的做法。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ComposeStackService {
+    /// 服务名（`[a-z0-9][a-z0-9_-]*`）
+    pub name: String,
+    pub image: String,
+    /// 覆盖镜像 ENTRYPOINT；逐元素渲染成 YAML 序列，不拼成一条 shell 串
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// `host:container[/proto]`
+    #[serde(default)]
+    pub ports: Vec<String>,
+    /// `KEY=VALUE`
+    #[serde(default)]
+    pub env: Vec<String>,
+    /// 具名卷或非敏感宿主路径；敏感路径（`/`、`/etc`、`docker.sock` 等）会被拒
+    #[serde(default)]
+    pub volumes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_limit: Option<String>,
+}
+
+/// 一次编排提交（创建或更新都走它）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ComposeStackSpec {
+    pub project: String,
+    pub services: Vec<ComposeStackService>,
+}
+
+/// 面板管理的 stack（磁盘读出的完整信息）。
+#[derive(Debug, Clone, Serialize)]
+pub struct ComposeStack {
+    pub project: String,
+    /// stack 目录绝对路径（compose 的工作目录）
+    pub dir: String,
+    /// 渲染产物 `compose.yaml` 绝对路径
+    pub config_file: String,
+    pub services: Vec<ComposeStackService>,
+    /// `compose.yaml` 与「由 spec 重新渲染的结果」不一致 ⇒ 被外部改过。
+    /// 此时面板**不再允许编辑**，避免静默覆盖用户的修改。
+    pub externally_modified: bool,
+}
+
 #[async_trait]
 pub trait ContainerProvider: Send + Sync {
     fn engine(&self) -> ContainerEngine;
@@ -1742,6 +1796,16 @@ pub trait ContainerProvider: Send + Sync {
         project: &str,
         working_dir: Option<&str>,
     ) -> Result<()>;
+
+    /// 列出**面板自己创建**的 stack（只扫 `compose-stacks/` 目录，不认识手写的项目）。
+    async fn compose_stacks(&self) -> Result<Vec<ComposeStack>>;
+
+    /// 读取单个 stack。不存在 → `NotFound`。
+    async fn compose_stack_get(&self, project: &str) -> Result<ComposeStack>;
+
+    /// 创建或更新 stack：写 `.forkpanel-compose.json`（单一事实源）并渲染
+    /// `compose.yaml`。已存在且 `compose.yaml` 被外部改过时**拒绝覆盖**。
+    async fn compose_stack_save(&self, spec: ComposeStackSpec) -> Result<ComposeStack>;
 }
 
 /// Compose 项目的生命周期动作。与 [`ContainerAction`] 同纪律：**声明式**，

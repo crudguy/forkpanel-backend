@@ -37,6 +37,7 @@
 //! 交由 `docker` CLI 手动执行）。
 
 use crate::cmd::{Bin, CmdOpt};
+use crate::linux::compose_stack;
 use crate::paths::{LinuxPathLayout, PathLayout};
 use crate::traits::*;
 use async_trait::async_trait;
@@ -60,6 +61,9 @@ pub struct LinuxContainers {
     engine: ContainerEngine,
     /// 探测结论（构造期一次性求值；`available()` 是纯读，不做重复探测）
     reachable: bool,
+    /// 面板数据目录。编排（compose stack）的文件落在 `<data_dir>/compose-stacks/`，
+    /// 所以这里必须留下目录——`detect` 接收 `paths` 后不能只取 socket 就丢掉。
+    data_dir: std::path::PathBuf,
 }
 
 impl LinuxContainers {
@@ -68,7 +72,13 @@ impl LinuxContainers {
         let engine = if Bin::Docker.available() { ContainerEngine::Docker } else { ContainerEngine::None };
         // 可达性：对 socket 做一次 connect（权限不足 / daemon 未运行都会立即失败）
         let reachable = engine != ContainerEngine::None && socket_connectable(&paths.container_socket());
-        Self { engine, reachable }
+        let data_dir = paths.data_dir();
+        Self { engine, reachable, data_dir }
+    }
+
+    /// 编排根目录（`<data_dir>/compose-stacks`）
+    fn stacks_root(&self) -> std::path::PathBuf {
+        crate::linux::compose_stack::stacks_root(&self.data_dir)
     }
 
     /// 调用前的统一前置检查：不可用即诚实报错，绝不返回空列表冒充"没有容器"。
@@ -526,6 +536,39 @@ impl ContainerProvider for LinuxContainers {
         LinuxContainers::check(&out, "docker compose")?;
         Ok(())
     }
+
+    // ── 面板编排（compose stack）──
+    //
+    // ⚠ 这三个方法**不调用 `ensure_ready()`**：编排文件的读写只碰
+    // `<data_dir>/compose-stacks/`，与 docker daemon 毫无关系。daemon 不可用时
+    // 用户仍然应该能查看/编辑自己的编排定义（只是不能部署）。
+    // 声明 501 会撒谎——那会让"daemon 挂了"看起来像"面板没有编排功能"。
+
+    async fn compose_stacks(&self) -> Result<Vec<ComposeStack>> {
+        let root = self.stacks_root();
+        tokio::task::spawn_blocking(move || compose_stack::list_stacks(&root))
+            .await
+            .map_err(|e| PanelError::Internal(format!("编排列举任务失败: {e}")))?
+    }
+
+    async fn compose_stack_get(&self, project: &str) -> Result<ComposeStack> {
+        validate_compose_project(project)?;
+        let root = self.stacks_root();
+        let project = project.to_string();
+        tokio::task::spawn_blocking(move || compose_stack::load_stack(&root, &project))
+            .await
+            .map_err(|e| PanelError::Internal(format!("编排读取任务失败: {e}")))?
+    }
+
+    async fn compose_stack_save(&self, spec: ComposeStackSpec) -> Result<ComposeStack> {
+        // 校验放在阻塞任务外：它是纯 CPU 且失败率高（用户输错很常见），
+        // 没必要为一次拒绝去占一个 blocking 线程。
+        compose_stack::validate_stack_spec(&spec)?;
+        let root = self.stacks_root();
+        tokio::task::spawn_blocking(move || compose_stack::save_stack(&root, &spec))
+            .await
+            .map_err(|e| PanelError::Internal(format!("编排保存任务失败: {e}")))?
+    }
 }
 
 /// Compose 项目名安全校验（进 argv 白名单）。返回 `Err` 时附可读原因。
@@ -734,7 +777,7 @@ fn parse_compose_projects(stdout: &str) -> Result<Vec<ContainerComposeProjectLin
 
 /// 镜像名不得含空白或 shell 元字符：docker 把 image 当单参数，
 /// 含空白会分裂 argv、含元字符可能被 shell 误解析（虽本项目走 argv 直传，仍守底线）。
-fn image_is_safe(img: &str) -> bool {
+pub(crate) fn image_is_safe(img: &str) -> bool {
     if img.is_empty() {
         return false; // 空镜像名本身即非法
     }
@@ -743,7 +786,7 @@ fn image_is_safe(img: &str) -> bool {
 
 /// 若卷挂载的宿主源路径命中敏感目录，返回该路径（供错误信息）；否则 None。
 /// 具名卷（不含 `/`）放行；宿主路径（`/...`）才进入敏感判定。
-fn sensitive_host_mount(spec: &str) -> Option<&'static str> {
+pub(crate) fn sensitive_host_mount(spec: &str) -> Option<&'static str> {
     let src = spec.split(':').next().unwrap_or("").trim();
     if src.is_empty() || !src.starts_with('/') {
         return None; // 空或具名卷
@@ -758,7 +801,7 @@ fn sensitive_host_mount(spec: &str) -> Option<&'static str> {
 }
 
 /// 端口映射 `host:container[/proto]`：端口须为数字，proto 仅 tcp/udp。
-fn port_mapping_is_safe(p: &str) -> bool {
+pub(crate) fn port_mapping_is_safe(p: &str) -> bool {
     let (hp, proto) = match p.split_once('/') {
         Some((a, b)) => (a, Some(b)),
         None => (p, None),
@@ -777,7 +820,7 @@ fn port_mapping_is_safe(p: &str) -> bool {
 }
 
 /// 内存上限 `^\d+[kmg]?$`（大小写不敏感，单位可选）。
-fn mem_limit_is_safe(m: &str) -> bool {
+pub(crate) fn mem_limit_is_safe(m: &str) -> bool {
     let b = m.trim();
     if b.is_empty() {
         return false;
@@ -965,7 +1008,7 @@ mod tests {
     #[test]
     fn empty_engine_is_honest() {
         // 无 socket 路径（空）→ 不可达；`unavailable_reason` 必须给出可行动原因
-        let c = LinuxContainers { engine: ContainerEngine::None, reachable: false };
+        let c = LinuxContainers { engine: ContainerEngine::None, reachable: false, data_dir: std::path::PathBuf::new() };
         assert!(!c.available());
         assert_eq!(c.unavailable_reason(), Some("binary_missing"));
         assert!(matches!(
@@ -977,7 +1020,7 @@ mod tests {
     #[test]
     fn binary_present_but_daemon_down_is_reported_as_unreachable() {
         // 本机真实形态：二进制在、socket 不可连（权限/未启动）→ 诚实报 daemon_unreachable
-        let c = LinuxContainers { engine: ContainerEngine::Docker, reachable: false };
+        let c = LinuxContainers { engine: ContainerEngine::Docker, reachable: false, data_dir: std::path::PathBuf::new() };
         assert_eq!(c.engine().as_str(), "docker");
         assert!(!c.available());
         assert_eq!(c.unavailable_reason(), Some("daemon_unreachable"));

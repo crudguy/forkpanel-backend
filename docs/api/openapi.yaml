@@ -1023,6 +1023,32 @@ components:
         remark:  { type: string, description: "对象说明（备注，022）：容器不入库，备注存 container_remarks 引用表；列表端点一次性联查挂载，无则为空串" }
         compose_project: { type: ["string", "null"], description: "所属 Compose 项目名（读 com.docker.compose.project 标签）；非 compose 创建的容器为 null（不是空串——空串无法与「项目名就是空」区分）" }
         compose_service: { type: ["string", "null"], description: "所属 Compose 服务名（com.docker.compose.service 标签）；与 compose_project 同生共死" }
+    ComposeStackService:
+      type: object
+      description: |
+        面板编排的单个服务。⚠ **这是类型层面的白名单**：只有这里列出的字段会被
+        渲染进 compose.yaml。`privileged` / `cap_add` / `pid` / `network_mode` /
+        `user` / `devices` 等等价宿主 root 的字段在类型上就不存在，因此不可能被写入
+        ——不依赖运行时黑名单拦截（compose 字段空间会随版本增长，黑名单追不上）。
+      required: [name, image]
+      properties:
+        name:      { type: string, description: "服务名（字母数字与 . _ -，不得以 - 开头）；项目内唯一" }
+        image:     { type: string, example: "nginx:1.27-alpine", description: 含 shell 元字符会被拒 }
+        command:   { type: array, items: { type: string }, description: 覆盖镜像 ENTRYPOINT；逐元素作为独立参数，不拼 shell 串 }
+        ports:     { type: array, items: { type: string }, description: "host:container[/proto]，如 8080:80" }
+        env:       { type: array, items: { type: string }, description: "KEY=VALUE；KEY 须符合 shell 标识符规则" }
+        volumes:   { type: array, items: { type: string }, description: "具名卷或非敏感宿主路径；`/`、`/etc`、`docker.sock`、`/proc`、`/sys`、`/var/run` 会被拒" }
+        restart:   { type: string, enum: [no, on-failure, always, unless-stopped] }
+        mem_limit: { type: string, example: 512m, description: "内存上限（512m / 2g / 纯字节数）" }
+    ComposeStack:
+      type: object
+      description: 面板管理的编排项目（磁盘读出）
+      properties:
+        project:             { type: string }
+        dir:                 { type: string, description: stack 目录绝对路径（即 compose 工作目录） }
+        config_file:         { type: string, description: 渲染产物 compose.yaml 绝对路径 }
+        services:            { type: array, items: { $ref: '#/components/schemas/ComposeStackService' } }
+        externally_modified: { type: boolean, description: "compose.yaml 与「由 .forkpanel-compose.json 重新渲染的结果」不一致 ⇒ 被外部改过；为 true 时面板拒绝覆盖保存" }
     ContainerImage:
       type: object
       description: 等价 `docker images` 的一行（含悬空镜像 `<none>`）
@@ -3010,6 +3036,51 @@ paths:
           description: ok，返回每项目一行（data 为 [name, status, config_files]；status 为组合语义串如 running(1) / exited(1)，config_files 为配置文件绝对路径）
           content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { type: object, properties: { name: { type: string }, status: { type: string }, config_files: { type: string } } } } } } } }
         '501': { description: "容器能力不可用，或 Compose 插件缺失（detail.reason：binary_missing / daemon_unreachable / compose_unavailable）。⚠ compose 是 CLI 插件，与 daemon 可达性无关：docker 可用但没装 docker-compose-plugin 时会返回 compose_unavailable（而非 502）" }
+  /api/v1/containers/stacks:
+    get:
+      tags: [containers]
+      summary: 列表面板创建的编排项目（Compose stack 定义）
+      description: 只扫 `<data_dir>/compose-stacks/` 下带 `.forkpanel-compose.json` 的目录；不识别用户手写的 compose 项目。⚠ 本组端点不检查 docker 可用性——编排定义的读写与 daemon 无关。
+      responses:
+        '200':
+          description: ok，data 为 ComposeStack 数组（按项目名排序）
+          content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/ComposeStack' } } } } } }
+  /api/v1/containers/stacks/{project}:
+    get:
+      tags: [containers]
+      summary: 读取单个编排项目
+      parameters:
+        - { name: project, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: ok，data 为 ComposeStack
+          content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/ComposeStack' } } } } }
+        '404': { description: 编排项目不存在 }
+    put:
+      tags: [containers]
+      summary: 创建或更新编排项目（幂等），需 container.manage
+      description: |
+        写入 `.forkpanel-compose.json`（单一事实源）并渲染 `compose.yaml`。
+        ⚠ 可写字段由服务端类型白名单限定：`privileged` / `cap_add` / `pid` /
+        `network_mode` / `user` / `devices` 等字段**不存在**，不接受用户提交原始 YAML。
+        ⚠ 已存在且 `compose.yaml` 被外部改过时返回 409，绝不静默覆盖用户修改。
+      parameters:
+        - { name: project, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [services]
+              properties:
+                services: { type: array, items: { $ref: '#/components/schemas/ComposeStackService' } }
+      responses:
+        '200':
+          description: ok，data 为落盘后的 ComposeStack
+          content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/ComposeStack' } } } } }
+        '400': { description: 校验失败（项目名/服务名/镜像/端口/挂载/环境变量/重启策略/资源限制） }
+        '409': { description: compose.yaml 已被外部修改，拒绝覆盖 }
   /api/v1/containers/join-docker-group:
     post:
       tags: [containers]

@@ -315,7 +315,11 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/containers/compose", get(containers::compose_projects))
         // Compose 生命周期动作（写）：up/stop/restart/down，需 container.manage。
         // down 需手输项目名确认；down 永不带 -v（不删卷）。
-        .route("/api/v1/containers/compose/{project}/act", post(containers::compose_act));
+        .route("/api/v1/containers/compose/{project}/act", post(containers::compose_act))
+        // 面板编排（stack 定义）：读写 `<data_dir>/compose-stacks/` 里的文件。
+        // ⚠ 不检查 docker 可用性：改编排定义与 daemon 无关（见 routes/containers.rs 注释）。
+        .route("/api/v1/containers/stacks", get(containers::stack_list))
+        .route("/api/v1/containers/stacks/{project}", get(containers::stack_get).put(containers::stack_save));
 
     // ── 本机便签（025：多条，由 022 单例说明升级） ──
     let notes_r = Router::new()

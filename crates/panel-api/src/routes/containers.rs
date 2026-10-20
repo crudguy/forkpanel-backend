@@ -543,6 +543,65 @@ pub async fn compose_act(
 }
 
 
+// ─────────────── 面板编排（Compose stack 定义管理） ───────────────
+//
+// ⚠ 与上面的 compose 动作不同：这一组**不检查 docker 可用性**（不调 `ensure_supported`）。
+// 理由：这些端点只读写 `<data_dir>/compose-stacks/` 里的文件，与 daemon 毫无关系。
+// daemon 挂掉时用户仍然应该能改自己的编排定义（只是不能部署）。
+// 用 501 把"daemon 不可用"说成"没有编排功能"是撒谎。
+//
+// 安全前提：能进入 compose.yaml 的字段由 `ComposeStackService` **类型**限定，
+// 不存在 privileged / cap_add / pid / network_mode 等字段，也不接受用户直接提交 YAML。
+
+/// 保存编排的请求体。`project` 由路径给出，body 只带服务列表——
+/// 避免"路径说 A、body 说 B"这种自相矛盾的请求。
+#[derive(Debug, Deserialize)]
+pub struct StackSaveReq {
+    pub services: Vec<panel_os::ComposeStackService>,
+}
+
+/// 列出面板创建的编排项目。
+pub async fn stack_list(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::CONTAINER_VIEW)?;
+    let items = state.os.containers().compose_stacks().await?;
+    Ok(ok(items))
+}
+
+/// 读取单个编排项目。
+pub async fn stack_get(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    AxPath(project): AxPath<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::CONTAINER_VIEW)?;
+    let st = state.os.containers().compose_stack_get(&project).await?;
+    Ok(ok(st))
+}
+
+/// 创建或更新编排项目（幂等）。
+///
+/// 已存在且 `compose.yaml` 被外部改过 → 409，**不覆盖**用户的修改。
+pub async fn stack_save(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    AxPath(project): AxPath<String>,
+    Json(req): Json<StackSaveReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::CONTAINER_MANAGE)?;
+
+    let existed = state.os.containers().compose_stack_get(&project).await.is_ok();
+
+    let spec = panel_os::ComposeStackSpec { project: project.clone(), services: req.services };
+    let st = state.os.containers().compose_stack_save(spec).await?;
+
+    let action = if existed { "container.stack.update" } else { "container.stack.create" };
+    audit(&state, &s, action, &project, "ok").await;
+    Ok(ok(st))
+}
+
 // ─────────────── 一键安装 Docker ───────────────
 
 /// 安装请求。**二次确认词** `confirm_token` 必须为「安装 Docker」——

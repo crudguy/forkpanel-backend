@@ -478,6 +478,32 @@ impl DatabaseProvider for MockDatabases {
 
 pub struct MockContainers;
 
+/// mock 的编排存储（进程级）。
+///
+/// 用静态而不是给 `MockContainers` 加字段：它是 unit struct，构造点是
+/// `&MockContainers` 字面量，加字段要改一圈调用方；而 mock 的价值只是
+/// "让前端能走通创建→列表→详情"，进程级内存足够。
+///
+/// ⚠ 这是 **mock 专用**，生产路径永远走 `LinuxContainers` 落真实文件。
+static MOCK_STACKS: std::sync::OnceLock<std::sync::Mutex<Vec<ComposeStackSpec>>> =
+    std::sync::OnceLock::new();
+
+fn mock_stacks() -> &'static std::sync::Mutex<Vec<ComposeStackSpec>> {
+    MOCK_STACKS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// mock 里 stack 的"目录"是编出来的，只为让前端能显示出路径
+fn mock_stack_view(spec: &ComposeStackSpec) -> ComposeStack {
+    ComposeStack {
+        project: spec.project.clone(),
+        dir: format!("/var/lib/panel/compose-stacks/{}", spec.project),
+        config_file: format!("/var/lib/panel/compose-stacks/{}/compose.yaml", spec.project),
+        services: spec.services.clone(),
+        // mock 没有真实文件可比对，恒为 false（"面板自己写的就是最新的"）
+        externally_modified: false,
+    }
+}
+
 #[async_trait]
 impl ContainerProvider for MockContainers {
     fn engine(&self) -> ContainerEngine { ContainerEngine::Docker }
@@ -651,6 +677,35 @@ impl ContainerProvider for MockContainers {
         }
         let _ = action;
         Ok(())
+    }
+
+    async fn compose_stacks(&self) -> Result<Vec<ComposeStack>> {
+        let guard = mock_stacks().lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<ComposeStack> = guard.iter().map(mock_stack_view).collect();
+        out.sort_by(|a, b| a.project.cmp(&b.project));
+        Ok(out)
+    }
+
+    async fn compose_stack_get(&self, project: &str) -> Result<ComposeStack> {
+        crate::linux::containers::validate_compose_project(project)?;
+        let guard = mock_stacks().lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .iter()
+            .find(|s| s.project == project)
+            .map(mock_stack_view)
+            .ok_or_else(|| PanelError::NotFound(format!("编排项目不存在: {project}")))
+    }
+
+    async fn compose_stack_save(&self, spec: ComposeStackSpec) -> Result<ComposeStack> {
+        // 与真实实现**同口径校验**：否则 mock 下能保存的输入在真机会被拒，
+        // 前端联调会得出错误结论。
+        crate::linux::compose_stack::validate_stack_spec(&spec)?;
+        let mut guard = mock_stacks().lock().unwrap_or_else(|e| e.into_inner());
+        match guard.iter_mut().find(|s| s.project == spec.project) {
+            Some(slot) => *slot = spec.clone(),
+            None => guard.push(spec.clone()),
+        }
+        Ok(mock_stack_view(&spec))
     }
 }
 
