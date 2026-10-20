@@ -30,3 +30,6 @@ tls/
 
 # ── CI 运行缓存 ──
 ci/.cache/
+
+# 会话临时文件（AI 调试脚本等），不入库
+.workbuddy/
