@@ -2972,6 +2972,15 @@ paths:
         '400': { description: ID/名称非法 }
         '501': { description: 容器能力不可用 }
 
+  /api/v1/containers/stats:
+    get:
+      tags: [containers]
+      summary: 读取全部容器的资源用量快照（docker stats --no-stream --all，非流式）
+      responses:
+        '200':
+          description: ok，返回每容器一行用量快照（data 为 [name, cpu_perc, mem_usage, mem_perc, net_io, block_io, pids]，均为 docker 格式化串）
+          content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { type: object, properties: { name: { type: string }, cpu_perc: { type: string }, mem_usage: { type: string }, mem_perc: { type: string }, net_io: { type: string }, block_io: { type: string }, pids: { type: string } } } } } } } }
+        '501': { description: 容器能力不可用 }
 /api/v1/containers/join-docker-group:
     post:
       tags: [containers]

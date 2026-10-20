@@ -550,6 +550,31 @@ impl ContainerProvider for MockContainers {
             .collect();
         Ok(lines)
     }
+
+    async fn stats_all(&self) -> Result<Vec<ContainerStatsLine>> {
+        // mock 不真正调用 docker：造两行样例资源快照，便于前端联调「资源」Tab。
+        // 形态与 `docker stats --no-stream --format` 一致（百分比/用量为人读串）。
+        Ok(vec![
+            ContainerStatsLine {
+                name: "mock-web".into(),
+                cpu_perc: "1.52%".into(),
+                mem_usage: "12.5MiB / 2GiB".into(),
+                mem_perc: "0.61%".into(),
+                net_io: "1.2MB / 800kB".into(),
+                block_io: "50MB / 0B".into(),
+                pids: "8".into(),
+            },
+            ContainerStatsLine {
+                name: "mock-db".into(),
+                cpu_perc: "0.05%".into(),
+                mem_usage: "128MiB / 2GiB".into(),
+                mem_perc: "6.25%".into(),
+                net_io: "0B / 0B".into(),
+                block_io: "820MB / 12MB".into(),
+                pids: "24".into(),
+            },
+        ])
+    }
 }
 
 #[async_trait]

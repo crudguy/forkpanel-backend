@@ -1567,6 +1567,27 @@ pub struct ContainerLogsOpts {
     pub timestamps: bool,
 }
 
+/// 单个容器的资源用量快照（等价 `docker stats --no-stream` 的一行）。
+/// 百分比/用量一律用**字符串**回传：`docker stats` 的输出本就是给人看的格式化串
+/// （如 `1.52%`、`12.5MiB / 2GiB`、`1.2MB / 800kB`），后端不做二次解析，
+/// 避免把 "0B" / "--" / 空值之类边界形态算错。前端等宽展示即可。
+#[derive(Debug, Clone, Serialize)]
+pub struct ContainerStatsLine {
+    pub name: String,
+    /// CPU 使用率，如 `1.52%`。
+    pub cpu_perc: String,
+    /// 内存用量，如 `12.5MiB / 2GiB`。
+    pub mem_usage: String,
+    /// 内存使用率，如 `0.61%`。
+    pub mem_perc: String,
+    /// 网络 IO，如 `1.2MB / 800kB`。
+    pub net_io: String,
+    /// 块设备 IO，如 `50MB / 0B`。
+    pub block_io: String,
+    /// 进程/线程数，如 `8`。
+    pub pids: String,
+}
+
 /// 容器生命周期动作。声明式——由平台实现翻译成具体 CLI 子命令，
 /// 业务层不出现 `start`/`stop` 之类命令字面量。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1647,6 +1668,10 @@ pub trait ContainerProvider: Send + Sync {
     /// `opts.tail` 上限 2000 行；`opts.timestamps` 控制是否带 RFC3339 前缀。
     /// 读操作，需 container.view；实现必须先校验 id 字符集。
     async fn logs(&self, id: &str, opts: ContainerLogsOpts) -> Result<Vec<ContainerLogLine>>;
+    /// 读取**全部**容器的资源用量快照（等价 `docker stats --no-stream --all`）。
+    /// 只读、一次性快照（不带流式 `--follow`，否则阻塞）；读操作需 container.view。
+    /// 无 id 参数（一次返回所有容器），故无参数注入面。
+    async fn stats_all(&self) -> Result<Vec<ContainerStatsLine>>;
 }
 
 // ═══════════════════════════ 终端 ═══════════════════════════

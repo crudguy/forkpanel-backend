@@ -305,7 +305,8 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/containers/join-docker-group", post(containers::join_docker_group))
         // 容器备注（022）：容器不入库，存 container_remarks 引用表；读写不强制 Docker 可达
         .route("/api/v1/containers/{id}/remark", get(containers::get_remark).patch(containers::update_remark))
-        .route("/api/v1/containers/{id}/logs", get(containers::logs));
+        .route("/api/v1/containers/{id}/logs", get(containers::logs))
+        .route("/api/v1/containers/stats", get(containers::stats));
 
     // ── 本机便签（025：多条，由 022 单例说明升级） ──
     let notes_r = Router::new()

@@ -15,11 +15,12 @@
 //! ## 已提供与边界
 //! 已实现：列举 / 镜像 / `create`（= `docker create`，**默认不启动**而非 `docker run`）
 //! / `pull` / 生命周期（start/stop/restart/rm/rm -f）/ 安装 / 加组 / **日志查看**
-//! （`docker logs`，只读最近 N 行快照，不带 --follow）。
+//! （`docker logs`，只读最近 N 行快照，不带 --follow）/ **资源用量快照**
+//! （`docker stats --no-stream --all`，只读一次性快照，不带流式否则阻塞）。
 //! `create` 的宿主机任意代码执行风险由 `validate_create` 强制拦截：禁 `--privileged`、
 //! 禁挂载 `/` `/etc` `/proc` `/sys` `/var/run/docker.sock`，且路由层需二次确认词
 //! 「创建容器」。
-//! **未提供**：镜像删除（磁盘回收风险，刻意不开放）；`docker exec` / `stats`、
+//! **未提供**：镜像删除（磁盘回收风险，刻意不开放）；`docker exec`、
 //! 网络 / 卷管理、compose / stack 暂未实现（非安全刻意排除，后续可补）。
 
 use crate::cmd::{Bin, CmdOpt};
@@ -319,6 +320,31 @@ impl ContainerProvider for LinuxContainers {
         LinuxContainers::check(&out, "docker logs")?;
         Ok(parse_logs(&out.stdout, opts.timestamps))
     }
+
+    async fn stats_all(&self) -> Result<Vec<ContainerStatsLine>> {
+        self.ensure_ready()?;
+        // `--no-stream`：一次性快照后 CLI 立即退出。若用默认流式模式，stdout 不 EOF、
+        // `docker stats` 会一直跑下去，把请求挂死——与 logs 不带 --follow 同理。
+        // `--all`：连已停止的容器一并列出（其用量为空，前端展示「—」）。
+        // 无 id 参数 → 无参数注入面；format 里的字段名是编译期常量，不经用户输入。
+        let args = [
+            "stats",
+            "--no-stream",
+            "--all",
+            "--format",
+            // 字段间用 Tab 分隔：用量串（如 "12.5MiB / 2GiB"）本身含空格，
+            // 用空格分隔会被撕裂，Tab 才是安全分隔符。
+            "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}\t{{.PIDs}}",
+        ];
+        let out = crate::cmd::run(
+            Bin::Docker,
+            &args,
+            CmdOpt { timeout: Duration::from_secs(20), ..Default::default() },
+        )
+        .await?;
+        LinuxContainers::check(&out, "docker stats")?;
+        Ok(parse_stats(&out.stdout))
+    }
 }
 
 /// 解析 `docker logs` 输出（不带 --follow）：每行一条，stdout/stderr 已合并。
@@ -337,6 +363,30 @@ fn parse_logs(stdout: &str, with_ts: bool) -> Vec<ContainerLogLine> {
             } else {
                 ContainerLogLine { ts: None, text: l.to_string() }
             }
+        })
+        .collect()
+}
+
+/// 解析 `docker stats --no-stream` 输出：每行一条，按 Tab 拆 7 段。
+/// 字段不足的行直接跳过（容器刚起、daemon 尚未采样时会吐空行或短行），
+/// 不做臆测填充——缺数据时宁可少一行，也不要造一个假用量。
+fn parse_stats(stdout: &str) -> Vec<ContainerStatsLine> {
+    stdout
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            if f.len() != 7 {
+                return None;
+            }
+            Some(ContainerStatsLine {
+                name: f[0].to_string(),
+                cpu_perc: f[1].to_string(),
+                mem_usage: f[2].to_string(),
+                mem_perc: f[3].to_string(),
+                net_io: f[4].to_string(),
+                block_io: f[5].to_string(),
+                pids: f[6].to_string(),
+            })
         })
         .collect()
 }
@@ -655,5 +705,38 @@ mod tests {
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].ts, None);
         assert_eq!(v[0].text, "2026-10-20T08:00:00Z-no-space");
+    }
+
+    #[test]
+    fn parse_stats_plain() {
+        // 用量串本身含空格（"12.5MiB / 2GiB"），只有 Tab 分隔才拆得对
+        let line = "web\t1.52%\t12.5MiB / 2GiB\t0.61%\t1.2MB / 800kB\t50MB / 0B\t8";
+        let v = parse_stats(&format!("{line}\n"));
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].name, "web");
+        assert_eq!(v[0].cpu_perc, "1.52%");
+        assert_eq!(v[0].mem_usage, "12.5MiB / 2GiB");
+        assert_eq!(v[0].mem_perc, "0.61%");
+        assert_eq!(v[0].net_io, "1.2MB / 800kB");
+        assert_eq!(v[0].block_io, "50MB / 0B");
+        assert_eq!(v[0].pids, "8");
+    }
+
+    #[test]
+    fn parse_stats_skips_short_and_empty_lines() {
+        // 容器刚起 / daemon 未采样时会吐空行或字段不足的行：跳过而非造数据
+        let raw = "web\t1.52%\t12.5MiB / 2GiB\t0.61%\t1.2MB / 800kB\t50MB / 0B\t8\n\nshort\t1%\ncache\t0%\t0B / 0B\t0%\t0B / 0B\t0B / 0B\t2\n";
+        let v = parse_stats(raw);
+        assert_eq!(v.len(), 2, "只保留两行完整数据，空行与短行被跳过");
+        assert_eq!(v[0].name, "web");
+        assert_eq!(v[1].name, "cache");
+    }
+
+    #[test]
+    fn parse_stats_rejects_space_separated_fake() {
+        // 负向对照：若实现误用空格分隔，"12.5MiB / 2GiB" 会被撕裂成 9 段而被拒。
+        // 断言「撕裂的行进不来」，防止将来有人把分隔符从 Tab 改成空格。
+        let bad = "web 1.52% 12.5MiB / 2GiB 0.61% 1.2MB / 800kB 50MB / 0B 8";
+        assert!(parse_stats(bad).is_empty(), "空格分隔不得被解析成合法行");
     }
 }
