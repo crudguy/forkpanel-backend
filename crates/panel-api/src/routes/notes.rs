@@ -23,6 +23,7 @@ use axum::{
 };
 use panel_core::PanelError;
 use serde::Deserialize;
+use crate::extract::PanelJson;
 
 /// 单条内容上限（与设计文档一致：长说明应写成文档而非备注）
 const REMARK_MAX: usize = 500;
@@ -79,7 +80,7 @@ pub async fn list(State(state): State<Shared>, Auth(_s): Auth) -> ApiResult<Json
 pub async fn create(
     State(state): State<Shared>,
     Auth(s): Auth,
-    Json(req): Json<NoteReq>,
+    PanelJson(req): PanelJson<NoteReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SYSTEM_MANAGE)?;
     let content = check_content(&req.content)?;
@@ -118,7 +119,7 @@ pub async fn update(
     State(state): State<Shared>,
     Auth(s): Auth,
     AxPath(id): AxPath<i64>,
-    Json(req): Json<NoteReq>,
+    PanelJson(req): PanelJson<NoteReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SYSTEM_MANAGE)?;
     let content = check_content(&req.content)?;

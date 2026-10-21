@@ -36,6 +36,7 @@ use axum::{
 use panel_core::PanelError;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use crate::extract::PanelJson;
 
 const UPLOAD_META: &str = "meta.json";
 /// 分片大小：服务端定档（见模块头第 3 条）。
@@ -179,7 +180,7 @@ pub struct InitReq {
 
 /// 开始一次分片上传。返回 `upload_id` 与服务端定档的分片大小。
 pub async fn init(
-    State(state): State<Shared>, Auth(s): Auth, Json(req): Json<InitReq>,
+    State(state): State<Shared>, Auth(s): Auth, PanelJson(req): PanelJson<InitReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FILE_WRITE)?;
     if req.size == 0 {

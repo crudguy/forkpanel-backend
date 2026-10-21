@@ -1,4 +1,5 @@
 use super::*;
+use crate::extract::PanelJson;
 
 
 pub async fn list(
@@ -52,7 +53,7 @@ pub struct CreateReq {
 pub async fn create(
     State(state): State<Shared>,
     Auth(s): Auth,
-    Json(req): Json<CreateReq>,
+    PanelJson(req): PanelJson<CreateReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SITE_MANAGE)?;
     // 没有 Web 服务器底座就不许建站：否则用户拿到一个「建好了但永远打不开」的
@@ -425,7 +426,7 @@ pub async fn update_remark(
     State(state): State<Shared>,
     Auth(s): Auth,
     AxPath(id): AxPath<i64>,
-    Json(req): Json<RemarkReq>,
+    PanelJson(req): PanelJson<RemarkReq>,
 ) -> ApiResult<StatusCode> {
     crate::auth::require(&s, perm::SITE_MANAGE)?;
     // 先读后写：站点不存在返回 404（校验必须在读路径上，不能塞进 db.exec 闭包，
@@ -456,7 +457,7 @@ pub async fn patch(
     State(state): State<Shared>,
     Auth(s): Auth,
     AxPath(id): AxPath<i64>,
-    Json(req): Json<PatchReq>,
+    PanelJson(req): PanelJson<PatchReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SITE_MANAGE)?;
     let cur = fetch_one(&state, id)

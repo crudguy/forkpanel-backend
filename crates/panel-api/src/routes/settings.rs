@@ -25,6 +25,7 @@ use panel_core::PanelError;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use crate::extract::PanelJson;
 
 const K_LLM_ENDPOINT: &str = "assistant.llm_endpoint";
 const K_LLM_MODEL: &str = "assistant.llm_model";
@@ -182,7 +183,7 @@ async fn load_table(state: &Shared) -> ApiResult<BTreeMap<String, String>> {
 pub async fn patch(
     State(state): State<Shared>,
     Auth(s): Auth,
-    Json(req): Json<PatchReq>,
+    PanelJson(req): PanelJson<PatchReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SETTINGS_MANAGE)?;
     if req.settings.is_empty() {
@@ -382,7 +383,7 @@ fn plain_api_key(state: &Shared, raw: &str) -> Option<String> {
 pub async fn test_llm(
     State(state): State<Shared>,
     Auth(s): Auth,
-    Json(req): Json<TestLlmReq>,
+    PanelJson(req): PanelJson<TestLlmReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SETTINGS_MANAGE)?;
 

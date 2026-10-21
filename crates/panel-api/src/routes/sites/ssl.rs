@@ -1,4 +1,5 @@
 use super::*;
+use crate::extract::PanelJson;
 
 /// 自签证书有效期（天）。825 天对齐主流浏览器对单张证书的最长信任上限。
 const SELF_SIGNED_DAYS: u32 = 825;
@@ -178,7 +179,7 @@ pub async fn ssl_apply(
     State(state): State<Shared>,
     Auth(s): Auth,
     AxPath(id): AxPath<i64>,
-    Json(req): Json<SslApplyReq>,
+    PanelJson(req): PanelJson<SslApplyReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SSL_MANAGE)?;
     // 无 Web 服务器底座时拒发证书：证书没有进程可加载，只会制造
@@ -679,7 +680,7 @@ pub async fn cert_auto_renew(
     State(state): State<Shared>,
     Auth(s): Auth,
     AxPath(id): AxPath<i64>,
-    Json(req): Json<AutoRenewReq>,
+    PanelJson(req): PanelJson<AutoRenewReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SSL_MANAGE)?;
     if req.enabled

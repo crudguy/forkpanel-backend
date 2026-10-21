@@ -28,6 +28,7 @@ use panel_core::{PanelError, Result, SafePath};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use crate::extract::PanelJson;
 
 #[derive(Debug, Serialize)]
 pub struct ConnDto {
@@ -141,7 +142,7 @@ pub struct CreateReq {
 }
 
 pub async fn create(
-    State(state): State<Shared>, Auth(s): Auth, Json(req): Json<CreateReq>,
+    State(state): State<Shared>, Auth(s): Auth, PanelJson(req): PanelJson<CreateReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_MANAGE)?;
 
@@ -206,7 +207,7 @@ pub async fn update(
     State(state): State<Shared>,
     Auth(s): Auth,
     AxPath(id): AxPath<i64>,
-    Json(req): Json<UpdateReq>,
+    PanelJson(req): PanelJson<UpdateReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_MANAGE)?;
     let cur = fetch_conn(&state, id)
@@ -380,7 +381,7 @@ pub async fn update_remark(
     State(state): State<Shared>,
     Auth(s): Auth,
     AxPath(conn): AxPath<String>,
-    Json(req): Json<ConnRemarkReq>,
+    PanelJson(req): PanelJson<ConnRemarkReq>,
 ) -> ApiResult<StatusCode> {
     crate::auth::require(&s, perm::DB_MANAGE)?;
     let id: i64 = state
@@ -417,7 +418,7 @@ pub async fn update_remark(
 }
 
 pub async fn backup(
-    State(state): State<Shared>, Auth(s): Auth, Json(req): Json<BackupReq>,
+    State(state): State<Shared>, Auth(s): Auth, PanelJson(req): PanelJson<BackupReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_MANAGE)?;
 
@@ -527,7 +528,7 @@ pub async fn restore(
     State(state): State<Shared>,
     Auth(s): Auth,
     AxPath(conn): AxPath<i64>,
-    Json(req): Json<RestoreReq>,
+    PanelJson(req): PanelJson<RestoreReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_MANAGE)?;
 
@@ -1005,7 +1006,7 @@ pub async fn sql_meta(
 /// provider 层会诚实 501。
 pub async fn query(
     State(state): State<Shared>, Auth(s): Auth,
-    AxPath(conn): AxPath<i64>, Json(req): Json<QueryReq>,
+    AxPath(conn): AxPath<i64>, PanelJson(req): PanelJson<QueryReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_VIEW)?;
     validate_read_only_sql(&req.sql)?;

@@ -22,6 +22,7 @@ use panel_core::PanelError;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use crate::extract::PanelJson;
 
 const K_ONBOARDING: &str = "onboarding.state";
 
@@ -191,7 +192,7 @@ pub async fn get(State(state): State<Shared>, Auth(_s): Auth) -> ApiResult<Json<
 pub async fn put(
     State(state): State<Shared>,
     Auth(s): Auth,
-    Json(body): Json<Value>,
+    PanelJson(body): PanelJson<Value>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SETTINGS_MANAGE)?;
 

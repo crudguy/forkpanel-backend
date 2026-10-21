@@ -29,6 +29,7 @@ use panel_core::PanelError;
 use panel_os::WafProfile;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
+use crate::extract::PanelJson;
 
 /// 模板名长度上限（与便签 500 不同：模板名是下拉/列表里的短标识）
 const NAME_MAX: usize = 64;
@@ -178,7 +179,7 @@ pub async fn get(
 pub async fn create(
     State(state): State<Shared>,
     Auth(s): Auth,
-    Json(req): Json<TplReq>,
+    PanelJson(req): PanelJson<TplReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SITE_MANAGE)?;
     let n = normalize(&req)?;
@@ -222,7 +223,7 @@ pub async fn update(
     State(state): State<Shared>,
     Auth(s): Auth,
     AxPath(id): AxPath<i64>,
-    Json(req): Json<TplReq>,
+    PanelJson(req): PanelJson<TplReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SITE_MANAGE)?;
     let n = normalize(&req)?;

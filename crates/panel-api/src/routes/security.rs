@@ -11,6 +11,7 @@ use axum::extract::{Path as AxPath, State};
 use axum::{Json, http::StatusCode};
 use serde::Deserialize;
 use serde_json::json;
+use crate::extract::PanelJson;
 
 /// 只读安全基线扫描。
 pub async fn baseline(
@@ -58,7 +59,7 @@ pub struct BaselineApplyReq {
 pub async fn baseline_apply(
     State(state): State<Shared>,
     Auth(s): Auth,
-    Json(req): Json<BaselineApplyReq>,
+    PanelJson(req): PanelJson<BaselineApplyReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SECURITY_MANAGE)?;
     if !is_apply_confirm(&req.confirm_token) {

@@ -27,6 +27,7 @@ use axum::{
 };
 use panel_core::PanelError;
 use serde::{Deserialize, Serialize};
+use crate::extract::PanelJson;
 
 const COLS: &str = "name, permissions, created_at";
 const ROLE_NAME_MIN: usize = 2;
@@ -165,7 +166,7 @@ pub struct CreateRoleReq {
 }
 
 pub async fn create(
-    State(state): State<Shared>, Auth(s): Auth, Json(req): Json<CreateRoleReq>,
+    State(state): State<Shared>, Auth(s): Auth, PanelJson(req): PanelJson<CreateRoleReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::USER_MANAGE)?;
     let name = req.name.trim().to_lowercase();
@@ -213,7 +214,7 @@ pub struct RolePermsReq {
 /// 修改自定义角色的权限（不开放改名，理由见模块头）。
 pub async fn patch(
     State(state): State<Shared>, Auth(s): Auth,
-    AxPath(name): AxPath<String>, Json(req): Json<RolePermsReq>,
+    AxPath(name): AxPath<String>, PanelJson(req): PanelJson<RolePermsReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::USER_MANAGE)?;
     if BUILTIN_ROLES.contains(&name.as_str()) {

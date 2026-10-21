@@ -25,6 +25,7 @@ use panel_core::{PanelError, Result, SafePath};
 use panel_os::EntryKind;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use crate::extract::PanelJson;
 
 /// 单次读取的上限。**刻意不允许一次读完大文件**：
 /// 编辑器场景用 `offset`+`len` 分块，下载走流式。
@@ -278,7 +279,7 @@ pub struct WriteReq {
 pub async fn write(
     State(state): State<Shared>,
     Auth(s): Auth,
-    Json(req): Json<WriteReq>,
+    PanelJson(req): PanelJson<WriteReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FILE_WRITE)?;
     // 写目标**可能尚不存在**（新建文件）。必须走 resolve_new(create=true)：
@@ -317,7 +318,7 @@ pub async fn write(
 pub struct MkdirReq { pub path: String, pub recursive: Option<bool> }
 
 pub async fn mkdir(
-    State(state): State<Shared>, Auth(s): Auth, Json(req): Json<MkdirReq>,
+    State(state): State<Shared>, Auth(s): Auth, PanelJson(req): PanelJson<MkdirReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FILE_WRITE)?;
     // 目标目录**尚不存在**，必须走 resolve_new(create=true)：resolve 会 canonicalize
@@ -332,7 +333,7 @@ pub async fn mkdir(
 pub struct DeleteReq { pub path: String, pub allow_dir: Option<bool> }
 
 pub async fn remove(
-    State(state): State<Shared>, Auth(s): Auth, Json(req): Json<DeleteReq>,
+    State(state): State<Shared>, Auth(s): Auth, PanelJson(req): PanelJson<DeleteReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FILE_WRITE)?;
     let p = resolve(&state, &s, &req.path)?;
@@ -453,7 +454,7 @@ async fn trash_one(state: &Shared, p: &SafePath) -> Result<serde_json::Value> {
 /// 移入回收站（软删除）。与 `remove`（永久删除）刻意分成两个端点：
 /// 用户误删是高频事件，恢复路径必须存在。
 pub async fn trash(
-    State(state): State<Shared>, Auth(s): Auth, Json(req): Json<TrashReq>,
+    State(state): State<Shared>, Auth(s): Auth, PanelJson(req): PanelJson<TrashReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FILE_WRITE)?;
     let p = resolve(&state, &s, &req.path)?;
@@ -501,7 +502,7 @@ pub struct TrashIdReq { pub id: String }
 /// **恢复目标重新走完整沙箱**（`resolve_new`）：回收站元数据是磁盘上的普通文件，
 /// 不能因为"是我们自己写的"就信任——被篡改的 meta 可以指向任意路径。
 pub async fn trash_restore(
-    State(state): State<Shared>, Auth(s): Auth, Json(req): Json<TrashIdReq>,
+    State(state): State<Shared>, Auth(s): Auth, PanelJson(req): PanelJson<TrashIdReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FILE_WRITE)?;
     if !is_valid_trash_id(&req.id) {
@@ -547,7 +548,7 @@ pub struct TrashPurgeReq { pub id: Option<String> }
 
 /// 彻底删除：给 `id` 删一条，不给则**清空**回收站。返回删除条数。
 pub async fn trash_purge(
-    State(state): State<Shared>, Auth(s): Auth, Json(req): Json<TrashPurgeReq>,
+    State(state): State<Shared>, Auth(s): Auth, PanelJson(req): PanelJson<TrashPurgeReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FILE_WRITE)?;
     let root = trash_root(&state);
@@ -581,7 +582,7 @@ pub async fn trash_purge(
 pub struct RenameReq { pub from: String, pub to: String, pub copy: Option<bool> }
 
 pub async fn rename(
-    State(state): State<Shared>, Auth(s): Auth, Json(req): Json<RenameReq>,
+    State(state): State<Shared>, Auth(s): Auth, PanelJson(req): PanelJson<RenameReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FILE_WRITE)?;
     // from 必须已存在（resolve）；to 通常是**尚不存在的新名字**，必须 resolve_new，
@@ -606,7 +607,7 @@ pub async fn rename(
 pub struct ChmodReq { pub path: String, pub mode: String, pub recursive: Option<bool> }
 
 pub async fn chmod(
-    State(state): State<Shared>, Auth(s): Auth, Json(req): Json<ChmodReq>,
+    State(state): State<Shared>, Auth(s): Auth, PanelJson(req): PanelJson<ChmodReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FILE_WRITE)?;
     let p = resolve(&state, &s, &req.path)?;
@@ -760,7 +761,7 @@ pub struct ActionItem {
 
 pub async fn action(
     State(state): State<Shared>, Auth(s): Auth,
-    Json(req): Json<ActionReq>,
+    PanelJson(req): PanelJson<ActionReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FILE_WRITE)?;
 

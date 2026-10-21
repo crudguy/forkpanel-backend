@@ -26,6 +26,7 @@ use panel_os::version_major_jump;
 use serde::{Deserialize, Serialize};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
+use crate::extract::PanelJson;
 
 /// 超过这个时长的操作必须走任务队列。
 ///
@@ -155,7 +156,7 @@ pub async fn act(
     State(state): State<Shared>,
     Auth(s): Auth,
     AxPath(name): AxPath<String>,
-    Json(req): Json<ActionReq>,
+    PanelJson(req): PanelJson<ActionReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SERVICE_MANAGE)?;
 
@@ -245,7 +246,7 @@ pub async fn show(
 async fn do_unit_action(
     state: Shared, s: crate::auth::Session, name: String, action: &str,
 ) -> ApiResult<Json<serde_json::Value>> {
-    act(State(state), Auth(s), AxPath(name), Json(ActionReq { action: action.into(), enable: None })).await
+    act(State(state), Auth(s), AxPath(name), PanelJson(ActionReq { action: action.into(), enable: None })).await
 }
 
 pub async fn start(
@@ -274,7 +275,7 @@ pub struct EnabledReq { pub enabled: bool }
 
 pub async fn set_enabled(
     State(state): State<Shared>, Auth(s): Auth,
-    AxPath(name): AxPath<String>, Json(req): Json<EnabledReq>,
+    AxPath(name): AxPath<String>, PanelJson(req): PanelJson<EnabledReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SERVICE_MANAGE)?;
     let unit = panel_core::unit_name(&name)
@@ -366,7 +367,7 @@ pub async fn config_get(
 
 pub async fn config_put(
     State(state): State<Shared>, Auth(s): Auth,
-    AxPath(name): AxPath<String>, Json(req): Json<ConfigPutReq>,
+    AxPath(name): AxPath<String>, PanelJson(req): PanelJson<ConfigPutReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SERVICE_MANAGE)?;
     if !state.capabilities.get(cap_keys::SERVICE_MANAGE).map(|c| c.supported).unwrap_or(false) {

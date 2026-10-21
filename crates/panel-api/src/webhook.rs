@@ -20,6 +20,7 @@ use panel_core::PanelError;
 use panel_os::cmd::{Bin, CmdOpt};
 use serde_json::Value;
 use std::time::Duration;
+use crate::extract::PanelJson;
 
 /// 校验 Webhook URL：仅 http/https、长度有界、无控制字符/空格。
 pub fn validate_url(url: &str) -> Result<(), PanelError> {
@@ -93,7 +94,7 @@ pub struct TestReq {
 pub async fn test(
     State(state): State<Shared>,
     Auth(s): Auth,
-    Json(req): Json<TestReq>,
+    PanelJson(req): PanelJson<TestReq>,
 ) -> ApiResult<Json<Value>> {
     crate::auth::require(&s, perm::SYSTEM_MANAGE)?;
     // Webhook 投递不依赖 scheduler 能力；curl 可用性在 fire 内判定。

@@ -13,6 +13,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use crate::extract::PanelJson;
 
 #[derive(Debug, Deserialize)]
 pub struct LoginReq {
@@ -38,7 +39,7 @@ pub struct MeResp {
 pub async fn login(
     State(state): State<Shared>,
     headers: HeaderMap,
-    Json(req): Json<LoginReq>,
+    PanelJson(req): PanelJson<LoginReq>,
 ) -> ApiResult<(HeaderMap, StatusCode)> {
     if req.username.is_empty() || req.password.is_empty() {
         return Err(ApiError::bad_request("username", "required"));
@@ -277,7 +278,7 @@ pub async fn change_password(
     State(state): State<Shared>,
     Auth(s): Auth,
     CurrentSid(cur): CurrentSid,
-    Json(req): Json<PwdReq>,
+    PanelJson(req): PanelJson<PwdReq>,
 ) -> ApiResult<StatusCode> {
     auth::check_password_policy(&req.new)?;
     if req.old == req.new {
@@ -489,7 +490,7 @@ pub async fn mfa_enroll(
 pub async fn mfa_verify(
     State(state): State<Shared>,
     Auth(s): Auth,
-    Json(req): Json<MfaCodeReq>,
+    PanelJson(req): PanelJson<MfaCodeReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let (secret_enc, _codes, enabled) = mfa_material(&state, s.user_id).await?;
     if enabled.is_some() {
@@ -526,7 +527,7 @@ pub async fn mfa_verify(
 pub async fn mfa_disable(
     State(state): State<Shared>,
     Auth(s): Auth,
-    Json(req): Json<MfaCodeReq>,
+    PanelJson(req): PanelJson<MfaCodeReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let (secret_enc, codes, enabled) = mfa_material(&state, s.user_id).await?;
     if enabled.is_none() {
@@ -557,7 +558,7 @@ pub async fn mfa_disable(
 
 pub async fn bootstrap(
     State(state): State<Shared>,
-    Json(req): Json<BootstrapReq>,
+    PanelJson(req): PanelJson<BootstrapReq>,
 ) -> ApiResult<StatusCode> {
     // 1) 已有 owner → 409（只读检查；防重放，后写事务还会再查一次）
     if owner_count(&state).await? > 0 {

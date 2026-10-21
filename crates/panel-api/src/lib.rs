@@ -21,6 +21,7 @@
 
 pub mod auth;
 pub mod ratelimit;
+pub mod extract;
 pub mod error;
 pub mod middleware;
 pub mod remote_store;

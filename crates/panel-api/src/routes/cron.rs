@@ -23,6 +23,7 @@ use axum::{
 use panel_core::{cap_keys, PanelError, Result};
 use std::time::Duration;
 use serde::{Deserialize, Serialize};
+use crate::extract::PanelJson;
 
 #[derive(Debug, Serialize)]
 pub struct JobDto {
@@ -180,7 +181,7 @@ fn check_timeout(sec: Option<i64>) -> ApiResult<i64> {
 }
 
 pub async fn create(
-    State(state): State<Shared>, Auth(s): Auth, Json(req): Json<CreateReq>,
+    State(state): State<Shared>, Auth(s): Auth, PanelJson(req): PanelJson<CreateReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::CRON_MANAGE)?;
     if !state.capabilities.get(cap_keys::SCHEDULER_MANAGE).map(|c| c.supported).unwrap_or(false) {
@@ -332,7 +333,7 @@ pub struct PatchReq {
 
 pub async fn patch_job(
     State(state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<String>,
-    Json(req): Json<PatchReq>,
+    PanelJson(req): PanelJson<PatchReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::CRON_MANAGE)?;
     if !state.capabilities.get(cap_keys::SCHEDULER_MANAGE).map(|c| c.supported).unwrap_or(false) {
@@ -601,7 +602,7 @@ pub struct PreviewReq {
 /// **纯计算零副作用**：表达式合法性仍由平台校验（与 create 同一入口），
 /// 时刻计算委托 provider 的 `next_fire_times`（本地时区语义，已回归测试钉死）。
 pub async fn preview(
-    State(state): State<Shared>, Auth(s): Auth, Json(req): Json<PreviewReq>,
+    State(state): State<Shared>, Auth(s): Auth, PanelJson(req): PanelJson<PreviewReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::CRON_VIEW)?;
     if !state.capabilities.get(cap_keys::SCHEDULER_MANAGE).map(|c| c.supported).unwrap_or(false) {

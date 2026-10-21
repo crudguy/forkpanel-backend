@@ -19,6 +19,7 @@ use axum::{extract::State, Json};
 use panel_core::PanelError;
 use rusqlite::OptionalExtension;
 use serde::Deserialize;
+use crate::extract::PanelJson;
 
 const THRESHOLD_DEFAULT: i64 = 50;
 const WINDOW_DEFAULT: i64 = 5;
@@ -76,7 +77,7 @@ pub struct AlertCfgReq {
 pub async fn put_alert(
     State(state): State<Shared>,
     Auth(s): Auth,
-    Json(req): Json<AlertCfgReq>,
+    PanelJson(req): PanelJson<AlertCfgReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SITE_MANAGE)?;
     let cur = load_cfg(&state).await?;

@@ -1,4 +1,5 @@
 use super::*;
+use crate::extract::PanelJson;
 
 //
 // 背景：面板托管的配置是「表单 → render → validate → 下发」的产物。手动维护
@@ -216,7 +217,7 @@ pub async fn log_clear(
     State(state): State<Shared>,
     Auth(s): Auth,
     AxPath(id): AxPath<i64>,
-    Json(req): Json<SiteLogClearReq>,
+    PanelJson(req): PanelJson<SiteLogClearReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SITE_MANAGE)?;
     let row = fetch_one(&state, id)
@@ -292,7 +293,7 @@ pub async fn conf_put(
     State(state): State<Shared>,
     Auth(s): Auth,
     AxPath(id): AxPath<i64>,
-    Json(req): Json<ConfPutReq>,
+    PanelJson(req): PanelJson<ConfPutReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SITE_MANAGE)?;
     if s.role != "owner" {
@@ -609,7 +610,7 @@ pub async fn conf_rollback(
     State(state): State<Shared>,
     Auth(s): Auth,
     AxPath(id): AxPath<i64>,
-    Json(req): Json<ConfRollbackReq>,
+    PanelJson(req): PanelJson<ConfRollbackReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SITE_MANAGE)?;
     if s.role != "owner" {

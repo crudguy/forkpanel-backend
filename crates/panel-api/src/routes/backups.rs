@@ -38,6 +38,7 @@ use panel_core::{cap_keys, PanelError, Result, SafePath};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
+use crate::extract::PanelJson;
 
 /// 当前只实装这两类；`db` 见 `/api/v1/db/{conn}/backup`（另一条线）。
 const KINDS: &[&str] = &["panel", "site"];
@@ -342,7 +343,7 @@ pub struct CreateReq {
 pub async fn create(
     State(state): State<Shared>,
     Auth(s): Auth,
-    Json(req): Json<CreateReq>,
+    PanelJson(req): PanelJson<CreateReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::BACKUP_MANAGE)?;
     let (kind, target, dest) = validate_target(&state, &req.kind, &req.target, &req.dest_dir).await?;
@@ -400,7 +401,7 @@ pub async fn patch(
     State(state): State<Shared>,
     Auth(s): Auth,
     AxPath(id): AxPath<i64>,
-    Json(req): Json<PatchReq>,
+    PanelJson(req): PanelJson<PatchReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::BACKUP_MANAGE)?;
     let full = fetch_plan_full(&state, id).await?
@@ -980,7 +981,7 @@ pub async fn restore(
     State(state): State<Shared>,
     Auth(s): Auth,
     AxPath(id): AxPath<i64>,
-    Json(req): Json<RestoreReq>,
+    PanelJson(req): PanelJson<RestoreReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::BACKUP_MANAGE)?;
     if !state.capabilities.get(cap_keys::BACKUP_MANAGE).map(|c| c.supported).unwrap_or(false) {
@@ -1221,7 +1222,7 @@ pub struct TestRemoteReq {
 pub async fn test_remote(
     State(state): State<Shared>,
     Auth(s): Auth,
-    Json(req): Json<TestRemoteReq>,
+    PanelJson(req): PanelJson<TestRemoteReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::BACKUP_MANAGE)?;
     let (cur, cur_secret) = match req.plan_id {

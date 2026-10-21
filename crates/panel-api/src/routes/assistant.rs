@@ -19,6 +19,7 @@ use panel_os::{LogQuery, ProcessInfo, ProcessSort, ServiceFilter, ServiceState, 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
+use crate::extract::PanelJson;
 
 /// 进程采样差分窗口。`top_processes` 与 `snapshot` 共享同一 prev 采样点，
 /// 窗口太短会让 CPU% 退化为 tick 量化噪声。
@@ -513,7 +514,7 @@ async fn generate_narrative(
 pub async fn diagnose(
     State(state): State<Shared>,
     Auth(s): Auth,
-    Json(req): Json<DiagnoseReq>,
+    PanelJson(req): PanelJson<DiagnoseReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SYSTEM_VIEW)?;
 

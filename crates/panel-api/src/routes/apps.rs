@@ -36,6 +36,7 @@ use panel_core::{PanelError, UnitName};
 use panel_os::{app_unit_name, render_app_unit, AppRuntime, AppUnitSpec};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use crate::extract::PanelJson;
 
 /// rusqlite 错误 → 面板错误（与 `sites::db_err` 同范式）。
 fn db_err(e: rusqlite::Error) -> PanelError {
@@ -652,7 +653,7 @@ async fn apply_site(state: &Shared, session: &Session, app: &RawApp) -> ApiResul
     // 直接 `?`：apply 失败必须让本次保存失败——否则 DB 说已建站、nginx 却没配置，
     // 用户下次排查会面对「应用在、站点不在」的错觉。
     // `apply` 返回 Json（must_use）——这里只要它成功，具体载荷由调用方各自查。
-    let _ = super::sites::apply(State(state.clone()), Auth(session.clone()), Json(req)).await?;
+    let _ = super::sites::apply(State(state.clone()), Auth(session.clone()), PanelJson(req)).await?;
     Ok(())
 }
 
@@ -690,7 +691,7 @@ async fn find_site_by_name(state: &Shared, name: &str) -> Option<i64> {
 pub async fn create(
     State(state): State<Shared>,
     Auth(s): Auth,
-    Json(req): Json<CreateReq>,
+    PanelJson(req): PanelJson<CreateReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SERVICE_MANAGE)?;
 
@@ -773,7 +774,7 @@ pub async fn patch(
     State(state): State<Shared>,
     Auth(s): Auth,
     AxPath(id): AxPath<i64>,
-    Json(req): Json<PatchReq>,
+    PanelJson(req): PanelJson<PatchReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SERVICE_MANAGE)?;
     let Some(cur) = fetch_one(&state, id).await? else {
@@ -878,7 +879,7 @@ pub async fn act(
     State(state): State<Shared>,
     Auth(s): Auth,
     AxPath(id): AxPath<i64>,
-    Json(req): Json<ActReq>,
+    PanelJson(req): PanelJson<ActReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SERVICE_MANAGE)?;
     let Some(app) = fetch_one(&state, id).await? else {

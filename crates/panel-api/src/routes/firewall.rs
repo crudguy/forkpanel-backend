@@ -18,6 +18,7 @@ use axum::{extract::{Path as AxPath, State}, Json};
 use panel_core::cap_keys;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
+use crate::extract::PanelJson;
 
 /// 受保护端口：**永远不能封**。22 是 SSH，面板自身端口由配置注入。
 const PROTECTED_PORTS: &[u16] = &[22];
@@ -141,7 +142,7 @@ pub struct RuleInput {
 pub async fn apply(
     State(state): State<Shared>,
     Auth(s): Auth,
-    Json(req): Json<ApplyReq>,
+    PanelJson(req): PanelJson<ApplyReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FIREWALL_MANAGE)?;
     if !state.capabilities.get(cap_keys::FIREWALL_MANAGE).map(|c| c.supported).unwrap_or(false) {
@@ -259,7 +260,7 @@ pub fn parse_cidr(s: &str) -> Option<(IpAddr, Option<u8>)> {
 pub struct ActiveReq { pub active: bool }
 
 pub async fn set_active(
-    State(state): State<Shared>, Auth(s): Auth, Json(req): Json<ActiveReq>,
+    State(state): State<Shared>, Auth(s): Auth, PanelJson(req): PanelJson<ActiveReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FIREWALL_MANAGE)?;
     // 关闭防火墙会暴露所有端口 —— 这是高危操作，必须留痕
@@ -289,10 +290,10 @@ pub async fn status(
 pub struct EnabledReq { pub enabled: bool }
 
 pub async fn set_enabled(
-    State(state): State<Shared>, Auth(s): Auth, Json(req): Json<EnabledReq>,
+    State(state): State<Shared>, Auth(s): Auth, PanelJson(req): PanelJson<EnabledReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FIREWALL_MANAGE)?;
-    set_active(State(state), Auth(s), Json(ActiveReq { active: req.enabled })).await
+    set_active(State(state), Auth(s), PanelJson(ActiveReq { active: req.enabled })).await
 }
 
 pub async fn delete_rule(
@@ -341,7 +342,7 @@ pub async fn fail2ban_status(
 pub struct JailReq { pub name: String, pub enabled: bool }
 
 pub async fn fail2ban_set_jail(
-    State(state): State<Shared>, Auth(s): Auth, Json(req): Json<JailReq>,
+    State(state): State<Shared>, Auth(s): Auth, PanelJson(req): PanelJson<JailReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FIREWALL_MANAGE)?;
     if !state.capabilities.get(cap_keys::FAIL2BAN).map(|c| c.supported).unwrap_or(false) {
@@ -356,7 +357,7 @@ pub async fn fail2ban_set_jail(
 pub struct UnbanReq { pub jail: String, pub ip: String }
 
 pub async fn fail2ban_unban(
-    State(state): State<Shared>, Auth(s): Auth, Json(req): Json<UnbanReq>,
+    State(state): State<Shared>, Auth(s): Auth, PanelJson(req): PanelJson<UnbanReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FIREWALL_MANAGE)?;
     if !state.capabilities.get(cap_keys::FAIL2BAN).map(|c| c.supported).unwrap_or(false) {

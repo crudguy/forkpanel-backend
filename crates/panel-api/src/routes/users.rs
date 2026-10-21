@@ -17,6 +17,7 @@ use axum::Json;
 use panel_core::PanelError;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use crate::extract::PanelJson;
 
 /// API 可创建/分配的角色（owner 除外——它是引导态专属，不可经 API 操作）
 const ASSIGNABLE_ROLES: &[&str] = &["admin", "operator", "viewer"];
@@ -147,7 +148,7 @@ pub async fn list(State(state): State<Shared>, Auth(s): Auth) -> ApiResult<Json<
 pub async fn create(
     State(state): State<Shared>,
     Auth(s): Auth,
-    Json(req): Json<CreateReq>,
+    PanelJson(req): PanelJson<CreateReq>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     crate::auth::require(&s, perm::USER_MANAGE)?;
 
@@ -194,7 +195,7 @@ pub async fn patch(
     State(state): State<Shared>,
     Auth(s): Auth,
     AxPath(id): AxPath<i64>,
-    Json(req): Json<PatchReq>,
+    PanelJson(req): PanelJson<PatchReq>,
 ) -> ApiResult<StatusCode> {
     crate::auth::require(&s, perm::USER_MANAGE)?;
 

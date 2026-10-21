@@ -6,6 +6,7 @@
 //! ——调用点零改动（`routes.rs` 里 12 条 `.route(...)` 不需改）。
 
 use super::*;
+use crate::extract::PanelJson;
 
 // ─────────────── 软件包（走任务队列） ───────────────
 
@@ -362,7 +363,7 @@ pub fn logical_pkg_name(real: &str) -> Option<&'static str> {
 pub async fn install(
     State(state): State<Shared>,
     Auth(s): Auth,
-    Json(req): Json<InstallReq>,
+    PanelJson(req): PanelJson<InstallReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::PACKAGE_MANAGE)?;
     // 重活限流：10 次 / 60 秒 / 用户（见 ratelimit.rs 的设计说明）
@@ -724,7 +725,7 @@ pub async fn packages_upgradable(
 pub async fn package_upgrade(
     State(state): State<Shared>,
     Auth(s): Auth,
-    Json(req): Json<InstallReq>,
+    PanelJson(req): PanelJson<InstallReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::PACKAGE_MANAGE)?;
     // 重活限流：10 次 / 60 秒 / 用户（见 ratelimit.rs 的设计说明）
@@ -858,7 +859,7 @@ pub async fn package_hold(
     State(state): State<Shared>,
     Auth(s): Auth,
     AxPath(name): AxPath<String>,
-    Json(req): Json<HoldReq>,
+    PanelJson(req): PanelJson<HoldReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::PACKAGE_MANAGE)?;
     if !state.capabilities.get(cap_keys::PACKAGE_INSTALL).map(|c| c.supported).unwrap_or(false) {

@@ -52,6 +52,7 @@ use panel_os::{cmd, ComposeAction, ContainerAction, ContainerCreateReq, Containe
 use serde::Deserialize;
 use std::time::Duration;
 use panel_task::{TaskRequest, TaskKind};
+use crate::extract::PanelJson;
 
 /// 能力前置检查：不可用即诚实 501，并把原因透出（前端无需再请求 capabilities 才能解释原因）。
 fn ensure_supported(state: &Shared) -> Result<(), ApiError> {
@@ -183,7 +184,7 @@ pub async fn update_remark(
     State(state): State<Shared>,
     Auth(s): Auth,
     AxPath(id): AxPath<String>,
-    Json(req): Json<ContainerRemarkReq>,
+    PanelJson(req): PanelJson<ContainerRemarkReq>,
 ) -> ApiResult<StatusCode> {
     crate::auth::require(&s, perm::CONTAINER_MANAGE)?;
     if !panel_core::rules::is_valid_container_ref(&id) {
@@ -244,7 +245,7 @@ const CREATE_CONFIRM: &str = "创建容器";
 pub async fn create(
     State(state): State<Shared>,
     Auth(s): Auth,
-    Json(req): Json<CreateReq>,
+    PanelJson(req): PanelJson<CreateReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::CONTAINER_MANAGE)?;
     ensure_supported(&state)?;
@@ -279,7 +280,7 @@ pub async fn create(
 pub(crate) async fn pull(
     State(state): State<Shared>,
     Auth(s): Auth,
-    Json(req): Json<PullReq>,
+    PanelJson(req): PanelJson<PullReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::CONTAINER_MANAGE)?;
     // 重活限流：10 次 / 60 秒 / 用户（见 ratelimit.rs 的设计说明）
@@ -483,7 +484,7 @@ pub async fn compose_act(
     State(state): State<Shared>,
     Auth(s): Auth,
     AxPath(project): AxPath<String>,
-    Json(req): Json<ComposeActReq>,
+    PanelJson(req): PanelJson<ComposeActReq>,
 ) -> ApiResult<StatusCode> {
     crate::auth::require(&s, perm::CONTAINER_MANAGE)?;
     ensure_supported(&state)?;
@@ -590,7 +591,7 @@ pub async fn stack_save(
     State(state): State<Shared>,
     Auth(s): Auth,
     AxPath(project): AxPath<String>,
-    Json(req): Json<StackSaveReq>,
+    PanelJson(req): PanelJson<StackSaveReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::CONTAINER_MANAGE)?;
 
@@ -627,7 +628,7 @@ const INSTALL_CONFIRM: &str = "安装 Docker";
 pub async fn install(
     State(state): State<Shared>,
     Auth(s): Auth,
-    Json(req): Json<InstallReq>,
+    PanelJson(req): PanelJson<InstallReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::CONTAINER_MANAGE)?;
     // 仅 docker 二进制缺失时允许安装；已装但 daemon 不可达是权限/服务问题，无需重装

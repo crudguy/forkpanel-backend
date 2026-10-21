@@ -1,4 +1,5 @@
 use super::*;
+use crate::extract::PanelJson;
 
 
 #[derive(Debug, Deserialize)]
@@ -287,7 +288,7 @@ fn validate_redirect_target(raw: &str) -> ApiResult<String> {
 pub async fn apply(
     State(state): State<Shared>,
     Auth(s): Auth,
-    Json(req): Json<ApplyReq>,
+    PanelJson(req): PanelJson<ApplyReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SITE_MANAGE)?;
     if !state
