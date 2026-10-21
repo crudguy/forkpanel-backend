@@ -24,21 +24,10 @@ pub struct LinuxFileProvider;
 /// 递归删除的条目上限。超过即拒绝——要么是误操作，要么该交给专门工具处理。
 const MAX_REMOVE_ENTRIES: usize = 50_000;
 
-/// 敏感路径判定。**刻意只做前缀/精确匹配**，不做模糊匹配（模糊匹配容易误伤且难审计）。
+/// 敏感路径判定：委托给 [`crate::sensitive`] 的唯一黑名单（不再本地维护副本）。
 pub fn is_sensitive_path(p: &Path) -> bool {
     let s = match p.to_str() { Some(s) => s, None => return false };
-    const DENY_EXACT: &[&str] = &[
-        "/etc/shadow", "/etc/gshadow", "/etc/sudoers",
-    ];
-    const DENY_PREFIX: &[&str] = &[
-        "/etc/ssh/", "/etc/ssl/private/", "/etc/panel/",
-        "/root/.ssh/", "/proc/", "/sys/", "/dev/",
-    ];
-    if DENY_EXACT.contains(&s) { return true; }
-    if DENY_PREFIX.iter().any(|x| s.starts_with(x)) { return true; }
-    // 任何用户的 authorized_keys（面板绝不该通过 Web 改它）
-    if s.ends_with("/authorized_keys") || s.ends_with("/.ssh/id_rsa") { return true; }
-    false
+    crate::sensitive::is_sensitive_path_str(s)
 }
 
 /// 目录内排序比较器：**dirs_first 与 sort 两个维度同时生效**。

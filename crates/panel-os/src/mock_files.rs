@@ -45,13 +45,7 @@ impl MockFiles {
     pub fn new(inner: Arc<Mutex<MemFs>>) -> Self { Self { inner, case_insensitive: false } }
 
     fn sensitive_of(p: &Path) -> bool {
-        let s = p.to_string_lossy().to_string();
-        const DENY_EXACT: &[&str] = &["/etc/shadow", "/etc/gshadow", "/etc/sudoers"];
-        const DENY_PREFIX: &[&str] = &["/etc/ssh/", "/etc/ssl/private/", "/etc/panel/",
-                                       "/root/.ssh/", "/proc/", "/sys/", "/dev/"];
-        DENY_EXACT.contains(&s.as_str())
-            || DENY_PREFIX.iter().any(|x| s.starts_with(x))
-            || s.ends_with("/authorized_keys")
+        crate::sensitive::is_sensitive_path_str(&p.to_string_lossy())
     }
 
     fn key(&self, p: &Path) -> PathBuf {
@@ -217,11 +211,8 @@ impl FileProvider for MockFiles {
 /// mock 的敏感路径判定，供 `is_sensitive` 与 `is_sensitive_path` **共用**——
 /// 两套判定迟早会漂移，而漂移的那一套就是漏网的那一套。
 fn is_sensitive_str(s: &str) -> bool {
-    // mock 复用与 Linux 相同的判定，保证一致性测试有意义
-    const DENY_EXACT: &[&str] = &["/etc/shadow", "/etc/gshadow", "/etc/sudoers"];
-    const DENY_PREFIX: &[&str] = &["/etc/ssh/", "/etc/ssl/private/", "/etc/panel/", "/root/.ssh/",
-                                   "/proc/", "/sys/", "/dev/"];
-    DENY_EXACT.contains(&s) || DENY_PREFIX.iter().any(|x| s.starts_with(x)) || s.ends_with("/authorized_keys")
+    // mock 与 Linux 共用同一份黑名单（见 sensitive.rs）——两份副本必然漂移
+    crate::sensitive::is_sensitive_path_str(s)
 }
 
 #[cfg(test)]

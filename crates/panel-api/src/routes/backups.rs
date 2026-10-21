@@ -629,6 +629,18 @@ struct BackupJob {
     tmp_dir: PathBuf,
 }
 
+/// 失败原因必须能从「任务」页看到。
+///
+/// `output_path` 的契约：**成功时**指向业务产物（备份 .db/.tar.gz），失败时没有产物——
+/// 此时指向**错误日志**是诚实的，且让 `/tasks/{id}/output` 直接可读。
+/// 此前失败只 `eprintln!` + 通知，任务页点开是空白输出（实测 task 30：
+/// state=failed、output_path=null、lines=[]，用户只能去翻服务端日志）。
+fn write_failure_log(task_id: i64, what: &str, msg: &str) -> std::path::PathBuf {
+    let p = std::env::temp_dir().join(format!("panel-task-{task_id}.log"));
+    let _ = std::fs::write(&p, format!("{what} #{task_id} 失败\n{msg}\n"));
+    p
+}
+
 #[async_trait::async_trait]
 impl panel_task::TaskBody for BackupJob {
     async fn run(&self, progress: panel_task::Progress) -> Result<panel_task::TaskOutcome> {
@@ -653,6 +665,7 @@ impl panel_task::TaskBody for BackupJob {
                 // 备份**静默失败等于没有备份** —— 必须让人知道，否则出事才发现无退路。
                 // 按天去重：同一计划当天只报一条，避免每次调度都刷屏。
                 let msg = e.to_string();
+                let log = write_failure_log(self.id, "备份计划", &msg);
                 crate::routes::notifications::push(
                     &self.writer,
                     crate::routes::notifications::NewNotification {
@@ -668,7 +681,13 @@ impl panel_task::TaskBody for BackupJob {
                     },
                 )
                 .await;
-                Err(e)
+                // 用 Ok(Failed) 而非 Err：这样 output_path 能带上错误日志，
+                // 「任务」页点开就能看到原因（Err 路径会被 runner 落成 output_path=null）。
+                Ok(panel_task::TaskOutcome {
+                    state: panel_task::TaskState::Failed,
+                    exit_code: Some(1),
+                    output_path: Some(log),
+                })
             }
         }
     }
@@ -1095,6 +1114,7 @@ impl panel_task::TaskBody for RestoreJob {
                 // 恢复失败意味着现场可能处于"已备份未覆盖"或"部分覆盖"的中间态，
                 // 必须立即告知人工确认——不去重（每次失败都是独立事件）。
                 let msg = e.to_string();
+                let log = write_failure_log(self.id, "恢复计划", &msg);
                 crate::routes::notifications::push(
                     &self.writer,
                     crate::routes::notifications::NewNotification {
@@ -1106,7 +1126,11 @@ impl panel_task::TaskBody for RestoreJob {
                     },
                 )
                 .await;
-                Err(e)
+                Ok(panel_task::TaskOutcome {
+                    state: panel_task::TaskState::Failed,
+                    exit_code: Some(1),
+                    output_path: Some(log),
+                })
             }
         }
     }
