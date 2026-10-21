@@ -20,6 +20,7 @@
 //! 新增同步调用时按这条判据自判，别照着邻近代码抄。
 
 pub mod auth;
+pub mod ratelimit;
 pub mod error;
 pub mod middleware;
 pub mod remote_store;
@@ -46,6 +47,8 @@ pub struct AppState {
     pub capabilities: CapabilityMap,
     pub sessions: Arc<crate::auth::SessionCache>,
     pub logins: Arc<crate::auth::LoginGuard>,
+    /// 非登录类的重活限流（安装/拉取/备份/跑任务）；见 ratelimit.rs
+    pub limits: Arc<crate::ratelimit::ActionLimiter>,
     /// 只读模式（启动期算一次）。**单一真值**：guard、设置页展示、终端入口都读它，
     /// 不要再各自去读环境变量——那正是此前 config.toml 的 `read_only` 配了不生效的原因。
     pub read_only: bool,
@@ -114,6 +117,7 @@ impl AppState {
                 sessions_db,
             )),
             logins: Arc::new(crate::auth::LoginGuard::new(max_login_attempts)),
+            limits: Arc::new(crate::ratelimit::ActionLimiter::heavy()),
             read_only,
             bootstrap: Arc::new(crate::auth::BootstrapGuard::new()),
             master_key,

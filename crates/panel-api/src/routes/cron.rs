@@ -411,6 +411,8 @@ pub async fn run(
     State(state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::CRON_MANAGE)?;
+    // 重活限流：10 次 / 60 秒 / 用户（见 ratelimit.rs 的设计说明）
+    crate::ratelimit::check_heavy(&state, &s.username, "cron.run")?;
     if !state.capabilities.get(cap_keys::SCHEDULER_MANAGE).map(|c| c.supported).unwrap_or(false) {
         return Err(ApiError::unsupported("scheduler.manage"));
     }
@@ -473,7 +475,7 @@ impl panel_task::TaskBody for CronRunTask {
             tokio::spawn(async move {
                 while let Some(line) = rx.recv().await {
                     {
-                        let mut b = buf.lock().unwrap();
+                        let mut b = panel_core::sync::lock_recover(&buf);
                         if b.len() >= MAX_BUF { b.remove(0); }
                         b.push(line.clone());
                     }
@@ -509,7 +511,7 @@ impl panel_task::TaskBody for CronRunTask {
         let _ = consumer.await;
 
         let mut output_path = None;
-        let lines: Vec<String> = buf.lock().unwrap().clone();
+        let lines: Vec<String> = panel_core::sync::lock_recover(&buf).clone();
         if !lines.is_empty() {
             // 日志写进专属子目录而非 temp_dir 根：id 递增 → 每次都是新文件，
             // 若散落在 /tmp 根既无法定向清理，也会污染临时目录。

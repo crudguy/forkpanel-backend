@@ -11,6 +11,10 @@ info:
     - 写操作（POST/PUT/PATCH/DELETE）必须带 `X-CSRF-Token` 头（双提交校验）+ `Origin` 白名单。
     - 所有耗时 > 1s 的操作返回 `202 Accepted` + `{task_id}`，通过 `GET /api/v1/tasks/{id}` 或 SSE `tasks` 频道获取进度。
     - 能力矩阵驱动：若某能力 `supported=false`，对应接口返回 `10009 unsupported`（而非伪造数据）。
+    - 重活限流：安装/升级/卸载软件包、拉取镜像、运行备份、运行定时任务这些高成本写操作
+      按 **(用户, 动作)** 限流 10 次 / 60 秒，超限返回 `429`（`code=10006`，
+      `detail.retry_after_secs` 指明还需等待秒数）。登录另有独立的防暴力策略
+      （失败计数 + 阶梯退避 + 15 分钟锁定），不受此限。
   contact:
     name: panel-backend
 

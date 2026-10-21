@@ -594,6 +594,8 @@ pub async fn install(
     Json(req): Json<InstallReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::PACKAGE_MANAGE)?;
+    // 重活限流：10 次 / 60 秒 / 用户（见 ratelimit.rs 的设计说明）
+    crate::ratelimit::check_heavy(&state, &s.username, "pkg.install")?;
     if !state.capabilities.get(cap_keys::PACKAGE_INSTALL)
         .map(|c| c.supported).unwrap_or(false) {
         return Err(ApiError::unsupported("package.install"));
@@ -694,7 +696,7 @@ impl panel_task::TaskBody for PackageTask {
                     while let Some(line) = rx.recv().await {
                         n += 1;
                         {
-                            let mut b = buf.lock().unwrap();
+                            let mut b = panel_core::sync::lock_recover(&buf);
                             if b.len() >= MAX_BUF { b.remove(0); }
                             b.push(line.clone());
                         }
@@ -727,14 +729,14 @@ impl panel_task::TaskBody for PackageTask {
 
         if let Some(e) = &result {
             progress.log(&format!("失败：{e}")).await;
-            let mut b = buf.lock().unwrap();
+            let mut b = panel_core::sync::lock_recover(&buf);
             if b.len() >= MAX_BUF { b.remove(0); }
             b.push(format!("失败：{e}"));
         }
 
         // 缓冲落盘 → 任务中心可读
         let mut output_path = None;
-        let lines_snapshot: Vec<String> = buf.lock().unwrap().clone();
+        let lines_snapshot: Vec<String> = panel_core::sync::lock_recover(&buf).clone();
         if !lines_snapshot.is_empty() {
             let p = std::env::temp_dir().join(format!("panel-task-{}.log", progress.id()));
             if tokio::fs::write(&p, lines_snapshot.join("\n")).await.is_ok() {
@@ -1034,7 +1036,7 @@ pub async fn package_versions(
 /// 否则只读探测只能看到发行版源的旧版，「接官方源」等于没接。
 async fn ensure_external_repos_once(state: &Shared) {
     for &logical in EXTERNAL_SOURCE_PACKAGES {
-        let first = ENSURED_EXTERNAL_REPOS.lock().unwrap().insert(logical);
+        let first = panel_core::sync::lock_recover(&ENSURED_EXTERNAL_REPOS).insert(logical);
         if !first {
             continue;
         }
@@ -1100,6 +1102,8 @@ pub async fn package_upgrade(
     Json(req): Json<InstallReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::PACKAGE_MANAGE)?;
+    // 重活限流：10 次 / 60 秒 / 用户（见 ratelimit.rs 的设计说明）
+    crate::ratelimit::check_heavy(&state, &s.username, "pkg.upgrade")?;
     if !state.capabilities.get(cap_keys::PACKAGE_UPGRADE)
         .map(|c| c.supported).unwrap_or(false) {
         return Err(ApiError::unsupported("package.upgrade"));
@@ -1179,6 +1183,8 @@ pub async fn package_remove(
     State(state): State<Shared>, Auth(s): Auth, AxPath(name): AxPath<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::PACKAGE_MANAGE)?;
+    // 重活限流：10 次 / 60 秒 / 用户（见 ratelimit.rs 的设计说明）
+    crate::ratelimit::check_heavy(&state, &s.username, "pkg.remove")?;
     if !state.capabilities.get(cap_keys::PACKAGE_INSTALL).map(|c| c.supported).unwrap_or(false) {
         return Err(ApiError::unsupported("package.install"));
     }

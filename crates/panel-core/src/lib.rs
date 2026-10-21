@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 pub mod crypto; // 应用层密钥加密（AES-256-GCM，关闭 M0 阻塞项）
+pub mod sync;   // 互斥锁中毒恢复（禁止裸 lock().unwrap()，见 ci/check_lock_unwrap.py）
 
 // ───────────────────────────── 错误模型 ─────────────────────────────
 

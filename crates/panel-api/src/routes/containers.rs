@@ -282,6 +282,8 @@ pub(crate) async fn pull(
     Json(req): Json<PullReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::CONTAINER_MANAGE)?;
+    // 重活限流：10 次 / 60 秒 / 用户（见 ratelimit.rs 的设计说明）
+    crate::ratelimit::check_heavy(&state, &s.username, "image.pull")?;
     ensure_supported(&state)?;
     let img = state.os.containers().pull(req.image.trim()).await?;
     audit(&state, &s, "container.pull", &img.id, "ok").await;

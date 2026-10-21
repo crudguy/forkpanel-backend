@@ -121,7 +121,7 @@ impl ServiceProvider for MockServices {
     fn init_system(&self) -> InitSystem { InitSystem::Systemd }
 
     async fn list(&self, _f: ServiceFilter) -> Result<Vec<ServiceUnit>> {
-        let st = self.state.lock().unwrap();
+        let st = panel_core::sync::lock_recover(&self.state);
         Ok(st.service_states.iter().map(|(name, s)| ServiceUnit {
             // SAFETY: mock 内部数据，名称取自已校验集合
             name: unsafe { UnitName::from_raw(name.clone()) },
@@ -134,12 +134,12 @@ impl ServiceProvider for MockServices {
     }
 
     async fn status(&self, name: &UnitName) -> Result<ServiceState> {
-        let st = self.state.lock().unwrap();
+        let st = panel_core::sync::lock_recover(&self.state);
         Ok(st.service_states.get(name.as_str()).copied().unwrap_or(ServiceState::Unknown))
     }
 
     async fn statuses(&self, names: &[UnitName]) -> Result<HashMap<String, ServiceState>> {
-        let st = self.state.lock().unwrap();
+        let st = panel_core::sync::lock_recover(&self.state);
         let mut map = HashMap::with_capacity(names.len());
         for n in names {
             let s = st.service_states.get(n.as_str()).copied().unwrap_or(ServiceState::Unknown);
@@ -149,7 +149,7 @@ impl ServiceProvider for MockServices {
     }
 
     async fn show(&self, name: &UnitName) -> Result<Option<ServiceUnit>> {
-        let st = self.state.lock().unwrap();
+        let st = panel_core::sync::lock_recover(&self.state);
         Ok(st.service_states.get(name.as_str()).map(|s| ServiceUnit {
             // SAFETY: mock 内部数据，名称取自已校验集合
             name: unsafe { UnitName::from_raw(name.as_str().to_string()) },
@@ -196,7 +196,7 @@ impl ServiceProvider for MockServices {
 
 impl MockServices {
     fn set(&self, name: &UnitName, s: ServiceState) -> Result<()> {
-        let mut st = self.state.lock().unwrap();
+        let mut st = panel_core::sync::lock_recover(&self.state);
         st.service_states.insert(name.as_str().to_string(), s);
         Ok(())
     }
@@ -216,12 +216,12 @@ impl FirewallProvider for MockFirewall {
     async fn set_active(&self, _a: bool) -> Result<()> { Ok(()) }
 
     async fn list_rules(&self) -> Result<Vec<FirewallRule>> {
-        Ok(self.state.lock().unwrap().rules.values().cloned().collect())
+        Ok(panel_core::sync::lock_recover(&self.state).rules.values().cloned().collect())
     }
 
     /// 幂等契约：同一 plan 连续 apply 两次，第二次 unchanged 计数应等于规则数
     async fn apply(&self, plan: RulePlan) -> Result<ApplyReport> {
-        let mut st = self.state.lock().unwrap();
+        let mut st = panel_core::sync::lock_recover(&self.state);
         st.apply_calls += 1;
         let mut rep = ApplyReport::default();
         for r in plan.rules {
@@ -243,7 +243,7 @@ impl FirewallProvider for MockFirewall {
     }
 
     async fn delete_rule(&self, id: &str) -> Result<()> {
-        let mut st = self.state.lock().unwrap();
+        let mut st = panel_core::sync::lock_recover(&self.state);
         if st.rules.remove(id).is_some() { Ok(()) }
         else { Err(PanelError::NotFound(format!("firewall rule `{id}`"))) }
     }
@@ -321,12 +321,12 @@ impl PackageProvider for MockPackages {
     async fn holds(&self) -> Result<Vec<String>> {
         // 进程内状态：mock 没有 apt-mark，用静态集合模拟「钉住全集」，
         // 使预览模式下 UI 的 hold 读写闭环（列徽标 + 切换后回读）可联调。
-        let set = mock_holds().lock().unwrap();
+        let set = panel_core::sync::lock_recover(mock_holds());
         Ok(set.iter().cloned().collect())
     }
 
     async fn set_hold(&self, name: &str, held: bool) -> Result<()> {
-        let mut set = mock_holds().lock().unwrap();
+        let mut set = panel_core::sync::lock_recover(mock_holds());
         if held { set.insert(name.to_string()); } else { set.remove(name); }
         Ok(())
     }
