@@ -41,7 +41,7 @@ ci_skip_no_frontend() {
   exit 0
 }
 
-BE_SRC="crates/panel-api/src/routes/services.rs"
+BE_SRC="crates/panel-api/src/routes/services/packages.rs"   # 拆域后白名单在 packages.rs（2026-10-21）
 FE_SRC="$FE_ROOT/src/views/ServicesView.vue"
 
 echo "== [A] 源文件存在性 =="
@@ -62,7 +62,9 @@ pass "后端 $BE_SRC / 前端 $FE_SRC 均存在"
 # 小写 + 点号，会被同一条正则抓进来，于是每个包都变成「后端允许但前端无入口」，
 # 门禁直接误报 18 条（本轮实际踩到）。判据必须锚在**包名字段**上，而不是
 # "看起来像包名的字符串"——单元名不是包名，两者格式完全重叠，只能靠位置区分。
-BE=$(awk '/^const ALLOWED_PACKAGES/,/^\];/' "$BE_SRC" 2>/dev/null \
+# 不锚 `^const`：拆域后该常量带可见性前缀（`pub(crate) const`）。
+# 仍保留"提取不到就判失败"的判据（见下方 BE_N 检查）。
+BE=$(awk '/const ALLOWED_PACKAGES/,/^\];/' "$BE_SRC" 2>/dev/null \
   | grep -oE 'name: "[a-z0-9][a-z0-9.+-]*"' | grep -oE '"[a-z0-9][a-z0-9.+-]*"' \
   | tr -d '"' | sort -u)
 

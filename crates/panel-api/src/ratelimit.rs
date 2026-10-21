@@ -156,9 +156,9 @@ mod tests {
     #[test]
     fn heavy_handlers_are_actually_wired() {
         let cases: [(&str, &str, &str); 6] = [
-            (include_str!("routes/services.rs"), "pkg.install", "services::install"),
-            (include_str!("routes/services.rs"), "pkg.upgrade", "services::package_upgrade"),
-            (include_str!("routes/services.rs"), "pkg.remove", "services::package_remove"),
+            (include_str!("routes/services/packages.rs"), "pkg.install", "services::install"),
+            (include_str!("routes/services/packages.rs"), "pkg.upgrade", "services::package_upgrade"),
+            (include_str!("routes/services/packages.rs"), "pkg.remove", "services::package_remove"),
             (include_str!("routes/containers.rs"), "image.pull", "containers::pull"),
             (include_str!("routes/backups.rs"), "backup.run", "backups::run"),
             (include_str!("routes/cron.rs"), "cron.run", "cron::run"),
