@@ -554,4 +554,103 @@ mod tests {
         assert!(!is_valid_container_ref("a\0b"));
         assert!(!is_valid_container_ref(&"x".repeat(256)));   // 超长
     }
+
+    // ───────────── 契约层：错误码 / 档位 / 构造器 ─────────────
+    //
+    // rules 层（上面那批）测的是"输入合法性"；这里测的是**跨 crate 的契约**：
+    // 错误码是前端映射的依据、档位决定采样与并发、构造器是唯一的安全入口。
+    // 这三类一旦悄悄变了，编译与 rules 测试都不会红，但行为会整体偏移。
+    mod contract {
+        use crate::{domain, unit_name, Capability, PanelError, Tier};
+
+        /// 错误码是**前后端契约**：前端按 10009 判"能力未实现"、10001 标字段错误、
+        /// 50001 提示路径越界。改这些数字等于改 API——必须连同 openapi 与前端
+        /// 映射一起动，所以用测试钉死。
+        #[test]
+        fn error_codes_are_stable() {
+            let cases: [(PanelError, u32); 11] = [
+                (PanelError::Validation { field: "f", reason: "r".into() }, 10001),
+                (PanelError::PermissionDenied("p"), 10003),
+                (PanelError::NotFound("x".into()), 10004),
+                (PanelError::Conflict("x".into()), 10005),
+                (PanelError::Unsupported("u"), 10009),
+                (PanelError::PathEscape("p".into()), 50001),
+                (PanelError::Io("i".into()), 50002),
+                (PanelError::Timeout(std::time::Duration::from_secs(1)), 80003),
+                (PanelError::ConfigInvalid { detail: "d".into() }, 40002),
+                (PanelError::Command { bin: "b".into(), detail: "d".into() }, 30000),
+                (PanelError::Database("d".into()), 60000),
+            ];
+            for (e, want) in cases {
+                assert_eq!(e.code(), want, "错误码变了会破坏前端映射: {e:?}");
+            }
+            assert_eq!(PanelError::Internal("x".into()).code(), 10999);
+        }
+
+        /// 档位边界：**1 核即使内存巨大也按 Nano**——这是刻意的保守取值
+        /// （采样、并发、SQLite 缓存都按单核能力给），别"优化"成只看内存。
+        #[test]
+        fn tier_detection_boundaries() {
+            assert_eq!(Tier::detect(512, 8), Tier::Nano, "≤512MB 即 Nano");
+            assert_eq!(Tier::detect(65536, 1), Tier::Nano, "单核按 Nano，不看内存");
+            assert_eq!(Tier::detect(513, 8), Tier::Small, "513MB 起进 Small");
+            assert_eq!(Tier::detect(65536, 2), Tier::Small, "双核按 Small");
+            assert_eq!(Tier::detect(2048, 8), Tier::Small, "2048MB 仍属 Small");
+            assert_eq!(Tier::detect(2049, 3), Tier::Standard, "2049MB 且 3 核起进 Standard");
+            assert_eq!(Tier::detect(8192, 4), Tier::Standard);
+        }
+
+        /// 各档位旋钮必须**单调**：低配采样更稀、SSE 更少、并发更低、缓存更小；
+        /// 只有 nano 不落历史。写反了不会 panic，只会悄悄压垮低配机器。
+        #[test]
+        fn tier_knobs_are_monotonic() {
+            let (n, s, d) = (Tier::Nano, Tier::Small, Tier::Standard);
+            assert!(n.sampling_interval_ms() > s.sampling_interval_ms());
+            assert!(s.sampling_interval_ms() > d.sampling_interval_ms());
+            assert!(n.max_sse_clients() < s.max_sse_clients());
+            assert!(s.max_sse_clients() < d.max_sse_clients());
+            assert!(n.task_concurrency() < s.task_concurrency());
+            assert!(s.task_concurrency() < d.task_concurrency());
+            // SQLite 的 cache_size 用**负值表示 KiB**（-4000 = 4MiB）⇒ 越负缓存越大。
+            // 初版这里写反了（以为数值大=缓存大），是这条断言把它抓出来的。
+            assert!(n.sqlite_cache_kib() > s.sqlite_cache_kib());
+            assert!(s.sqlite_cache_kib() > d.sqlite_cache_kib());
+            assert!(!n.persist_history(), "nano 只留内存环形缓冲");
+            assert!(s.persist_history() && d.persist_history());
+        }
+
+        /// 能力位的两个构造器必须保持"支持⇔有 backend、不支持⇔有 reason"的不变式：
+        /// 前端拿 `supported` 判开关、拿 `reason` 显示为什么灰。混填会让 UI 自相矛盾。
+        #[test]
+        fn capability_constructors_keep_invariants() {
+            let yes = Capability::yes("nginx");
+            assert!(yes.supported);
+            assert_eq!(yes.backend.as_deref(), Some("nginx"));
+            assert!(yes.reason.is_none());
+
+            let no = Capability::no("binary_missing");
+            assert!(!no.supported);
+            assert!(no.backend.is_none());
+            assert_eq!(no.reason.as_deref(), Some("binary_missing"));
+        }
+
+        /// 域名构造器：**必须小写归一**（落库与 nginx server_name 都按小写比对），
+        /// 非法输入必须返回 10001 且字段名可定位。
+        #[test]
+        fn domain_constructor_normalizes_case_and_reports_field() {
+            let d = domain("Example.COM").expect("合法域名");
+            assert_eq!(d.as_str(), "example.com");
+            let e = domain("asdf.qwer").unwrap_err();
+            assert_eq!(e.code(), 10001);
+            assert!(format!("{e}").contains("domain"), "错误必须带字段名: {e}");
+        }
+
+        #[test]
+        fn unit_name_constructor_rejects_injection() {
+            assert_eq!(unit_name("nginx.service").unwrap().as_str(), "nginx.service");
+            let e = unit_name("nginx; rm -rf /").unwrap_err();
+            assert_eq!(e.code(), 10001);
+            assert!(format!("{e}").contains("unit_name"), "错误必须带字段名: {e}");
+        }
+    }
 }
