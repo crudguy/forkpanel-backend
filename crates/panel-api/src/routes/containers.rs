@@ -707,6 +707,40 @@ fn is_install_confirm(token: Option<&str>) -> bool {
 mod tests {
     use super::*;
 
+    /// ⭐⭐ **Compose 动作接线守卫**：枚举有的变体，路由必须认。
+    ///
+    /// 为什么需要：帮助文案与模块注释曾把**已实现**的 up/down/restart 说成
+    /// "仍不提供"——文案与实现漂移过一次（用户读到"不提供"就不会去点，
+    /// 功能等于白做）。本测试钉住"实现内部"这一半：`ComposeAction` 每个变体的
+    /// `as_str()` 都必须出现在 handler 的 action match 里，否则就是"枚举加了、
+    /// 路由没接"，前端点了只会收到 400。
+    ///
+    /// 文案那一半由前端用**同一份常量**同时渲染按钮与句子（见 ContainersView
+    /// 的 `COMPOSE_ACTIONS`），从结构上避免"文案说没有、按钮却在"。
+    #[test]
+    fn compose_act_route_accepts_every_action_variant() {
+        let src = include_str!("containers.rs");
+        // ⚠ 必须剔除注释行：模块文档里也写着 `up` 等字样，不剔会恒真。
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for a in [
+            ComposeAction::Up,
+            ComposeAction::Stop,
+            ComposeAction::Restart,
+            ComposeAction::Down,
+        ] {
+            let arm = format!("\"{}\" => ComposeAction::", a.as_str());
+            assert!(
+                code.contains(&arm),
+                "路由的 action match 缺少 `{}` 分支：枚举加了变体却没接线路由",
+                a.as_str()
+            );
+        }
+    }
+
     #[test]
     fn create_confirm_requires_exact_word() {
         assert!(is_create_confirm(Some("创建容器")));

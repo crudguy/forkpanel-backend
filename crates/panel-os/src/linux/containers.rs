@@ -26,11 +26,13 @@
 //! `create` 的宿主机任意代码执行风险由 `validate_create` 强制拦截：禁 `--privileged`、
 //! 禁挂载 `/` `/etc` `/proc` `/sys` `/var/run/docker.sock`，且路由层需二次确认词
 //! 「创建容器」。
-//! **未提供**：镜像删除（磁盘回收风险，刻意不开放）；`docker exec`、
-//! 卷的创建/删除（**只读列举已开放**；删除卷=数据丢失，与镜像删除同理）、
-//! compose 生命周期写操作（up/down/restart/logs 等；**只读列举已开放**，
-//! 写操作影响面大，交由 `docker compose` CLI 手动执行）、
-//! stack 暂未实现（非安全刻意排除，后续可补）。
+//! **已开放**的 compose 生命周期写操作：`up` / `stop` / `restart` / `down`
+//! （`down` **永不传 `-v`**，见 [`ComposeAction::Down`]）；面板编排（stack 定义）
+//! 见 [`crate::linux::compose_stack`]。
+//! **未提供**（刻意，非遗漏）：镜像删除（磁盘回收风险）；`docker exec`；
+//! 卷的创建/删除（**只读列举已开放**；删除卷=数据丢失，与镜像删除同理）；
+//! compose **项目级日志**（`docker compose logs` 未接，请用 CLI）；
+//! `docker compose` 的 `pull` / `build` / `scale` 等其余子命令。
 //! 网络侧刻意**只读列举**：创建/删除网络、容器接入/断开网络等写操作未实现
 //! （改网络连通性影响面大，交由 `docker` CLI 手动执行）。
 //! 卷侧刻意**只读列举**：创建/删除卷未实现（删除卷有数据丢失风险，

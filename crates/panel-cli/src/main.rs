@@ -675,7 +675,7 @@ async fn register_internal_jobs(
         }).await;
     }
 
-    // ── 清理：指标 + 审计 + 任务记录 ──
+    // ── 清理：指标 + 审计 + 任务记录 + 通知 ──
     {
         let writer = writer.clone();
         let retention = cfg.audit.retention_days;
@@ -689,6 +689,9 @@ async fn register_internal_jobs(
                     // 审计：默认 90 天 + 5 万行上限（实测 180 天 = 4.12MB）
                     panel_db::cleanup::prune_audit(conn, retention, max_rows)?;
                     panel_db::cleanup::prune_task_runs(conn, retention)?;
+                    // 通知此前是唯一没有 prune 的业务表（只增不减：WAF 告警 /
+                    // 任务完成 / 备份结果都会写一行）。保留期与审计同口径。
+                    panel_db::cleanup::prune_notifications(conn, retention, max_rows)?;
                     Ok(panel_db::WriteAck { rows_changed: 0 })
                 }).await?;
                 // 清理后回收 WAL（实测：无界时 5 万行即 7.71MB）
