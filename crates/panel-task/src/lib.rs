@@ -629,6 +629,107 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// 闸门任务体：跑起来就**等通知**，任务何时结束由测试完全掌控。
+    ///
+    /// ⚠ 别用 `sleep` 撑时间：实测一次 `submit()` 要 300~400ms（每次开新连接 +
+    /// 走 writer actor），撑 3 次触发至少要 1.5s 的任务体，慢机器上仍然会偶发翻红。
+    /// 用闸门后这条测试与机器快慢无关。
+    struct GateBody {
+        ran: Arc<AtomicUsize>,
+        gate: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait::async_trait]
+    impl TaskBody for GateBody {
+        async fn run(&self, _p: Progress) -> Result<TaskOutcome> {
+            self.ran.fetch_add(1, Ordering::SeqCst);
+            self.gate.notified().await;
+            Ok(TaskOutcome { state: TaskState::Ok, exit_code: Some(0), output_path: None })
+        }
+    }
+
+    /// ⭐⭐ 长任务 + 高频 cron：**备份比调度周期慢**时的重叠防护。
+    ///
+    /// `backup.sweep` 每 60s 跑一次，而一次站点/数据库备份动辄好几分钟。这期间
+    /// 每次 sweep 都会再次判定"到期"并 submit——必须合并到**同一个**任务、执行体
+    /// **只跑一次**。否则同一计划会并发跑出 N 个备份，把磁盘和 IO 一起吃光，
+    /// 产物还互相覆盖。
+    ///
+    /// 为什么不是 `concurrent_same_key_collapses_to_one` 的重复：那条钉的是**同一
+    /// 瞬间**的并发 INSERT 竞态；这条钉的是**跨时间**的重复触发（内存 map 命中
+    /// 路径），两条走的分支不同，完全可以只坏一条。
+    ///
+    /// ⚠ `TaskKind::Backup` **没有** exclusive_group（只有 Package 有），所以防重叠
+    /// 完全依赖幂等键——这条测试是真的在守，不是走过场。
+    #[tokio::test]
+    async fn long_task_plus_frequent_cron_ticks_collapses_to_one_run() {
+        let (runner, dir) = runner_for("longtask", Tier::Nano);
+        let ran = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let req = || TaskRequest {
+            idempotency_key: "backup:1".to_string(),
+            kind: TaskKind::Backup,
+            label: "backup:1".to_string(),
+            timeout: Duration::from_secs(20),
+        };
+        let body = || GateBody { ran: ran.clone(), gate: gate.clone() };
+
+        let (first, created) = runner.submit(req(), body()).await.expect("首次提交");
+        assert!(created, "首次触发应当新建任务");
+
+        // 等执行体真的跑起来——下面的触发必须发生在"执行期间"，否则这条测试
+        // 什么都没测到（活性自检，防止它退化成恒绿）
+        let started = wait_until(|| ran.load(Ordering::SeqCst) == 1);
+        started.await;
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "执行体未启动");
+        assert!(!runner.is_terminal(first).await.unwrap(), "任务此刻应在执行中");
+
+        // 模拟 cron 在任务还没跑完时又触发 3 次
+        for _ in 0..3 {
+            let (id, created2) = runner.submit(req(), body()).await.expect("重复触发提交");
+            assert_eq!(id, first, "cron 再触发时必须合并到既有任务，不能另起一个（得到 {id}）");
+            assert!(!created2, "合并时应返回 created=false，让上层知道这不是新任务");
+        }
+        assert!(
+            !runner.is_terminal(first).await.unwrap(),
+            "三次触发必须发生在任务执行期间——否则这条测试什么都没测到"
+        );
+
+        gate.notify_waiters();
+        wait_all(&runner, &[first]).await;
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            1,
+            "执行体必须只跑一次——跑多次就是同一计划的备份在并发执行"
+        );
+        let c = rusqlite::Connection::open(dir.join("panel.db")).unwrap();
+        let rows: i64 = c
+            .query_row("SELECT COUNT(*) FROM task_runs WHERE task_id='backup:1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "同 key 的任务行应为 1，实为 {rows}");
+
+        // 反向：任务**跑完之后**再触发必须能新建——否则计划从此再也不会执行
+        let (again, created3) = runner.submit(req(), body()).await.expect("终态后再提交");
+        assert_ne!(again, first, "上一个任务已终态，新的触发应当另起任务");
+        assert!(created3, "终态后提交应为新建");
+        wait_until(|| ran.load(Ordering::SeqCst) == 2).await;
+        gate.notify_waiters();
+        wait_all(&runner, &[again]).await;
+        assert_eq!(ran.load(Ordering::SeqCst), 2, "终态后的新触发必须真的执行");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 轮询直到条件成立（上限 2s）。不用固定 sleep，避免慢机器上偶发翻红。
+    async fn wait_until(f: impl Fn() -> bool) {
+        for _ in 0..200 {
+            if f() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("条件未在 2s 内成立");
+    }
+
     // ─────────────── 并发闸门 ───────────────
 
     // `use` 是 item，可出现在模块任意位置；就近声明，免得为新增用例再动文件头部。
