@@ -673,6 +673,127 @@ pub async fn verify_artifact_cli(
     verify_artifact(path, key, tmp_dir).await
 }
 
+/// 远端对象名里属于**面板库产物**的那些（`.db` / `.db.enc`），按新到旧排序。
+///
+/// 排序依据：对象名形如 `plan1-1700000000.db`，时间戳定长 unix 秒 ⇒ 字典序即时间序。
+/// 只要名字里的时间戳是定长的，这就成立；不读 mtime 是因为远端列表**不给 mtime**
+/// （S3 `list-type=2` 只返回 key 与 size）。
+fn panel_db_names(objects: &[String]) -> Vec<&str> {
+    let mut v: Vec<&str> = objects
+        .iter()
+        .map(|s| s.as_str())
+        // 远端列出来的可能是带前缀的完整 key（S3 尤其如此），只看最后一段
+        .map(|s| s.rsplit('/').next().unwrap_or(s))
+        .filter(|n| n.ends_with(".db") || n.ends_with(".db.enc"))
+        .collect();
+    v.sort_unstable();
+    v.reverse();
+    v
+}
+
+/// CLI 入口（`panel restore-db --remote <plan_id>`）：**本地盘没了**的时候，
+/// 从远端副本把面板库产物拉回来。
+///
+/// 为什么不复用 HTTP 那条路径：HTTP 侧一切都挂在 `&Shared`（连接池、任务队列、
+/// 能力矩阵）上，而 `restore-db` 的前提恰恰是**服务已停**——为了读一行配置去构造
+/// 一个 Shared 既重又别扭。这里直接只读打开面板库取计划行：同样的表、同样的解密，
+/// 只是不经过 axum。
+///
+/// ⚠ 只接受 `kind=panel` 的计划：把别的计划（哪怕产物也是 `.db`）盖到 panel.db
+/// 上，得到的是一个"能打开但不是面板库"的库，比打不开更难查。
+pub async fn fetch_remote_artifact_cli(
+    db_path: &std::path::Path,
+    plan_id: i64,
+    wanted: Option<&str>,
+    dest_dir: &std::path::Path,
+    key: Option<&panel_core::crypto::MasterKey>,
+) -> Result<PathBuf> {
+    use rusqlite::OpenFlags;
+    // 优先只读打开：没有任何理由在"取回产物"这一步改动面板库。
+    // 兜底读写打开：非正常停机留下的 -wal 需要创建 -shm 才能读，只读会直接失败。
+    let conn = rusqlite::Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .or_else(|_| rusqlite::Connection::open(db_path))
+        .map_err(|e| PanelError::Database(format!("打开面板库失败: {e}")))?;
+
+    let (kind, r_kind, r_url, r_bucket, r_prefix, r_region, r_user, secret_enc): (
+        String, Option<String>, Option<String>, Option<String>,
+        Option<String>, Option<String>, Option<String>, Option<Vec<u8>>,
+    ) = conn
+        .query_row(
+            "SELECT kind, remote_kind, remote_url, remote_bucket, remote_prefix, \
+                    remote_region, remote_user, remote_secret_enc \
+             FROM backup_jobs WHERE id = ?1",
+            rusqlite::params![plan_id],
+            |r| {
+                Ok((
+                    r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?,
+                    r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?,
+                ))
+            },
+        )
+        .map_err(|_| PanelError::NotFound(format!("备份计划 #{plan_id}")))?;
+
+    if kind != "panel" {
+        return Err(PanelError::Validation {
+            field: "plan".into(),
+            reason: format!("计划 #{plan_id} 是 kind={kind}，不是面板库备份计划（--remote 只用于恢复面板库）"),
+        });
+    }
+    let Some(kind_s) = r_kind.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return Err(PanelError::Validation {
+            field: "remote_kind".into(),
+            reason: format!("计划 #{plan_id} 没配远端副本，无处可取"),
+        });
+    };
+    let rk = RemoteKind::parse(kind_s)
+        .ok_or_else(|| PanelError::Validation { field: "remote_kind".into(), reason: format!("未知的远端类型：{kind_s}") })?;
+    let secret = match (&secret_enc, key) {
+        (Some(blob), Some(k)) => Some(String::from_utf8(k.decrypt(blob)?).map_err(|_| {
+            PanelError::Internal("远端凭据不是合法 UTF-8".into())
+        })?),
+        (Some(_), None) => {
+            return Err(PanelError::Internal("计划存了远端凭据但读不到主密钥，无法连接远端".into()))
+        }
+        (None, _) => None,
+    };
+    let target = RemoteTarget {
+        kind: rk,
+        url: r_url.unwrap_or_default(),
+        bucket: r_bucket,
+        prefix: r_prefix.clone(),
+        region: r_region,
+        user: r_user,
+        secret,
+    };
+    target.validate()?;
+
+    let objects = target.list(r_prefix.as_deref().unwrap_or("")).await?;
+    let cands = panel_db_names(&objects);
+    if cands.is_empty() {
+        return Err(PanelError::NotFound(format!(
+            "远端没有面板库产物（共 {} 个对象）",
+            objects.len()
+        )));
+    }
+    let name = match wanted {
+        Some(w) => {
+            if !cands.iter().any(|c| *c == w) {
+                return Err(PanelError::NotFound(format!(
+                    "远端没有名为 {w} 的面板库产物；可选：{}",
+                    cands.iter().take(5).copied().collect::<Vec<_>>().join("、")
+                )));
+            }
+            w.to_string()
+        }
+        None => cands[0].to_string(),
+    };
+
+    std::fs::create_dir_all(dest_dir).map_err(|e| PanelError::Io(format!("create dest: {e}")))?;
+    let dest = dest_dir.join(&name);
+    target.download(&name, &dest).await?;
+    Ok(dest)
+}
+
 /// 极简目录计数（校验用，不需要 walkdir 依赖）。
 fn walkdir_count(dir: &std::path::Path) -> usize {
     let mut n = 0usize;
@@ -2739,6 +2860,83 @@ mod restore_verify_tests {
             .expect("解包之后必须校验落盘结果");
         let done = joined[start..].find("progress.set(100").expect("应有收尾");
         assert!(v < done, "校验必须在任务标记完成之前");
+    }
+}
+
+#[cfg(test)]
+mod remote_cli_tests {
+    use super::*;
+
+    /// 远端对象名里挑出面板库产物：要能过滤掉别的产物，也要按新到旧排。
+    #[test]
+    fn only_panel_db_names_sorted_newest_first() {
+        let objs = vec![
+            "backups/plan1-1700000001.db".to_string(),
+            "backups/plan1-1700000003.tar.gz".to_string(), // 站点产物，不能选
+            "backups/plan1-1700000005.db.enc".to_string(), // 加密产物也要认
+            "backups/plan2-1700000009.sql".to_string(),    // 别的计划且是 dump
+            "backups/plan1-1700000002.db".to_string(),
+        ];
+        let got = panel_db_names(&objs);
+        assert_eq!(got, vec!["plan1-1700000005.db.enc", "plan1-1700000002.db", "plan1-1700000001.db"]);
+    }
+
+    #[test]
+    fn no_panel_db_objects_means_empty() {
+        let objs = vec!["a.tar.gz".to_string(), "b.sql".to_string()];
+        assert!(panel_db_names(&objs).is_empty());
+    }
+
+    /// 真库 + 真迁移：把计划行读出来做前置校验（不碰网络）。
+    // ⚠ tag 必须每条用例不同：同进程内用例并发跑，只靠 pid 会撞同一目录
+    // （实测：UNIQUE constraint failed: backup_jobs.id）
+    fn db_with_plan(tag: &str, kind: &str, remote_kind: Option<&str>) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("panel-rcli-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("panel.db");
+        {
+            let mut c = rusqlite::Connection::open(&db).unwrap();
+            panel_db::migrate::apply(&mut c).unwrap();
+            c.execute(
+                "INSERT INTO backup_jobs(id, kind, target, keep_count, dest_dir, enabled, remote_kind, remote_url) \
+                 VALUES(1, ?1, 'panel', 5, 'plans', 1, ?2, 'http://127.0.0.1:9/x')",
+                rusqlite::params![kind, remote_kind],
+            )
+            .unwrap();
+        }
+        db
+    }
+
+    /// ⚠ 非 panel 计划必须被拒：把别的计划的 `.db` 盖到 panel.db 上，得到的是
+    /// 一个"能打开但不是面板库"的库——比打不开更难查。
+    #[tokio::test]
+    async fn non_panel_plan_is_rejected() {
+        let db = db_with_plan("site", "site", None);
+        let e = fetch_remote_artifact_cli(&db, 1, None, std::env::temp_dir().as_path(), None)
+            .await
+            .unwrap_err();
+        let m = e.to_string();
+        assert!(m.contains("不是面板库备份计划"), "{m}");
+    }
+
+    /// 没配远端的计划：诚实报"无处可取"，而不是去连一个空 URL。
+    #[tokio::test]
+    async fn plan_without_remote_is_rejected() {
+        let db = db_with_plan("nor", "panel", None);
+        let e = fetch_remote_artifact_cli(&db, 1, None, std::env::temp_dir().as_path(), None)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("没配远端副本"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn missing_plan_is_not_found() {
+        let db = db_with_plan("miss", "panel", Some("webdav"));
+        let e = fetch_remote_artifact_cli(&db, 99, None, std::env::temp_dir().as_path(), None)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("备份计划 #99"), "{e}");
     }
 }
 

@@ -119,7 +119,16 @@ enum Cmd {
     /// 离线恢复面板数据库（**必须先停服务**：在线覆盖会损坏 SQLite WAL）
     RestoreDb {
         /// 产物路径（`.db` 或 `.db.enc`；站点 `.tar.gz` 会拒绝）
-        path: PathBuf,
+        ///
+        /// 与 `--remote` 二选一：本地盘还在就直接用它；盘没了用 `--remote`。
+        path: Option<PathBuf>,
+        /// 从远端副本取产物：指定备份计划 id（**本地盘没了**时用）。
+        /// 计划必须配置为 `kind=panel` 且配了远端副本。
+        #[arg(long, value_name = "PLAN_ID")]
+        remote: Option<i64>,
+        /// `--remote` 时指定产物名；缺省取该计划**最新**的面板库产物
+        #[arg(long, value_name = "NAME")]
+        artifact: Option<String>,
         /// 跳过"服务仍在监听"的检查（容器里进程名不同 / 已确认停机时用）
         #[arg(long)]
         force: bool,
@@ -531,25 +540,12 @@ fn run(cli: Cli) -> Result<()> {
         // 但"拒绝"只解决了一半问题——出事时用户仍要手抄一份 mv 命令，而且
         // 没人先验一遍产物是不是好的。这个子命令把那段手工流程收敛成一条：
         // 先验产物 → 留当前态快照 → 原子替换 → 清掉旧 -wal/-shm。
-        Cmd::RestoreDb { ref path, force } => {
+        Cmd::RestoreDb { ref path, remote, ref artifact, force } => {
             let layout0 = build_layout(&os, None);
             let cfg = load_cfg(&cli, &layout0)?;
             let layout = build_layout(&os, Some(&cfg));
 
-            // ① 只接受面板库产物。verify 对 .tar.gz 也会通过——但把站点归档
-            //    盖到 panel.db 上会得到一个打不开的库，必须先按扩展名挡掉。
-            let fname = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            if !is_db_artifact_name(&fname) {
-                return Err(PanelError::Validation {
-                    field: "path".into(),
-                    reason: format!("只接受面板库产物（.db / .db.enc），收到：{fname}"),
-                });
-            }
-            if !path.is_file() {
-                return Err(PanelError::NotFound(format!("产物 {}", path.display())));
-            }
-
-            // ② 服务在跑就不能动库：在线覆盖会让 WAL 与主库不一致
+            // ① 服务在跑就不能动库：在线覆盖会让 WAL 与主库不一致
             if !force {
                 let host = match cfg.server.bind.as_str() {
                     "0.0.0.0" | "::" => "127.0.0.1",
@@ -570,9 +566,50 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
 
-            // ③ 产物先验：坏产物绝不能覆盖正在用的库
+            // ② 二选一：本地产物路径，或从远端副本拉回来。
+            //    `--remote` 拉下来的文件落在临时目录，**用完必须删**（它不是备份，
+            //    留在那里只会让人误以为本地还有一份副本）。
+            let mut downloaded: Option<PathBuf> = None;
+            let path: PathBuf = match (path.clone(), remote) {
+                (Some(p), None) => p,
+                (None, Some(plan_id)) => {
+                    let db_path = layout.sqlite_path();
+                    let key = load_master_key(&layout.data_dir());
+                    let rt = tokio::runtime::Runtime::new()
+                        .map_err(|e| PanelError::Internal(format!("runtime: {e}")))?;
+                    let p = rt.block_on(panel_api::routes::backups::fetch_remote_artifact_cli(
+                        &db_path, plan_id, artifact.as_deref(), &layout.tmp_dir(), key.as_ref(),
+                    ))?;
+                    println!("已从远端取回产物：{}", p.display());
+                    downloaded = Some(p.clone());
+                    p
+                }
+                (Some(_), Some(_)) => return Err(PanelError::Validation {
+                    field: "path".into(),
+                    reason: "产物路径与 --remote 只能给一个".into(),
+                }),
+                (None, None) => return Err(PanelError::Validation {
+                    field: "path".into(),
+                    reason: "请给产物路径，或用 --remote <计划 id> 从远端副本取回".into(),
+                }),
+            };
+
+            // ③ 只接受面板库产物。verify 对 .tar.gz 也会通过——但把站点归档
+            //    盖到 panel.db 上会得到一个打不开的库，必须先按扩展名挡掉。
+            let fname = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            if !is_db_artifact_name(&fname) {
+                return Err(PanelError::Validation {
+                    field: "path".into(),
+                    reason: format!("只接受面板库产物（.db / .db.enc），收到：{fname}"),
+                });
+            }
+            if !path.is_file() {
+                return Err(PanelError::NotFound(format!("产物 {}", path.display())));
+            }
+
+            // ④ 产物先验：坏产物绝不能覆盖正在用的库
             let key = load_master_key(&layout.data_dir());
-            if panel_os::backup::is_encrypted_file(path) && key.is_none() {
+            if panel_os::backup::is_encrypted_file(path.as_path()) && key.is_none() {
                 return Err(PanelError::Internal(
                     "产物已加密但读不到主密钥（data_dir/master.key）——没有它无法恢复".into(),
                 ));
@@ -580,23 +617,23 @@ fn run(cli: Cli) -> Result<()> {
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| PanelError::Internal(format!("runtime: {e}")))?;
             let note = rt.block_on(panel_api::routes::backups::verify_artifact_cli(
-                path, key.as_ref(), &layout.tmp_dir(),
+                path.as_path(), key.as_ref(), &layout.tmp_dir(),
             ))?;
             println!("✅ 产物可恢复：{note}");
 
-            // ④ 加密产物先解密到临时文件（不原地解密）
+            // ⑤ 加密产物先解密到临时文件（不原地解密）
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-            let plain: PathBuf = if panel_os::backup::is_encrypted_file(path) {
+            let plain: PathBuf = if panel_os::backup::is_encrypted_file(path.as_path()) {
                 std::fs::create_dir_all(layout.tmp_dir()).ok();
                 let p = layout.tmp_dir().join(format!("restore-db-{ts}.db"));
-                rt.block_on(panel_os::backup::decrypt_file(path, &p, key.as_ref().unwrap()))?;
+                rt.block_on(panel_os::backup::decrypt_file(path.as_path(), &p, key.as_ref().unwrap()))?;
                 p
             } else {
                 path.clone()
             };
 
-            // ⑤ 当前库先留快照：这是回滚的唯一依据
+            // ⑥ 当前库先留快照：这是回滚的唯一依据
             let db = layout.sqlite_path();
             if db.exists() {
                 std::fs::create_dir_all(layout.backup_dir()).ok();
@@ -605,10 +642,14 @@ fn run(cli: Cli) -> Result<()> {
                 println!("当前库已留快照：{}", snap.display());
             }
 
-            // ⑥ 原子替换 + 清掉旧库的 -wal/-shm（见 `atomic_replace_db` 的说明）
+            // ⑦ 原子替换 + 清掉旧库的 -wal/-shm（见 `atomic_replace_db` 的说明）
             atomic_replace_db(&plain, &db)?;
             if plain.as_path() != path.as_path() {
                 let _ = std::fs::remove_file(&plain);
+            }
+            // 从远端拉下来的临时副本用完即删：留着会让人误以为本地另有一份备份
+            if let Some(d) = downloaded {
+                let _ = std::fs::remove_file(&d);
             }
             println!("✅ 已恢复：{}", db.display());
             println!("现在可以启动服务（如 systemctl start panel）。");

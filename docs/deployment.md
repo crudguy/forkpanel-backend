@@ -257,6 +257,17 @@ curl -fsS http://127.0.0.1:2083/api/v1/version
 只接受 `.db` / `.db.enc`：站点 `.tar.gz` 会被明确拒绝（把归档盖到 `panel.db`
 上只会得到一个打不开的库）。
 
+**本地盘没了**（机器挂了、盘换了）：只要计划配了远端副本，可以直接从远端取回——
+
+```bash
+panel --config "$CFG" restore-db --remote 3            # 取该计划最新的面板库产物
+panel --config "$CFG" restore-db --remote 3 --artifact plan3-1700000000.db   # 指定某一版
+```
+
+约束与行为：计划必须是 `kind=panel` 且配了远端副本（否则明确报错，不会去连一个
+空 URL）；只认 `.db` / `.db.enc`；拉下来的临时副本用完即删——留在临时目录会让
+人误以为本地另有一份备份。服务仍在运行时会先被拦下（不会白下一个大文件）。
+
 <details><summary>没有 <code>restore-db</code> 的旧版本（手工步骤）</summary>
 
 ```bash
