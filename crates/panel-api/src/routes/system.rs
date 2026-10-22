@@ -8,6 +8,7 @@ use crate::{
 use axum::{extract::{Query, State}, Json};
 use panel_core::cap_keys;
 use serde::Serialize;
+use serde_json::json;
 
 #[derive(Debug, Serialize)]
 pub struct VersionResp {
@@ -186,6 +187,79 @@ pub async fn users(State(state): State<Shared>, Auth(s): Auth) -> ApiResult<Json
     crate::auth::require(&s, perm::SERVICE_VIEW)?;
     let list = state.os.users().list().await?;
     Ok(ok(list))
+}
+
+/// 目录与文件位置：面板自身、数据、日志、Web 服务器（系统自带）、前端（内嵌）。
+///
+/// 用途：让终端用户在管理页面一眼看清"装到了哪、数据在哪、日志在哪、软件哪来的"，
+/// 不必去翻服务器或文档。所有路径来自 PathLayout（配置感知），与运行时实际落点一致。
+pub async fn directories(State(state): State<Shared>, Auth(s): Auth) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::SYSTEM_VIEW)?;
+    let p = state.os.paths();
+    let data = p.data_dir();
+    let bin = std::env::current_exe()
+        .map(|x| x.display().to_string())
+        .unwrap_or_default();
+    let ws_name = state.os.webserver().name();
+    let item = |label: &str, path: String, desc: Option<&str>| {
+        json!({ "label": label, "path": path, "desc": desc })
+    };
+    let groups = json!([
+        {
+            "key": "panel",
+            "title": "面板自身（二进制与目录）",
+            "items": [
+                item("二进制文件", bin.clone(), Some("单文件静态二进制，前端已内嵌其中")),
+                item("配置目录", p.config_dir().display().to_string(), None),
+                item("数据根目录", data.display().to_string(), None),
+                item("日志目录", p.log_dir().display().to_string(), None),
+                item("站点根目录", p.site_root().display().to_string(), None),
+                item("服务单元目录", p.service_dir().display().to_string(), Some("systemd 单元所在")),
+            ]
+        },
+        {
+            "key": "data",
+            "title": "数据存放",
+            "items": [
+                item("主数据库", p.sqlite_path().display().to_string(), Some("SQLite（WAL 模式）")),
+                item("主密钥", data.join("master.key").display().to_string(), Some("加密 SSL 私钥/凭据；不进任何备份")),
+                item("证书与 CA", data.join("ssl").display().to_string(), None),
+                item("备份产物", data.join("backups").display().to_string(), None),
+                item("配置自动备份", data.join("conf-backups").display().to_string(), None),
+                item("计划任务脚本", data.join("scripts").display().to_string(), Some("受限目录")),
+                item("缓存 / 临时", format!("{} / {}", data.join("cache").display(), data.join("tmp").display()), None),
+            ]
+        },
+        {
+            "key": "log",
+            "title": "日志存放",
+            "items": [
+                item("面板日志", p.log_dir().display().to_string(), None),
+                item("站点访问日志", p.web_log_dir().display().to_string(), None),
+            ]
+        },
+        {
+            "key": "web",
+            "title": "Web 服务器（系统自带，非面板安装）",
+            "items": [
+                item("Web 服务器", ws_name.to_string(), Some("由发行版包管理器安装，面板只写配置")),
+                item("站点配置 drop-in", p.web_conf_dir().display().to_string(), None),
+                item("站点访问日志", p.web_log_dir().display().to_string(), None),
+            ]
+        },
+        {
+            "key": "frontend",
+            "title": "前端文件",
+            "items": [
+                item("说明", format!("已内嵌于二进制 {}，无独立目录", bin), None),
+            ]
+        }
+    ]);
+    Ok(ok(json!({
+        "binary": bin,
+        "frontend_embedded": true,
+        "groups": groups,
+    })))
 }
 
 #[allow(dead_code)]

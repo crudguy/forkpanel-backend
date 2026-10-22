@@ -106,6 +106,7 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/metrics/realtime", get(system::realtime))
         .route("/api/v1/metrics/history", get(system::history))
         .route("/api/v1/system/users", get(system::users))
+        .route("/api/v1/system/directories", get(system::directories))
         .route("/api/v1/metrics/snapshot", get(system::snapshot));
 
     // ── 进程（M2） ──
