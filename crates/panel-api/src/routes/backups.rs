@@ -1388,9 +1388,37 @@ pub async fn restore(
             .await?
             .ok_or_else(|| ApiError::bad_request("target", "db connection not found"))?;
         let target = super::databases::load_target(&state, cid, None).await?;
-        // SafePath 的根要与产物实际所在目录一致：本地产物在 dest、远端下载在 tmp
-        let (base, rel) = if req.from_remote {
-            let f = archive
+
+        // 加密产物**必须先解密**：provider 的 sqlite 分支是 `fs::copy` 直拷——
+        // 把 .enc 容器盖到用户库上等于静默损坏（mysql/pg 至少会因垃圾 SQL 响亮失败，
+        // sqlite 是悄悄坏掉，更糟）。绝不原地解密：失败会毁掉唯一那份产物。
+        let mut cleanup: Vec<PathBuf> = match cleanup {
+            Some(p) => vec![p],
+            None => Vec::new(),
+        };
+        let effective = if panel_os::backup::is_encrypted_file(archive.as_path()) {
+            let master = state.require_secret_key()?;
+            let tmp = state.os.paths().tmp_dir();
+            tokio::fs::create_dir_all(&tmp)
+                .await
+                .map_err(|e| ApiError::from(PanelError::Internal(format!("create tmp: {e}"))))?;
+            let plain = tmp.join(format!(
+                "db-restore-plain-{id}-{}-{}",
+                crate::now_unix(),
+                name.trim_end_matches(".enc")
+            ));
+            panel_os::backup::decrypt_file(archive.as_path(), &plain, &master)
+                .await
+                .map_err(ApiError::from)?;
+            cleanup.push(plain.clone());
+            plain
+        } else {
+            archive.clone()
+        };
+
+        // SafePath 的根要与产物实际所在目录一致：本地产物在 dest、临时文件在 tmp
+        let (base, rel) = if req.from_remote || !effective.starts_with(dest.as_path()) {
+            let f = effective
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
@@ -1512,14 +1540,25 @@ struct RestoreJob {
 /// 这里只多挂一个清理钩子——从远端拉下来的临时文件必须删。
 struct PlanDbRestoreJob {
     inner: super::databases::DbRestoreTask,
-    cleanup: Option<PathBuf>,
+    /// 任务结束要删的临时文件（远端下载副本、解密明文，最多两个）
+    cleanup: Vec<PathBuf>,
 }
 
 #[async_trait::async_trait]
 impl panel_task::TaskBody for PlanDbRestoreJob {
     async fn run(&self, progress: panel_task::Progress) -> Result<panel_task::TaskOutcome> {
-        let _guard = TempGuard(self.cleanup.clone());
+        let _guard = TempGuardN(self.cleanup.clone());
         self.inner.run(progress).await
+    }
+}
+
+/// 多文件版清理守卫：db 恢复可能同时产生「远端下载副本」和「解密明文」两个临时文件。
+struct TempGuardN(Vec<PathBuf>);
+impl Drop for TempGuardN {
+    fn drop(&mut self) {
+        for p in &self.0 {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
 
@@ -2329,6 +2368,32 @@ mod daily_tests {
         let p = std::path::Path::new("/nonexistent/panel-daily-x");
         assert!(list_daily_db(p).is_empty());
         assert!(prune_daily_db(p, 7).is_empty());
+    }
+}
+
+/// 源码级守卫：`kind=db` 的恢复分支**必须先解密加密产物**。
+///
+/// 这个缺口真出现过：db 分支最初直接把（可能是 .enc 的）产物交给 provider，
+/// 而 provider 的 sqlite 分支是 `fs::copy` 直拷——加密容器会静默盖掉用户的库。
+/// 行为测试难以覆盖（要整套 AppState），按项目纪律退到源码断言：
+/// 截取 db 分支块，要求其中出现 `decrypt_file` 调用。
+/// 先 split 掉测试段：本断言自身就含 "decrypt_file"，不剔会恒绿。
+#[cfg(test)]
+mod db_restore_guard {
+    #[test]
+    fn db_restore_branch_decrypts_encrypted_artifacts() {
+        let src = include_str!("backups.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        let start = prod.find("if plan.kind == \"db\" {")
+            .expect("db 恢复分支必须存在");
+        let end = prod[start..].find("let root = PathBuf::from(")
+            .map(|i| start + i)
+            .expect("db 分支之后应回到站点恢复路径");
+        let block = &prod[start..end];
+        assert!(
+            block.contains("panel_os::backup::decrypt_file("),
+            "db 恢复必须先解密加密产物，否则 .enc 容器会被 fs::copy 静默盖掉用户的库"
+        );
     }
 }
 
