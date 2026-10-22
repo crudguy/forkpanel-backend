@@ -2936,6 +2936,26 @@ paths:
         '400': { description: 文件名非法 }
         '404': { description: 计划或产物不存在 }
 
+  /api/v1/backups/{id}/remote/artifacts:
+    get:
+      tags: [backups]
+      summary: 列远端副本（本地盘出事后唯一能问的地方）
+      description: |
+        直接向远端存储要清单（WebDAV PROPFIND / S3 ListObjectsV2），只返回名字
+        以 `plan<id>-` 开头且通过白名单的对象。未配置远端时返回 400。
+        注意：远端不可达时返回 5xx/4xx 而**不是空列表**——"列不出来"与
+        "远端确实没有"是两件事，不能混。
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+        '400': { description: 该计划未配置远端副本 }
+        '502': { description: 远端不可达 / 凭据被拒 }
+
   /api/v1/backups/{id}/restore:
     post:
       tags: [backups]
@@ -2956,6 +2976,13 @@ paths:
               properties:
                 artifact: { type: string, description: "产物文件名（取自 artifacts 列表），不接受路径" }
                 confirm_token: { type: string, description: "二次确认词，须等于「覆盖恢复」" }
+                from_remote:
+                  type: boolean
+                  default: false
+                  description: >-
+                    从远端副本恢复：先按名字把对象下载到临时文件（任务结束即删），
+                    再走同一条恢复流程。本地那份已丢失时用这个——此时不要求本地产物存在。
+                    仅 kind=site 可用（panel 仍 501）。
       responses:
         '202':
           description: 已入队

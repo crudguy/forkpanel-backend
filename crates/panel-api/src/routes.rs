@@ -290,6 +290,7 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/backups/{id}/run", post(backups::run))
         .route("/api/v1/backups/{id}/artifacts", get(backups::artifacts))
         .route("/api/v1/backups/{id}/artifacts/{name}", get(backups::artifact_download))
+        .route("/api/v1/backups/{id}/remote/artifacts", get(backups::remote_artifacts))
         .route("/api/v1/backups/{id}/restore", post(backups::restore));
 
     // ── 容器（Docker）──

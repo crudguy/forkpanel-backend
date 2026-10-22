@@ -1113,6 +1113,29 @@ pub async fn artifacts(
     Ok(ok(items))
 }
 
+/// `GET /api/v1/backups/{id}/remote/artifacts`：列远端副本。
+///
+/// 存在的理由：本地盘坏掉时，产物列表（`/artifacts`）读的是本地目录——它已经
+/// 空了，用户无从知道异地还有没有、有哪几份。这个端点直接问远端要清单。
+pub async fn remote_artifacts(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    AxPath(id): AxPath<i64>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::BACKUP_VIEW)?;
+    let full = fetch_plan_full(&state, id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("backup plan"))?;
+    let remote = remote_target_from(&state, &full.dto, full.secret_enc.as_ref())?
+        .ok_or_else(|| ApiError::bad_request("remote", "该计划未配置远端副本"))?;
+    let prefix = format!("plan{id}-");
+    let mut names = remote.list(&prefix).await.map_err(ApiError::from)?;
+    // 远端对象名同样是**不可信输入**（别人可能往桶里塞东西）：只放行本计划的
+    // 合法产物名，避免把任意对象名带进 UI 再喂回恢复接口。
+    names.retain(|n| is_plan_artifact_name(id, n));
+    Ok(ok(serde_json::json!({ "items": names })))
+}
+
 /// 计划产物名白名单：必须是 `plan<id>-` 前缀，其余只允许 `[A-Za-z0-9._-]`
 /// （**不含路径分隔符**，`..` 也因此不可能出现为独立段）。
 ///
@@ -1163,6 +1186,10 @@ pub struct RestoreReq {
     pub artifact: String,
     /// 二次确认词，必须等于 [`RESTORE_CONFIRM_WORD`]
     pub confirm_token: String,
+    /// 从远端副本恢复：先按名字下载到本地临时文件，再走同一条恢复流程。
+    /// 缺省 false = 从本地产物恢复（原行为）。
+    #[serde(default)]
+    pub from_remote: bool,
 }
 
 /// 从产物恢复：**高危**（覆盖当前数据）。
@@ -1193,7 +1220,10 @@ pub async fn restore(
         ));
     }
 
-    let plan = fetch_plan(&state, id).await?.ok_or_else(|| ApiError::not_found("backup plan"))?;
+    let full = fetch_plan_full(&state, id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("backup plan"))?;
+    let plan = full.dto.clone();
     if plan.kind == "panel" {
         return Err(ApiError::unsupported(
             "面板数据库为面板自身运行中的库：在线覆盖会损坏 SQLite WAL。请先停止 panel 服务，再用产物文件手动替换数据目录内的库文件。",
@@ -1207,10 +1237,29 @@ pub async fn restore(
         return Err(ApiError::bad_request("artifact", "产物名不属于本计划或含非法路径成分"));
     }
     let dest = resolve_dest(&state, &plan.dest_dir)?;
-    let archive = dest.as_path().join(name);
-    if !archive.is_file() {
-        return Err(ApiError::not_found("artifact"));
-    }
+
+    // 产物来源：本地目录，或先按名字从远端拉回临时文件。
+    //
+    // 远端恢复是"本地盘已经出事"时才用的路径——此时本地那份很可能已经没了，
+    // 因此**不能**要求本地存在同名文件。拉到 tmp 而不是产物目录：它是临时副本，
+    // 归 TempGuard 在任务结束时删除，不该混进产物列表被裁剪逻辑当成一份备份。
+    let (archive, cleanup) = if req.from_remote {
+        let remote = remote_target_from(&state, &plan, full.secret_enc.as_ref())?
+            .ok_or_else(|| ApiError::bad_request("remote", "该计划未配置远端副本"))?;
+        let tmp = state.os.paths().tmp_dir();
+        tokio::fs::create_dir_all(&tmp)
+            .await
+            .map_err(|e| ApiError::from(PanelError::Internal(format!("create tmp: {e}"))))?;
+        let local = tmp.join(format!("remote-restore-{id}-{}-{name}", crate::now_unix()));
+        remote.download(name, &local).await.map_err(ApiError::from)?;
+        (local.clone(), Some(local))
+    } else {
+        let p = dest.as_path().join(name);
+        if !p.is_file() {
+            return Err(ApiError::not_found("artifact"));
+        }
+        (p, None)
+    };
 
     let root = PathBuf::from(
         site_root_by_name(&state, &plan.target)
@@ -1232,6 +1281,7 @@ pub async fn restore(
         safety_dir: dest.as_path().to_path_buf(),
         writer: state.db.clone(),
         master,
+        cleanup,
     };
     // 幂等键含产物名：同一产物重复提交返回同一任务，天然防误触两次
     let (tid, _) = state
@@ -1289,6 +1339,8 @@ struct RestoreJob {
     writer: std::sync::Arc<panel_db::WriterActor>,
     /// 产物为加密容器时的主密钥；明文产物为 `None`
     master: Option<panel_core::crypto::MasterKey>,
+    /// 从远端恢复时，本地临时下载文件的清理钩子（Drop 时删除）
+    cleanup: Option<PathBuf>,
 }
 
 /// 临时解密文件的清理守卫。
@@ -1339,6 +1391,8 @@ impl panel_task::TaskBody for RestoreJob {
 
 impl RestoreJob {
     async fn execute(&self, progress: panel_task::Progress) -> Result<panel_task::TaskOutcome> {
+        // 从远端拉下来的临时文件：无论成功失败都要删（Drop 时统一处理）
+        let _cleanup = TempGuard(self.cleanup.clone());
         // ⓪ 加密产物：先解密到临时文件。**绝不原地解密**——
         //    中途失败会把唯一的那份备份毁掉；解密失败也不该动原产物分毫。
         let decrypted: Option<PathBuf> = if let Some(key) = &self.master {

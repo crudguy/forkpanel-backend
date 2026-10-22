@@ -23,6 +23,9 @@ use std::time::Duration;
 const UPLOAD_TIMEOUT_SECS: u64 = 3600;
 /// 单次删除的超时（删除是幂等轻量操作，不该占着连接）
 const DELETE_TIMEOUT_SECS: u64 = 120;
+/// 列表 / 下载的超时。列表是元数据操作应很快；下载按产物大小给足。
+const LIST_TIMEOUT_SECS: u64 = 120;
+const DOWNLOAD_TIMEOUT_SECS: u64 = 3600;
 /// 连接自检用的探针对象名。固定名且用完即删，不会在远端累积垃圾。
 pub const PROBE_OBJECT: &str = ".panel-conn-test";
 
@@ -157,6 +160,124 @@ impl RemoteTarget {
             });
         }
         Ok(())
+    }
+
+    /// 需要读响应体的调用（LIST）：与 [`Self::run_curl`] 同纪律，但返回 stdout。
+    async fn curl_stdout(&self, args: Vec<String>, timeout_secs: u64) -> Result<String, PanelError> {
+        if !Bin::Curl.available() {
+            return Err(PanelError::Unsupported("curl"));
+        }
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let out = panel_os::run(
+            Bin::Curl,
+            &arg_refs,
+            CmdOpt { timeout: Duration::from_secs(timeout_secs + 30), ..Default::default() },
+        )
+        .await?;
+        if out.code != Some(0) {
+            return Err(PanelError::Command {
+                bin: "curl".into(),
+                detail: out.stderr.trim().to_string(),
+            });
+        }
+        Ok(out.stdout)
+    }
+
+    /// 列表用的 URL 与请求方式（两种协议完全不同，抽出来便于单测）。
+    fn list_request(&self, prefix: &str) -> Result<(String, Vec<String>), PanelError> {
+        let base = self.url.trim_end_matches('/');
+        match self.kind {
+            RemoteKind::Webdav => {
+                let url = format!("{base}/");
+                validate_remote_url(&url)?;
+                let body = r#"<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>"#;
+                Ok((
+                    url,
+                    vec![
+                        "--request".into(), "PROPFIND".into(),
+                        "--header".into(), "Depth: 1".into(),
+                        "--header".into(), "Content-Type: application/xml".into(),
+                        "--data".into(), body.into(),
+                    ],
+                ))
+            }
+            RemoteKind::S3 => {
+                let bucket = self.bucket.as_deref().filter(|b| !b.is_empty()).ok_or_else(|| {
+                    PanelError::Validation {
+                        field: "remote_bucket".into(),
+                        reason: "S3 需要填写 bucket".into(),
+                    }
+                })?;
+                let key_prefix = match self.prefix.as_deref().map(|p| p.trim_matches('/')) {
+                    Some(p) if !p.is_empty() => format!("{p}/{prefix}"),
+                    _ => prefix.to_string(),
+                };
+                let url = format!(
+                    "{base}/{bucket}?list-type=2&prefix={}",
+                    urlencode(&key_prefix)
+                );
+                validate_remote_url(&url)?;
+                Ok((url, Vec::new()))
+            }
+        }
+    }
+
+    /// 列出远端以 `prefix` 开头的对象名（**只返回最后一段文件名**）。
+    ///
+    /// 为什么只需要名字：恢复要按名字取回对象，UI 也只展示名字。大小/时间在
+    /// S3 要额外 HEAD、在 WebDAV 要解析 getcontentlength——先不做，避免为
+    /// 展示信息引入更多协议分支（真需要时再加）。
+    pub async fn list(&self, prefix: &str) -> Result<Vec<String>, PanelError> {
+        let (url, extra) = self.list_request(prefix)?;
+        let mut args: Vec<String> = vec![
+            "--fail".into(),
+            "--silent".into(),
+            "--show-error".into(),
+            "--max-time".into(),
+            LIST_TIMEOUT_SECS.to_string(),
+        ];
+        args.extend(extra);
+        args.extend(self.auth_args());
+        args.push(url);
+        let body = self.curl_stdout(args, LIST_TIMEOUT_SECS).await?;
+
+        let mut names: Vec<String> = match self.kind {
+            RemoteKind::Webdav => {
+                let mut raw = extract_tag_values(&body, "D:href");
+                raw.extend(extract_tag_values(&body, "d:href"));
+                raw.extend(extract_tag_values(&body, "href"));
+                raw.iter().map(|h| last_segment(h)).collect()
+            }
+            RemoteKind::S3 => extract_tag_values(&body, "Key")
+                .iter()
+                .map(|k| last_segment(k))
+                .collect(),
+        };
+        names.retain(|n| !n.is_empty() && n.starts_with(prefix));
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
+    /// 把远端对象下载到本地 `dest`（覆盖写）。
+    pub async fn download(&self, name: &str, dest: &Path) -> Result<(), PanelError> {
+        let url = self.object_url(name)?;
+        validate_remote_url(&url)?;
+        let dest_s = dest
+            .to_str()
+            .ok_or_else(|| PanelError::Internal("下载目标路径非 UTF-8".into()))?;
+        let mut args: Vec<String> = vec![
+            "--fail".into(),
+            "--silent".into(),
+            "--show-error".into(),
+            "--max-time".into(),
+            DOWNLOAD_TIMEOUT_SECS.to_string(),
+            "--output".into(),
+            dest_s.to_string(),
+        ];
+        args.extend(self.auth_args());
+        args.push(url);
+        self.run_curl(args, DOWNLOAD_TIMEOUT_SECS).await
     }
 
     /// 上传本地文件到远端。返回远端地址（展示 / 日志用）。
@@ -332,5 +453,130 @@ mod tests {
             validate_remote_url(&url).is_err(),
             "file:// 必须被拒（防 SSRF / 本地文件读取）"
         );
+    }
+}
+
+/// 取出 XML 里 `<tag>...</tag>` 的全部值。
+///
+/// **不引 XML 库**：依赖预算只剩 1 位，而这里要解析的是我们自己发出的
+/// LIST 响应——S3 ListObjectsV2 与 WebDAV multistatus 都是扁平结构。
+/// 只认**精确标签名**（`Key` / `D:href` 等），不做通用 XML 解析；
+/// 取不到就返回空（调用方按"远端没有产物"处理，不会误判）。
+fn extract_tag_values(xml: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(i) = rest.find(&open) {
+        rest = &rest[i + open.len()..];
+        match rest.find(&close) {
+            Some(j) => {
+                out.push(rest[..j].trim().to_string());
+                rest = &rest[j + close.len()..];
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+/// 取 href / key 的最后一段（去掉尾部斜杠）。
+fn last_segment(s: &str) -> String {
+    s.trim_end_matches('/').rsplit('/').next().unwrap_or("").to_string()
+}
+
+/// 最小 percent-encode：只保留 RFC 3986 unreserved。
+/// 前缀里可能有用户填的目录（`backups/2026`），不编码会让 query 断掉。
+fn urlencode(s: &str) -> String {
+    let mut o = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            o.push(b as char);
+        } else {
+            o.push_str(&format!("%{b:02X}"));
+        }
+    }
+    o
+}
+
+#[cfg(test)]
+mod list_tests {
+    use super::*;
+
+    fn dav() -> RemoteTarget {
+        RemoteTarget {
+            kind: RemoteKind::Webdav,
+            url: "https://dav.example.com/backups/".into(),
+            bucket: None,
+            prefix: None,
+            region: None,
+            user: Some("u".into()),
+            secret: Some("s".into()),
+        }
+    }
+
+    fn s3() -> RemoteTarget {
+        RemoteTarget {
+            kind: RemoteKind::S3,
+            url: "https://s3.example.com".into(),
+            bucket: Some("bk".into()),
+            prefix: Some("backups/".into()),
+            region: Some("ap-east-1".into()),
+            user: Some("ak".into()),
+            secret: Some("sk".into()),
+        }
+    }
+
+    #[test]
+    fn extracts_s3_keys_and_takes_last_segment() {
+        let xml = r#"<?xml version="1.0"?><ListBucketResult>
+            <Contents><Key>backups/plan1-123.tar.gz</Key></Contents>
+            <Contents><Key>backups/plan1-456.db</Key></Contents>
+        </ListBucketResult>"#;
+        let keys = extract_tag_values(xml, "Key");
+        assert_eq!(keys.len(), 2);
+        assert_eq!(last_segment(&keys[0]), "plan1-123.tar.gz");
+        assert_eq!(last_segment(&keys[1]), "plan1-456.db");
+    }
+
+    #[test]
+    fn extracts_webdav_hrefs_with_namespace_prefix() {
+        let xml = r#"<D:multistatus xmlns:D="DAV:">
+            <D:response><D:href>/dav/backups/</D:href></D:response>
+            <D:response><D:href>/dav/backups/plan2-9.tar.gz</D:href></D:response>
+        </D:multistatus>"#;
+        let hrefs = extract_tag_values(xml, "D:href");
+        assert_eq!(hrefs.len(), 2);
+        assert_eq!(last_segment(&hrefs[0]), "backups");
+        assert_eq!(last_segment(&hrefs[1]), "plan2-9.tar.gz");
+    }
+
+    #[test]
+    fn s3_list_url_encodes_the_prefix() {
+        let (url, extra) = s3().list_request("plan7-").unwrap();
+        assert_eq!(url, "https://s3.example.com/bk?list-type=2&prefix=backups%2Fplan7-");
+        assert!(extra.is_empty(), "S3 不需要额外 header");
+    }
+
+    #[test]
+    fn webdav_list_uses_propfind_depth_one() {
+        let (url, extra) = dav().list_request("plan7-").unwrap();
+        assert_eq!(url, "https://dav.example.com/backups/");
+        let joined = extra.join(" ");
+        assert!(joined.contains("PROPFIND"), "{joined}");
+        assert!(joined.contains("Depth: 1"), "{joined}");
+    }
+
+    #[test]
+    fn s3_without_bucket_is_rejected_before_any_network_call() {
+        let mut t = s3();
+        t.bucket = None;
+        assert!(t.list_request("plan7-").is_err());
+    }
+
+    #[test]
+    fn urlencode_keeps_unreserved_and_escapes_slashes() {
+        assert_eq!(urlencode("plan7-"), "plan7-");
+        assert_eq!(urlencode("a/b c"), "a%2Fb%20c");
     }
 }
