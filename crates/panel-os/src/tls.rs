@@ -394,12 +394,42 @@ mod tests {
         assert_eq!(san_entry("sub.example.com"), "DNS:sub.example.com");
     }
 
+    /// 真机用例的临时根目录：**带 pid + 先清残留**。
+    ///
+    /// 此前只写 `panel-xxx-{计数器}`，计数器是进程内从 0 开始的自增——于是
+    /// ①上一次跑到一半挂掉的遗留目录会被下一次直接复用；②pid 复用时也会撞名。
+    /// 实测后果：`half_present_root_ca_*` 一进场就看到上一次遗留的 `ca.key`，
+    /// "只有 cert" 的场景根本构造不出来，用例恒红（而它的对立面同样可能恒绿）。
+    /// 测试结论依赖 /tmp 的历史状态，比没有这条测试更危险。
+    /// 名字只由 `tag + pid` 决定（同进程内每个用例 tag 不同），这样"再取一次"
+    /// 必然回到同一处——下面的哨兵用例正是靠这一点证明残留被清掉了。
+    fn tmp_base(tag: &str) -> std::path::PathBuf {
+        let b = std::env::temp_dir().join(format!("panel-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&b);
+        std::fs::create_dir_all(&b).unwrap();
+        b
+    }
+
+    /// 残留清理的反向证明：写一个哨兵文件，再取同名目录，哨兵必须消失。
+    /// 去掉 `tmp_base` 里的 `remove_dir_all` 本条即红。
+    #[test]
+    fn tmp_base_wipes_stale_state_from_a_previous_run() {
+        let b = tmp_base("wipe-probe");
+        std::fs::write(b.join("stale.key"), b"sentinel").unwrap();
+        let again = tmp_base("wipe-probe");
+        assert_eq!(again, b, "同名应回到同一处，否则本用例无从证明清理");
+        assert!(
+            !again.join("stale.key").exists(),
+            "上一次运行的残留必须清掉——否则用例结论取决于 /tmp 的历史状态"
+        );
+        let _ = std::fs::remove_dir_all(&again);
+    }
+
     /// 需真机 openssl 的端到端：本沙箱有 openssl 时应真实生成一对可解析 PEM。
     #[tokio::test]
     async fn generate_roundtrip_when_openssl_present() {
         if !available() { return; }
-        let tmp = std::env::temp_dir().join(format!("panel-tls-test-{}", unique()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = tmp_base("tls-test");
         let domains = vec!["a.example".to_string(), "b.example".to_string()];
         let (cert, key) = generate_self_signed(&tmp, &domains, 30).await.expect("生成自签证书");
         assert!(cert.contains("BEGIN CERTIFICATE"), "cert 应为 PEM: {cert}");
@@ -413,7 +443,7 @@ mod tests {
     #[tokio::test]
     async fn issue_leaf_by_ca_when_openssl_present() {
         if !available() { return; }
-        let base = std::env::temp_dir().join(format!("panel-ca-test-{}", unique()));
+        let base = tmp_base("ca-test");
         let tmp = base.join("tmp");
         let ca_dir = base.join("ca");
         std::fs::create_dir_all(&tmp).unwrap();
@@ -437,7 +467,7 @@ mod tests {
     #[tokio::test]
     async fn half_present_root_ca_is_refused_not_regenerated() {
         if !available() { return; }
-        let base = std::env::temp_dir().join(format!("panel-ca-half-{}", unique()));
+        let base = tmp_base("ca-half");
         let tmp = base.join("tmp");
         let ca_dir = base.join("ca");
         std::fs::create_dir_all(&tmp).unwrap();
