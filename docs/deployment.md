@@ -228,29 +228,49 @@ journalctl -u panel-healthcheck.service -n 20 --no-pager
 
 ```bash
 CFG=/etc/forkpanel/config.toml
-DATA=/var/lib/forkpanel
 
 # ① 停服务（systemd 环境下探活 timer 会连着报失败，属预期，恢复后自愈）
 systemctl stop panel
 
-# ② 备份当前态——哪怕它已经坏了。恢复失败时这是唯一的回退素材
-cp -a "$DATA/panel.db" "$DATA/panel.db.broken-$(date +%s)"
-
-# ③ 校验手上的备份真的能恢复（不要跳过这一步）
-panel --config "$CFG" verify-backup /path/to/plan1-1234567890.db
+# ② 一条命令完成：验产物 → 给当前库留快照 → 原子替换 → 清掉旧 WAL/SHM
+panel --config "$CFG" restore-db /path/to/plan1-1234567890.db
 #    ✅ 产物可恢复：… integrity_check=ok，含 users 表
+#    当前库已留快照：/var/lib/forkpanel/backups/pre-restore-<ts>.db
+#    ✅ 已恢复：/var/lib/forkpanel/panel.db
 
-# ④ 换库。三个文件一起换：主库 + WAL + SHM。
-#    留着旧的 -wal/-shm 会让新主库去应用一套不属于它的帧，直接错乱。
-rm -f "$DATA/panel.db" "$DATA/panel.db-wal" "$DATA/panel.db-shm"
-cp /path/to/plan1-1234567890.db "$DATA/panel.db"
-chmod 600 "$DATA/panel.db"
-
-# ⑤ 起来，然后**验证数据真的回来了**——不只是 200
+# ③ 起来，然后**验证数据真的回来了**——不只是 200
 systemctl start panel
 curl -fsS http://127.0.0.1:2083/api/v1/version
 # 登录进面板，核对站点数 / 用户数 / 最近备份时间与备份时刻一致
 ```
+
+`restore-db` 的四道保护（缺一条都可能把"恢复"变成"二次事故"）：
+
+1. **拒绝在线恢复**：先探测 `server.bind:port` 是否可连接，能连就中止；
+   容器里进程名不同、或已确认停机，可加 `--force`。
+2. **先验产物**：`integrity_check` + 必须含 `users` 表；坏产物当场失败，
+   不会拿它覆盖正在用的库（退出码 1）。
+3. **先留当前态快照**：`backups/pre-restore-<ts>.db`，恢复错了还能退回去。
+4. **原子替换 + 清 WAL/SHM**：先写同目录临时文件再 `rename`；旧的 `-wal/-shm`
+   属于被替换掉的那个库，留着会被回放到新库上——必须一起删。
+
+只接受 `.db` / `.db.enc`：站点 `.tar.gz` 会被明确拒绝（把归档盖到 `panel.db`
+上只会得到一个打不开的库）。
+
+<details><summary>没有 <code>restore-db</code> 的旧版本（手工步骤）</summary>
+
+```bash
+DATA=/var/lib/forkpanel
+# 备份当前态——哪怕它已经坏了
+cp -a "$DATA/panel.db" "$DATA/panel.db.broken-$(date +%s)"
+panel --config "$CFG" verify-backup /path/to/plan1-1234567890.db
+# 主库 + WAL + SHM 三个一起换
+rm -f "$DATA/panel.db" "$DATA/panel.db-wal" "$DATA/panel.db-shm"
+cp /path/to/plan1-1234567890.db "$DATA/panel.db"
+chmod 600 "$DATA/panel.db"
+```
+
+</details>
 
 **验收标准**（恢复成功的定义）：能登录 + 站点与账号数量、内容与备份时刻一致。
 只看 `/api/v1/version` 返回 200 是不够的——那只能证明进程起来了。

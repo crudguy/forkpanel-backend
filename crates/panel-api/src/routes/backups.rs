@@ -1200,7 +1200,7 @@ pub struct RestoreReq {
 /// 3. **自动先备份当前态** —— 任务内第一步（见 `RestoreJob`），失败即中止、绝不裸覆盖。
 ///
 /// `kind=panel` 例外：面板库是面板自身运行的库，在线覆盖会让 SQLite WAL 损坏，
-/// 诚实 501 并给出停服后手动替换的指引——不提供"看起来能点"的危险按钮。
+/// 诚实 501 并指向停服后的恢复命令（`panel restore-db`）——不提供"看起来能点"的危险按钮。
 pub async fn restore(
     State(state): State<Shared>,
     Auth(s): Auth,
@@ -1226,7 +1226,8 @@ pub async fn restore(
     let plan = full.dto.clone();
     if plan.kind == "panel" {
         return Err(ApiError::unsupported(
-            "面板数据库为面板自身运行中的库：在线覆盖会损坏 SQLite WAL。请先停止 panel 服务，再用产物文件手动替换数据目录内的库文件。",
+            "面板数据库为面板自身运行中的库：在线覆盖会损坏 SQLite WAL。请先停止 panel 服务，\
+             再执行 `panel restore-db <产物路径>`（会先校验产物、给当前库留快照、原子替换并清理 WAL/SHM）。",
         ));
     }
 

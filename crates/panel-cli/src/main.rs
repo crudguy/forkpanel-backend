@@ -19,6 +19,33 @@ use std::{
 
 /// 加载主密钥：优先读已有 `master.key`（0600）；不存在则生成。
 /// 任意一步失败都返回 `None`（密钥加密存储降级关闭，绝不明文存秘密）。
+/// 只接受面板库产物：`.db` / `.db.enc`。
+///
+/// `.tar.gz` 也能通过 `verify_artifact`（它是合法的站点归档），但把它盖到
+/// `panel.db` 上只会得到一个打不开的库——所以必须在扩展名这一层先挡掉。
+fn is_db_artifact_name(name: &str) -> bool {
+    name.trim_end_matches(".enc").ends_with(".db")
+}
+
+/// 原子替换数据库：先写同目录临时文件再 `rename`，并清掉属于**旧库**的 -wal/-shm。
+///
+/// 为什么必须删 WAL/SHM：它们记录的是被替换掉那个库的事务帧。留着会让 SQLite
+/// 把旧帧回放到新库上——库能打开但数据错乱，比打不开更难查。
+fn atomic_replace_db(plain: &std::path::Path, db: &std::path::Path) -> Result<()> {
+    let tmp = db.with_extension("db.restore-tmp");
+    std::fs::copy(plain, &tmp)
+        .map_err(|e| PanelError::Io(format!("写入临时库失败: {e}")))?;
+    std::fs::rename(&tmp, db)
+        .map_err(|e| PanelError::Io(format!("替换数据库失败: {e}")))?;
+    for suffix in ["-wal", "-shm"] {
+        let p = PathBuf::from(format!("{}{suffix}", db.display()));
+        if p.exists() {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+    Ok(())
+}
+
 fn load_master_key(data_dir: &std::path::Path) -> Option<MasterKey> {
     let p = bootstrap::master_key_path(data_dir);
     let bytes = if p.exists() {
@@ -88,6 +115,14 @@ enum Cmd {
     VerifyBackup {
         /// 产物路径（.db / .tar.gz 及其 .enc 变体）
         path: std::path::PathBuf,
+    },
+    /// 离线恢复面板数据库（**必须先停服务**：在线覆盖会损坏 SQLite WAL）
+    RestoreDb {
+        /// 产物路径（`.db` 或 `.db.enc`；站点 `.tar.gz` 会拒绝）
+        path: PathBuf,
+        /// 跳过"服务仍在监听"的检查（容器里进程名不同 / 已确认停机时用）
+        #[arg(long)]
+        force: bool,
     },
     /// 安装/卸载外部探活（覆盖 Restart=on-failure 管不了的"活着但不服务"）
     Healthcheck {
@@ -489,6 +524,94 @@ fn run(cli: Cli) -> Result<()> {
                 path, key.as_ref(), &layout.tmp_dir(),
             ))?;
             println!("✅ 产物可恢复：{note}");
+            Ok(())
+        }
+
+        // 面板自身的库是**运行中的库**：API 侧一直拒绝在线恢复（会损坏 WAL）。
+        // 但"拒绝"只解决了一半问题——出事时用户仍要手抄一份 mv 命令，而且
+        // 没人先验一遍产物是不是好的。这个子命令把那段手工流程收敛成一条：
+        // 先验产物 → 留当前态快照 → 原子替换 → 清掉旧 -wal/-shm。
+        Cmd::RestoreDb { ref path, force } => {
+            let layout0 = build_layout(&os, None);
+            let cfg = load_cfg(&cli, &layout0)?;
+            let layout = build_layout(&os, Some(&cfg));
+
+            // ① 只接受面板库产物。verify 对 .tar.gz 也会通过——但把站点归档
+            //    盖到 panel.db 上会得到一个打不开的库，必须先按扩展名挡掉。
+            let fname = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            if !is_db_artifact_name(&fname) {
+                return Err(PanelError::Validation {
+                    field: "path".into(),
+                    reason: format!("只接受面板库产物（.db / .db.enc），收到：{fname}"),
+                });
+            }
+            if !path.is_file() {
+                return Err(PanelError::NotFound(format!("产物 {}", path.display())));
+            }
+
+            // ② 服务在跑就不能动库：在线覆盖会让 WAL 与主库不一致
+            if !force {
+                let host = match cfg.server.bind.as_str() {
+                    "0.0.0.0" | "::" => "127.0.0.1",
+                    other => other,
+                };
+                let addr = format!("{host}:{}", cfg.server.port);
+                if let Ok(sa) = addr.parse::<std::net::SocketAddr>() {
+                    if std::net::TcpStream::connect_timeout(
+                        &sa, std::time::Duration::from_millis(300),
+                    ).is_ok() {
+                        return Err(PanelError::Validation {
+                            field: "service".into(),
+                            reason: format!(
+                                "服务仍在运行（{addr} 可连接）。请先停止 panel 再恢复；\n                                 确认已停机（例如容器内进程名不同）可加 --force"
+                            ),
+                        });
+                    }
+                }
+            }
+
+            // ③ 产物先验：坏产物绝不能覆盖正在用的库
+            let key = load_master_key(&layout.data_dir());
+            if panel_os::backup::is_encrypted_file(path) && key.is_none() {
+                return Err(PanelError::Internal(
+                    "产物已加密但读不到主密钥（data_dir/master.key）——没有它无法恢复".into(),
+                ));
+            }
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| PanelError::Internal(format!("runtime: {e}")))?;
+            let note = rt.block_on(panel_api::routes::backups::verify_artifact_cli(
+                path, key.as_ref(), &layout.tmp_dir(),
+            ))?;
+            println!("✅ 产物可恢复：{note}");
+
+            // ④ 加密产物先解密到临时文件（不原地解密）
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            let plain: PathBuf = if panel_os::backup::is_encrypted_file(path) {
+                std::fs::create_dir_all(layout.tmp_dir()).ok();
+                let p = layout.tmp_dir().join(format!("restore-db-{ts}.db"));
+                rt.block_on(panel_os::backup::decrypt_file(path, &p, key.as_ref().unwrap()))?;
+                p
+            } else {
+                path.clone()
+            };
+
+            // ⑤ 当前库先留快照：这是回滚的唯一依据
+            let db = layout.sqlite_path();
+            if db.exists() {
+                std::fs::create_dir_all(layout.backup_dir()).ok();
+                let snap = layout.backup_dir().join(format!("pre-restore-{ts}.db"));
+                panel_db::backup_file(&db, &snap)?;
+                println!("当前库已留快照：{}", snap.display());
+            }
+
+            // ⑥ 原子替换 + 清掉旧库的 -wal/-shm（见 `atomic_replace_db` 的说明）
+            atomic_replace_db(&plain, &db)?;
+            if plain.as_path() != path.as_path() {
+                let _ = std::fs::remove_file(&plain);
+            }
+            println!("✅ 已恢复：{}", db.display());
+            println!("现在可以启动服务（如 systemctl start panel）。");
             Ok(())
         }
 
@@ -933,5 +1056,45 @@ mod wiring_guard_tests {
             prod.contains("backups::sweep_due(&state)"),
             "注册的实现必须真的调用 sweep_due"
         );
+    }
+}
+
+#[cfg(test)]
+mod restore_cli_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("panel-rstdb-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn only_db_artifacts_pass_the_gate() {
+        assert!(is_db_artifact_name("plan1-1700000000.db"));
+        assert!(is_db_artifact_name("plan1-1700000000.db.enc"));
+        assert!(!is_db_artifact_name("plan1-1700000000.tar.gz"), "站点归档不能盖到 panel.db");
+        assert!(!is_db_artifact_name("plan1-1700000000.tar.gz.enc"));
+        assert!(!is_db_artifact_name("panel.db.bak"));
+    }
+
+    #[test]
+    fn atomic_replace_swaps_content_and_clears_wal_and_shm() {
+        let d = tmp("swap");
+        let db = d.join("panel.db");
+        let src = d.join("art.db");
+        std::fs::write(&db, b"OLD-DB").unwrap();
+        std::fs::write(d.join("panel.db-wal"), b"STALE-WAL").unwrap();
+        std::fs::write(d.join("panel.db-shm"), b"STALE-SHM").unwrap();
+        std::fs::write(&src, b"NEW-DB").unwrap();
+
+        atomic_replace_db(&src, &db).unwrap();
+
+        assert_eq!(std::fs::read(&db).unwrap(), b"NEW-DB", "主库必须被替换");
+        assert!(!d.join("panel.db-wal").exists(), "旧 WAL 必须删掉，否则会回放到新库");
+        assert!(!d.join("panel.db-shm").exists(), "旧 SHM 必须删掉");
+        assert!(!d.join("panel.db.restore-tmp").exists(), "临时文件不能留下");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
