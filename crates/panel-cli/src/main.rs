@@ -435,15 +435,25 @@ fn run(cli: Cli) -> Result<()> {
         }
 
         Cmd::SystemdUnit { install } => {
-            let tier = detect_tier(&*os, &Config::default());
+            // 关键修复：必须用配置感知的布局构造 `writable`。否则用户在 config.toml
+            // 覆盖 [paths] 后，生成的单元 ReadWritePaths 仍是默认值，而 ExecStart
+            // 指向自定义 --config ⇒ ProtectSystem=strict 下面板写不进真实
+            // 数据/日志/站点目录 ⇒ 起不来或丢数据。逻辑与 Cmd::Serve 对齐。
+            // 容错：config 尚未写入（仅打印单元预览）时回退默认布局。
+            let layout0 = build_layout(&os, None);
+            let cfgp = cli.config.clone().unwrap_or_else(|| layout0.config_dir().join("config.toml"));
+            let mut cfg = Config::load(&cfgp).unwrap_or_default();
+            if let Some(t) = &cli.tier { cfg.tier = t.clone(); }
+            let layout = build_layout(&os, Some(&cfg));
+            let tier = detect_tier(&*os, &cfg);
             let bin = std::env::current_exe()
                 .map(|p| p.display().to_string())
                 .map_err(|e| PanelError::Internal(format!("无法确定自身路径：{e}")))?;
-            let layout_data = os.paths().data_dir();
-            let layout_log = os.paths().log_dir();
-            let layout_site = os.paths().site_root();
-            let cfgp = cli.config.clone().unwrap_or_else(|| os.paths().config_dir().join("config.toml"));
-            let writable = vec![layout_data.clone(), layout_log.clone(), layout_site.clone(), os.paths().config_dir()];
+            let layout_data = layout.data_dir();
+            let layout_log = layout.log_dir();
+            let layout_site = layout.site_root();
+            let cfgp = cli.config.clone().unwrap_or_else(|| layout.config_dir().join("config.toml"));
+            let writable = vec![layout_data.clone(), layout_log.clone(), layout_site.clone(), layout.config_dir()];
             let unit = bootstrap::systemd_unit(&bin, &cfgp.display().to_string(), tier, &writable);
             if install {
                 let dir = os.paths().service_dir();

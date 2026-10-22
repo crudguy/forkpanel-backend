@@ -275,4 +275,27 @@ mod tests {
         let u = systemd_unit("panel", "config.toml", Tier::Standard, &[std::path::PathBuf::from("data")]);
         assert!(u.contains("MemoryMax=384M"));
     }
+
+    /// 回归：ReadWritePaths 必须逐字反映调用方传入的可写目录（来自配置感知的
+    /// PathLayout），不得写死默认值。历史上 Cmd::SystemdUnit 用 `os.paths()`
+    /// 默认布局构造 writable，而 ExecStart 指向用户自定义的 --config ⇒ 一旦
+    /// config.toml 覆盖了 [paths]，ProtectSystem=strict 下面板写不进真实
+    /// 数据/日志/站点目录 ⇒ 起不来或丢数据。
+    #[test]
+    fn read_write_paths_track_configured_layout() {
+        let custom = vec![
+            std::path::PathBuf::from("/srv/fp/data"),
+            std::path::PathBuf::from("/srv/fp/log"),
+            std::path::PathBuf::from("/srv/fp/www"),
+            std::path::PathBuf::from("/srv/fp/conf"),
+        ];
+        let u = systemd_unit("panel", "/srv/fp/conf/config.toml", Tier::Small, &custom);
+        let line = u.lines().find(|l| l.starts_with("ReadWritePaths=")).unwrap();
+        assert_eq!(
+            line,
+            "ReadWritePaths=/srv/fp/data /srv/fp/log /srv/fp/www /srv/fp/conf",
+            "ReadWritePaths 必须与配置 [paths] 一致，不能回落默认 /var/lib/panel 等"
+        );
+        assert!(u.contains("ExecStart=panel --config /srv/fp/conf/config.toml serve"));
+    }
 }
