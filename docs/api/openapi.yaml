@@ -2837,8 +2837,10 @@ paths:
       summary: 系统自动备份列表（面板库每日快照）
       description: |
         每日自动备份（`panel-<unix>.db`）此前**只写不列**：产物接口只认 `plan<id>-`
-        前缀，用户完全看不到面板每天在备份、更不知道堆了多少。保留份数由
-        `config.toml [db] backup_keep` 控制（默认 7），写完立刻裁剪。
+        前缀，用户完全看不到面板每天在备份、更不知道堆了多少。
+
+        响应同时回 `keep` / `daily_backup`：**实际生效值**（config.toml `[db]`
+        的 backup_keep / daily_backup），前端据此显示"保留 N 份"，不得写死默认 7。
       responses:
         '200':
           description: ok
@@ -2853,6 +2855,8 @@ paths:
                         type: object
                         properties:
                           dir: { type: string, description: 备份目录绝对路径 }
+                          keep: { type: integer, description: "实际保留份数（config.toml [db] backup_keep，默认 7）" }
+                          daily_backup: { type: boolean, description: "每日备份是否已启用（config.toml [db] daily_backup；nano 档位恒不执行）" }
                           items:
                             type: array
                             items:

@@ -330,11 +330,15 @@ fn run(cli: Cli) -> Result<()> {
                 let localhost_only = cfg.server.localhost_only;
                 let daily_backup = cfg.db.daily_backup;
                 let db_synchronous = cfg.db.synchronous.clone();
+                // 保留份数：`[db] backup_keep`。与 daily_backup 同一条链——调度器
+                // 注册 `db.backup` 时就取它做裁剪阈值（见下方 register_internal_jobs），
+                // 这里同时注入 AppState 供备份页显示"实际保留几份"。
+                let backup_keep = cfg.db.backup_keep;
                 let state = Arc::new(panel_api::AppState::new(
                     os.clone(), writer.clone(), pool, tasks.clone(), metrics.clone(), tier,
                     master_key, read_only, max_login_attempts, session_idle, session_absolute,
                     audit_retention_days, audit_max_rows, localhost_only, daily_backup,
-                    db_synchronous));
+                    db_synchronous, backup_keep));
 
                 // ── 内部周期任务 ──
                 register_internal_jobs(&sched_in, &os, writer.clone(), metrics.clone(), &layout, &cfg, tier, state.clone()).await;

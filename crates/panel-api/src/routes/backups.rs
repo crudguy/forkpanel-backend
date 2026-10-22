@@ -2514,6 +2514,9 @@ pub fn prune_daily_db(dir: &std::path::Path, keep: i64) -> Vec<String> {
 ///
 /// 存在的理由：这些文件此前**只写不列**——产物接口只认 `plan<id>-` 前缀，
 /// 所以用户完全不知道面板每天在备份、更不知道它们已经堆了多少。
+///
+/// 同时回 `keep` / `daily_backup`：卡片要显示"实际保留几份/是否已关闭"，这两个值
+/// 只有进程知道（来自 config.toml `[db]`），页面写死就会在改过配置的机器上说谎。
 pub async fn system_artifacts(
     State(state): State<Shared>,
     Auth(s): Auth,
@@ -2524,7 +2527,13 @@ pub async fn system_artifacts(
         .into_iter()
         .map(|(name, size, mtime)| serde_json::json!({ "name": name, "size": size, "mtime": mtime }))
         .collect();
-    Ok(ok(serde_json::json!({ "dir": dir.display().to_string(), "items": items })))
+    Ok(ok(serde_json::json!({
+        "dir": dir.display().to_string(),
+        "items": items,
+        // 实际生效值（只读）：卡片据此写"保留 N 份"，而不是写死 7
+        "keep": state.backup_keep,
+        "daily_backup": state.daily_backup,
+    })))
 }
 
 /// 流式读文件，避免把整份备份读进内存（低配机上是致命的）。
@@ -2645,6 +2654,39 @@ mod daily_tests {
         let p = std::path::Path::new("/nonexistent/panel-daily-x");
         assert!(list_daily_db(p).is_empty());
         assert!(prune_daily_db(p, 7).is_empty());
+    }
+
+    /// 端点必须把**实际生效值**回出去（源码级：注释行先剔，否则注释里写着
+    /// `keep` 也会让它恒绿）。
+    ///
+    /// 为什么需要：卡片上"保留几份"如果由前端写死，改过 `[db] backup_keep`
+    /// 的机器上立刻变成谎言；而后端只要不回这个字段，前端就只能写死。
+    #[test]
+    fn system_endpoint_reports_effective_keep_and_switch() {
+        let src = include_str!("backups.rs");
+        // ⚠ 不能靠 `split("#[cfg(test)]").next()` 取"生产段"：本文件中段就有测试模块，
+        // 那样切出来的片段根本不含 `system_artifacts`（断言恒红——比没守卫更糟，
+        // 因为它看起来在保护，实际只是每次都失败/被人忽略）。改为按函数体定位。
+        let start = src
+            .find("pub async fn system_artifacts(")
+            .expect("系统备份端点必须存在");
+        let end = src[start..]
+            .find("\n}\n")
+            .map(|i| start + i)
+            .expect("system_artifacts 函数体应有结束");
+        let body: String = src[start..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("\"keep\": state.backup_keep"),
+            "`/backups/system` 必须回 AppState 里的实际保留份数"
+        );
+        assert!(
+            body.contains("\"daily_backup\": state.daily_backup"),
+            "每日备份开关同样要回，否则页面无法区分「关了」和「还没生成」"
+        );
     }
 }
 

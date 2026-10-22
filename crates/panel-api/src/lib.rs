@@ -69,6 +69,11 @@ pub struct AppState {
     /// 每日自动备份开关（来自 config.toml `[db] daily_backup`）。deployment 段展示用。
     /// **真实生效**：`main.rs` 的调度器据此注册每日备份任务（nano 档位除外）。
     pub daily_backup: bool,
+    /// 每日自动备份的保留份数（来自 config.toml `[db] backup_keep`，默认 7）。
+    /// **真实生效**：`main.rs` 的 `db.backup` 任务写完立刻按它裁剪 `panel-<ts>.db`
+    /// （此前只增不减，一年堆 365 份）。备份页系统卡片只读展示——页面写死
+    /// 「保留 7 份」会在用户改成 3 份时变成谎言。
+    pub backup_keep: i64,
     /// SQLite 落盘同步档（来自 config.toml `[db] synchronous`，归一化后的大写值）。
     /// **真实生效**：`panel_db::open` 据此设置 `PRAGMA synchronous`（非法值启动即报错）。
     pub db_synchronous: String,
@@ -104,7 +109,8 @@ impl AppState {
                max_login_attempts: usize,
                session_idle: std::time::Duration, session_absolute: std::time::Duration,
                audit_retention_days: u32, audit_max_rows: u64,
-               localhost_only: bool, daily_backup: bool, db_synchronous: String) -> Self {
+               localhost_only: bool, daily_backup: bool, db_synchronous: String,
+               backup_keep: i64) -> Self {
         let capabilities = os.capabilities();
         // 会话持久化：把写者交给 SessionCache（`sessions` 表 001 已定义、此前无人使用）。
         // 先 clone——下方 struct 字面量会把 db move 进字段。
@@ -112,6 +118,7 @@ impl AppState {
         Self {
             os, db, pool, tasks, metrics, tier, capabilities, session_idle, session_absolute,
             audit_retention_days, audit_max_rows, localhost_only, daily_backup, db_synchronous,
+            backup_keep,
             sessions: Arc::new(crate::auth::SessionCache::new_with_db(
                 session_idle,
                 session_absolute,
