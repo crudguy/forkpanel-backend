@@ -48,9 +48,15 @@ crates/
 migrations/            内嵌 SQL（编号 + 校验和）
 docs/api/openapi.yaml  ★ 前后端唯一接口契约（事实源）
 docs/abi/             抽象层接口冻结文档
+docs/                  deployment / coverage / env；审查报告见
+                       audit-2026-10-17.md（全文）与 audit-2026-10-17-summary.md（归纳版）
 deploy/               systemd unit、安装/卸载脚本、默认配置
 ci/                   分层门禁 + 注入/鉴权/CLI/任务/模块仿真用例集
 ```
+
+> **新人建议先读** [`docs/audit-2026-10-17-summary.md`](docs/audit-2026-10-17-summary.md)：
+> 全项目审查结论、19 项发现的处置记录，以及「哪些看着像问题其实不是」的清单
+> （避免重复排查）。
 
 ## 构建与运行
 
@@ -75,9 +81,11 @@ panel serve --bind 127.0.0.1:2083
   契约正文大量使用 flow 风格单行（`{ a: 1 }`），**值里出现 `{`/`}` 必须加单引号**，
   否则整份文件无法被 YAML 解析器读取——该脚本会定位到行号。
 
-## 质量门禁（手动运行；本项目无自动 CI 流水线）
+## 质量门禁（`make check` 一条命令跑全部；CI 同路径自动跑）
 
-按改动类型跑对应 `ci/` 门禁：
+`make check` = 5 个静态门禁 + `cargo test --workspace`；`make audit` 单独成目标
+（依赖安全扫描，GitHub Actions 里也是独立 job——避免本机没装 cargo-audit 就红主门禁）。
+按改动类型可单独跑对应 `ci/` 门禁：
 
 - 分层 / 权限：`ci/check-layering.sh`、`ci/check-permissions.sh`
 - 前后端契约：`ci/check-api-contract.sh`（内含契约结构体检 `ci/check_openapi.py`）
