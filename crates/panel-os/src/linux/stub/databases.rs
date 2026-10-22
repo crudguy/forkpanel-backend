@@ -853,6 +853,11 @@ impl DatabaseProvider for LinuxDatabases {
                 if let Some(p) = &t.password { env.insert("PGPASSWORD".into(), std::ffi::OsString::from(p)); }
                 let mut a: Vec<String> = vec![
                     "-f".into(), o.as_path().to_string_lossy().into(),
+                    // --clean --if-exists：产物自带"先 DROP 再 CREATE"，否则恢复到
+                    // 已存在的库上必然撞 `relation already exists`。
+                    // 这不是可选优化：一旦 psql 侧开了 ON_ERROR_STOP（见 restore），
+                    // 没有这两个参数的产物会让**每一次**恢复都以失败告终。
+                    "--clean".into(), "--if-exists".into(),
                     "-h".into(), t.host.clone().unwrap_or_else(|| "127.0.0.1".into()),
                 ];
                 if let Some(p) = t.port { a.push("-p".into()); a.push(p.to_string()); }
@@ -910,7 +915,15 @@ impl DatabaseProvider for LinuxDatabases {
             DbEngine::Postgres => {
                 let mut env: std::collections::HashMap<String, std::ffi::OsString> = std::collections::HashMap::new();
                 if let Some(p) = &t.password { env.insert("PGPASSWORD".into(), std::ffi::OsString::from(p)); }
+                // ⚠ `-v ON_ERROR_STOP=1` 是本分支最重要的一行。
+                // psql 默认遇错继续往下跑并以 **0** 退出，于是"CREATE TABLE 已存在 →
+                // 整份 dump 没生效"会被上报成任务成功。真机实证（PG 17）：恢复任务
+                // state=ok、exit_code=0，而目标库一行未变——用户以为恢复了。
+                // `--single-transaction`：整份 dump 一个事务，失败整体回滚，
+                // 不留"DROP 掉了却没建回来"的中间态。
                 let mut a: Vec<String> = vec![
+                    "-v".into(), "ON_ERROR_STOP=1".into(),
+                    "--single-transaction".into(),
                     "-h".into(), t.host.clone().unwrap_or_else(|| "127.0.0.1".into()),
                     "-f".into(), from.as_path().to_string_lossy().into(),
                 ];
@@ -925,6 +938,59 @@ impl DatabaseProvider for LinuxDatabases {
                 Ok(())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod pg_dump_restore_guards {
+    /// 取某个函数体内的某个引擎分支源码（**剔除注释行**）。
+    ///
+    /// 为什么要剔除：本文件里那几行注释逐字写着 `ON_ERROR_STOP=1` 与 `--clean`，
+    /// 不剔除的话"注释还在、代码没了"照样恒绿——恒绿守卫比没守卫更危险。
+    fn branch_of(fn_sig: &str, engine_arm: &str) -> String {
+        let src = include_str!("databases.rs");
+        let code: Vec<&str> = src.lines().filter(|l| !l.trim_start().starts_with("//")).collect();
+        let joined = code.join("\n");
+        let f = joined.find(fn_sig).unwrap_or_else(|| panic!("{fn_sig} 必须存在"));
+        let after = &joined[f..];
+        let s = after
+            .find(engine_arm)
+            .unwrap_or_else(|| panic!("{fn_sig} 里必须有 {engine_arm}"));
+        let e = after[s..]
+            .find("crate::cmd::run_checked")
+            .map(|i| s + i)
+            .unwrap_or_else(|| panic!("{engine_arm} 必须以 run_checked 收尾"));
+        after[s..e].to_string()
+    }
+
+    /// ⭐⭐ psql 恢复必须开 `ON_ERROR_STOP`。
+    ///
+    /// 真机实证（PG 17.11，2026-10-22）：不开时 `psql -f` 遇错继续往下跑并以 **0**
+    /// 退出 ⇒ "关系已存在、整份 dump 一条都没生效"被上报成**任务成功**，目标库
+    /// 一行未变。同一条命令开了之后退出码是 3、任务正确置 failed。
+    #[test]
+    fn pg_restore_stops_on_error() {
+        let b = branch_of("async fn restore(", "DbEngine::Postgres => {");
+        assert!(b.contains("ON_ERROR_STOP=1"), "psql 恢复缺 ON_ERROR_STOP=1：失败会被静默吞成成功");
+        assert!(b.contains("--single-transaction"), "缺 --single-transaction：失败会留下 DROP 掉却没建回的中间态");
+    }
+
+    /// `mysql` 客户端默认（非 `--force`）就是遇错即中止，与 ON_ERROR_STOP 等价。
+    /// 这里反向钉死：**不许**有人为了"跑得下去"给它加 `--force`。
+    #[test]
+    fn mysql_restore_never_forces() {
+        let b = branch_of("async fn restore(", "DbEngine::MySql => {");
+        assert!(!b.contains("--force"), "mysql 恢复加了 --force：错误会被跳过，同样是静默成功");
+    }
+
+    /// 与 [`pg_restore_stops_on_error`] 必须成对存在：开了 ON_ERROR_STOP 之后，
+    /// 不带 `--clean` 的旧产物会让**每一次**恢复都撞"关系已存在"而必然失败。
+    /// 只改判据不改写入方 = 把功能改没了，还看不出来。
+    #[test]
+    fn pg_dump_emits_self_overwriting_artifacts() {
+        let b = branch_of("async fn backup(", "DbEngine::Postgres => {");
+        assert!(b.contains("--clean"), "pg_dump 缺 --clean：产物无法覆盖恢复");
+        assert!(b.contains("--if-exists"), "pg_dump 缺 --if-exists：DROP 会在对象不存在时先报一次错");
     }
 }
 

@@ -549,7 +549,9 @@ pub async fn restore(
 
     let target = load_target(&state, conn, None).await?;
     let os = state.os.clone();
-    let job = DbRestoreTask { target, src: src.clone(), os };
+    // 快照与产物同目录：用户找得到，且仍在备份允许根内（src 已过沙箱）
+    let safety_dir = src.as_path().parent().map(|p| p.to_path_buf());
+    let job = DbRestoreTask { target, src: src.clone(), os, safety_dir };
     let (tid, _) = state
         .tasks
         .submit(
@@ -576,6 +578,64 @@ pub(crate) struct DbRestoreTask {
     pub(crate) target: panel_os::DbTarget,
     pub(crate) src: SafePath,
     pub(crate) os: std::sync::Arc<dyn panel_os::OsAdapter>,
+    /// 恢复前快照的落点目录（`None` = 不快照）。
+    ///
+    /// mysql/pg 的恢复是**覆盖当前库**：导进来的 dump 会先 DROP 再建，原数据随即消失。
+    /// provider 里只有 sqlite 分支自带 `.bak-<ts>` 快照，mysql/pg 什么都没留——
+    /// 于是「覆盖恢复」这个按钮点下去是不可逆的。这里先导出当前态再动手，
+    /// 且**导出失败即中止**：宁可什么都不做，也不裸覆盖。
+    pub(crate) safety_dir: Option<std::path::PathBuf>,
+}
+
+/// 恢复前快照的文件名前缀与保留份数。
+///
+/// 保留 3 份而不是无限留：快照的意义是"刚恢复完发现不对能立刻退回"，
+/// 再老的没有回滚价值，却会把备份目录撑满（与每日备份踩过的坑同源）。
+const PRE_RESTORE_KEEP: usize = 3;
+
+/// 对 mysql/pg 导出一份"当前态"快照，失败即返回 Err（调用方据此中止恢复）。
+async fn snapshot_before_restore(
+    os: &std::sync::Arc<dyn panel_os::OsAdapter>,
+    target: &panel_os::DbTarget,
+    dir: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    let tag = match target.engine {
+        panel_os::DbEngine::MySql => "mysql",
+        panel_os::DbEngine::Postgres => "pg",
+        // sqlite 由 provider 内 `.bak-<ts>` 承担，不应走到这里
+        panel_os::DbEngine::Sqlite => return Err(PanelError::Internal("sqlite 不需要 pg/mysql 快照".into())),
+    };
+    std::fs::create_dir_all(dir).map_err(|e| PanelError::Io(format!("create safety dir: {e}")))?;
+    let name = format!("pre-restore-{tag}-{}.sql", crate::now_unix());
+    let snap = panel_os::paths::resolve_within_for_create(dir, &name)?;
+    os.databases().backup(target, &snap, Box::new(|_line| {})).await?;
+    prune_pre_restore(dir, tag, PRE_RESTORE_KEEP);
+    Ok(snap.as_path().to_path_buf())
+}
+
+/// 只留最近 `keep` 份恢复前快照，删掉更老的（按名字排序）。
+///
+/// 名字形如 `pre-restore-pg-<unix秒>.sql`：同类前缀 + 定长时间戳 ⇒ 字典序即时间序，
+/// 不需要读 mtime（也避免了"touch 一下就永远不会被删"的偏差）。
+///
+/// ⚠ 删除条数必须夹到**实际待删量**：`olds.len() - keep`，不能是固定批量，
+/// 否则"超出一点"会被放大成"清空"（`prune_audit` 踩过同款坑）。
+fn prune_pre_restore(dir: &std::path::Path, tag: &str, keep: usize) {
+    let prefix = format!("pre-restore-{tag}-");
+    let mut olds: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(&prefix)))
+                .collect()
+        })
+        .unwrap_or_default();
+    olds.sort();
+    if olds.len() > keep {
+        for p in olds.iter().take(olds.len() - keep) {
+            let _ = std::fs::remove_file(p);
+        }
+    }
 }
 
 /// 按**连接名**查 id（备份计划的 `target` 存名字：页面展示友好，改名后计划会
@@ -600,6 +660,12 @@ pub(crate) async fn conn_id_by_name(state: &Shared, name: &str) -> Result<Option
 impl panel_task::TaskBody for DbRestoreTask {
     async fn run(&self, progress: panel_task::Progress) -> Result<panel_task::TaskOutcome> {
         progress.set(10, "准备还原").await;
+        // 覆盖恢复前先把当前态导出来（sqlite 已在 provider 内留 `.bak-`，跳过）
+        if let (Some(dir), false) = (&self.safety_dir, matches!(self.target.engine, panel_os::DbEngine::Sqlite))
+        {
+            progress.set(15, "导出当前态快照").await;
+            snapshot_before_restore(&self.os, &self.target, dir).await?;
+        }
         self.os.databases().restore(&self.target, &self.src).await?;
         progress.set(100, "完成").await;
         Ok(panel_task::TaskOutcome {
@@ -1180,6 +1246,93 @@ fn scrub_sql(sql: &str) -> (String, usize) {
         i += 1;
     }
     (out, semis)
+}
+
+#[cfg(test)]
+mod restore_snapshot_tests {
+    use super::*;
+
+    /// 临时目录 + 造 n 份"快照"，跑完自删。
+    fn with_snapshots(n: usize) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("prune-pre-restore-{}-{}", std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        for i in 0..n {
+            // 时间戳定长 10 位：字典序必须等于时间序，否则裁剪会删错
+            let name = format!("pre-restore-pg-17926800{:02}.sql", i);
+            std::fs::write(dir.join(&name), "x").expect("write snapshot");
+        }
+        dir
+    }
+
+    #[test]
+    fn only_the_newest_snapshots_survive() {
+        let dir = with_snapshots(5);
+        prune_pre_restore(&dir, "pg", PRE_RESTORE_KEEP);
+        let left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        let mut left = left;
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                "pre-restore-pg-1792680002.sql".to_string(),
+                "pre-restore-pg-1792680003.sql".to_string(),
+                "pre-restore-pg-1792680004.sql".to_string(),
+            ],
+            "必须只删超出的那几份，不能把整个目录清空"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 边界：待删条数少于 keep 时一份都不许删（防"固定批量"把快照清空）。
+    #[test]
+    fn nothing_is_deleted_when_under_the_limit() {
+        let dir = with_snapshots(2);
+        prune_pre_restore(&dir, "pg", PRE_RESTORE_KEEP);
+        let n = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(n, 2, "未超上限却删了快照——删除条数没夹到实际待删量");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 别的引擎/别的前缀的文件不能被顺手删掉。
+    #[test]
+    fn other_files_are_untouched() {
+        let dir = with_snapshots(4);
+        std::fs::write(dir.join("plan1-1792680000.sql"), "x").unwrap();
+        std::fs::write(dir.join("pre-restore-mysql-1792680000.sql"), "x").unwrap();
+        prune_pre_restore(&dir, "pg", PRE_RESTORE_KEEP);
+        assert!(dir.join("plan1-1792680000.sql").exists(), "产物被快照裁剪误删");
+        assert!(dir.join("pre-restore-mysql-1792680000.sql").exists(), "mysql 快照被 pg 的裁剪误删");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 接线守卫：非 sqlite 的恢复**必须**先导出当前态。
+    ///
+    /// 用源码断言而非行为测试：`DbRestoreTask::run` 需要一个真能导出的 OsAdapter，
+    /// 单测里造不出；而"注释里写了有快照、代码里其实没有"正是最难发现的一类。
+    /// ⚠ 断言前剔除注释行——本块注释里逐字写着 `snapshot_before_restore`。
+    #[test]
+    fn non_sqlite_restore_snapshots_first() {
+        let src = include_str!("databases.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        let code: Vec<&str> = prod.lines().filter(|l| !l.trim_start().starts_with("//")).collect();
+        let joined = code.join("\n");
+        let start = joined
+            .find("impl panel_task::TaskBody for DbRestoreTask")
+            .expect("DbRestoreTask 必须存在");
+        let after = &joined[start..];
+        let end = after
+            .find("self.os.databases().restore(")
+            .expect("DbRestoreTask 必须调用 restore");
+        let block = &after[..end];
+        assert!(block.contains("snapshot_before_restore("), "恢复前没有导出当前态快照：覆盖恢复不可逆");
+        assert!(block.contains("safety_dir"), "快照目录没接进任务体");
+        assert!(block.contains("Sqlite"), "必须显式排除 sqlite（它已在 provider 内留 .bak-，重复快照是浪费）");
+    }
 }
 
 #[cfg(test)]

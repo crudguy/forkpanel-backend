@@ -1428,7 +1428,13 @@ pub async fn restore(
         };
         let src = panel_os::paths::resolve_within_for_create(&base, &rel)?;
         let job = PlanDbRestoreJob {
-            inner: super::databases::DbRestoreTask { target, src, os: state.os.clone() },
+            inner: super::databases::DbRestoreTask {
+                target,
+                src,
+                os: state.os.clone(),
+                // 快照一律落计划产物目录（远端恢复时源码在 tmp，但快照仍归计划管）
+                safety_dir: Some(dest.as_path().to_path_buf()),
+            },
             cleanup,
         };
         let (tid, _) = state

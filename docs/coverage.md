@@ -80,7 +80,7 @@
 | GET `/db/{conn}/{db}/tables` | 表列表（含行数） | ✅ | mysql/pg ✅（客户端存在即启用；密码经 `MYSQL_PWD`/`PGPASSWORD` 传，**绝不进 argv**；行数取不到给 -1 不伪造） | DatabasesView |
 | GET `/db/{conn}/{db}/{table}/rows` | 行预览（分页，禁 Web SQL） | ✅ | NULL 保真；缺表/连接优雅 404；mysql/pg ✅（客户端模式下 NULL 与空串无法区分，一律按文本返回，**不伪造 NULL 语义**） | DatabasesView |
 | POST `/db/{conn}/backup` | 备份（→202 task） | ✅ | **VACUUM INTO 不可在写者事务内**——改独立连接备份（根因修复） | DatabasesView |
-| 🔵 POST `/db/{conn}/restore` | 恢复 | ✅/🟡 | SQLite 已实装（任务化：确认词 + 自动先备份当前库 + 源文件沙箱校验）；mysql/pg 需外部客户端 → 🟡 | — |
+| 🔵 POST `/db/{conn}/restore` | 恢复 | ✅/🟡 | 三引擎均已实装（任务化：确认词 + 源文件沙箱校验 + **非 sqlite 先导出当前态快照**）。**PG ✅ 真机闭环验证（2026-10-22，PG 17.11：备份→漂移→恢复，数据逐行对上）**；mysql 🟡（开发机无 `mysqldump`，导出/导入路径未真机跑过）；SQLite ✅（provider 内 `.bak-<ts>` 快照） | — |
 
 ## 8. 防火墙
 
@@ -194,7 +194,8 @@
   - **i18n**：属大工程，尚未开工（不是"做了一半"）。
   - **插件系统**：**已有设计稿但未实施**（`docs/design-plugin-system.md`），
     落地需按 M1~M4 分期评审；本文件不把它计入已覆盖。
-- **🟠 真机验证项**：nginx 下发/reload、ufw、mysql/postgres 真连、ACME（需公网 80 + certbot）、
+- **🟠 真机验证项**：nginx 下发/reload、ufw、mysql 真连（postgres ✅ 已于 2026-10-22
+  在本机 17.11 实例上端到端验证）、ACME（需公网 80 + certbot）、
   容器创建（需可达的 docker daemon）、fail2ban（需已安装并运行）、加密备份的恢复
   （需主密钥在位）——能力位按二进制/客户端存在性诚实置灰，沙箱内只验证降级路径。
   另：站点 WAF 的**实际拦截效果**需真实承载流量才能验收（配置**语法**已由真实 `nginx -t`
