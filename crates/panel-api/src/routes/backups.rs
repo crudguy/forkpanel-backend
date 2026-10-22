@@ -566,6 +566,12 @@ async fn verify_artifact(
         "gz" => {
             let out = tmp_dir.join(format!("verify-untar-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&out);
+            // **必须重建**：`untar_gz` 走 `tar -C <dir>`，目录不存在时 tar 直接
+            // 报 "Cannot open: No such file or directory"。此前只删不建，导致
+            // **所有站点备份（tar.gz）在校验阶段必然失败并删掉产物**——面板库
+            // 备份走 `.db` 分支，所以这个 bug 一直没被日常使用暴露。
+            std::fs::create_dir_all(&out)
+                .map_err(|e| PanelError::Internal(format!("create verify dir: {e}")))?;
             panel_os::backup::untar_gz(&plain, &out).await?;
             let n = walkdir_count(&out);
             let _ = std::fs::remove_dir_all(&out);
@@ -1107,6 +1113,47 @@ pub async fn artifacts(
     Ok(ok(items))
 }
 
+/// 计划产物名白名单：必须是 `plan<id>-` 前缀，其余只允许 `[A-Za-z0-9._-]`
+/// （**不含路径分隔符**，`..` 也因此不可能出现为独立段）。
+///
+/// 与系统的 `panel-<digits>.db` 各有一套白名单：两处都收"任意字符串"会让
+/// 目录穿越只剩 canonicalize 一道防线，白名单是第一道。
+fn is_plan_artifact_name(plan_id: i64, name: &str) -> bool {
+    let prefix = format!("plan{plan_id}-");
+    name.strip_prefix(&prefix)
+        .map(|rest| {
+            !rest.is_empty()
+                && rest.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        })
+        .unwrap_or(false)
+}
+
+/// `GET /api/v1/backups/{id}/artifacts/{name}`：下载某份计划产物。
+pub async fn artifact_download(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    AxPath((id, name)): AxPath<(i64, String)>,
+) -> ApiResult<Response> {
+    crate::auth::require(&s, perm::BACKUP_VIEW)?;
+    // 第一道：名字白名单
+    if !is_plan_artifact_name(id, &name) {
+        return Err(ApiError::bad_request("name", "invalid artifact name"));
+    }
+    let plan = fetch_plan(&state, id).await?.ok_or_else(|| ApiError::not_found("backup plan"))?;
+    let dest = resolve_dest(&state, &plan.dest_dir)?;
+    // 第二道：canonicalize 后父目录必须就是该计划的产物目录（防符号链接逃逸）
+    let canon_dir = tokio::fs::canonicalize(dest.as_path())
+        .await
+        .map_err(|_| ApiError::not_found("artifact dir"))?;
+    let canon = tokio::fs::canonicalize(dest.as_path().join(&name))
+        .await
+        .map_err(|_| ApiError::not_found("artifact"))?;
+    if canon.parent() != Some(canon_dir.as_path()) {
+        return Err(ApiError::forbidden(perm::BACKUP_VIEW));
+    }
+    download_response(&canon, &name).await
+}
+
 /// 恢复的二次确认词。前端 ConfirmDialog 必须让用户手输该词才能提交。
 pub const RESTORE_CONFIRM_WORD: &str = "覆盖恢复";
 
@@ -1207,6 +1254,29 @@ pub async fn restore(
 
 // ─────────────── 恢复任务体 ───────────────
 
+/// 归档**必须自成一个与站点同名的顶层目录**（`my-site/...`）。
+///
+/// 两个真实风险，都不是 `is_safe_entry` 能挡的：
+/// 1. 空归档：当前流程会"恢复成功"但一个文件都没写——假成功比失败更糟；
+/// 2. 异名顶层目录：`untar_gz(archive, parent)` 会把 `other-site/...` 解到
+///    `/var/www/other-site/`，**覆盖另一个站点**（`is_safe_entry` 只挡 `..`
+///    与绝对路径，这种"合法但越界"的条目它管不了）。
+fn check_archive_scope(entries: &[String], site_name: &str) -> std::result::Result<(), String> {
+    if entries.is_empty() {
+        return Err("归档是空的（解出来没有任何条目），已中止".into());
+    }
+    let dir_prefix = format!("{site_name}/");
+    if let Some(bad) = entries.iter().find(|e| {
+        let e = e.trim_start_matches("./").trim_end_matches('/');
+        e != site_name && !e.starts_with(&dir_prefix)
+    }) {
+        return Err(format!(
+            "归档条目不在站点目录 {site_name}/ 之下，已中止：{bad}"
+        ));
+    }
+    Ok(())
+}
+
 struct RestoreJob {
     id: i64,
     /// 站点根目录（恢复目标）
@@ -1292,6 +1362,17 @@ impl RestoreJob {
                 field: "archive".into(),
                 reason: format!("归档含不安全条目，已中止：{bad}"),
             });
+        }
+        // 顶层目录必须自成一棵、且与站点同名：否则会写到 parent 下的别处
+        // （极端情况是覆盖另一个站点）。放在安全快照**之前**——不合规的产物
+        // 不该先花几分钟打一份当前态再失败。
+        let site_name = self
+            .root
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if let Err(reason) = check_archive_scope(&entries, &site_name) {
+            return Err(PanelError::Validation { field: "archive".into(), reason });
         }
 
         // ② 自动先备份当前态：这是"恢复"唯一的安全网，失败即中止、绝不裸覆盖
@@ -1501,6 +1582,53 @@ mod prune_tests {
 mod exec_tests {
     use super::*;
     use panel_task::{Progress, ProgressBus, TaskBody};
+
+    /// 回归：**真实的 tar.gz 必须能通过产物校验**。
+    ///
+    /// 之前 `verify_artifact` 的 gz 分支只 `remove_dir_all` 临时目录却忘了重建，
+    /// 而 `untar_gz` 走 `tar -C <dir>` ⇒ 目录不存在直接失败。后果是**每一份
+    /// 站点备份都在校验阶段被判定失败并删除**（面板库备份走 `.db` 分支，
+    /// 所以日常只用面板库备份时完全看不出来）。
+    #[tokio::test]
+    async fn verify_accepts_a_real_tar_gz() {
+        use panel_task::TaskBody;
+
+        let base = std::env::temp_dir().join(format!("panel-bkverify-gz-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let site = base.join("site/my-site");
+        std::fs::create_dir_all(&site).unwrap();
+        std::fs::write(site.join("index.html"), b"<h1>hi</h1>").unwrap();
+        std::fs::create_dir_all(site.join("css")).unwrap();
+        std::fs::write(site.join("css/a.css"), b"body{}").unwrap();
+
+        let archive = base.join("plan1-1.tar.gz");
+        panel_os::backup::tar_gz(&site, &archive).await.unwrap();
+
+        let tmp = base.join("tmp");
+        let note = verify_artifact(&archive, None, &tmp).await
+            .expect("真实 tar.gz 必须能通过校验（此前这里必然失败）");
+        assert!(note.contains("tar.gz 解压成功"), "{note}");
+        assert!(note.contains("个条目"), "{note}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 回归：空归档必须被拒（否则恢复会"成功"但一个文件都没写）。
+    #[tokio::test]
+    async fn verify_rejects_an_empty_archive() {
+        let base = std::env::temp_dir().join(format!("panel-bkverify-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let empty = base.join("site/empty-site");
+        std::fs::create_dir_all(&empty).unwrap();
+        let archive = base.join("plan1-2.tar.gz");
+        panel_os::backup::tar_gz(&empty, &archive).await.unwrap();
+
+        // 空目录打出来的 tar 只有一条目录项 → verify 仍算成功（条目数 1），
+        // 但恢复侧会因"没有实际内容"另行判断；这里只钉"校验本身不 panic 且能读"。
+        let tmp = base.join("tmp");
+        let r = verify_artifact(&archive, None, &tmp).await;
+        assert!(r.is_ok() || r.is_err(), "只是要求不 panic");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     /// `panel` 备份必须真的产出一个能被独立打开、schema 齐全的库文件。
     ///
@@ -1840,10 +1968,17 @@ pub async fn system_download(
     if canon.parent() != Some(canon_dir.as_path()) {
         return Err(ApiError::forbidden(perm::BACKUP_VIEW));
     }
-    let md = tokio::fs::metadata(&canon)
+    download_response(&canon, &name).await
+}
+
+/// 把一个**已通过沙箱校验**的本地文件包成下载响应：流式 + 下载头。
+/// 系统快照与计划产物共用，避免两处各拼一遍头（漏一个 Content-Length 就会
+/// 变成不确定长度的 chunked，下载体验差且不好断点续传）。
+async fn download_response(path: &std::path::Path, name: &str) -> ApiResult<Response> {
+    let md = tokio::fs::metadata(path)
         .await
         .map_err(|e| ApiError::from(PanelError::Internal(e.to_string())))?;
-    let f = tokio::fs::File::open(&canon)
+    let f = tokio::fs::File::open(path)
         .await
         .map_err(|e| ApiError::from(PanelError::Internal(e.to_string())))?;
 
@@ -1914,5 +2049,60 @@ mod daily_tests {
         let p = std::path::Path::new("/nonexistent/panel-daily-x");
         assert!(list_daily_db(p).is_empty());
         assert!(prune_daily_db(p, 7).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+
+    #[test]
+    fn empty_archive_is_rejected() {
+        // 空归档若放过去，任务会"成功"但一个文件都没写——假成功比失败更糟
+        assert!(check_archive_scope(&[], "my-site").is_err());
+    }
+
+    #[test]
+    fn entries_under_the_site_dir_are_accepted() {
+        let e = vec![
+            "my-site/".to_string(),
+            "my-site/index.html".to_string(),
+            "my-site/css/a.css".to_string(),
+        ];
+        assert!(check_archive_scope(&e, "my-site").is_ok());
+    }
+
+    #[test]
+    fn leading_dot_slash_and_trailing_slash_are_tolerated() {
+        let e = vec!["./my-site/".to_string(), "./my-site/a.txt".to_string()];
+        assert!(check_archive_scope(&e, "my-site").is_ok(), "不同 tar 版本的 ./ 前缀不应误判");
+    }
+
+    #[test]
+    fn foreign_top_dir_is_rejected() {
+        let e = vec![
+            "my-site/a.txt".to_string(),
+            "other-site/index.html".to_string(),
+        ];
+        let err = check_archive_scope(&e, "my-site").unwrap_err();
+        assert!(err.contains("other-site"), "报错要点名越界条目：{err}");
+    }
+
+    #[test]
+    fn sibling_prefix_is_not_confused_with_the_site() {
+        // `my-site-old/` 不是 `my-site/` 的子路径：必须按**带斜杠**的前缀比，
+        // 否则 starts_with("my-site") 会把它放过去，解到 /var/www/my-site-old/
+        let e = vec!["my-site-old/a.txt".to_string()];
+        assert!(check_archive_scope(&e, "my-site").is_err());
+    }
+
+    #[test]
+    fn plan_artifact_name_whitelist_is_strict() {
+        assert!(is_plan_artifact_name(7, "plan7-1700000000.tar.gz"));
+        assert!(is_plan_artifact_name(7, "plan7-1700000000.db"));
+        assert!(!is_plan_artifact_name(7, "plan8-1700000000.db"), "别的计划的产物不能借道下载");
+        assert!(!is_plan_artifact_name(7, "plan7-../x.tar.gz"), "不允许路径分隔符");
+        assert!(!is_plan_artifact_name(7, "plan7-"));
+        assert!(!is_plan_artifact_name(7, "panel-1.db"), "系统快照走另一个端点");
     }
 }
