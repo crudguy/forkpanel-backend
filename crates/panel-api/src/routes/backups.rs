@@ -27,16 +27,21 @@
 use crate::{
     auth::perm,
     error::{ok, ApiError, ApiResult},
-    routes::{audit, Auth, Shared},
+    routes::{audit, audit_system, Auth, Shared},
 };
 use axum::{
+    body::Body,
     extract::{Path as AxPath, State},
+    http::{header, HeaderValue},
+    response::{IntoResponse, Response},
     Json,
 };
 use crate::remote_store::{RemoteKind, RemoteTarget};
 use panel_core::{cap_keys, PanelError, Result, SafePath};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use crate::extract::PanelJson;
 
@@ -897,24 +902,36 @@ pub async fn run(
     if !state.capabilities.get(cap_keys::BACKUP_MANAGE).map(|c| c.supported).unwrap_or(false) {
         return Err(ApiError::unsupported("backup.manage"));
     }
-    let full = fetch_plan_full(&state, id).await?
+    let tid = submit_run(&state, id).await?;
+    audit(&state, &s, "backup.run", &id.to_string(), "queued").await;
+    Ok(ok(serde_json::json!({ "task_id": tid })))
+}
+
+/// 提交一次备份任务。HTTP 手动执行与 cron 定时**共用这一段**——两套提交逻辑
+/// 迟早会漂移（手动取了密钥、定时忘了取；手动校验了远端、定时没校验）。
+///
+/// **不写审计**：调用方各自写。手动走 `audit`（有 Session，记用户与来源 IP），
+/// 定时走 `audit_system`（actor=system）。合进来反而要传 `Option<&Session>`。
+pub async fn submit_run(state: &Shared, id: i64) -> ApiResult<i64> {
+    let full = fetch_plan_full(state, id)
+        .await?
         .ok_or_else(|| ApiError::not_found("backup plan"))?;
     let plan = full.dto.clone();
-    let dest = resolve_dest(&state, &plan.dest_dir)?.as_path().to_path_buf();
+    let dest = resolve_dest(state, &plan.dest_dir)?.as_path().to_path_buf();
     let root = match plan.kind.as_str() {
         "site" => Some(PathBuf::from(
-            site_root_by_name(&state, &plan.target).await?
+            site_root_by_name(state, &plan.target)
+                .await?
                 .ok_or_else(|| ApiError::bad_request("target", "site not found"))?,
         )),
         _ => None,
     };
 
-    // 加密计划的密钥在**提交任务前**取：取不到就当场 501，
+    // 加密计划的密钥在**提交任务前**取：取不到就当场失败，
     // 不让任务进队列后在后台反复失败（用户会以为备份在跑）
     let master = if plan.encrypt { Some(state.require_secret_key()?) } else { None };
-    // 远端目标也在**提交任务前**组装：凭据解不开就当场报错，
-    // 而不是让任务进队列后在后台反复失败（用户会以为备份在跑）。
-    let remote = remote_target_from(&state, &plan, full.secret_enc.as_ref())?;
+    // 远端目标也在**提交任务前**组装：凭据解不开就当场报错
+    let remote = remote_target_from(state, &plan, full.secret_enc.as_ref())?;
     let job = BackupJob {
         id,
         kind: plan.kind.clone(),
@@ -941,8 +958,122 @@ pub async fn run(
         )
         .await
         .map_err(ApiError::from)?;
-    audit(&state, &s, "backup.run", &id.to_string(), "queued").await;
-    Ok(ok(serde_json::json!({ "task_id": tid })))
+    Ok(tid)
+}
+
+// ─────────────────────────── cron 调度 ───────────────────────────
+
+/// cron 调度的进程内状态：plan_id → （表达式, 下一次触发时刻）。
+///
+/// **只存内存、不落库**：重启后重新登记"下一个触发点"，**不补跑**历史错过的
+/// 那几次。补跑会在面板停机一天后一次涌出十几份备份，把磁盘打满——比漏跑更糟。
+static SWEEP_STATE: OnceLock<Mutex<HashMap<i64, (String, i64)>>> = OnceLock::new();
+
+fn sweep_state() -> &'static Mutex<HashMap<i64, (String, i64)>> {
+    SWEEP_STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 解析表达式的下一个触发点（本地时区语义，与 Cron 页同一个 provider）。
+fn next_fire_at(state: &Shared, expr: &str) -> Option<i64> {
+    state.os.scheduler().next_fire_times(expr, 1).ok()?.into_iter().next()
+}
+
+/// 纯逻辑：算出本轮哪些计划到期，并就地维护状态。
+///
+/// 抽成纯函数是为了**能测**——`sweep_due` 里全是 DB 与任务队列，单测跑不动。
+/// 语义三条（都有单测钉住）：
+/// 1. 首次见到 / 表达式刚改过 ⇒ 只登记下一个触发点，**不立即执行**；
+/// 2. 已登记且 `now >= next` ⇒ 到期（推进触发点由调用方负责，失败也要推进）；
+/// 3. 不再启用/已被删的计划 ⇒ 从状态里摘掉，避免无限增长。
+fn plan_sweep(
+    known: &mut HashMap<i64, (String, i64)>,
+    plans: &[(i64, String)],
+    now: i64,
+    next_of: &dyn Fn(&str) -> Option<i64>,
+) -> Vec<i64> {
+    let mut due = Vec::new();
+    let mut seen = HashSet::new();
+    for (id, expr) in plans {
+        seen.insert(*id);
+        match known.get(id) {
+            Some((cur, next)) if cur == expr => {
+                if now >= *next { due.push(*id); }
+            }
+            _ => match next_of(expr) {
+                Some(n) => { known.insert(*id, (expr.clone(), n)); }
+                None => { known.remove(id); }
+            },
+        }
+    }
+    known.retain(|k, _| seen.contains(k));
+    due
+}
+
+/// 每分钟由内部调度器调用：把到期的**启用**计划提交为备份任务。
+///
+/// **为什么需要它**：`cron_expr` / `enabled` 此前只存不读——用户在页面上配了
+/// "每天 3 点"，实际永远不会执行（典型「配置项假控制」，伪装成已做）。
+/// 本函数是这两个字段**唯一**的消费者；删掉它，定时备份立刻退回装饰品。
+pub async fn sweep_due(state: &Shared) -> Result<usize> {
+    if !state.capabilities.get(cap_keys::BACKUP_MANAGE).map(|c| c.supported).unwrap_or(false) {
+        return Ok(0);
+    }
+    // 只取调度需要的两列；空表达式在 SQL 里就滤掉（留空 = 仅手动，契约语义）
+    let plans: Vec<(i64, String)> = state
+        .pool
+        .with(|conn| {
+            let mut st = conn
+                .prepare(
+                    "SELECT id, cron_expr FROM backup_jobs
+                     WHERE enabled = 1 AND cron_expr IS NOT NULL AND TRIM(cron_expr) <> ''",
+                )
+                .map_err(db_err)?;
+            let it = st
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+                .map_err(db_err)?;
+            let mut v = Vec::new();
+            for x in it { v.push(x.map_err(db_err)?); }
+            Ok(v)
+        })
+        .await?;
+
+    let now = crate::now_unix();
+    let due = {
+        let mut st = panel_core::sync::lock_recover(sweep_state());
+        plan_sweep(&mut st, &plans, now, &|e| next_fire_at(state, e))
+    };
+
+    let mut submitted = 0usize;
+    for id in due {
+        let expr = {
+            let st = panel_core::sync::lock_recover(sweep_state());
+            st.get(&id).map(|(e, _)| e.clone())
+        };
+        match submit_run(state, id)
+            .await
+            .map_err(|e| PanelError::Internal(format!("{}（{}）", e.message, e.code)))
+        {
+            Ok(_) => {
+                submitted += 1;
+                audit_system(state, "backup.run", &id.to_string(), "scheduled").await;
+            }
+            Err(e) => {
+                // 失败必须留痕：否则"定时在跑但一直失败"在外观上是完全静默的
+                eprintln!("[WARN] 定时备份计划 #{id} 提交失败: {e}");
+                audit_system(state, "backup.run", &id.to_string(), "failed").await;
+            }
+        }
+        // 无论成败都推进到下一个触发点：失败后每分钟重试只会刷屏，不会更可能成功
+        if let Some(expr) = expr {
+            let next = next_fire_at(state, &expr);
+            let mut st = panel_core::sync::lock_recover(sweep_state());
+            match next {
+                Some(n) => { st.insert(id, (expr, n)); }
+                None => { st.remove(&id); }
+            }
+        }
+    }
+    Ok(submitted)
 }
 
 /// 产物列表（目录内 `plan<id>-` 前缀文件）。
@@ -1540,5 +1671,248 @@ mod exec_tests {
 
     fn ls_files(d: &std::path::Path) -> Vec<std::path::PathBuf> {
         std::fs::read_dir(d).map(|rd| rd.flatten().map(|e| e.path()).collect()).unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+
+    /// 表达式 → 下一个触发点的假实现（不碰 OS / 时区，纯确定）。
+    fn next_map(pairs: &[(&'static str, i64)]) -> impl Fn(&str) -> Option<i64> {
+        let pairs: Vec<(&'static str, i64)> = pairs.to_vec();
+        move |e| pairs.iter().find(|(k, _)| *k == e).map(|(_, v)| *v)
+    }
+
+    #[test]
+    fn new_plan_is_registered_but_not_run_immediately() {
+        let mut known = HashMap::new();
+        let next = next_map(&[("0 3 * * *", 1000)]);
+        let due = plan_sweep(&mut known, &[(1, "0 3 * * *".into())], 500, &next);
+        assert!(due.is_empty(), "第一次见到只登记下一个触发点，不能立刻跑");
+        assert_eq!(known.get(&1), Some(&("0 3 * * *".to_string(), 1000)));
+    }
+
+    #[test]
+    fn due_plan_fires_at_the_registered_instant() {
+        let mut known = HashMap::new();
+        known.insert(1, ("0 3 * * *".to_string(), 1000));
+        let next = next_map(&[("0 3 * * *", 1000)]);
+        assert!(plan_sweep(&mut known, &[(1, "0 3 * * *".into())], 999, &next).is_empty());
+        assert_eq!(
+            plan_sweep(&mut known, &[(1, "0 3 * * *".into())], 1000, &next),
+            vec![1],
+            "到点必须触发（此前 cron_expr 无人消费，永远不触发）"
+        );
+    }
+
+    #[test]
+    fn changed_expression_does_not_fire_immediately() {
+        let mut known = HashMap::new();
+        known.insert(1, ("0 3 * * *".to_string(), 1000));
+        let next = next_map(&[("*/5 * * * *", 2000)]);
+        let due = plan_sweep(&mut known, &[(1, "*/5 * * * *".into())], 1500, &next);
+        assert!(due.is_empty(), "改了表达式应重新登记，不能按旧触发点立刻跑");
+        assert_eq!(known.get(&1), Some(&("*/5 * * * *".to_string(), 2000)));
+    }
+
+    #[test]
+    fn disabled_or_deleted_plans_drop_out_of_state() {
+        let mut known = HashMap::new();
+        known.insert(1, ("0 3 * * *".to_string(), 1000));
+        known.insert(2, ("0 4 * * *".to_string(), 1000));
+        let next = next_map(&[("0 3 * * *", 3000)]);
+        // 本轮只有 #1 启用（#2 被禁用或删除）
+        let _ = plan_sweep(&mut known, &[(1, "0 3 * * *".into())], 500, &next);
+        assert!(known.contains_key(&1));
+        assert!(!known.contains_key(&2), "禁用/删除的计划不能留在状态里白占内存");
+    }
+
+    #[test]
+    fn unparsable_expression_never_fires_and_keeps_no_state() {
+        let mut known = HashMap::new();
+        let next = next_map(&[]);
+        let due = plan_sweep(&mut known, &[(1, "not a cron".into())], 9_999_999, &next);
+        assert!(due.is_empty());
+        assert!(!known.contains_key(&1), "解析不了的表达式不该反复重试");
+    }
+}
+
+// ─────────────────── 系统自动备份（面板库每日快照） ───────────────────
+
+/// 每日自动备份的文件名：`panel-<unix>.db`。
+///
+/// 与计划产物（`plan<id>-<ts>.<ext>`）刻意区分开：两者同住 `backup_dir`，
+/// 前缀不同才能各管各的裁剪，互不误伤。
+fn is_daily_db_name(n: &str) -> bool {
+    n.strip_prefix("panel-")
+        .and_then(|r| r.strip_suffix(".db"))
+        .map(|ts| !ts.is_empty() && ts.bytes().all(|b| b.is_ascii_digit()))
+        .unwrap_or(false)
+}
+
+/// 列出每日自动备份（名称倒序 = 新的在前；unix 秒定长，字典序即时间序）。
+pub fn list_daily_db(dir: &std::path::Path) -> Vec<(String, u64, i64)> {
+    let mut v = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else { return v };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !is_daily_db_name(&name) { continue; }
+        let Ok(md) = e.metadata() else { continue };
+        let mtime = md
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        v.push((name, md.len(), mtime));
+    }
+    v.sort_by(|a, b| b.0.cmp(&a.0));
+    v
+}
+
+/// 按保留份数裁剪每日自动备份，返回被删除的文件名。
+///
+/// `keep` 夹到 `>= 1`：配置写成 0 时删光会把"最后一次备份"也带走，比不裁剪危险。
+/// 只认 `panel-<digits>.db` —— 计划产物与用户放进来的文件一律不碰。
+pub fn prune_daily_db(dir: &std::path::Path, keep: i64) -> Vec<String> {
+    let keep = keep.max(1) as usize;
+    let mut removed = Vec::new();
+    for (name, _, _) in list_daily_db(dir).into_iter().skip(keep) {
+        if std::fs::remove_file(dir.join(&name)).is_ok() {
+            removed.push(name);
+        }
+    }
+    removed
+}
+
+/// `GET /api/v1/backups/system`：每日自动备份列表。
+///
+/// 存在的理由：这些文件此前**只写不列**——产物接口只认 `plan<id>-` 前缀，
+/// 所以用户完全不知道面板每天在备份、更不知道它们已经堆了多少。
+pub async fn system_artifacts(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::BACKUP_VIEW)?;
+    let dir = state.os.paths().backup_dir();
+    let items: Vec<serde_json::Value> = list_daily_db(&dir)
+        .into_iter()
+        .map(|(name, size, mtime)| serde_json::json!({ "name": name, "size": size, "mtime": mtime }))
+        .collect();
+    Ok(ok(serde_json::json!({ "dir": dir.display().to_string(), "items": items })))
+}
+
+/// 流式读文件，避免把整份备份读进内存（低配机上是致命的）。
+fn file_body(f: tokio::fs::File) -> impl futures_util::Stream<Item = std::io::Result<axum::body::Bytes>> + Send + 'static {
+    futures_util::stream::try_unfold(f, |mut f| async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 64 * 1024];
+        let n = f.read(&mut buf).await?;
+        if n == 0 {
+            Ok::<_, std::io::Error>(None)
+        } else {
+            buf.truncate(n);
+            Ok(Some((axum::body::Bytes::from(buf), f)))
+        }
+    })
+}
+
+/// `GET /api/v1/backups/system/{name}`：下载其中一份。
+pub async fn system_download(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    AxPath(name): AxPath<String>,
+) -> ApiResult<Response> {
+    crate::auth::require(&s, perm::BACKUP_VIEW)?;
+    // 第一道：名字白名单（只可能是 panel-<digits>.db）
+    if !is_daily_db_name(&name) {
+        return Err(ApiError::bad_request("name", "invalid backup name"));
+    }
+    let dir = state.os.paths().backup_dir();
+    // 第二道：canonicalize 后父目录必须就是 backup_dir（防符号链接逃逸）
+    let canon_dir = tokio::fs::canonicalize(&dir)
+        .await
+        .map_err(|_| ApiError::not_found("backup dir"))?;
+    let canon = tokio::fs::canonicalize(dir.join(&name))
+        .await
+        .map_err(|_| ApiError::not_found("backup"))?;
+    if canon.parent() != Some(canon_dir.as_path()) {
+        return Err(ApiError::forbidden(perm::BACKUP_VIEW));
+    }
+    let md = tokio::fs::metadata(&canon)
+        .await
+        .map_err(|e| ApiError::from(PanelError::Internal(e.to_string())))?;
+    let f = tokio::fs::File::open(&canon)
+        .await
+        .map_err(|e| ApiError::from(PanelError::Internal(e.to_string())))?;
+
+    let mut resp = Body::from_stream(file_body(f)).into_response();
+    let h = resp.headers_mut();
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+    if let Ok(v) = HeaderValue::from_str(&format!("attachment; filename=\"{name}\"")) {
+        h.insert(header::CONTENT_DISPOSITION, v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&md.len().to_string()) {
+        h.insert(header::CONTENT_LENGTH, v);
+    }
+    Ok(resp)
+}
+
+#[cfg(test)]
+mod daily_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("panel-daily-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn name_whitelist_only_accepts_panel_digits_db() {
+        assert!(is_daily_db_name("panel-1700000000.db"));
+        assert!(!is_daily_db_name("panel-.db"));
+        assert!(!is_daily_db_name("panel-abc.db"));
+        assert!(!is_daily_db_name("plan1-1700000000.db"), "计划产物不是每日备份");
+        assert!(!is_daily_db_name("panel-1700000000.db.bak"));
+    }
+
+    #[test]
+    fn prune_keeps_newest_n_and_never_touches_other_files() {
+        let d = tmp("prune");
+        for ts in [300, 100, 200] {
+            std::fs::write(d.join(format!("panel-{ts}.db")), b"x").unwrap();
+        }
+        std::fs::write(d.join("plan7-999.tar.gz"), b"x").unwrap();
+        std::fs::write(d.join("readme.txt"), b"x").unwrap();
+
+        let removed = prune_daily_db(&d, 2);
+        assert_eq!(removed, vec!["panel-100.db".to_string()], "应只删最旧的那份");
+        assert!(d.join("panel-300.db").exists());
+        assert!(d.join("panel-200.db").exists());
+        assert!(d.join("plan7-999.tar.gz").exists(), "计划产物不能被误删");
+        assert!(d.join("readme.txt").exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn keep_is_clamped_to_at_least_one() {
+        let d = tmp("clamp");
+        for ts in [1, 2, 3] {
+            std::fs::write(d.join(format!("panel-{ts}.db")), b"x").unwrap();
+        }
+        let removed = prune_daily_db(&d, 0);
+        assert_eq!(removed.len(), 2, "keep=0 也只能删到剩 1 份，不能把唯一备份也删了");
+        assert_eq!(list_daily_db(&d).len(), 1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn missing_dir_is_not_an_error() {
+        let p = std::path::Path::new("/nonexistent/panel-daily-x");
+        assert!(list_daily_db(p).is_empty());
+        assert!(prune_daily_db(p, 7).is_empty());
     }
 }

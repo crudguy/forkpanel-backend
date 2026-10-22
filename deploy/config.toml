@@ -22,6 +22,8 @@ site_root = "/var/www"
 [db]
 synchronous = "NORMAL"
 daily_backup = true
+# 每日自动备份保留份数：超出即删最旧的（0/负数按 1 处理，避免把唯一一份删掉）
+backup_keep = 7
 
 [security]
 session_idle = "30m"

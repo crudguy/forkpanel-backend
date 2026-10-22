@@ -283,6 +283,9 @@ pub fn build_router(state: Shared) -> Router {
         // 连接自检。axum(matchit) 里静态段优先级高于参数段，故与 `/backups/{id}` 不冲突；
         // 放在这里只是让"这是一个固定路径"读起来更直白。
         .route("/api/v1/backups/test-remote", post(backups::test_remote))
+        // 系统自动备份（面板库每日快照）。静态段优先于 `{id}`，与 test-remote 同理。
+        .route("/api/v1/backups/system", get(backups::system_artifacts))
+        .route("/api/v1/backups/system/{name}", get(backups::system_download))
         .route("/api/v1/backups/{id}", patch(backups::patch).delete(backups::delete))
         .route("/api/v1/backups/{id}/run", post(backups::run))
         .route("/api/v1/backups/{id}/artifacts", get(backups::artifacts))

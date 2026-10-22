@@ -82,6 +82,14 @@ pub fn builtin_schedules(tier: panel_core::Tier) -> Vec<Schedule> {
             kind: ScheduleKind::Every(Duration::from_secs(3600)),
             jitter_sec: 120,
         },
+        // 备份计划的 cron 扫描。**每分钟一次**：备份粒度最细到分钟，
+        // 扫得更勤只是空转（一次查询只读两列），更懒则会让"3:00 的备份"
+        // 拖到 3:05。真正的到期判断在 `backups::plan_sweep`（按表达式算触发点）。
+        Schedule {
+            name: "backup.sweep",
+            kind: ScheduleKind::Every(Duration::from_secs(60)),
+            jitter_sec: 20,
+        },
     ];
     // nano 档位不做每日备份：512MB 机器上 VACUUM INTO 的 IO 与内存开销不划算
     if !matches!(tier, panel_core::Tier::Nano) {
@@ -233,6 +241,25 @@ mod tests {
             .unwrap_or(0);
         assert!(d > 0 && d <= 6 * 3600,
             "uploads.sweep 周期应 <= 6h（会话 TTL 24h），实际 {d}s");
+    }
+
+    /// 备份计划的 cron 扫描必须挂在内置调度上：否则 `cron_expr` / `enabled`
+    /// 又回到"只存不读"——页面上配了定时，实际永远不跑。
+    #[test]
+    fn builtin_includes_backup_cron_sweep() {
+        let v = builtin_schedules(panel_core::Tier::Standard);
+        let d = v
+            .iter()
+            .find(|s| s.name == "backup.sweep")
+            .map(|s| match s.kind {
+                ScheduleKind::Every(d) => d.as_secs(),
+                _ => 0,
+            })
+            .unwrap_or(0);
+        assert!(d > 0 && d <= 60, "backup.sweep 应每分钟扫一次，实际 {d}s");
+        // 所有档位都要有：备份与内存大小无关（nano 只是跳过每日库备份）
+        assert!(builtin_schedules(panel_core::Tier::Nano)
+            .iter().any(|s| s.name == "backup.sweep"));
     }
 
     #[test]

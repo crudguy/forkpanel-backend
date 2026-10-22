@@ -718,6 +718,10 @@ async fn register_internal_jobs(
     if cfg.db.daily_backup && !matches!(tier, Tier::Nano) {
         let backup_dir = layout.backup_dir();
         let db_path = layout.sqlite_path();
+        // 保留份数必须在**注册时**取出：闭包里再读 cfg 会活不过 'static。
+        // 这个值是真消费者——写完后立刻按它裁剪，否则 `panel-*.db` 只增不减，
+        // 一年堆 365 份把磁盘慢慢吃满（且此前页面完全看不到这些文件）。
+        let keep = cfg.db.backup_keep;
         sched.register("db.backup", move || {
             let backup_dir = backup_dir.clone();
             let db_path = db_path.clone();
@@ -727,6 +731,10 @@ async fn register_internal_jobs(
                 let dest = backup_dir.join(format!("panel-{ts}.db"));
                 // 独立连接备份：写者把 op 包在事务里，事务内不能 VACUUM INTO
                 panel_db::backup_file(&db_path, &dest)?;
+                let pruned = panel_api::routes::backups::prune_daily_db(&backup_dir, keep);
+                if !pruned.is_empty() {
+                    tracing::info!("每日备份已裁剪 {} 份旧文件（保留 {keep}）", pruned.len());
+                }
                 Ok(())
             }
         }).await;
@@ -752,6 +760,26 @@ async fn register_internal_jobs(
                         Err(e)
                     }
                 }
+            }
+        }).await;
+    }
+
+    // ── 备份计划的 cron 扫描（每分钟）──
+    //
+    // `backup_jobs.cron_expr` / `enabled` 此前**只存不读**：页面上配了"每天 3 点"，
+    // 实际永远只有手动执行（典型「配置项假控制」）。这里挂上唯一消费者——
+    // 定时表在 `panel-task::builtin_schedules`，注册在这里，两处名字必须一致。
+    {
+        let state = state.clone();
+        sched.register("backup.sweep", move || {
+            let state = state.clone();
+            async move {
+                match panel_api::routes::backups::sweep_due(&state).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!("定时备份：本轮提交 {n} 个计划"),
+                    Err(e) => tracing::warn!("定时备份扫描失败: {e}"),
+                }
+                Ok(())
             }
         }).await;
     }
@@ -882,4 +910,28 @@ fn init_tracing() {
         .with_env_filter(filter)
         .with_target(false)
         .try_init();
+}
+
+#[cfg(test)]
+mod wiring_guard_tests {
+    /// **判据必须指向生产代码那一份**：调度表在 `panel-task`、注册在 `panel-cli`，
+    /// 只靠名字约定对齐。漏注册时调度器每轮 `jobs.get(name)` 取到 None 就静默跳过
+    /// ——页面上配了定时备份却永远不跑，且没有任何报错。
+    ///
+    /// 注意先 `.split("#[cfg(test)]")`：本模块自身的断言字符串里就含有
+    /// `sched.register("backup.sweep"`，不剔掉测试段的话，把注册删了测试照样绿
+    /// （正是「判据指向错」那类恒绿守卫）。
+    #[test]
+    fn backup_sweep_is_registered_in_serve() {
+        let src = include_str!("main.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        assert!(
+            prod.contains("sched.register(\"backup.sweep\", move ||"),
+            "builtin_schedules 声明了 backup.sweep，serve 必须注册同名实现，否则定时备份静默不跑"
+        );
+        assert!(
+            prod.contains("backups::sweep_due(&state)"),
+            "注册的实现必须真的调用 sweep_due"
+        );
+    }
 }

@@ -74,6 +74,10 @@ pub struct Db {
     pub synchronous: String,
     #[serde(default = "default_true")]
     pub daily_backup: bool,
+    /// 每日自动备份的保留份数（**真实消费者**：`db.backup` 写完立刻按它裁剪）。
+    /// 此前这些 `panel-<ts>.db` 只增不减——一年后就是 365 份，把磁盘慢慢吃满。
+    #[serde(default = "default_backup_keep")]
+    pub backup_keep: i64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -111,9 +115,12 @@ fn default_attempts() -> usize { 5 }
 fn default_retention() -> u32 { 90 }
 fn default_max_rows() -> u64 { 50_000 }
 fn default_true() -> bool { true }
+fn default_backup_keep() -> i64 { 7 }
 
 impl Default for Db {
-    fn default() -> Self { Self { synchronous: default_sync(), daily_backup: default_true() } }
+    fn default() -> Self {
+        Self { synchronous: default_sync(), daily_backup: default_true(), backup_keep: default_backup_keep() }
+    }
 }
 impl Default for Security {
     fn default() -> Self {
