@@ -25,6 +25,9 @@ const UPLOAD_TIMEOUT_SECS: u64 = 3600;
 const DELETE_TIMEOUT_SECS: u64 = 120;
 /// 列表 / 下载的超时。列表是元数据操作应很快；下载按产物大小给足。
 const LIST_TIMEOUT_SECS: u64 = 120;
+/// 列表翻页上限。S3 每页最多 1000 个 ⇒ 上限约 5 万个对象，远超任何备份目录的
+/// 合理规模；设上限是为了**不会**因为服务端反复返回同一个令牌而无限循环。
+const LIST_MAX_PAGES: usize = 50;
 const DOWNLOAD_TIMEOUT_SECS: u64 = 3600;
 /// 连接自检用的探针对象名。固定名且用完即删，不会在远端累积垃圾。
 pub const PROBE_OBJECT: &str = ".panel-conn-test";
@@ -183,8 +186,35 @@ impl RemoteTarget {
         Ok(out.stdout)
     }
 
+    /// 从 S3 列表响应里取"下一页"令牌；未截断或没有令牌 → `None`。
+    ///
+    /// S3 `list-type=2` **单次最多 1000 个对象**，超过会回 `IsTruncated=true` +
+    /// `NextContinuationToken`。不翻页的话远端看起来"只有 1000 个产物"，
+    /// 用户会以为更早的备份丢了——这是典型的静默截断。
+    ///
+    /// WebDAV 的 PROPFIND 没有分页概念，永远返回 `None`。
+    fn next_continuation(&self, body: &str) -> Option<String> {
+        if self.kind != RemoteKind::S3 {
+            return None;
+        }
+        let truncated = extract_tag_values(body, "IsTruncated");
+        if !truncated.iter().any(|t| t.trim() == "true") {
+            return None;
+        }
+        extract_tag_values(body, "NextContinuationToken")
+            .into_iter()
+            .find(|t| !t.trim().is_empty())
+            .map(|t| t.trim().to_string())
+    }
+
     /// 列表用的 URL 与请求方式（两种协议完全不同，抽出来便于单测）。
-    fn list_request(&self, prefix: &str) -> Result<(String, Vec<String>), PanelError> {
+    ///
+    /// `continuation` 仅 S3 用：翻页时带上 `continuation-token`。
+    fn list_request(
+        &self,
+        prefix: &str,
+        continuation: Option<&str>,
+    ) -> Result<(String, Vec<String>), PanelError> {
         let base = self.url.trim_end_matches('/');
         match self.kind {
             RemoteKind::Webdav => {
@@ -212,10 +242,14 @@ impl RemoteTarget {
                     Some(p) if !p.is_empty() => format!("{p}/{prefix}"),
                     _ => prefix.to_string(),
                 };
-                let url = format!(
+                let mut url = format!(
                     "{base}/{bucket}?list-type=2&prefix={}",
                     urlencode(&key_prefix)
                 );
+                if let Some(t) = continuation.map(str::trim).filter(|t| !t.is_empty()) {
+                    url.push_str("&continuation-token=");
+                    url.push_str(&urlencode(t));
+                }
                 validate_remote_url(&url)?;
                 Ok((url, Vec::new()))
             }
@@ -227,33 +261,56 @@ impl RemoteTarget {
     /// 为什么只需要名字：恢复要按名字取回对象，UI 也只展示名字。大小/时间在
     /// S3 要额外 HEAD、在 WebDAV 要解析 getcontentlength——先不做，避免为
     /// 展示信息引入更多协议分支（真需要时再加）。
+    ///
+    /// S3 会**自动翻页**直到取完（每页最多 1000 个，见 [`Self::next_continuation`]）；
+    /// 页数超过 [`LIST_MAX_PAGES`] 时停止并如实告警——不留一个"看着完整其实截断"的
+    /// 列表。
     pub async fn list(&self, prefix: &str) -> Result<Vec<String>, PanelError> {
-        let (url, extra) = self.list_request(prefix)?;
-        let mut args: Vec<String> = vec![
-            "--fail".into(),
-            "--silent".into(),
-            "--show-error".into(),
-            "--max-time".into(),
-            LIST_TIMEOUT_SECS.to_string(),
-        ];
-        args.extend(extra);
-        args.extend(self.auth_args());
-        args.push(url);
-        let body = self.curl_stdout(args, LIST_TIMEOUT_SECS).await?;
+        let mut names: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
 
-        let mut names: Vec<String> = match self.kind {
-            RemoteKind::Webdav => {
-                let mut raw = extract_tag_values(&body, "D:href");
-                raw.extend(extract_tag_values(&body, "d:href"));
-                raw.extend(extract_tag_values(&body, "href"));
-                raw.iter().map(|h| last_segment(h)).collect()
+        for _ in 0..LIST_MAX_PAGES {
+            let (url, extra) = self.list_request(prefix, token.as_deref())?;
+            let mut args: Vec<String> = vec![
+                "--fail".into(),
+                "--silent".into(),
+                "--show-error".into(),
+                "--max-time".into(),
+                LIST_TIMEOUT_SECS.to_string(),
+            ];
+            args.extend(extra);
+            args.extend(self.auth_args());
+            args.push(url);
+            let body = self.curl_stdout(args, LIST_TIMEOUT_SECS).await?;
+
+            let mut page: Vec<String> = match self.kind {
+                RemoteKind::Webdav => {
+                    let mut raw = extract_tag_values(&body, "D:href");
+                    raw.extend(extract_tag_values(&body, "d:href"));
+                    raw.extend(extract_tag_values(&body, "href"));
+                    raw.iter().map(|h| last_segment(h)).collect()
+                }
+                RemoteKind::S3 => extract_tag_values(&body, "Key")
+                    .iter()
+                    .map(|k| last_segment(k))
+                    .collect(),
+            };
+            page.retain(|n| !n.is_empty() && n.starts_with(prefix));
+            names.extend(page);
+
+            token = self.next_continuation(&body);
+            if token.is_none() {
+                break;
             }
-            RemoteKind::S3 => extract_tag_values(&body, "Key")
-                .iter()
-                .map(|k| last_segment(k))
-                .collect(),
-        };
-        names.retain(|n| !n.is_empty() && n.starts_with(prefix));
+        }
+        if token.is_some() {
+            eprintln!(
+                "[panel] 远端对象超过 {} 页（约 {} 个），列表到此为止——\
+                 如需完整清单请缩小 prefix 或分批清理",
+                LIST_MAX_PAGES,
+                LIST_MAX_PAGES * 1000
+            );
+        }
         names.sort();
         names.dedup();
         Ok(names)
@@ -551,16 +608,86 @@ mod list_tests {
         assert_eq!(last_segment(&hrefs[1]), "plan2-9.tar.gz");
     }
 
+    /// ⭐ S3 单次只回 1000 个对象，截断后必须能接着翻页。
+    #[test]
+    fn reads_the_next_page_token_when_truncated() {
+        let xml = r#"<ListBucketResult>
+            <IsTruncated>true</IsTruncated>
+            <NextContinuationToken>1ueGcxLPRx1Tr/XYExHnhbYLgveDs2J/wm36Hy4vbOwM=</NextContinuationToken>
+        </ListBucketResult>"#;
+        let t = s3().next_continuation(xml);
+        assert_eq!(
+            t.as_deref(),
+            Some("1ueGcxLPRx1Tr/XYExHnhbYLgveDs2J/wm36Hy4vbOwM="),
+            "截断时必须拿到下一页令牌，否则列表会静默停在 1000 个"
+        );
+    }
+
+    #[test]
+    fn no_token_when_not_truncated() {
+        let xml = r#"<ListBucketResult><IsTruncated>false</IsTruncated>
+            <NextContinuationToken>ignored</NextContinuationToken></ListBucketResult>"#;
+        assert_eq!(s3().next_continuation(xml), None);
+    }
+
+    /// 没有令牌却说截断（部分兼容实现会这样）：返回 None 而不是空串死循环。
+    #[test]
+    fn truncated_without_a_token_stops() {
+        let xml = r#"<ListBucketResult><IsTruncated>true</IsTruncated></ListBucketResult>"#;
+        assert_eq!(s3().next_continuation(xml), None);
+    }
+
+    /// WebDAV 的 PROPFIND 没有分页——永远 None（否则会给 DAV 请求拼上 S3 参数）。
+    #[test]
+    fn webdav_never_paginates() {
+        assert_eq!(dav().next_continuation("<IsTruncated>true</IsTruncated>"), None);
+    }
+
+    #[test]
+    fn continuation_token_is_appended_and_encoded() {
+        let (url, _) = s3()
+            .list_request("plan7-", Some("ab/c="))
+            .unwrap();
+        assert!(url.contains("continuation-token=ab%2Fc%3D"), "{url}");
+        assert!(url.contains("list-type=2"), "{url}");
+    }
+
+    #[test]
+    fn empty_continuation_is_omitted() {
+        let (url, _) = s3().list_request("plan7-", Some("  ")).unwrap();
+        assert!(!url.contains("continuation-token"), "{url}");
+    }
+
+    /// 接线守卫：`list()` 必须**真的翻页**。
+    ///
+    /// `next_continuation` / `list_request` 两条单测都过了，不代表有人调用它们——
+    /// 而"函数写了没人用"正是最难靠 review 发现的一类。用源码断言钉住接线；
+    /// ⚠ 断言前剔除注释行（本文件注释里逐字写着 `next_continuation`）。
+    #[test]
+    fn list_follows_continuation_tokens() {
+        let src = include_str!("remote_store.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        let code: Vec<&str> = prod.lines().filter(|l| !l.trim_start().starts_with("//")).collect();
+        let joined = code.join("\n");
+        let start = joined.find("pub async fn list(").expect("list 必须存在");
+        let rest = &joined[start..];
+        let end = rest.find("\n    pub ").unwrap_or(rest.len());
+        let block = &rest[..end];
+        assert!(block.contains("for _ in 0..LIST_MAX_PAGES"), "list 必须翻页循环，否则远端超过 1000 个对象就静默截断");
+        assert!(block.contains("self.next_continuation(&body)"), "list 必须取下一页令牌");
+        assert!(block.contains("if token.is_none()"), "取不到令牌时必须停，不能死循环");
+    }
+
     #[test]
     fn s3_list_url_encodes_the_prefix() {
-        let (url, extra) = s3().list_request("plan7-").unwrap();
+        let (url, extra) = s3().list_request("plan7-", None).unwrap();
         assert_eq!(url, "https://s3.example.com/bk?list-type=2&prefix=backups%2Fplan7-");
         assert!(extra.is_empty(), "S3 不需要额外 header");
     }
 
     #[test]
     fn webdav_list_uses_propfind_depth_one() {
-        let (url, extra) = dav().list_request("plan7-").unwrap();
+        let (url, extra) = dav().list_request("plan7-", None).unwrap();
         assert_eq!(url, "https://dav.example.com/backups/");
         let joined = extra.join(" ");
         assert!(joined.contains("PROPFIND"), "{joined}");
@@ -571,7 +698,7 @@ mod list_tests {
     fn s3_without_bucket_is_rejected_before_any_network_call() {
         let mut t = s3();
         t.bucket = None;
-        assert!(t.list_request("plan7-").is_err());
+        assert!(t.list_request("plan7-", None).is_err());
     }
 
     #[test]

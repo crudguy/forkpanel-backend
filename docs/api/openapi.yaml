@@ -2945,6 +2945,10 @@ paths:
         以 `plan<id>-` 开头且通过白名单的对象。未配置远端时返回 400。
         注意：远端不可达时返回 5xx/4xx 而**不是空列表**——"列不出来"与
         "远端确实没有"是两件事，不能混。
+
+        S3 的 ListObjectsV2 单次最多 1000 个对象，本接口会**自动翻页**
+        （`continuation-token`）直到取完，上限约 5 万个；真超过上限时会在
+        服务端日志告警，不会返回一个看着完整其实截断的列表。
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       responses:
         '200':
