@@ -728,20 +728,26 @@ struct BackupJob {
 /// 会贴着 0 走——盘写满的代价是面板连自己的库都写不进去，不只是这次备份丢掉。
 const BACKUP_FREE_HEADROOM: u64 = 64 * 1024 * 1024;
 
-/// 递归统计目录体积（字节）。读不到的条目（权限不足 / 已被并发删除）**跳过**而不是
-/// 整体失败：这只是估算，为单个条目废掉整次备份不划算。
-fn dir_bytes(path: &std::path::Path) -> u64 {
-    let mut total = 0u64;
+/// 递归统计目录的 `(字节数, 文件数)`。
+///
+/// 两个口径共用**同一个**遍历：写成两份迟早会漂移（一个数文件、一个不算目录，
+/// 日后改一处忘另一处就说不清了）。读不到的条目（权限不足 / 已被并发删除）
+/// **跳过**而不是整体失败——这只是估算，为单个条目废掉整次备份不划算。
+fn dir_stats(path: &std::path::Path) -> (u64, usize) {
+    let (mut bytes, mut files) = (0u64, 0usize);
     let mut stack = vec![path.to_path_buf()];
     while let Some(p) = stack.pop() {
         let Ok(rd) = std::fs::read_dir(&p) else { continue };
         for e in rd.flatten() {
             let Ok(m) = e.metadata() else { continue };
-            if m.is_dir() { stack.push(e.path()); } else { total += m.len(); }
+            if m.is_dir() { stack.push(e.path()); } else { bytes += m.len(); files += 1; }
         }
     }
-    total
+    (bytes, files)
 }
+
+fn dir_bytes(path: &std::path::Path) -> u64 { dir_stats(path).0 }
+fn count_files(path: &std::path::Path) -> usize { dir_stats(path).1 }
 
 /// 本次备份预计占多少字节。`None` = **估不出来**。
 ///
@@ -1595,6 +1601,68 @@ fn check_archive_scope(entries: &[String], site_name: &str) -> std::result::Resu
     Ok(())
 }
 
+/// 恢复**之后**的校验：`untar_gz` 退出 0 ≠ **文件真的回到了站点目录**。
+///
+/// 判据是"归档列出的文件，落盘后是否真在站点目录下"，而不是目录里的文件总数——
+/// 站点里本来就有归档之外的新文件（日志、缓存），总数对不上是噪声不是信号。
+///
+/// 两种失败都不静默（都会让任务红、并发通知）：
+/// - 一个都没落盘 → 解包极可能写到了别处，这是**静默空恢复**，比报错危险得多；
+/// - 只找回一部分 → 恢复不完整，宁可红着等人来查，也不能在"恢复成功"的
+///   标题下留半个站点（当前态快照还在，不会没退路）。
+///
+/// 用 `symlink_metadata` 而非 `exists()`：**归档里的符号链接指向不存在的目标是
+/// 合法的**，`exists()` 会穿越链接返回 false，把正常站点误判成"没恢复"。
+fn verify_restored_tree(
+    root: &std::path::Path,
+    entries: &[String],
+    site_name: &str,
+) -> Result<String> {
+    let prefix = format!("{site_name}/");
+    let expected: Vec<String> = entries
+        .iter()
+        .map(|e| e.trim_start_matches("./"))
+        .filter(|e| !e.is_empty() && !e.ends_with('/') && *e != site_name)
+        .map(|e| e.strip_prefix(&prefix).unwrap_or(e).to_string())
+        .filter(|e| !e.is_empty())
+        .collect();
+
+    let on_disk = count_files(root);
+    // 归档里一个文件都没有（只有目录条目）时无从校验，如实说明而不是编个数字
+    if expected.is_empty() {
+        return Ok(format!("归档内无文件条目（仅目录），站点目录现有 {on_disk} 个文件"));
+    }
+
+    let mut missing: Vec<String> = Vec::new();
+    for rel in &expected {
+        if root.join(rel).symlink_metadata().is_err() {
+            missing.push(rel.clone());
+        }
+    }
+    let present = expected.len() - missing.len();
+    let note = format!(
+        "归档 {} 个条目（文件 {} 个）：找回 {present}/{}，站点目录现有 {on_disk} 个文件",
+        entries.len(),
+        expected.len(),
+        expected.len(),
+    );
+    if present == 0 {
+        return Err(PanelError::Internal(format!(
+            "{note}——一个归档文件都没落盘，解包极可能写到了别处；\
+             当前态快照仍在，请先别重复恢复"
+        )));
+    }
+    if !missing.is_empty() {
+        let sample: Vec<String> = missing.iter().take(3).cloned().collect();
+        return Err(PanelError::Internal(format!(
+            "{note}——缺 {} 个（例如 {}），恢复不完整",
+            missing.len(),
+            sample.join("、")
+        )));
+    }
+    Ok(note)
+}
+
 struct RestoreJob {
     id: i64,
     /// 站点根目录（恢复目标）
@@ -1740,6 +1808,14 @@ impl RestoreJob {
             .ok_or_else(|| PanelError::Internal("站点目录无父目录".into()))?
             .to_path_buf();
         panel_os::backup::untar_gz(archive, &parent).await?;
+
+        // ④ 恢复后校验：只信"文件真的在盘上"，不信 untar 的退出码。
+        //    解包报 0 但一个文件都没落盘的情况是存在的（写到了别处、被权限挡住）；
+        //    不校验的话任务就是 ok，用户以为恢复了。
+        progress.set(90, "校验恢复结果").await;
+        let note = verify_restored_tree(&self.root, &entries, &site_name)?;
+        eprintln!("[panel] 恢复计划 #{} 校验通过：{note}", self.id);
+        progress.log(&format!("恢复结果：{note}")).await;
 
         progress.set(100, "完成").await;
         // output_path 指向**恢复前的快照**：出问题可据此回滚
@@ -2558,6 +2634,111 @@ mod space_tests {
             .find("let out_path = match self.kind.as_str()")
             .expect("execute 必须进入备份执行分支");
         assert!(call < work, "空间检查必须在真正开写之前，否则等于没检查");
+    }
+}
+
+#[cfg(test)]
+mod restore_verify_tests {
+    use super::*;
+
+    /// 真夹具：真目录 → 真 `tar` 打包 → 真条目列表（不用手搓的条目数组，
+    /// 手搓数组会绕过"真实 tar 输出的条目长什么样"，守卫就形同虚设）。
+    async fn fixture(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf, Vec<String>) {
+        let base = std::env::temp_dir().join(format!("panel-rvfy-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let site = base.join("site/my-site");
+        std::fs::create_dir_all(site.join("css")).unwrap();
+        std::fs::write(site.join("index.html"), b"<h1>hi</h1>").unwrap();
+        std::fs::write(site.join("css/a.css"), b"body{}").unwrap();
+        let archive = base.join("plan1-1.tar.gz");
+        panel_os::backup::tar_gz(&site, &archive).await.unwrap();
+        let entries = panel_os::backup::list_tar_entries(&archive).await.unwrap();
+        (base, site, archive, entries)
+    }
+
+    #[tokio::test]
+    async fn fully_restored_tree_passes() {
+        let (base, site, archive, entries) = fixture("ok").await;
+        let parent = site.parent().unwrap().to_path_buf();
+        std::fs::remove_dir_all(&site).unwrap();
+        panel_os::backup::untar_gz(&archive, &parent).await.unwrap();
+        let note = verify_restored_tree(&site, &entries, "my-site").expect("全部找回应通过");
+        assert!(note.contains("找回 2/2"), "{note}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ⭐ 静默空恢复：解包没报错，但站点目录里一个归档文件都没有。
+    #[tokio::test]
+    async fn nothing_landed_on_disk_is_a_failure() {
+        let (base, site, _archive, entries) = fixture("empty").await;
+        std::fs::remove_dir_all(&site).unwrap();
+        std::fs::create_dir_all(&site).unwrap(); // 目录在，内容是空的
+        let e = verify_restored_tree(&site, &entries, "my-site").unwrap_err();
+        let m = e.to_string();
+        assert!(m.contains("一个归档文件都没落盘"), "{m}");
+        assert!(m.contains("找回 0/2"), "{m}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn partial_restore_is_a_failure_not_a_success() {
+        let (base, site, _archive, entries) = fixture("partial").await;
+        std::fs::remove_dir_all(&site).unwrap();
+        std::fs::create_dir_all(&site).unwrap();
+        std::fs::write(site.join("index.html"), b"x").unwrap(); // 只回来一个
+        let m = verify_restored_tree(&site, &entries, "my-site").unwrap_err().to_string();
+        assert!(m.contains("恢复不完整"), "{m}");
+        assert!(m.contains("找回 1/2"), "{m}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 归档里只有目录条目（空站点）时无从校验：如实说明，不编造一个数字。
+    #[tokio::test]
+    async fn dir_only_archive_is_reported_not_failed() {
+        let base = std::env::temp_dir().join(format!("panel-rvfy-dirs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let site = base.join("site/empty-site");
+        std::fs::create_dir_all(&site).unwrap();
+        let archive = base.join("plan1-3.tar.gz");
+        panel_os::backup::tar_gz(&site, &archive).await.unwrap();
+        let entries = panel_os::backup::list_tar_entries(&archive).await.unwrap();
+        let note = verify_restored_tree(&site, &entries, "empty-site").expect("仅目录条目不算恢复失败");
+        assert!(note.contains("无文件条目"), "{note}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ⭐ 悬空符号链接必须算"已恢复"。
+    ///
+    /// 归档里的链接指向不存在的目标是合法的（站点里很常见）。`exists()` 会**穿越**
+    /// 链接返回 false，把恢复成功的站点误判成"一个文件都没落盘"——这是选择
+    /// `symlink_metadata` 的唯一理由，必须钉住。
+    #[tokio::test]
+    async fn dangling_symlink_counts_as_restored() {
+        let (base, site, archive, _old) = fixture("link").await;
+        std::os::unix::fs::symlink("nowhere.txt", site.join("broken.lnk")).unwrap();
+        std::fs::remove_file(&archive).unwrap();
+        panel_os::backup::tar_gz(&site, &archive).await.unwrap();
+        let entries = panel_os::backup::list_tar_entries(&archive).await.unwrap();
+        let note = verify_restored_tree(&site, &entries, "my-site").expect("悬空链接必须算已恢复");
+        assert!(note.contains("找回 3/3"), "{note}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 接线守卫：校验必须挂在 `untar_gz` **之后**。
+    #[test]
+    fn verification_runs_after_untar() {
+        let src = include_str!("backups.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        let code: Vec<&str> = prod.lines().filter(|l| !l.trim_start().starts_with("//")).collect();
+        let joined = code.join("\n");
+        let start = joined
+            .find("panel_os::backup::untar_gz(archive, &parent)")
+            .expect("站点恢复必须解包");
+        let v = joined[start..]
+            .find("verify_restored_tree(")
+            .expect("解包之后必须校验落盘结果");
+        let done = joined[start..].find("progress.set(100").expect("应有收尾");
+        assert!(v < done, "校验必须在任务标记完成之前");
     }
 }
 
