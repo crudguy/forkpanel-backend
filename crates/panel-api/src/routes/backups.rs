@@ -45,8 +45,11 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use crate::extract::PanelJson;
 
-/// 当前只实装这两类；`db` 见 `/api/v1/db/{conn}/backup`（另一条线）。
-const KINDS: &[&str] = &["panel", "site"];
+/// `panel` = 面板自身库；`site` = 站点文件；`db` = 数据库连接（按连接名）。
+///
+/// `db` 与 `/api/v1/db/{conn}/backup`（手动导出）共用同一个 provider 实现，
+/// 但产物归计划管：有 cron、keep_count 裁剪、远端副本与统一恢复入口。
+const KINDS: &[&str] = &["panel", "site", "db"];
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PlanDto {
@@ -491,6 +494,12 @@ async fn validate_target(
         if target != "panel" {
             return Err(PanelError::Validation { field: "target".into(), reason: "panel 计划的 target 必须为 panel".into() });
         }
+    } else if kind == "db" {
+        // 按连接名落库：页面展示友好；改名后计划会明确报"连接不存在"，
+        // 而不是悄悄备份到别的库上（比按 id 更不容易出静默错误）。
+        if super::databases::conn_id_by_name(state, &target).await?.is_none() {
+            return Err(PanelError::NotFound(format!("db connection {target}")));
+        }
     } else if site_root_by_name(state, &target).await?.is_none() {
         return Err(PanelError::NotFound(format!("site {target}")));
     }
@@ -585,6 +594,75 @@ async fn verify_artifact(
     Ok(format!("{fname}: {summary}"))
 }
 
+/// 数据库产物的扩展名：SQLite 是库文件副本（`.db`），mysql/pg 是 SQL 文本（`.sql`）。
+fn db_artifact_ext(engine: &panel_os::DbEngine) -> &'static str {
+    match engine {
+        panel_os::DbEngine::Sqlite => "db",
+        _ => "sql",
+    }
+}
+
+/// 数据库产物的可恢复性校验（`kind=db` 专用）。
+///
+/// 与 [`verify_artifact`] 的区别：SQLite 产物是**用户的库**，不能套用面板库的
+/// 「必须含 users 表」判据；mysql/pg 产物是 SQL 文本，没有服务端可连，只能证明
+/// 非空（这一点必须如实写进摘要，不能让"校验通过"听起来比实际更强）。
+async fn verify_db_artifact(
+    path: &std::path::Path,
+    key: Option<&panel_core::crypto::MasterKey>,
+    tmp_dir: &std::path::Path,
+    engine: Option<panel_os::DbEngine>,
+) -> Result<String> {
+    let fname = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+
+    let mut tmp_plain: Option<PathBuf> = None;
+    let plain = if panel_os::backup::is_encrypted_file(path) {
+        let k = key.ok_or_else(|| {
+            PanelError::Internal(format!("产物 {fname} 已加密，但没有主密钥可解密校验"))
+        })?;
+        std::fs::create_dir_all(tmp_dir)
+            .map_err(|e| PanelError::Internal(format!("create tmp: {e}")))?;
+        let p = tmp_dir.join(format!(
+            "verify-db-{}-{}",
+            std::process::id(),
+            fname.trim_end_matches(".enc")
+        ));
+        panel_os::backup::decrypt_file(path, &p, k).await?;
+        tmp_plain = Some(p.clone());
+        p
+    } else {
+        path.to_path_buf()
+    };
+    let _guard = TempGuard(tmp_plain);
+
+    let len = std::fs::metadata(&plain)
+        .map_err(|e| PanelError::Io(format!("stat 产物: {e}")))?
+        .len();
+    if len == 0 {
+        return Err(PanelError::Internal("产物是 0 字节".into()));
+    }
+
+    match engine {
+        Some(panel_os::DbEngine::Sqlite) => {
+            let p = plain.clone();
+            // integrity_check 要读全库，放 blocking 池
+            tokio::task::spawn_blocking(move || {
+                let conn = rusqlite::Connection::open(&p)
+                    .map_err(|e| PanelError::Database(format!("open db backup: {e}")))?;
+                let r = panel_db::integrity_check(&conn)?;
+                if r != "ok" {
+                    return Err(PanelError::Internal(format!("SQLite 自检未通过: {r}")));
+                }
+                Ok::<(), PanelError>(())
+            })
+            .await
+            .map_err(|e| PanelError::Internal(format!("校验线程异常: {e}")))??;
+            Ok(format!("{fname}: SQLite integrity_check=ok，{len} B"))
+        }
+        _ => Ok(format!("{fname}: SQL 转储 {len} B（非空；未连库校验）")),
+    }
+}
+
 /// CLI 入口（`panel verify-backup <path>`）：与 [`verify_artifact`] 同一实现，
 /// 单独包一层是为了让 panel-cli 不必接触 `routes::backups` 的私有内部。
 pub async fn verify_artifact_cli(
@@ -623,6 +701,10 @@ struct BackupJob {
     id: i64,
     kind: String,
     root: Option<PathBuf>,
+    /// 数据库连接目标（`kind=db` 时必填；凭据已解密）
+    db_target: Option<panel_os::DbTarget>,
+    /// OS 适配器：db 备份要走 `os.databases()`（与手动导出同一实现）
+    os: std::sync::Arc<dyn panel_os::OsAdapter>,
     dest: PathBuf,
     /// 保留份数：成功后按此裁剪最旧产物（防止低配盘被备份撑爆）
     keep_count: i64,
@@ -733,6 +815,20 @@ impl BackupJob {
                 panel_os::backup::tar_gz(&root, &dest).await?;
                 dest
             }
+            "db" => {
+                let t = self
+                    .db_target
+                    .as_ref()
+                    .ok_or_else(|| PanelError::Internal("db target 缺失".into()))?;
+                let name = format!("plan{}-{}.{}", self.id, ts, db_artifact_ext(&t.engine));
+                // 出口必须走 SafePath：provider 直接拿它写文件，绕不过沙箱
+                let safe = panel_os::paths::resolve_within_for_create(&self.dest, &name)?;
+                self.os
+                    .databases()
+                    .backup(t, &safe, Box::new(|_line| {}))
+                    .await?;
+                self.dest.join(name)
+            }
             other => {
                 return Err(PanelError::Validation {
                     field: "kind".into(),
@@ -770,7 +866,21 @@ impl BackupJob {
         // 放在上传远端**之前**：本地这份就坏的话，传上去只是把垃圾复制到异地，
         // 还多付一份流量。校验不过就让整个任务失败并通知，不等事故当天才发现。
         progress.set(88, "校验产物").await;
-        let verify_note = match verify_artifact(&out_path, self.master.as_ref(), &self.tmp_dir).await {
+        // `kind=db` 有自己的判据：SQLite 产物是**用户的库**（不能要求含 users 表），
+        // mysql/pg 是 SQL 文本（没有服务端可校验，只能证明非空）。
+        let verified = match self.kind.as_str() {
+            "db" => {
+                verify_db_artifact(
+                    &out_path,
+                    self.master.as_ref(),
+                    &self.tmp_dir,
+                    self.db_target.as_ref().map(|t| t.engine),
+                )
+                .await
+            }
+            _ => verify_artifact(&out_path, self.master.as_ref(), &self.tmp_dir).await,
+        };
+        let verify_note = match verified {
             Ok(note) => {
                 eprintln!("[panel] 备份计划 #{} 产物校验通过：{note}", self.id);
                 note
@@ -924,12 +1034,20 @@ pub async fn submit_run(state: &Shared, id: i64) -> ApiResult<i64> {
         .ok_or_else(|| ApiError::not_found("backup plan"))?;
     let plan = full.dto.clone();
     let dest = resolve_dest(state, &plan.dest_dir)?.as_path().to_path_buf();
+    let mut db_target = None;
     let root = match plan.kind.as_str() {
         "site" => Some(PathBuf::from(
             site_root_by_name(state, &plan.target)
                 .await?
                 .ok_or_else(|| ApiError::bad_request("target", "site not found"))?,
         )),
+        "db" => {
+            let cid = super::databases::conn_id_by_name(state, &plan.target)
+                .await?
+                .ok_or_else(|| ApiError::bad_request("target", "db connection not found"))?;
+            db_target = Some(super::databases::load_target(state, cid, None).await?);
+            None
+        }
         _ => None,
     };
 
@@ -942,6 +1060,8 @@ pub async fn submit_run(state: &Shared, id: i64) -> ApiResult<i64> {
         id,
         kind: plan.kind.clone(),
         root,
+        os: state.os.clone(),
+        db_target,
         dest,
         keep_count: plan.keep_count,
         db_path: state.os.paths().sqlite_path(),
@@ -1262,6 +1382,45 @@ pub async fn restore(
         (p, None)
     };
 
+    // 数据库恢复：走 provider 的还原实现（它会先给当前库留快照，再覆盖）
+    if plan.kind == "db" {
+        let cid = super::databases::conn_id_by_name(&state, &plan.target)
+            .await?
+            .ok_or_else(|| ApiError::bad_request("target", "db connection not found"))?;
+        let target = super::databases::load_target(&state, cid, None).await?;
+        // SafePath 的根要与产物实际所在目录一致：本地产物在 dest、远端下载在 tmp
+        let (base, rel) = if req.from_remote {
+            let f = archive
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            (state.os.paths().tmp_dir(), f)
+        } else {
+            (dest.as_path().to_path_buf(), name.to_string())
+        };
+        let src = panel_os::paths::resolve_within_for_create(&base, &rel)?;
+        let job = PlanDbRestoreJob {
+            inner: super::databases::DbRestoreTask { target, src, os: state.os.clone() },
+            cleanup,
+        };
+        let (tid, _) = state
+            .tasks
+            .submit(
+                panel_task::TaskRequest {
+                    // 幂等键带 db 后缀：同名的站点恢复与库恢复是两件事
+                    idempotency_key: format!("restore:{id}:{name}:db"),
+                    kind: panel_task::TaskKind::Restore,
+                    label: format!("恢复计划 #{id}（{name}，数据库）"),
+                    timeout: Duration::from_secs(1800),
+                },
+                job,
+            )
+            .await
+            .map_err(ApiError::from)?;
+        audit(&state, &s, "backup.restore", &format!("{id}:{name}:db"), "queued").await;
+        return Ok(ok(serde_json::json!({ "task_id": tid })));
+    }
+
     let root = PathBuf::from(
         site_root_by_name(&state, &plan.target)
             .await?
@@ -1348,6 +1507,22 @@ struct RestoreJob {
 ///
 /// 用 `Drop` 而不是在函数尾部手动删：`execute` 里有多个 `?` 提前返回，
 /// 靠人工逐个补清理迟早会漏一条路径，把**解密后的明文**留在 /tmp。
+/// `kind=db` 的恢复任务：内核完全复用 `databases::DbRestoreTask`
+/// （provider 自己会"覆盖前先快照"，且 sqlite / mysql / pg 的差异都在 provider 里），
+/// 这里只多挂一个清理钩子——从远端拉下来的临时文件必须删。
+struct PlanDbRestoreJob {
+    inner: super::databases::DbRestoreTask,
+    cleanup: Option<PathBuf>,
+}
+
+#[async_trait::async_trait]
+impl panel_task::TaskBody for PlanDbRestoreJob {
+    async fn run(&self, progress: panel_task::Progress) -> Result<panel_task::TaskOutcome> {
+        let _guard = TempGuard(self.cleanup.clone());
+        self.inner.run(progress).await
+    }
+}
+
 struct TempGuard(Option<PathBuf>);
 
 impl Drop for TempGuard {
@@ -1638,6 +1813,53 @@ mod exec_tests {
     use super::*;
     use panel_task::{Progress, ProgressBus, TaskBody};
 
+    /// 回归：**用户的 SQLite 库没有 `users` 表，也不能被判失败**。
+    ///
+    /// `verify_artifact`（面板库专用）会检查 `users` 表——直接套到 `kind=db` 上
+    /// 会把绝大多数用户的库误判成"不像面板库"并删掉产物。
+    #[tokio::test]
+    async fn verify_db_artifact_accepts_a_user_sqlite_db_without_users_table() {
+        let base = std::env::temp_dir().join(format!("panel-dbverify-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let p = base.join("user.db");
+        {
+            let c = rusqlite::Connection::open(&p).unwrap();
+            c.execute_batch("CREATE TABLE notes(id INTEGER); INSERT INTO notes VALUES(1);").unwrap();
+        }
+        let note = verify_db_artifact(
+            &p, None, &base.join("tmp"), Some(panel_os::DbEngine::Sqlite),
+        )
+        .await
+        .expect("用户库应通过校验");
+        assert!(note.contains("integrity_check=ok"), "{note}");
+        assert!(!note.contains("users"), "不应套用面板库的 users 表判据：{note}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn verify_db_artifact_rejects_garbage_sqlite() {
+        let base = std::env::temp_dir().join(format!("panel-dbbad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let p = base.join("bad.db");
+        std::fs::write(&p, b"NOT-A-SQLITE-FILE").unwrap();
+        assert!(
+            verify_db_artifact(&p, None, &base.join("tmp"), Some(panel_os::DbEngine::Sqlite))
+                .await
+                .is_err(),
+            "垃圾文件必须被拒（否则会当成有效备份留着）"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn db_artifact_extension_follows_engine() {
+        assert_eq!(db_artifact_ext(&panel_os::DbEngine::Sqlite), "db");
+        assert_eq!(db_artifact_ext(&panel_os::DbEngine::MySql), "sql");
+        assert_eq!(db_artifact_ext(&panel_os::DbEngine::Postgres), "sql");
+    }
+
     /// 回归：**真实的 tar.gz 必须能通过产物校验**。
     ///
     /// 之前 `verify_artifact` 的 gz 分支只 `remove_dir_all` 临时目录却忘了重建，
@@ -1711,6 +1933,9 @@ mod exec_tests {
             id: 1,
             kind: "panel".into(),
             root: None,
+            // panel 分支不碰 os / db_target，给 mock 即可
+            os: std::sync::Arc::new(panel_os::mock::MockOsAdapter::new()),
+            db_target: None,
             dest: dest.clone(),
             keep_count: 3,
             db_path: src_db.clone(),

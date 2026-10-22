@@ -572,10 +572,28 @@ pub async fn restore(
 /// 库还原任务体：覆盖前快照与具体导入逻辑都下沉到 provider（见 stub.rs）。
 /// 此处只驱动任务进度与结果——不重复实现引擎差异（sqlite 先备份再复制、
 /// mysql/pg 走外部客户端导入）。
-struct DbRestoreTask {
-    target: panel_os::DbTarget,
-    src: SafePath,
-    os: std::sync::Arc<dyn panel_os::OsAdapter>,
+pub(crate) struct DbRestoreTask {
+    pub(crate) target: panel_os::DbTarget,
+    pub(crate) src: SafePath,
+    pub(crate) os: std::sync::Arc<dyn panel_os::OsAdapter>,
+}
+
+/// 按**连接名**查 id（备份计划的 `target` 存名字：页面展示友好，改名后计划会
+/// 明确报"连接不存在"，而不是悄悄备份到别的库上）。
+pub(crate) async fn conn_id_by_name(state: &Shared, name: &str) -> Result<Option<i64>> {
+    let name = name.to_string();
+    state
+        .pool
+        .with(move |c| {
+            let mut st = c
+                .prepare("SELECT id FROM db_connections WHERE name = ?1")
+                .map_err(|e| PanelError::Database(e.to_string()))?;
+            let mut it = st
+                .query_map([name], |r| r.get::<_, i64>(0))
+                .map_err(|e| PanelError::Database(e.to_string()))?;
+            Ok(it.next().transpose().map_err(|e| PanelError::Database(e.to_string()))?)
+        })
+        .await
 }
 
 #[async_trait::async_trait]
@@ -644,7 +662,7 @@ fn validate_connection_create(engine: &str, user: &Option<String>) -> ApiResult<
 }
 
 /// 读连接行 → 解密口令 → 构造 `DbTarget`（浏览各端点的统一入口）。
-async fn load_target(state: &Shared, conn: i64, db_override: Option<&str>) -> ApiResult<panel_os::DbTarget> {
+pub(crate) async fn load_target(state: &Shared, conn: i64, db_override: Option<&str>) -> ApiResult<panel_os::DbTarget> {
     let row = state.pool.with(move |c| {
         let mut st = c.prepare(
             "SELECT engine, host, port, username, password_enc, default_db \

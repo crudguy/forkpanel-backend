@@ -945,7 +945,7 @@ components:
       required: [kind, target, dest_dir]
       properties:
         id:          { type: integer }
-        kind:        { type: string, enum: [panel, site], description: "panel=面板自身数据；site=站点文件" }
+        kind:        { type: string, enum: [panel, site, db], description: "panel=面板自身数据；site=站点文件；db=数据库连接（按连接名，产物为 .db 或 .sql）" }
         target:      { type: string, description: "panel 固定 'panel'；site 为站点名" }
         cron_expr:   { type: [string, "null"], description: "留空=仅手动执行" }
         keep_count:  { type: integer, default: 7 }
@@ -2798,7 +2798,7 @@ paths:
               type: object
               required: [kind, target, dest_dir]
               properties:
-                kind:       { type: string, enum: [panel, site] }
+                kind:       { type: string, enum: [panel, site, db], description: "db 时 target 为连接名（见 /db/connections）" }
                 target:     { type: string, description: "panel 固定 'panel'；site 为站点名" }
                 dest_dir:   { type: string, description: "相对面板 backup_dir 的子目录" }
                 cron_expr:  { type: [string, "null"] }
