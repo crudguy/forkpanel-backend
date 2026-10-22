@@ -722,6 +722,77 @@ struct BackupJob {
     tmp_dir: PathBuf,
 }
 
+/// 备份前必须留出的余量（64 MiB）。
+///
+/// 备份期间面板自己的库还在写、校验时还要解压/解密到临时目录，只按产物体积卡线
+/// 会贴着 0 走——盘写满的代价是面板连自己的库都写不进去，不只是这次备份丢掉。
+const BACKUP_FREE_HEADROOM: u64 = 64 * 1024 * 1024;
+
+/// 递归统计目录体积（字节）。读不到的条目（权限不足 / 已被并发删除）**跳过**而不是
+/// 整体失败：这只是估算，为单个条目废掉整次备份不划算。
+fn dir_bytes(path: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&p) else { continue };
+        for e in rd.flatten() {
+            let Ok(m) = e.metadata() else { continue };
+            if m.is_dir() { stack.push(e.path()); } else { total += m.len(); }
+        }
+    }
+    total
+}
+
+/// 本次备份预计占多少字节。`None` = **估不出来**。
+///
+/// mysql/pg 的 dump 体积事先无从得知（`mysqldump`/`pg_dump` 不预告），诚实返回
+/// `None` ⇒ 跳过检查。⚠ 不能用"上一次产物多大"代替：库可能刚涨了十倍，
+/// 拿旧产物当判据就是把错觉当护栏。
+fn estimate_backup_bytes(job: &BackupJob) -> Option<u64> {
+    match job.kind.as_str() {
+        "panel" => std::fs::metadata(&job.db_path).ok().map(|m| m.len()),
+        "site" => job.root.as_ref().map(|r| dir_bytes(r)),
+        "db" => match job.db_target.as_ref()?.engine {
+            // SQLite 就是个文件，体积等于它本身
+            panel_os::DbEngine::Sqlite => {
+                let p = job.db_target.as_ref()?.database.as_deref()?;
+                std::fs::metadata(p).ok().map(|m| m.len())
+            }
+            panel_os::DbEngine::MySql | panel_os::DbEngine::Postgres => None,
+        },
+        _ => None,
+    }
+}
+
+/// 判定：这次备份放得下吗。
+///
+/// `avail = None`（查不到可用空间）一律**放行**：宁可少拦一次，也不能把备份全挡在
+/// 门外——备份静默消失远比备份失败严重。同理，绝不能把 `None` 当成 0。
+fn free_space_verdict(avail: Option<u64>, needed: u64) -> std::result::Result<(), String> {
+    let Some(a) = avail else { return Ok(()) };
+    if a >= needed {
+        return Ok(());
+    }
+    let h = crate::routes::assistant::human_bytes;
+    Err(format!(
+        "备份目录可用空间不足：预计需要 {}，当前可用 {}。\
+         请先清理备份目录下的旧产物（或调小保留份数 / 扩容）再执行——\
+         写一半才发现盘满，会连面板自己的库一起写不进去",
+        h(needed),
+        h(a),
+    ))
+}
+
+/// 备份**开始前**的空间水位检查：宁可现在失败，也不写到一半才炸。
+fn ensure_free_space(job: &BackupJob) -> Result<()> {
+    let Some(est) = estimate_backup_bytes(job) else { return Ok(()) };
+    // 加密时明文与密文会短暂共存（先写 .enc，成功后才删明文），峰值按两倍算
+    let needed = if job.encrypt { est.saturating_mul(2) } else { est }
+        .saturating_add(BACKUP_FREE_HEADROOM);
+    let avail = panel_os::paths::available_bytes(&job.dest);
+    free_space_verdict(avail, needed).map_err(PanelError::Io)
+}
+
 /// 失败原因必须能从「任务」页看到。
 ///
 /// `output_path` 的契约：**成功时**指向业务产物（备份 .db/.tar.gz），失败时没有产物——
@@ -790,6 +861,9 @@ impl BackupJob {
     async fn execute(&self, progress: panel_task::Progress) -> Result<panel_task::TaskOutcome> {
         progress.set(5, "准备备份").await;
         std::fs::create_dir_all(&self.dest).map_err(|e| PanelError::Internal(e.to_string()))?;
+        // 先确认放得下：盘写到一半才失败，留下的半截产物既不能恢复又占地方，
+        // 更糟的是盘满会让面板自己的库也写不进去（比"这次备份没成"严重得多）
+        ensure_free_space(self)?;
         let ts = crate::now_unix();
 
         let out_path = match self.kind.as_str() {
@@ -2400,6 +2474,90 @@ mod db_restore_guard {
             block.contains("panel_os::backup::decrypt_file("),
             "db 恢复必须先解密加密产物，否则 .enc 容器会被 fs::copy 静默盖掉用户的库"
         );
+    }
+}
+
+#[cfg(test)]
+mod space_tests {
+    use super::*;
+
+    /// 真实目录（含子目录）：`dir_bytes` 必须递归到底。
+    #[test]
+    fn dir_bytes_counts_nested_files() {
+        let d = std::env::temp_dir().join(format!("panel-dirbytes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("sub/deeper")).unwrap();
+        std::fs::write(d.join("a.txt"), vec![0u8; 100]).unwrap();
+        std::fs::write(d.join("sub/b.txt"), vec![0u8; 250]).unwrap();
+        std::fs::write(d.join("sub/deeper/c.txt"), vec![0u8; 7]).unwrap();
+        assert_eq!(dir_bytes(&d), 357);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 读不到的目录（不存在）按 0 处理，不整体失败——这只是估算。
+    #[test]
+    fn dir_bytes_of_missing_dir_is_zero() {
+        let d = std::env::temp_dir().join(format!("panel-dirbytes-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(dir_bytes(&d), 0);
+    }
+
+    /// ⭐ 查不到可用空间必须**放行**：把 `None` 当成 0 会让所有备份一律被挡下，
+    /// 那是把"不知道"伪装成"没空间"——备份静默消失比备份失败严重得多。
+    #[test]
+    fn unknown_free_space_never_blocks_the_backup() {
+        assert!(free_space_verdict(None, 1024).is_ok());
+    }
+
+    #[test]
+    fn enough_space_passes_and_shortage_fails_with_numbers() {
+        assert!(free_space_verdict(Some(200), 100).is_ok());
+        // 恰好相等算放得下（>=，不是 >）
+        assert!(free_space_verdict(Some(100), 100).is_ok());
+        let e = free_space_verdict(Some(99), 100).unwrap_err();
+        assert!(e.contains("100 B"), "报错必须带上需要的量：{e}");
+        assert!(e.contains("99 B"), "报错必须带上可用的量：{e}");
+    }
+
+    /// 余量必须真的被算进去（只比产物大一点不算够）。
+    #[test]
+    fn headroom_is_included() {
+        let est = 10 * 1024 * 1024;
+        let needed = est + BACKUP_FREE_HEADROOM;
+        assert!(free_space_verdict(Some(needed - 1), needed).is_err());
+        assert!(free_space_verdict(Some(needed), needed).is_ok());
+    }
+
+    /// `available_bytes` 在真实目录上必须给得出正数（不是 None 也不是 0）。
+    #[test]
+    fn available_bytes_is_positive_on_a_real_dir() {
+        let d = std::env::temp_dir();
+        match panel_os::paths::available_bytes(&d) {
+            Some(v) => assert!(v > 0, "可用空间不可能是 0：{v}"),
+            // 非 Linux 平台上取不到属预期；本测试不做断言，避免恒红
+            None => eprintln!("[skip] 本平台取不到可用空间，跳过"),
+        }
+    }
+
+    /// 接线守卫：空间检查必须挂在最先执行的位置。
+    ///
+    /// 用源码断言：真跑需要把盘填满，CI 里做不到；而"函数写了却没人调用"
+    /// 正是最难靠 review 发现的一类。
+    #[test]
+    fn backup_execute_checks_free_space_first() {
+        let src = include_str!("backups.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        let code: Vec<&str> = prod.lines().filter(|l| !l.trim_start().starts_with("//")).collect();
+        let joined = code.join("\n");
+        let start = joined
+            .find("async fn execute(&self, progress: panel_task::Progress) -> Result<panel_task::TaskOutcome>")
+            .expect("BackupJob::execute 必须存在");
+        let after = &joined[start..];
+        let call = after.find("ensure_free_space(self)").expect("execute 必须调用 ensure_free_space");
+        let work = after
+            .find("let out_path = match self.kind.as_str()")
+            .expect("execute 必须进入备份执行分支");
+        assert!(call < work, "空间检查必须在真正开写之前，否则等于没检查");
     }
 }
 

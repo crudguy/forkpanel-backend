@@ -550,7 +550,7 @@ fn human_kib(kib: u64) -> String {
 }
 
 /// 字节人读。
-fn human_bytes(b: u64) -> String {
+pub(crate) fn human_bytes(b: u64) -> String {
     const U: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut v = b as f64;
     let mut u = 0;

@@ -206,6 +206,31 @@ pub fn resolve_within_for_create(root: &Path, input: &str) -> Result<SafePath> {
     Ok(unsafe { SafePath::from_raw(joined) })
 }
 
+/// `path` 所在文件系统的**可用**字节数（`f_bavail`：非 root 用户真正能用的那部分，
+/// 已扣除给 root 预留的额度）。
+///
+/// 返回 `None` 表示**取不到**（非 Linux / statvfs 失败 / 路径含 NUL）。调用方必须
+/// 把 `None` 当成"不知道"来处理——**绝不能当成 0**：当成 0 会把所有备份一律挡下，
+/// 那是把"查不到"伪装成"没空间"，比不检查更糟。
+#[cfg(target_os = "linux")]
+pub fn available_bytes(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c = CString::new(path.as_os_str().as_bytes()).ok()?;
+    unsafe {
+        let mut st: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c.as_ptr(), &mut st) != 0 {
+            return None;
+        }
+        Some(st.f_bavail as u64 * st.f_frsize as u64)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn available_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
