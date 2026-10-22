@@ -210,12 +210,29 @@ fn ca_key_path(ca_dir: &Path) -> PathBuf { ca_dir.join("ca.key") }
 /// 确保 ForkPanel 本地根 CA 存在：缺失时生成一对 RSA-2048（`CA:TRUE,pathlen:0`）
 /// 落盘到 `ca_dir`；已存在则直接返回（幂等）。
 ///
+/// ## 半张在场时**拒绝**而不是重签
+/// `ca.crt` 与 `ca.key` 必须成对：只缺一张说明根 CA 被破坏（误删、备份只恢复
+/// 了一半）。此时若按"缺失即重签"处理，新根会**覆盖** `ca.crt`——而用户浏览器
+/// 里装的是旧根，于是**全部自签站点当场报警，且毫无提示**。这比报错严重得多，
+/// 故直接返回 [`PanelError::Conflict`]，把恢复动作交回给人。
+///
 /// 并发首跑的最坏情况：两个请求都判定缺失、各生成一张，后落的覆盖先落的——
 /// 本地开发可接受（用户重装一次根证书即可）。落盘前会再判一次，若此时已被
 /// 其它请求创建则丢弃本次生成，避免无谓覆盖。
 pub async fn ensure_root_ca(ca_dir: &Path, tmp_dir: &Path) -> Result<()> {
-    if ca_cert_path(ca_dir).is_file() && ca_key_path(ca_dir).is_file() {
+    let has_cert = ca_cert_path(ca_dir).is_file();
+    let has_key = ca_key_path(ca_dir).is_file();
+    if has_cert && has_key {
         return Ok(());
+    }
+    // 一张在、一张丢 = 根 CA 不完整。重签会作废已分发的信任（见文档注释）。
+    if has_cert || has_key {
+        let (kept, lost) = if has_cert { ("ca.crt", "ca.key") } else { ("ca.key", "ca.crt") };
+        return Err(PanelError::Conflict(format!(
+            "根 CA 不完整：{kept} 在、{lost} 丢失。重新签发会覆盖 {kept}，\
+             使已安装旧根证书的浏览器/系统全部报警，已拒绝执行。\
+             请从备份恢复整个 ca 目录；确认要重新分发根证书，请先手动删除 {kept}。"
+        )));
     }
     std::fs::create_dir_all(ca_dir).map_err(|e| PanelError::Internal(e.to_string()))?;
 
@@ -411,6 +428,60 @@ mod tests {
         assert!(ca.contains("BEGIN CERTIFICATE"), "根证书应为 PEM: {ca}");
         assert!(ca_dir.join("ca.crt").is_file(), "ca.crt 应落盘");
         assert!(ca_dir.join("ca.key").is_file(), "ca.key 应落盘");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 半张根 CA 在场时必须**拒绝**（409）而非重签——重签会覆盖 ca.crt，
+    /// 让已安装旧根的浏览器全部报警且毫无提示。这是回归测试：改坏
+    /// `ensure_root_ca` 的成对校验即红。
+    #[tokio::test]
+    async fn half_present_root_ca_is_refused_not_regenerated() {
+        if !available() { return; }
+        let base = std::env::temp_dir().join(format!("panel-ca-half-{}", unique()));
+        let tmp = base.join("tmp");
+        let ca_dir = base.join("ca");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::create_dir_all(&ca_dir).unwrap();
+
+        // 场景①：只有 ca.crt（模拟备份只恢复一半 / 误删 key）
+        std::fs::write(ca_dir.join("ca.crt"), b"sentinel-cert").unwrap();
+        let e = ensure_root_ca(&ca_dir, &tmp).await.expect_err("只有 cert 时必须拒绝");
+        match &e {
+            PanelError::Conflict(m) => {
+                assert!(m.contains("ca.key"), "必须点明丢的是哪张: {m}");
+                assert!(m.contains("拒绝"), "必须说明为什么拒绝: {m}");
+            }
+            other => panic!("应返回 Conflict，实际 {other:?}"),
+        }
+        // 关键断言：原文件**未被覆盖**（sentinel 还在），即没有偷偷重签
+        assert_eq!(
+            std::fs::read(ca_dir.join("ca.crt")).unwrap(),
+            b"sentinel-cert",
+            "拒绝时不得覆盖既有 ca.crt——覆盖即作废已分发的信任"
+        );
+
+        // 场景②：只有 ca.key
+        std::fs::remove_file(ca_dir.join("ca.crt")).unwrap();
+        std::fs::write(ca_dir.join("ca.key"), b"sentinel-key").unwrap();
+        let e = ensure_root_ca(&ca_dir, &tmp).await.expect_err("只有 key 时必须拒绝");
+        assert!(matches!(e, PanelError::Conflict(_)), "只有 key 也应 Conflict: {e:?}");
+        assert_eq!(
+            std::fs::read(ca_dir.join("ca.key")).unwrap(),
+            b"sentinel-key",
+            "拒绝时不得覆盖既有 ca.key"
+        );
+
+        // 场景③：两张都撤掉 → 正常生成（不是把"缺失"一律当错误）
+        std::fs::remove_file(ca_dir.join("ca.key")).unwrap();
+        ensure_root_ca(&ca_dir, &tmp).await.expect("两张都缺应正常生成");
+        assert!(ca_dir.join("ca.crt").is_file() && ca_dir.join("ca.key").is_file());
+        // 生成的 key 必须是 0600
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(ca_dir.join("ca.key")).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "ca.key 必须 0600，实际 {mode:o}");
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 }
