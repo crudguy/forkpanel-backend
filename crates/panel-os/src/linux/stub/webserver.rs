@@ -465,6 +465,7 @@ pub(super) fn render_nginx(spec: &SiteSpec) -> String {
             // SPA 回退：history 路由的单页应用需要把所有未命中文件的路径交给
             // /index.html 处理；非 SPA 则 404（避免把未知路径当成 index 引发漏洞）。
             if spec.spa_fallback {
+                out.push_str(&spa_hardening_locations(true, true));
                 out.push_str("    location / {\n        try_files $uri $uri/ /index.html;\n    }\n");
             } else {
                 out.push_str("    location / {\n        try_files $uri $uri/ =404;\n    }\n");
@@ -595,6 +596,59 @@ pub(super) fn route_proxy_target(server_names: &[String], prefix: &str, upstream
     }
 }
 
+/// SPA 回退的"硬化"配置（资产 404 化 + 空目录 404 化）。**server 级，只发一次。**
+///
+/// 只发 `try_files $uri $uri/ /index.html` 有两个**实测**的坑（2026-10-22）：
+///
+/// ① **资产缺失被吞成 200 HTML**：`/missing.js` 返回 `200 + text/html`
+///    （index.html 的正文）。浏览器随即报
+///    `Refused to execute script ... MIME type ('text/html')`——看着像服务器
+///    配置坏了，实际只是文件不存在。构建产物改名（哈希变化）、路径拼错都会撞上。
+///
+/// ② **空目录 500**：`/index.html` 本身不存在时，try_files 回退到它、该内部
+///    请求又进 `location /`、再回退……nginx 判
+///    `rewrite or internal redirection cycle`，跑满 10 次返回 500。
+///    「建好站点还没上传文件」是完全正常的状态，不该得到 500。
+///
+/// 优先级依据：nginx 是 `=` 精确 > `^~` 前缀 > 正则 > 普通前缀。故本块不影响
+/// ACME 挑战（`^~`）；deny/WAF 用的是 server 级 `if`（rewrite 阶段，先于任何
+/// location）也依旧生效。
+///
+/// ⚠ 多路由站点会 bypass 本块的正则：每条路由都是 `location ^~ <前缀>`，而 `^~`
+/// 一旦命中永不再走正则。资产保护对它们不生效——刻意取舍：**优先级确定性 >
+/// 资产 404 化**（这正是 deny 改用 server 级 `if` 的同一理由，见
+/// [`render_deny_locations`]）。
+///
+/// `at_site_root`：是否发 `location = /`。多路由站点**不能发**——精确匹配优先级
+/// 最高，它会抢走反代/其它路由的根路径。
+///
+/// `asset_guard`：是否发资产正则 location。多路由站点**不能发**——那里每条路由都是
+/// `location ^~ <前缀>`，任何路径都会先被某条 `^~` 命中，正则永远没机会执行
+/// （死配置），还会违反「路由表段一条正则都不用」的不变量
+/// （`routed_sites_use_no_regex_locations` 守着它）。
+fn spa_hardening_locations(at_site_root: bool, asset_guard: bool) -> String {
+    let mut o = String::new();
+    o.push_str(
+        "\n    # ── SPA 回退硬化：资产缺失 404 / 空目录 404（打断 try_files 内循环）──\n",
+    );
+    // ① 资产类扩展名：缺失必须 404，绝不回退成 HTML（避开 MIME 陷阱）
+    if asset_guard {
+        o.push_str(
+            "    location ~* \\.(js|css|mjs|map|json|woff2?|ttf|eot|png|jpe?g|gif|svg|ico|webp|txt|pdf)$ {\n",
+        );
+        o.push_str("        try_files $uri =404;\n    }\n");
+    }
+    // ② /index.html 缺失时 404：=404 不再触发内部重定向，循环被打断
+    o.push_str("    location = /index.html {\n");
+    o.push_str("        try_files /index.html =404;\n    }\n");
+    // ③ 站点根：目录存在但无 index 时给 404（nginx 默认是 403）
+    if at_site_root {
+        o.push_str("    location = / {\n");
+        o.push_str("        try_files /index.html =404;\n    }\n");
+    }
+    o
+}
+
 /// 多路由渲染：按 prefix 长度降序输出 `location ^~ <prefix>`。
 ///
 /// 全部用 `^~`（**不用正则**）：带 `^~` 的前缀一旦命中就**不再走正则**，
@@ -602,6 +656,18 @@ pub(super) fn route_proxy_target(server_names: &[String], prefix: &str, upstream
 /// 不再取决于配置里的书写顺序——这正是引入多路由时必须一并锁掉的东西。
 pub(super) fn render_routed_server(routes: &SiteRoutes, spec: &SiteSpec) -> String {
     let mut o = String::new();
+    // SPA 硬化只发一次，且必须放在「多路由」段标**之前**：它是 server 级配置、
+    // 不是路由表的一部分。放进段内会违反「路由表只允许 ^~」的不变量
+    // （`routed_sites_use_no_regex_locations` 逐行守着那段）。
+    // 这里只发 `= /index.html` 守卫：不发 `location = /`（会抢走反代路由的根路径），
+    // 也不发资产正则（每条路径都会被某条 ^~ 命中，正则永远执行不到）。
+    if routes
+        .sorted()
+        .iter()
+        .any(|r| matches!(r.kind, RouteKind::Static { spa: true, .. }))
+    {
+        o.push_str(&spa_hardening_locations(false, false));
+    }
     o.push_str("\n    # ── 多路由（按前缀长度降序；`^~` 保证不被正则抢走）──\n");
     for r in routes.sorted() {
         o.push_str(&format!("\n    # {} → {:?}\n", r.prefix, r.kind));
@@ -975,6 +1041,36 @@ pub(super) fn caddy_tls_protocols(min: Option<&str>) -> &'static str {
 }
 
 /// 渲染 caddy 站点块（纯函数，黄金单测）。
+/// caddy 的 SPA 回退块：**语法修正 + 资产 404 化**（已用 caddy 2.10.0 真机验证）。
+///
+/// ⚠⚠ 原写法 `file_server { try_files ... }` **caddy 直接拒绝解析**：
+/// `parsing caddyfile tokens for 'file_server': unknown subdirective 'try_files'`。
+/// `try_files` 是**独立的 site 级指令**，与 `file_server` 平级，不是它的子指令。
+/// 也就是说改前生成的 caddy 配置**根本加载不了**——caddy 路径从未真跑过，
+/// 这条语法错误在"静态审查 + 黄金单测"下活了下来。
+///
+/// 资产 404 化：缺失的 `/missing.js` 会拿到 `200 + text/html`（caddy 实测，与
+/// nginx 同坑，见 [`spa_hardening_locations`]）。用 `@assets` 命名匹配器分流——
+/// 资产只走 `file_server`（缺失即 404），其余才走 `try_files` 回退。
+///
+/// 空目录无需像 nginx 那样加守卫：caddy 的 try_files 末项不存在时直接 404，
+/// 不会内循环（实测 `/` 与深链均为 404）。
+///
+/// `depth`：tab 缩进深度（站点级传 1）。
+fn caddy_spa_block(depth: usize) -> String {
+    let t = "\t".repeat(depth);
+    let t1 = "\t".repeat(depth + 1);
+    let mut o = String::new();
+    o.push_str(&format!(
+        "{t}@assets path_regexp \\.(js|css|mjs|map|json|woff2?|ttf|eot|png|jpe?g|gif|svg|ico|webp|txt|pdf)$\n"
+    ));
+    o.push_str(&format!("{t}handle @assets {{\n{t1}file_server\n{t}}}\n"));
+    o.push_str(&format!(
+        "{t}handle {{\n{t1}try_files {{path}} {{path}}/ /index.html\n{t1}file_server\n{t}}}\n"
+    ));
+    o
+}
+
 pub(super) fn render_caddy(spec: &SiteSpec) -> String {
     let has_tls = spec.tls_cert.is_some() && spec.tls_key.is_some();
     let mut out = String::new();
@@ -1044,11 +1140,12 @@ pub(super) fn render_caddy(spec: &SiteSpec) -> String {
     }
 
     match &spec.kind {
+
         SiteKind::Static => {
             out.push_str(&format!("\troot * {}\n", spec.root.display()));
             if spec.spa_fallback {
                 // SPA：未命中文件回退 /index.html（history 路由）
-                out.push_str("\tfile_server {\n\t\ttry_files {path} {path}/ /index.html\n\t}\n");
+                out.push_str(&caddy_spa_block(1));
             } else {
                 out.push_str("\tfile_server\n");
             }
@@ -1095,7 +1192,10 @@ pub(super) fn render_caddy(spec: &SiteSpec) -> String {
                             out.push_str(&format!("\t\troot * {}\n", spec.root.display()));
                         }
                         if *spa {
-                            out.push_str("\t\tfile_server {\n\t\t\ttry_files {path} {path}/ /index.html\n\t\t}\n");
+                            // ⚠ 只修语法（try_files 与 file_server 平级）。
+                            // **不发资产 handle**：它若排在反代 handle 之前，会把
+                            // `/api/foo.js` 这类反代路径也抢去 file_server（404）。
+                            out.push_str("\t\ttry_files {path} {path}/ /index.html\n\t\tfile_server\n");
                         } else {
                             out.push_str("\t\tfile_server\n");
                         }

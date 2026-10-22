@@ -620,7 +620,80 @@ use super::*;
         assert!(render_nginx(&plain).contains("try_files $uri $uri/ =404;"), "{plain:?}");
     }
 
-    /// 多路由核心：`/` 静态 + `/api` 反代，各生成一条 `location ^~`。
+    /// SPA 硬化的三块：资产 404 化 + `/index.html` 守卫 + 站点根 404 化。
+    ///
+    /// 判据来自 2026-10-22 的真机实测：只发 `try_files … /index.html` 时，
+    /// ① 缺失的 `/missing.js` 会拿到 `200 + text/html`（MIME 陷阱）；
+    /// ② `/index.html` 不存在时深链返回 **500**（internal redirection cycle）。
+    #[test]
+    fn spa_fallback_hardens_asset_and_empty_dir() {
+        let mut s = spec_static();
+        s.spa_fallback = true;
+        let out = render_nginx(&s);
+        // ① 资产缺失必须 404（绝不回退成 HTML）
+        assert!(
+            out.contains("location ~* \\.(js|css|mjs|map|json|woff2?|ttf|eot|png|jpe?g|gif|svg|ico|webp|txt|pdf)$ {"),
+            "缺资产 404 化 location：\n{out}"
+        );
+        assert!(out.contains("try_files $uri =404;"), "{out}");
+        // ② /index.html 守卫：=404 不再触发内部重定向，打断 500 循环
+        assert!(out.contains("location = /index.html {"), "缺 index 守卫：\n{out}");
+        // ③ 站点根从 403 变 404
+        assert!(out.contains("location = / {"), "缺站点根 404 化：\n{out}");
+        // 主回退仍在，且没被改成 404
+        assert!(out.contains("try_files $uri $uri/ /index.html;"), "{out}");
+    }
+
+    /// 非 SPA 静态站：一块硬化都不该发（未知路径就该 404）。
+    #[test]
+    fn non_spa_static_has_no_hardening() {
+        let mut s = spec_static();
+        s.spa_fallback = false;
+        let out = render_nginx(&s);
+        assert!(!out.contains("location = /index.html"), "非 SPA 不该发 index 守卫：\n{out}");
+        assert!(!out.contains("location ~* \\.(js|"), "非 SPA 不该发资产 location：\n{out}");
+        assert!(out.contains("try_files $uri $uri/ =404;"), "{out}");
+    }
+
+    /// 多路由 + SPA：只发 `= /index.html` 守卫（放在段标之前），
+    /// **不发**资产正则与 `location = /`。
+    ///
+    /// 不发资产正则的理由：每条路由都是 `^~`，任何路径都先被某条路由命中，
+    /// 正则永远执行不到（死配置）；发 `location = /` 会抢走反代路由的根路径。
+    #[test]
+    fn routed_spa_hardens_only_index_guard() {
+        let out = render_nginx(&spec_routed());
+        assert!(out.contains("location = /index.html {"), "多路由 SPA 也需 index 守卫：\n{out}");
+        // 资产正则与站点根守卫都不得出现
+        assert!(
+            !out.contains("location ~* \\.(js|css|"),
+            "多路由不该发资产正则（^~ 会 bypass 它，属死配置）：\n{out}"
+        );
+        // `location = / {` 会被精确匹配抢走反代根路径，故不得出现
+        assert!(
+            !out.contains("location = / {"),
+            "多路由不该发 location = /（会抢走反代路由的根路径）：\n{out}"
+        );
+    }
+
+    /// 多路由但**没有任何 SPA 静态路由**时，一块硬化都不发。
+    #[test]
+    fn routed_without_spa_has_no_hardening() {
+        let mut s = spec_routed();
+        // 把唯一的静态路由也改成反代
+        if let SiteKind::Routed { routes } = &mut s.kind {
+            for route in routes.routes.iter_mut() {
+                if matches!(route.kind, RouteKind::Static { .. }) {
+                    route.kind =
+                        RouteKind::Proxy { upstreams: vec!["http://127.0.0.1:3000".into()] };
+                }
+            }
+        }
+        let out = render_nginx(&s);
+        assert!(!out.contains("location = /index.html"), "无 SPA 路由不该发守卫：\n{out}");
+    }
+
+    /// 多路由核心：`/` 静态 + `/api` 反代，各生成一条 `location ^~`。    /// 多路由核心：`/` 静态 + `/api` 反代，各生成一条 `location ^~`。
     ///
     /// 这正是「Vue dist + Go/Node API」这一最高频形态——此前必须拆成两个站点。
     #[test]
@@ -1133,12 +1206,50 @@ use super::*;
         assert!(out.contains("file_server"), "静态站应 file_server：{out}");
     }
 
+    /// ⚠⚠ 原断言只查 `contains("try_files {path} {path}/ /index.html")`——而
+    /// **非法嵌套** `file_server { try_files ... }` 的文本里也含这个子串，所以
+    /// 那条语法错误（caddy 拒绝加载）在黄金单测下活了下来。现补"不得嵌套"断言。
     #[test]
     fn caddy_spa_fallback_emits_try_files_index_html() {
         let mut s = spec_static();
         s.spa_fallback = true;
         let out = render_caddy(&s);
         assert!(out.contains("try_files {path} {path}/ /index.html"), "SPA 回退：{out}");
+        // `try_files` 是 site 级指令，必须与 `file_server` 平级——
+        // 嵌套进 file_server 会被 caddy 拒析（caddy 2.10.0 实测）
+        assert!(
+            !out.contains("file_server {\n\t\ttry_files"),
+            "try_files 不得嵌进 file_server（caddy 拒绝解析）：\n{out}"
+        );
+        // 资产 404 化：命名匹配器 + handle 分流（caddy 2.10.0 实测有效）
+        assert!(out.contains("@assets path_regexp"), "缺资产匹配器：\n{out}");
+        assert!(out.contains("handle @assets {"), "缺资产 handle：\n{out}");
+        assert!(out.contains("handle {"), "缺回退 handle：\n{out}");
+    }
+
+    /// caddy 多路由 + SPA：只修语法，**不发资产 handle**。
+    ///
+    /// 理由：资产 handle 若排在反代 handle 之前，会把 `/api/foo.js` 这类反代
+    /// 路径也抢去 file_server（404）——与 nginx 侧"多路由不发资产正则"同源。
+    #[test]
+    fn caddy_routed_spa_fixes_syntax_only() {
+        let mut s = spec_routed();
+        s.kind = SiteKind::Routed {
+            routes: crate::SiteRoutes {
+                routes: vec![crate::SiteRoute {
+                    prefix: "/".into(),
+                    kind: crate::RouteKind::Static { spa: true, root: None },
+                }],
+            },
+        };
+        let out = render_caddy(&s);
+        assert!(out.contains("try_files {path} {path}/ /index.html"), "多路由 SPA 回退：\n{out}");
+        assert!(
+            !out.contains("file_server {\n\t\t\ttry_files"),
+            "try_files 不得嵌进 file_server：\n{out}"
+        );
+        // 多路由不发资产 handle（会抢反代路径）
+        assert!(!out.contains("@assets"), "多路由不该发资产匹配器：\n{out}");
     }
 
     #[test]
