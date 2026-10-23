@@ -114,7 +114,12 @@ pub fn run(os: &dyn OsAdapter, layout: &dyn PathLayout, db_path: &Path, tier: Ti
         }
     }
 
-    // 7. 能力矩阵摘要：让用户一眼看到哪些功能不可用及原因
+    // 7. 迁移校验和漂移：迁移文件在应用到本库之后又被改过（热补丁 / 二进制与库不同构建）
+    if let Some(c) = migration_checksum_check(db_path, tier, synchronous) {
+        v.push(c);
+    }
+
+    // 8. 能力矩阵摘要：让用户一眼看到哪些功能不可用及原因
     let caps = os.capabilities();
     let missing: Vec<String> = caps.iter()
         .filter(|(_, c)| !c.supported)
@@ -129,14 +134,14 @@ pub fn run(os: &dyn OsAdapter, layout: &dyn PathLayout, db_path: &Path, tier: Ti
             fix: None }
     });
 
-    // 8. 防火墙能力缺失时提醒"面板不会自动改你的规则"
+    // 9. 防火墙能力缺失时提醒"面板不会自动改你的规则"
     if !caps.get(cap_keys::FIREWALL_MANAGE).map(|c| c.supported).unwrap_or(false) {
         v.push(Check { name: "firewall", level: Level::Warn,
             message: "未检测到受支持的防火墙后端，防火墙页将不可用".into(),
             fix: Some("安装 nftables 或 iptables；面板不会自行创建防火墙规则".into()) });
     }
 
-    // 9. 档位与采样降频提示
+    // 10. 档位与采样降频提示
     v.push(match tier {
         Tier::Nano => Check { name: "tier", level: Level::Warn,
             message: "nano 档位：采样 5s、不落盘历史、SSE 上限 3 客户端".into(),
@@ -146,6 +151,59 @@ pub fn run(os: &dyn OsAdapter, layout: &dyn PathLayout, db_path: &Path, tier: Ti
     });
 
     v
+}
+
+/// 迁移校验和核对。独立成函数：三态（一致 / 漂移 / 库不存在）各自可单测，
+/// 且 run() 里只是一行 push——逻辑不藏在闭包段落里。
+///
+/// 库不存在 ⇒ `None`（不出 row）：与 db_integrity 口径一致——都没库可查，
+/// 不重复报警。库打不开同样不出 row：db_integrity 已经 Fail 过了。
+fn migration_checksum_check(db_path: &Path, tier: Tier, synchronous: &str) -> Option<Check> {
+    if !db_path.exists() {
+        return None;
+    }
+    let conn = panel_db::open(db_path, tier, synchronous).ok()?;
+    match panel_db::migrate::checksum_drift(&conn) {
+        Ok(drift) if drift.is_empty() => Some(Check {
+            name: "migration_checksum",
+            level: Level::Ok,
+            message: "迁移校验和一致（无文件漂移）".into(),
+            fix: None,
+        }),
+        Ok(drift) => {
+            let items: Vec<String> = drift
+                .iter()
+                .map(|d| match &d.embedded {
+                    Some(cur) => format!(
+                        "v{}（库内 {} → 当前 {}",
+                        d.version,
+                        d.stored.get(..8).unwrap_or(&d.stored),
+                        cur.get(..8).unwrap_or(cur)
+                    ),
+                    None => format!(
+                        "v{}（库内 {}，当前二进制无此迁移文件）",
+                        d.version,
+                        d.stored.get(..8).unwrap_or(&d.stored)
+                    ),
+                })
+                .collect();
+            Some(Check {
+                name: "migration_checksum",
+                level: Level::Warn,
+                message: format!("{} 个迁移版本校验和漂移：{}", drift.len(), items.join("，")),
+                fix: Some(
+                    "这些迁移文件在应用到本库之后又被修改过。核对改动是否有意：有意的 schema 变更应新增迁移版本（而非改旧文件）并评估库内现状差异；无意的请恢复文件。面板按库内现状继续运行，不会自动改写库存校验和（那会抹掉漂移证据）"
+                        .into(),
+                ),
+            })
+        }
+        Err(e) => Some(Check {
+            name: "migration_checksum",
+            level: Level::Warn,
+            message: format!("校验和核对失败：{e}"),
+            fix: None,
+        }),
+    }
 }
 
 pub fn has_fail(v: &[Check]) -> bool { v.iter().any(|c| c.level == Level::Fail) }
@@ -158,4 +216,89 @@ pub fn render(v: &[Check]) -> String {
         if let Some(f) = &c.fix { out.push_str(&format!("    → 修复：{}\n", f)); }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 真机临时库：带 pid 防并行互踩，先 remove 三件套（db/-wal/-shm）。
+    fn temp_db(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("panel-doctor-mc-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(p.with_extension("db-wal"));
+        let _ = std::fs::remove_file(p.with_extension("db-shm"));
+        p
+    }
+
+    #[test]
+    fn migration_checksum_check_ok_on_consistent_db() {
+        let p = temp_db("ok");
+        {
+            let mut c = panel_db::open(&p, Tier::Nano, "NORMAL").unwrap();
+            panel_db::migrate::apply(&mut c).unwrap();
+        }
+        let chk = migration_checksum_check(&p, Tier::Nano, "NORMAL").expect("库存在应出 row");
+        assert_eq!(chk.name, "migration_checksum");
+        assert_eq!(chk.level, Level::Ok);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn migration_checksum_check_warns_on_drift() {
+        let p = temp_db("drift");
+        {
+            let mut c = panel_db::open(&p, Tier::Nano, "NORMAL").unwrap();
+            panel_db::migrate::apply(&mut c).unwrap();
+            c.execute(
+                "UPDATE schema_migrations SET checksum='deadbeefdeadbeef' WHERE version=1",
+                [],
+            )
+            .unwrap();
+        }
+        let chk = migration_checksum_check(&p, Tier::Nano, "NORMAL").expect("库存在应出 row");
+        assert_eq!(chk.level, Level::Warn, "漂移必须 Warn 而非静默 Ok");
+        assert!(chk.message.contains("v1"), "告警应点名版本：{}", chk.message);
+        let fix = chk.fix.expect("Warn 必须带修复建议");
+        assert!(fix.contains("新增迁移版本"), "修复建议要说清正确做法：{fix}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn migration_checksum_check_absent_when_db_missing() {
+        let p = temp_db("missing");
+        assert!(
+            migration_checksum_check(&p, Tier::Nano, "NORMAL").is_none(),
+            "库不存在时不出 row（与 db_integrity 口径一致：都没库可查）"
+        );
+    }
+
+    #[test]
+    fn run_surfaces_drift_row_end_to_end() {
+        // run() 的接线与 render() 也要真跑：只测独立函数会漏「忘了 push」
+        let p = temp_db("run");
+        {
+            let mut c = panel_db::open(&p, Tier::Nano, "NORMAL").unwrap();
+            panel_db::migrate::apply(&mut c).unwrap();
+            c.execute(
+                "UPDATE schema_migrations SET checksum='deadbeefdeadbeef' WHERE version=2",
+                [],
+            )
+            .unwrap();
+        }
+        let os = panel_os::mock::MockOsAdapter::new();
+        let layout = panel_os::mock::MockPathLayout;
+        let checks = run(&os, &layout, &p, Tier::Nano, "NORMAL");
+        let row = checks
+            .iter()
+            .find(|c| c.name == "migration_checksum")
+            .expect("run() 必须产出 migration_checksum row");
+        assert_eq!(row.level, Level::Warn);
+        assert!(row.message.contains("v2"));
+        // render 也要能吐出来（mark 映射 Warn → "!"），不能只在结构体里正确
+        let out = render(&checks);
+        assert!(out.contains("migration_checksum"), "render 输出应含该检查");
+        assert!(out.contains('!'), "Warn 行应有 ! 标记");
+        let _ = std::fs::remove_file(&p);
+    }
 }
