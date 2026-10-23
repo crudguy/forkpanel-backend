@@ -204,4 +204,39 @@
   校验，见 `panel-os` 的 `rendered_config_passes_real_nginx_syntax_check`）。
 - **能力驱动 UI**：未支持能力一律 EmptyState/置灰 + 原因，绝不假装可用。
 
+## 真机 E2E 脚本（七域，`ci/e2e-*.sh`）
+
+对**运行中的真实后端**打请求的脚本化验收，弥补"单测只覆盖纯逻辑、覆盖不到
+路由注册 + 能力位门禁 + OS provider 真实落盘"的空白。
+
+| 脚本 | 真机覆盖 | **刻意不做**（破坏性/需外部条件） | 断言 |
+|---|---|---|---|
+| `e2e-files` | 列目录 / 读写 / 重命名 / chmod / 软删 / 回收站恢复与清空 / stat | —（临时根目录自建自删，零残留） | 61 |
+| `e2e-backups` | 计划 CRUD、`/backups/system` 的 keep 与 settings 跨端点对账、run→task→artifacts→下载、panel 在线恢复诚实 501 | 不恢复生产库 | 23 |
+| `e2e-containers` | 能力位（按 daemon 可达性）、7 类只读端点、创建安全闸门 6 条（缺确认词/特权/敏感挂载/非法名/错词） | **不创建真实容器** | 15 |
+| `e2e-cron` | 能力位、读端点、预览、11 条创建校验拒绝、创建→手动执行→任务输出与状态回写→删除 | —（用 `echo` 产证据，末了删 crontab 条目） | 34 |
+| `e2e-databases` | 6 条连接校验拒绝、SQLite 浏览全链路（库→schema→表→行→CSV 导出）、只读 SQL 闸门、生命周期 | 不碰 mysql/pg（需远端） | 42 |
+| `e2e-sites` | 能力位、读端点、7 条创建拒绝、纯 DB 生命周期、SSL `http-01`/`dns-01` 诚实 501 | **不 apply/reload 真实 nginx、不签证书** | 36 |
+| `e2e-firewall` | 能力位、读端点、apply 拒绝（端口/CIDR/动作）+ **SSH 失联保护冲突** | **不写真实 iptables/nft、不改启停、不删规则** | 17 |
+
+合计 **228 条断言**。运行方式：
+
+```bash
+make e2e-all                                    # 七域串行跑完并聚合（上线前整机自检）
+make e2e-containers BASE=http://127.0.0.1:2084  # 单域
+```
+
+- 凭据走 `PANEL_E2E_USER` / `PANEL_E2E_PASS`（默认 dev 的 `admin/DevPreview2026x`）。
+- 拒绝分支一律**钉死具体错误码**（`10001`/`10005`/`50001`），不用"期望非 0"——
+  否则 URL 写错命中 404 时会假绿（数据库脚本实测踩过：404 冒充了 5 条业务拒绝）。
+- 聚合器以**退出码为权威信号**：某域退出码非 0 即判失败，即使结果行写着 `FAIL=0`。
+  后端不可达时首个脚本即 `[skip]`，聚合器立即停止并明确"未验证任何东西"。
+- **不进 `make check`**：CI 无真机服务，脚本只会走 `[skip]` 分支——那是恒绿，
+  比没有守卫更危险。人工在真机跑。
+
+> 本节不改变上文 🟠 项的结论：nginx `reload`、ufw 真实下发、真实容器创建、ACME、
+> fail2ban 仍**未被脚本覆盖**（破坏性或需公网/外部条件）。脚本只验证这些能力的
+> **只读面与拒绝分支**；cron / databases(SQLite) / backups / files 的**非破坏性真实
+> 路径**已由脚本覆盖。
+
 > 按分工约定：AI 仅做本地 `git commit`，`push` 由用户自行执行。
