@@ -192,6 +192,25 @@ impl RemoteColumns {
     }
 }
 
+/// 远端副本**必须**静态加密（`encrypt=true`）。
+///
+/// 为什么不给用户留这个开关：本地未加密备份的暴露面是"本机文件系统"，而远端副本
+/// 会把**整个面板库**（users 表、站点配置、远端凭据密文）放到第三方存储上——bucket
+/// 误公开或凭据泄露即整库外泄。这不是"多一层保险"，是同一份数据换了持有者。
+///
+/// 为什么是拒绝而不是"顺手替你加密"：静默改写用户提交的值，会让"我明明没勾加密"
+/// 变成谎言（与配置项假控制同源）。宁可当场 400，让他自己确认这一步。
+fn require_encryption_for_remote(remote_kind: Option<&str>, encrypt: bool) -> ApiResult<()> {
+    if !encrypt && remote_kind.is_some() {
+        return Err(ApiError::bad_request(
+            "encrypt",
+            "开启远端副本时必须同时开启静态加密：明文备份会落到第三方存储（S3/WebDAV），\
+             bucket 泄露即整库外泄。请勾选加密，或把 remote_kind 设为 none 只做本地备份",
+        ));
+    }
+    Ok(())
+}
+
 /// 合并请求片段与现值，并在**落库前**做完整校验。
 fn merge_remote(
     state: &Shared,
@@ -367,6 +386,9 @@ pub async fn create(
     // 远端配置同样在**创建时**就完整校验：地址、协议、bucket、凭据配对，
     // 任何一处不对都当场 400，而不是等第一次执行时才在后台报错。
     let remote = merge_remote(&state, &req.remote, None, None)?;
+    // 远端副本必须加密：放在 merge_remote 之后，才能用**合并后**的 kind 判断
+    // （req.remote_kind 可能是 None，表示沿用现值）。
+    require_encryption_for_remote(remote.kind.as_deref(), encrypt != 0)?;
     state
         .db
         .exec(move |conn| {
@@ -432,6 +454,9 @@ pub async fn patch(
 
     // 远端：与现值合并后再落库（凭据三态语义见 `merge_remote`），同样**保存前**校验
     let remote = merge_remote(&state, &req.remote, Some(&cur), full.secret_enc.as_ref())?;
+    // 与 create 同理：用合并后的 kind 判断。覆盖"给本地计划补上远端"这条路径——
+    // 只盯 create 会漏掉它（用户先建本地计划，再改成带远端）。
+    require_encryption_for_remote(remote.kind.as_deref(), encrypt != 0)?;
 
     state
         .db
@@ -2902,6 +2927,51 @@ mod restore_verify_tests {
             .expect("解包之后必须校验落盘结果");
         let done = joined[start..].find("progress.set(100").expect("应有收尾");
         assert!(v < done, "校验必须在任务标记完成之前");
+    }
+}
+
+#[cfg(test)]
+mod remote_encryption_tests {
+    use super::*;
+
+    #[test]
+    fn remote_backup_without_encryption_is_rejected() {
+        assert!(
+            require_encryption_for_remote(Some("s3"), false).is_err(),
+            "远端副本未加密必须拒绝：明文整库会落到第三方存储"
+        );
+        assert!(
+            require_encryption_for_remote(Some("webdav"), false).is_err(),
+            "WebDAV 副本同理，不能只盯 S3"
+        );
+        assert!(
+            require_encryption_for_remote(Some("s3"), true).is_ok(),
+            "远端 + 已加密应放行"
+        );
+        assert!(
+            require_encryption_for_remote(None, false).is_ok(),
+            "纯本地备份允许不加密：加密会抬高恢复门槛，本地场景的取舍仍交给用户"
+        );
+    }
+
+    /// ⭐⭐ 接线守卫：handler 里那两行删掉，**没有任何行为测试会变红**——
+    /// 少一层保护，计划照样能建、照样能跑，只是产物变成了明文躺在远端。
+    /// 故只能源码级断言；剔注释行是必须的（接线段有解释性注释）。
+    #[test]
+    fn create_and_patch_enforce_remote_encryption() {
+        let src = include_str!("backups.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        let code: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            code.matches("require_encryption_for_remote(").count(),
+            3,
+            "生产段应有 1 处定义 + 2 处接线（create 与 patch）；\
+             少一处就等于放行明文远端备份"
+        );
     }
 }
 
