@@ -24,6 +24,7 @@ guards:
 	bash ci/check-layering.sh
 	bash ci/check-api-contract.sh
 	bash ci/check-permissions.sh
+	bash ci/check-docs-consistency.sh
 	bash ci/check-pkg-whitelist.sh
 	python3 ci/check_openapi.py
 	# 锁中毒恢复：禁止生产代码裸 lock().unwrap()（见 ci/check_lock_unwrap.py）

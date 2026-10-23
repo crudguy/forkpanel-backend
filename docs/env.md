@@ -13,7 +13,7 @@
 |---|---|---|---|
 | `PANEL_READ_ONLY` | `1` = 开，其它值 = 关 | 关 | 开启后所有写请求（POST/PUT/PATCH/DELETE）返回 `403`（`code 10007`），Web 终端入口同样拒绝。与 `config.toml` 的 `[security] read_only` 是**或**的关系——任一为真即开（`panel_api::read_only_from`） |
 | `PANEL_HSTS` | `1` = 开 | 关 | 响应下发 `Strict-Transport-Security` 头。仅公网 / TLS 部署才开：本地 http 监听时开，会让浏览器缓存后无法访问 |
-| `PANEL_TLS` | `1` = 开 | 关 | 会话 cookie 加 `Secure` 属性。面板经 TLS（自身或前置反代）对外服务时才开 |
+| `PANEL_TLS` | `1` = 开 | 关 | 会话 cookie 加 `Secure` 属性。面板经**前置反代**终结 TLS 对外服务时才开（面板本体只提供 http，不终结 TLS——`[server].tls` 配了会被拒绝启动） |
 | `PANEL_SSHD_CONFIG` | 文件绝对路径 | `/etc/ssh/sshd_config` | 安全基线页读取并解析的 sshd 主配置路径；测试与非标准部署可用它指向别处 |
 | `RUST_LOG` | `tracing` 过滤器语法 | `info` | 日志级别与按模块过滤，如 `debug`、`panel_api=debug,info` |
 | `PANEL_WEB_DIST` | 目录路径 | `web/dist` | **仅 `dev-assets` 特性构建**生效：前端静态资源从磁盘读取而非打进二进制。改前端后免重编后端 |
@@ -35,6 +35,8 @@
 
 ## 相关
 
-- 高危并发上限（Web 终端 4 路）目前是编译期常量，靠注释与前端 `MAX_TABS=4`
-  手工对齐——属审计 P2-5 待办（计划由 `/api/v1/capabilities` 下发，消除两处 4
-  漂移的风险）。
+- 高危并发上限（Web 终端 4 路）已是**单一真值**：`panel-api` 的
+  `TERMINAL_MAX_SESSIONS`（同时用它构造信号量），经 `/api/v1/system/capabilities`
+  的 `limits.terminal_max_sessions` 下发给前端；前端的 `MAX_TABS=4` 常量**已删除**，
+  改读 `auth.terminalMax`（审计 P2-5，`23050e9` + `16b67d9`）。两处各写一个 4 的
+  漂移风险已消除。
