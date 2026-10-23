@@ -70,7 +70,7 @@ ForkPanel 当前是**单实例**架构：一个 `panel serve` 进程 = 采集 + 
 - **形态**：单文件二进制 + systemd unit（`panel-agent.service`）；无嵌入前端；tier 恒按 Nano 预算（目标 RSS < 15MB 稳态）。
 - **不监听任何端口**（本地调试 socket 可选）。
 - **CLI**：`panel-agent enroll --hub https://hub:2083 --token <一次性令牌>` → 交换 node token 存 `0600` 本地文件；`panel-agent run` 按配置重连（指数退避）。
-- **依赖预算**：直接新增 `tokio-tungstenite`（或复用 axum ws 的客户端侧）+ 既有 workspace 依赖；门禁 [8] 当前 36/38，加入后 37/38，**预算是本方案最紧的硬约束**——若超，优先把 hub 的 `rand`/`time` 等合并裁剪。
+- **依赖预算**：直接新增 `tokio-tungstenite`（或复用 axum ws 的客户端侧）+ 既有 workspace 依赖；门禁 [8] 当前去重后第三方直接依赖约 22/38（上限 38），余量有限，**任何新增依赖必须先决策、优先合并裁剪既有依赖**。
 
 ## 6. Agent 协议（WS 帧语义）
 
@@ -167,7 +167,7 @@ ALTER TABLE tasks ADD COLUMN node_id INTEGER REFERENCES nodes(id);  -- NULL=hub 
 |---|---|---|
 | 🔴 | 批量通道被滥用为任意代码执行 | 白名单 task_kind、无 shell 下发、owner+确认词+逐节点审计（§9-3） |
 | 🔴 | node token 泄露 → 节点被冒充 | 仅存哈希、一键吊销、agent 侧 hub 指纹固定（§9-4/5） |
-| 🟡 | 依赖预算超限（门禁 [8] 36/38） | agent 与 hub 共享 workspace 依赖；必要时裁剪 hub 侧低频依赖 |
+| 🟡 | 依赖预算余量有限（门禁 [8] 去重后约 22/38，上限 38） | agent 与 hub 共享 workspace 依赖；新增依赖须先决策、必要时裁剪 hub 侧低频依赖 |
 | 🟡 | 长连断线风暴（hub 重启 → 20 节点同时重连） | agent 指数退避 + 抖动；hub 半开连接上限 |
 | 🟡 | 低配 hub 内存（20 节点长连） | 每连接缓冲上限、观测数据不落盘（D6）、Nano 档关闭集群 |
 | 🟢 | 与单实例行为回归冲突 | §11 回滚保证：独立命名空间 + 未启用零介入 |

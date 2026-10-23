@@ -492,7 +492,7 @@ fn format_journal_line(raw: &str) -> Option<String> {
 
 /// epoch 秒 → 本地时区 `YYYY-MM-DD HH:MM:SS`。
 /// 用 libc `localtime_r`（libc 已是本 crate 直接依赖），不引入 chrono/time 新依赖
-/// （直接依赖预算 38/38 已满）。转换失败给占位符，绝不 panic。
+/// （直接依赖预算上限 38，去重后现约 22）。转换失败给占位符，绝不 panic。
 fn format_local_ts(secs: i64) -> String {
     let t: libc::time_t = secs as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };

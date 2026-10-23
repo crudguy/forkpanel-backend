@@ -148,7 +148,7 @@
 
 | 方法 + 路径 | 模块 | 后端状态 | 备注 |
 |---|---|---|---|
-| GET `/notifications`、`/notifications/unread-count`；POST `/{id}/read`、`/read-all`；DELETE `/{id}` | 站内通知 | ✅ | 002 表；`dedup_key` 唯一约束去重。**刻意不做邮件/Webhook**——需 reqwest/lettre，依赖预算上限 38、现 37。落点：备份失败（按天去重）、恢复失败（不去重） |
+| GET `/notifications`、`/notifications/unread-count`；POST `/{id}/read`、`/read-all`；DELETE `/{id}` | 站内通知 | ✅ | 002 表；`dedup_key` 唯一约束去重。**刻意不做邮件/Webhook**——需 reqwest/lettre，依赖预算上限 38、去重后第三方直接依赖现约 22（`check-layering.sh` [8] 实测）。落点：备份失败（按天去重）、恢复失败（不去重） |
 | `sessions` 表落库（001 已定义、此前零引用） | 会话持久化 | ✅ | **只存 sid 哈希**；中间件 `get_or_restore` 惰性重建 → 重启不再全员登出；DB 写入 spawn 到 runtime，绝不持 MutexGuard 跨 await |
 | `/auth/mfa/{enroll,verify,disable}` + 登录第二因子 | MFA（TOTP） | ✅ | RFC 6238 HMAC-SHA1（验证器兼容档）+ 10 个恢复码（只存哈希，一次性消费）；**关闭 MFA 必须出示第二因子** |
 

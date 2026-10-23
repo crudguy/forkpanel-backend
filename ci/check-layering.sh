@@ -148,8 +148,16 @@ fi
 
 echo "== [8] 依赖数量预算 =="
 if command -v cargo >/dev/null 2>&1; then
-  N=$(cargo tree --depth 1 2>/dev/null | grep -c "^[├└]")
-  echo "  · 直接依赖约 ${N} 个（预算 ≤ 38）"
+  # 统计**去重后**的第三方直接依赖：
+  #  - `--edges normal` 排除 dev/build 依赖（测试工具不应占用生产依赖预算）；
+  #  - `grep -v '^panel-'` 排除内部 workspace crate（它们是第一方代码，不是"依赖"）；
+  #  - 按成员去重——`cargo tree --depth 1` 会为每个 member 重复列出同一依赖，
+  #    不清重会把"被多个 crate 共用的依赖"翻倍计数，虚高到顶格、误导"预算已满"。
+  # 口径对应 docs 里的"直接依赖预算 ≤ 38"（第三方、去重、生产）。
+  N=$(cargo tree --edges normal --depth 1 2>/dev/null \
+        | grep '^[├└]' | sed 's/^[├└]── //' | sed 's/ v[0-9].*//' \
+        | grep -v '^panel-' | sort -u | wc -l)
+  echo "  · 第三方直接依赖（去重、生产）约 ${N} 个（预算 ≤ 38）"
   [ "$N" -gt 38 ] && note_fail "直接依赖超出预算" || note_ok "依赖数量在预算内"
 else
   echo "  · 未检测到 cargo（跳过）"

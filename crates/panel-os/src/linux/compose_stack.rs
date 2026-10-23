@@ -7,7 +7,7 @@
 //! - `compose.yaml` —— 渲染产物，给人看、给 `docker compose` 用。
 //!
 //! 为什么不是反过来（让用户直接编辑 YAML、面板去解析）：本 crate 的依赖预算
-//! 是 38/38 已满，加不了 YAML 解析器；更要紧的是，允许自由 YAML 就等于允许
+//! 上限 38（去重后第三方直接依赖现约 22），不轻易加 YAML 解析器；更要紧的是，允许自由 YAML 就等于允许
 //! `privileged: true` / 挂载 `/` / 挂 `docker.sock`——那正是
 //! `validate_create` 一直在拦的东西。用**类型白名单**（见 `ComposeStackService`）
 //! 让危险字段在生成阶段就不可能出现，比"解析后黑名单过滤"可证明得多。

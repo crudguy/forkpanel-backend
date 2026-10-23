@@ -12,7 +12,7 @@
 //!   文件变小（轮转/截断）则从头读。
 //!
 //! # 无额外依赖
-//! combined 解析与 time_local→unix 全部手写（依赖预算已满，不引 regex / chrono）。
+//! combined 解析与 time_local→unix 全部手写（依赖预算上限 38、去重后现约 22，不引 regex / chrono）。
 //! 时间换算用 Howard Hinnant 的 days_from_civil（有单测钉住 1970/2026 两个已知值）。
 
 use crate::{

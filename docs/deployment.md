@@ -173,7 +173,7 @@ sudo chmod 600 /root/forkpanel-ca-*.tar.gz
 | 方案 | 做法 | 代价 |
 |---|---|---|
 | **外部探活（当前最现实）** | systemd timer / cron 每分钟 `curl -fsS http://127.0.0.1:2083/api/v1/version`，连续失败则 `systemctl restart panel` | 多一个计时器单元；探活脚本要自己幂等 |
-| **sd_notify watchdog** | 单元加 `WatchdogSec=60`，应用侧周期性 `sd_notify(0, "WATCHDOG=1")` | 需引 `libsystemd`（或自己实现 `sd_notify` 的 datagram 协议），依赖预算当前 38/38 已满，需先决策 |
+| **sd_notify watchdog** | 单元加 `WatchdogSec=60`，应用侧周期性 `sd_notify(0, "WATCHDOG=1")` | 需引 `libsystemd`（或自己实现 `sd_notify` 的 datagram 协议），依赖预算上限 38（去重后第三方直接依赖现约 22），新增仍须先决策 |
 | **Type=notify** | 同上，启动完成也走 sd_notify | 同上 |
 
 ### 5.2 已提供：`panel healthcheck`（方案①的落地件）
