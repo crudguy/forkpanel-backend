@@ -160,7 +160,7 @@ sudo chmod 600 /root/forkpanel-ca-*.tar.gz
 `panel systemd-unit --install` 生成的单元已含：
 
 - `NoNewPrivileges / ProtectSystem=strict / ProtectHome / ProtectKernelTunables / ProtectControlGroups / RestrictSUIDSGID`
-- `ReadWritePaths` 仅开放数据、日志、站点、配置四个目录（由 `PathLayout` 提供，非硬编码）
+- `ReadWritePaths` 开放数据、日志、站点、配置四个**必填**目录（由 `PathLayout` 提供，非硬编码），外加 nginx `conf.d` / caddy `sites` 两个**可选**目录（`-` 前缀：不存在时 systemd 忽略而非拒绝启动）——站点部署要直写这两个 /etc 落点
 - `MemoryMax` 按档位（96M / 192M / 384M）、`CPUQuota=20%`、`TasksMax=256`
 - `Restart=on-failure` + `RestartSec=3`：**进程崩溃 / 非零退出会自愈**
 

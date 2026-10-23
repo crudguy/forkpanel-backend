@@ -744,6 +744,7 @@ impl crate::PathLayout for MockPathLayout {
     fn tmp_dir(&self) -> PathBuf { self.data_dir().join("tmp") }
     fn site_root(&self) -> PathBuf { PathBuf::from("/mock/var/www") }
     fn web_conf_dir(&self) -> PathBuf { self.config_dir().join("nginx/conf.d") }
+    fn caddy_sites_dir(&self) -> PathBuf { PathBuf::from("/mock/etc/caddy/sites") }
     fn web_log_dir(&self) -> PathBuf { self.log_dir().join("web") }
     fn service_dir(&self) -> PathBuf { PathBuf::from("/mock/etc/systemd/system") }
     fn cron_dir(&self) -> PathBuf { PathBuf::from("/mock/etc/cron.d") }

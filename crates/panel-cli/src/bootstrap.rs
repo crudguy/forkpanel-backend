@@ -52,7 +52,13 @@ pub fn read_password(prompt: &str) -> Result<String> { fs::read_password(prompt)
 ///
 /// 刻意使用 `PathLayout::service_dir()` 决定安装位置，可写目录由调用方传入。
 /// 安全相关的硬化项都是 systemd 的原生能力，比自己实现更可靠。
-pub fn systemd_unit(bin: &str, config: &str, tier: Tier, writable: &[std::path::PathBuf]) -> String {
+///
+/// `optional_writable`：**允许不存在**的可写目录，一律带 `-` 前缀下发。
+/// systemd 对无前缀的缺失路径直接让单元 226/NAMESPACE 起不来（无法 reopen
+/// 一个不存在的目录），所以「没装 nginx/caddy 的机器」与「装了的机器」
+/// 必须共用同一份单元文本，差别只在 systemd 侧忽略缺失项。
+pub fn systemd_unit(bin: &str, config: &str, tier: Tier, writable: &[std::path::PathBuf],
+                    optional_writable: &[std::path::PathBuf]) -> String {
     let mem_max = match tier {
         Tier::Nano => "96M",
         Tier::Small => "192M",
@@ -79,6 +85,7 @@ ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 # 数据/日志/站点目录需要可写，其余只读（由 PathLayout 提供，非硬编码）
+# 可选档（web 服务器 conf drop-in）带 - 前缀：不存在时 systemd 忽略而非拒绝启动
 ReadWritePaths={writable}
 
 # —— 资源上限：与「常驻 ≤12MB」目标一致，防止异常时拖垮整机 ——
@@ -90,8 +97,38 @@ TasksMax=256
 WantedBy=multi-user.target
 "#,
         bin = bin, config = config, mem_max = mem_max,
-        writable = writable.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(" ")
+        writable = {
+            let mut v: Vec<String> = writable.iter().map(|p| p.display().to_string()).collect();
+            v.extend(optional_writable.iter().map(|p| format!("-{}", p.display())));
+            v.join(" ")
+        }
     )
+}
+
+/// 从路径布局推导 systemd 单元的放行目录，返回 `(必填, 可选)` 两档。
+///
+/// - **必填**：数据 / 日志 / 站点 / 配置四目录——面板自身的立足点，缺一个就
+///   起不来或丢数据。无 `-` 前缀：缺了就该让单元红，而不是 silent 半残运行。
+/// - **可选**：web 服务器 conf drop-in（nginx `conf.d` / caddy `sites`）——
+///   站点部署时**直写**的 /etc 落点（`LinuxWebServer::deploy`）。不放行它们，
+///   `ProtectSystem=strict` 下官方单元部署后建站必然 EROFS；但它们可能不存在
+///   （没装 web 服务器）⇒ 带 `-` 前缀，systemd 忽略缺失项。
+///
+/// 收敛成函数而不是在 main.rs 里拼 vec：「单元到底放行了哪些目录」需要一条
+/// 回归测试盯着，且调用方（CLI 与测试）必须同源。
+pub fn writable_dirs(layout: &dyn panel_os::PathLayout)
+    -> (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) {
+    let required = vec![
+        layout.data_dir(),
+        layout.log_dir(),
+        layout.site_root(),
+        layout.config_dir(),
+    ];
+    let optional = vec![
+        layout.web_conf_dir(),
+        layout.caddy_sites_dir(),
+    ];
+    (required, optional)
 }
 
 /// 生成外部探活脚本内容（`sh`，放 `PathLayout::script_dir()`）。
@@ -261,7 +298,7 @@ mod tests {
 
     #[test]
     fn systemd_unit_has_no_hardcoded_service_dir_and_is_hardened() {
-        let u = systemd_unit("panel", "config.toml", Tier::Nano, &[std::path::PathBuf::from("data")]);
+        let u = systemd_unit("panel", "config.toml", Tier::Nano, &[std::path::PathBuf::from("data")], &[]);
         assert!(u.contains("MemoryMax=96M"), "nano 档位内存上限");
         assert!(u.contains("NoNewPrivileges=yes"));
         assert!(u.contains("ProtectSystem=strict"));
@@ -272,7 +309,7 @@ mod tests {
 
     #[test]
     fn standard_tier_gets_higher_cap() {
-        let u = systemd_unit("panel", "config.toml", Tier::Standard, &[std::path::PathBuf::from("data")]);
+        let u = systemd_unit("panel", "config.toml", Tier::Standard, &[std::path::PathBuf::from("data")], &[]);
         assert!(u.contains("MemoryMax=384M"));
     }
 
@@ -289,7 +326,7 @@ mod tests {
             std::path::PathBuf::from("/srv/fp/www"),
             std::path::PathBuf::from("/srv/fp/conf"),
         ];
-        let u = systemd_unit("panel", "/srv/fp/conf/config.toml", Tier::Small, &custom);
+        let u = systemd_unit("panel", "/srv/fp/conf/config.toml", Tier::Small, &custom, &[]);
         let line = u.lines().find(|l| l.starts_with("ReadWritePaths=")).unwrap();
         assert_eq!(
             line,
@@ -297,5 +334,42 @@ mod tests {
             "ReadWritePaths 必须与配置 [paths] 一致，不能回落默认 /var/lib/forkpanel 等"
         );
         assert!(u.contains("ExecStart=panel --config /srv/fp/conf/config.toml serve"));
+    }
+
+    /// 回归：可选档必须带 `-` 前缀。systemd 对**无前缀的缺失路径**直接让单元
+    /// 226/NAMESPACE 起不来——没装 nginx/caddy 的机器上漏了前缀就是起不来。
+    #[test]
+    fn optional_writable_paths_use_dash_prefix() {
+        let u = systemd_unit("panel", "config.toml", Tier::Nano,
+                             &[std::path::PathBuf::from("/srv/fp/data")],
+                             &[std::path::PathBuf::from("/etc/nginx/conf.d")]);
+        let line = u.lines().find(|l| l.starts_with("ReadWritePaths=")).unwrap();
+        assert_eq!(line, "ReadWritePaths=/srv/fp/data -/etc/nginx/conf.d");
+    }
+
+    /// 回归：站点 conf 的 /etc 落点必须进 ReadWritePaths（可选档）。
+    /// 少了它，`ProtectSystem=strict` 下官方单元部署后建站必然 EROFS——
+    /// `LinuxWebServer::deploy` 直写 web_conf_dir / caddy_sites_dir，
+    /// 而单元只放行数据/日志/站点/配置四目录（自 16826ae 起冲突至今）。
+    #[test]
+    fn writable_dirs_cover_web_conf_drop_in_dirs() {
+        use panel_os::PathLayout as _;
+        let layout = panel_os::paths::LinuxPathLayout::default();
+        let (required, optional) = writable_dirs(&layout);
+        assert_eq!(required, vec![layout.data_dir(), layout.log_dir(),
+                                   layout.site_root(), layout.config_dir()],
+                   "必填四目录保持原状");
+        assert!(optional.contains(&layout.web_conf_dir()), "nginx conf.d 必须放行");
+        assert!(optional.contains(&layout.caddy_sites_dir()), "caddy sites 必须放行");
+        // 组合生成一遍：六条目、四必填两可选、顺序稳定
+        let u = systemd_unit("panel", "config.toml", Tier::Small, &required, &optional);
+        let line = u.lines().find(|l| l.starts_with("ReadWritePaths=")).unwrap();
+        let expect = format!(
+            "ReadWritePaths={} {} {} {} -{} -{}",
+            layout.data_dir().display(), layout.log_dir().display(),
+            layout.site_root().display(), layout.config_dir().display(),
+            layout.web_conf_dir().display(), layout.caddy_sites_dir().display(),
+        );
+        assert_eq!(line, expect);
     }
 }

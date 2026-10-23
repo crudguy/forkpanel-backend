@@ -1530,7 +1530,9 @@ use super::*;
 
     #[test]
     fn caddy_sites_dir_and_main_conf_are_caddy_paths() {
-        assert_eq!(caddy_sites_dir(), PathBuf::from("/etc/caddy/sites"));
+        // 站点片段目录收敛到 PathLayout（与 systemd 单元 ReadWritePaths 同源）：
+        // webserver 写一份、单元放行另一份的漂移，曾让官方部署下建站必然 EROFS。
+        assert_eq!(LinuxPathLayout::default().caddy_sites_dir(), PathBuf::from("/etc/caddy/sites"));
         assert_eq!(caddy_main_conf(), PathBuf::from("/etc/caddy/Caddyfile"));
     }
 

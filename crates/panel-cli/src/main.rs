@@ -503,12 +503,12 @@ fn run(cli: Cli) -> Result<()> {
             let bin = std::env::current_exe()
                 .map(|p| p.display().to_string())
                 .map_err(|e| PanelError::Internal(format!("无法确定自身路径：{e}")))?;
-            let layout_data = layout.data_dir();
-            let layout_log = layout.log_dir();
-            let layout_site = layout.site_root();
-            let cfgp = cli.config.clone().unwrap_or_else(|| layout.config_dir().join("config.toml"));
-            let writable = vec![layout_data.clone(), layout_log.clone(), layout_site.clone(), layout.config_dir()];
-            let unit = bootstrap::systemd_unit(&bin, &cfgp.display().to_string(), tier, &writable);
+            // 放行目录两档（必填四目录 / 可选 web conf drop-in）由 bootstrap 收敛，
+            // 与单测同源：可选档漏了 web conf 目录，官方单元部署后建站必然 EROFS
+            // （LinuxWebServer::deploy 直写 /etc/nginx/conf.d 等）。
+            let (writable, optional_writable) = bootstrap::writable_dirs(&layout);
+            let unit = bootstrap::systemd_unit(&bin, &cfgp.display().to_string(), tier,
+                                               &writable, &optional_writable);
             if install {
                 let dir = os.paths().service_dir();
                 if dir.as_os_str().is_empty() {

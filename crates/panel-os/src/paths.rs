@@ -13,6 +13,10 @@ pub trait PathLayout: Send + Sync {
     fn tmp_dir(&self) -> PathBuf;
     fn site_root(&self) -> PathBuf;
     fn web_conf_dir(&self) -> PathBuf;      // nginx conf.d / caddy sites / IIS 配置目录
+    /// caddy 站点片段目录（`/etc/caddy/sites`，靠主 Caddyfile import 加载）。
+    /// 与 `web_conf_dir`（nginx）并列：都是面板部署站点时**直写**的 /etc 落点，
+    /// systemd 单元的 ReadWritePaths 必须放行，否则建站在官方单元下必然 EROFS。
+    fn caddy_sites_dir(&self) -> PathBuf;
     fn web_log_dir(&self) -> PathBuf;
     fn service_dir(&self) -> PathBuf;       // systemd unit / launchd plist / 无意义时返回空
     fn cron_dir(&self) -> PathBuf;
@@ -85,6 +89,7 @@ impl PathLayout for LinuxPathLayout {
         if self.prefix.join("nginx").exists() { self.prefix.join("nginx/conf.d") }
         else { PathBuf::from("/etc/nginx/conf.d") }
     }
+    fn caddy_sites_dir(&self) -> PathBuf { PathBuf::from("/etc/caddy/sites") }
     fn web_log_dir(&self) -> PathBuf { self.log_dir.join("web") }
     fn service_dir(&self) -> PathBuf { PathBuf::from("/etc/systemd/system") }
     fn cron_dir(&self) -> PathBuf { PathBuf::from("/etc/cron.d") }

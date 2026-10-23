@@ -115,8 +115,13 @@ tmp/  cache/  log/  临时 / 缓存 / 内部日志
 ForkPanel 做了四层：
 
 1. **systemd 层就锁死**：生成的单元带 `ProtectSystem=strict` +
-   `ReadWritePaths=/var/lib/forkpanel /var/log/forkpanel /var/www /etc/forkpanel`——
-   **进程想写这 4 个目录之外的任何位置，内核直接拒绝**（面板有漏洞也写不出去）。
+   `ReadWritePaths=/var/lib/forkpanel /var/log/forkpanel /var/www /etc/forkpanel`
+   （另有两个 **`-` 前缀的可选档**：`-/etc/nginx/conf.d`、`-/etc/caddy/sites`）——
+   **进程想写这些目录之外的任何位置，内核直接拒绝**（面板有漏洞也写不出去）。
+   > 可选档是站点部署的**直写落点**（`LinuxWebServer::deploy` 原子替换
+   > `panel-<host>.conf`）：不放行它，官方单元部署后建站必然 EROFS。带 `-`
+   > 前缀是因为没装 nginx/caddy 的机器上这两个目录不存在，而 systemd 对
+   > 无前缀的缺失路径直接让单元 226/NAMESPACE 起不来。
    > ⚠️ 这个 `ReadWritePaths` 由 `config.toml` 的 `[paths]` 决定。历史上曾有个 bug：
    > 生成单元时用的是**代码默认路径**而非**配置实际路径**，一旦你覆盖 `[paths]`，
    > 单元会放行错误的目录，导致 `ProtectSystem=strict` 下面板写不进真实数据目录。

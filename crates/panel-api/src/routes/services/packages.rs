@@ -115,7 +115,7 @@ pub(crate) const ALLOWED_PACKAGES: &[PkgDef] = &[
         features: "静态站点、PHP、虚拟主机、.htaccess 覆盖配置。",
         scenes: "兼容迁移过来的既有 Apache 项目。",
         entry: "面板的站点托管目前只渲染 nginx / caddy：Apache 装好后需自行维护配置。「服务」页仍可启停、看日志、改单元配置。",
-        howto: "面板不代写 Apache 配置：建站请首选 nginx / caddy。若必须用 Apache，装好后到「服务」页启停、看日志，配置文件用「文件」页或「终端」自行编辑（/etc/apache2/）。",
+        howto: "面板不代写 Apache 配置：建站请首选 nginx / caddy。若必须用 Apache，装好后到「服务」页启停、看日志，配置文件（/etc/apache2/）请通过 SSH 编辑——面板按官方 systemd 单元部署时进程受 ProtectSystem=strict 约束，/etc 只读：文件页能看不能写，终端是面板子进程、同样写不进。",
         units: &["apache2.service"],
     },
     PkgDef {
@@ -142,7 +142,7 @@ pub(crate) const ALLOWED_PACKAGES: &[PkgDef] = &[
         features: "缓存、会话存储、消息队列、分布式锁。",
         scenes: "加速读多写少的应用、跨进程共享状态。",
         entry: "面板无独立页面；应用连 127.0.0.1:6379（默认端口，以你的配置为准）；「服务」页看状态 / 日志 / 配置。",
-        howto: "无需在面板里填连接：应用连 127.0.0.1:6379。要改端口/密码用「文件」页编辑/etc/redis/redis.conf，改完到「服务」页重启 redis-server。",
+        howto: "无需在面板里填连接：应用连 127.0.0.1:6379。要改端口/密码请通过 SSH 编辑 /etc/redis/redis.conf，改完到「服务」页重启 redis-server——面板按官方 systemd 单元部署时 /etc 只读（ProtectSystem=strict），文件页能看不能写，终端同理。",
         units: &["redis-server.service"],
     },
     PkgDef {
@@ -151,7 +151,7 @@ pub(crate) const ALLOWED_PACKAGES: &[PkgDef] = &[
         features: "对象缓存（重启即清空）。",
         scenes: "减轻数据库读压力，可接受缓存丢失。",
         entry: "面板无独立页面；应用连 127.0.0.1:11211（默认端口）；「服务」页看状态与日志。",
-        howto: "无需填连接：应用连 127.0.0.1:11211。要调内存上限改 /etc/memcached.conf 后到「服务」页重启。",
+        howto: "无需填连接：应用连 127.0.0.1:11211。要调内存上限请通过 SSH 编辑 /etc/memcached.conf 后到「服务」页重启（面板按官方 systemd 单元部署时 /etc 只读，文件页写不进）。",
         units: &["memcached.service"],
     },
     // 只保留元包 php-fpm：它 Depends 当前发行版的默认 phpX.Y-fpm，任何一代
@@ -209,7 +209,7 @@ pub(crate) const ALLOWED_PACKAGES: &[PkgDef] = &[
         features: "功能同 Redis：缓存、会话、队列、分布式锁。",
         scenes: "Redis 变更许可证后的替代选择，客户端无需改动。",
         entry: "与 Redis 相同（面板无独立页面，应用连默认端口）；注意服务名是 valkey-server。",
-        howto: "无需填连接：应用连 127.0.0.1:6379（与 Redis 同端口，二选一装）。配置文件在/etc/valkey/，改名后到「服务」页重启。",
+        howto: "无需填连接：应用连 127.0.0.1:6379（与 Redis 同端口，二选一装）。配置文件在 /etc/valkey/，请通过 SSH 编辑后到「服务」页重启（面板按官方 systemd 单元部署时 /etc 只读，文件页写不进）。",
         units: &["valkey-server.service"],
     },
     PkgDef {
@@ -218,7 +218,7 @@ pub(crate) const ALLOWED_PACKAGES: &[PkgDef] = &[
         features: "按目标抓取指标、PromQL 查询、告警规则。",
         scenes: "自建监控体系、需要长期留存历史指标。",
         entry: "面板无独立页面（「概览」的主机监控是内置采集，不依赖它）；用它自己的 Web UI（默认 :9090）看指标与告警。",
-        howto: "无需在面板里配：面板的主机监控是内置采集，不读 Prometheus。要用它就到http://<本机>:9090 打开它自己的 Web UI，抓取目标写在 /etc/prometheus/prometheus.yml。",
+        howto: "无需在面板里配：面板的主机监控是内置采集，不读 Prometheus。要用它就到 http://<本机>:9090 打开它自己的 Web UI；抓取目标写在 /etc/prometheus/prometheus.yml，该文件请通过 SSH 编辑（面板按官方 systemd 单元部署时 /etc 只读，文件页写不进）。",
         units: &["prometheus.service"],
     },
     PkgDef {
@@ -236,7 +236,7 @@ pub(crate) const ALLOWED_PACKAGES: &[PkgDef] = &[
         features: "秒级指标采集、内置告警、开箱即用的图表面板。",
         scenes: "单机快速排障、看瞬时毛刺。",
         entry: "面板无独立页面（「概览」的主机监控为内置实现）；用它自己的 Web UI（默认 :19999）看秒级图表。",
-        howto: "面板不内嵌 Netdata：装好后开 http://<本机>:19999 看秒级图表。要调告警编辑/etc/netdata/health.d/ 下的文件。",
+        howto: "面板不内嵌 Netdata：装好后开 http://<本机>:19999 看秒级图表。要调告警请通过 SSH 编辑 /etc/netdata/health.d/ 下的文件（面板按官方 systemd 单元部署时 /etc 只读，文件页写不进）。",
         units: &["netdata.service"],
     },
     PkgDef {
@@ -244,8 +244,8 @@ pub(crate) const ALLOWED_PACKAGES: &[PkgDef] = &[
         summary: "四层 / 七层负载均衡器。",
         features: "TCP 与 HTTP 反向代理、健康检查、多后端分流。",
         scenes: "多个后端实例之间分流、需要比 Web 服务器更强的转发控制。",
-        entry: "面板无独立页面；「服务」页改配置 / 看日志，或走「文件」「终端」。",
-        howto: "面板不代写 HAProxy 配置：用「文件」页编辑 /etc/haproxy/haproxy.cfg（frontend / backend / server 三段），保存后到「服务」页重启 haproxy。只想给 Web 站点做反代与负载均衡，直接用「网站」页的「反向代理」类型更省事。",
+        entry: "面板无独立页面；「服务」页看状态 / 日志；改配置请走 SSH（/etc/haproxy/haproxy.cfg，面板按官方 systemd 单元部署时 /etc 只读）。",
+        howto: "面板不代写 HAProxy 配置：/etc/haproxy/haproxy.cfg（frontend / backend / server 三段）请通过 SSH 编辑，保存后到「服务」页重启 haproxy（面板按官方 systemd 单元部署时 /etc 只读，文件页写不进）。只想给 Web 站点做反代与负载均衡，直接用「网站」页的「反向代理」类型更省事。",
         units: &["haproxy.service"],
     },
     PkgDef {
@@ -292,8 +292,8 @@ pub(crate) const ALLOWED_PACKAGES: &[PkgDef] = &[
         summary: "现代轻量 VPN（点对点隧道）。",
         features: "内核态加密隧道、点对点与站点互联、按密钥识别对端。",
         scenes: "远程接入内网、在多台主机之间建立私有网络。",
-        entry: "面板无独立页面；用「文件」或「终端」编辑 /etc/wireguard/*.conf；「服务」页看 wg-quick@ 单元状态。",
-        howto: "面板不代写 WireGuard 配置：用「文件」页或「终端」编辑 /etc/wireguard/wg0.conf（私钥、Address、对端 PublicKey/Endpoint/AllowedIPs），再到「服务」页启停 wg-quick@wg0。",
+        entry: "面板无独立页面；配置请通过 SSH 编辑 /etc/wireguard/*.conf；「服务」页看 wg-quick@ 单元状态。",
+        howto: "面板不代写 WireGuard 配置：/etc/wireguard/wg0.conf（私钥、Address、对端 PublicKey/Endpoint/AllowedIPs）请通过 SSH 编辑，再到「服务」页启停 wg-quick@wg0（面板按官方 systemd 单元部署时 /etc 只读，文件页与终端都写不进）。",
         units: &["wg-quick@.service"],
     },
 ];

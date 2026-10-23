@@ -79,7 +79,7 @@ root 才能管服务与防火墙——但开了一整套硬化。插件作为面
 
 | 硬化项 | 对插件的免费收益 |
 |---|---|
-| `ProtectSystem=strict` + `ReadWritePaths=<数据/日志/站点目录>` | 插件写不了这些之外的地方（`/etc`、`/usr` 全只读）——"插件写坏系统"这条路基本被堵住 |
+| `ProtectSystem=strict` + `ReadWritePaths=<数据/日志/站点目录>`（另有 web 服务器 conf drop-in 两个可选档） | 插件写不了这些之外的地方（`/etc`、`/usr` 几乎全只读，仅 nginx `conf.d` / caddy `sites` 放行）——"插件写坏系统"这条路基本被堵住 |
 | `ProtectHome=yes` | 读不到 `/home`、`/root` |
 | `NoNewPrivileges=yes` | 插件拿不到新权限（`setuid` 提权失败）。注意它**不阻止降权**，所以 `CmdOpt.run_as` 依然可用 |
 | `TasksMax=256` | 插件 fork 炸弹会撞上限而失败（面板自身也在同一配额内，见下） |

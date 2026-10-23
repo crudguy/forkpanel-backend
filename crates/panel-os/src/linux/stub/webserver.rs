@@ -31,7 +31,7 @@ impl LinuxWebServer {
         let stem = server_names.first().map(|s| slug(s)).unwrap_or_else(|| "site".into());
         match self.name {
             // caddy 站点片段进 sites/、扩展名 .caddy（靠主 Caddyfile import 加载）
-            Some("caddy") => caddy_sites_dir().join(format!("panel-{stem}.caddy")),
+            Some("caddy") => self.paths.caddy_sites_dir().join(format!("panel-{stem}.caddy")),
             // nginx 走 conf.d、扩展名 .conf
             _ => self.paths.web_conf_dir().join(format!("panel-{stem}.conf")),
         }
@@ -969,15 +969,6 @@ pub(super) fn render_acme_challenge_location(root: &std::path::Path) -> String {
 //
 // Caddyfile 用 **tab 缩进**（caddy 官方风格）。`{host}`/`{uri}`/`{path}` 等是 caddy
 // 占位符（快捷指令），在 format! 字符串里必须写成 `{{...}}` 转义。
-
-/// caddy 站点片段目录（平台默认）。caddy **无** nginx 的 `conf.d/*.conf` 自动
-/// include——多站点靠**主 Caddyfile 显式 `import`**。故部署约定：
-/// 主 Caddyfile（[`caddy_main_conf`]）需含 `import /etc/caddy/sites/*`，
-/// 面板每站点写一个 `panel-<slug>.caddy` 进 sites/。缺那条 import 时面板下发的
-/// 站点不生效（reload 无报错但站点缺席）——能力位注释与文档均已注明此约定。
-pub(super) fn caddy_sites_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from("/etc/caddy/sites")
-}
 
 /// caddy 主配置文件路径（reload 用）。caddy reload 必须指向**主配置**（含 import），
 /// 与 nginx `-s reload` 自动找主配置不同。
