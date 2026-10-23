@@ -97,6 +97,8 @@ async fn run_action(
 /// 容器列表（等价 `docker ps -a`，含已停止）。
 pub async fn list(State(state): State<Shared>, Auth(s): Auth) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::CONTAINER_VIEW)?;
+    // docker ps 是子进程调用，容器页还会轮询它——必须设上限
+    crate::ratelimit::check_read(&state, &s.username, "container.list")?;
     ensure_supported(&state)?;
     let items = state.os.containers().list().await?;
     // 022：一次性联查 container_remarks，把备注挂到每个容器上（无则为空串）。

@@ -289,6 +289,8 @@ pub async fn journal(
     AxPath(name): AxPath<String>, Query(q): Query<JournalQ>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SERVICE_VIEW)?;
+    // journalctl 是子进程、且可能拉回上千行，刷新/轮询式访问必须设上限
+    crate::ratelimit::check_read(&state, &s.username, "service.journal")?;
     if !state.capabilities.get(cap_keys::SERVICE_MANAGE).map(|c| c.supported).unwrap_or(false) {
         return Err(ApiError::unsupported("service.manage"));
     }

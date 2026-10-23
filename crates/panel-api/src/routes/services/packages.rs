@@ -689,6 +689,8 @@ pub async fn packages_upgradable(
     State(state): State<Shared>, Auth(s): Auth,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::PACKAGE_MANAGE)?;
+    // 探测可升级包要跑 apt 子进程（还要先 ensure_repo），是本仓最贵的只读端点之一
+    crate::ratelimit::check_read(&state, &s.username, "pkg.upgradable")?;
     if !state.capabilities.get(cap_keys::PACKAGE_UPGRADE)
         .map(|c| c.supported).unwrap_or(false) {
         return Err(ApiError::unsupported("package.upgrade"));

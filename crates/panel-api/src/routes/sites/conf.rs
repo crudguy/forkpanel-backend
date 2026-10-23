@@ -717,6 +717,10 @@ pub async fn logs(
     if crate::auth::require(&s, perm::SITE_VIEW).is_err() {
         return ApiError::forbidden(perm::SITE_VIEW).into_response();
     }
+    // 站点日志可能很大（读取 + 截断都要过文件），限流放在鉴权之后
+    if let Err(e) = crate::ratelimit::check_read(&state, &s.username, "site.logs") {
+        return e.into_response();
+    }
     if !state.capabilities.get(cap_keys::LOGS_READ).map(|c| c.supported).unwrap_or(false) {
         return ApiError::unsupported("logs.read").into_response();
     }

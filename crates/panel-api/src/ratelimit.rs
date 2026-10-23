@@ -35,6 +35,16 @@ use std::time::{Duration, Instant};
 const LIMIT: usize = 10;
 const WINDOW: Duration = Duration::from_secs(60);
 
+/// 只读但**成本不低**的动作：每个 (user, action) 在窗口内允许的次数。
+///
+/// 为什么比重活档宽松（30 而非 10）：只读端点会被前端**轮询**正常访问（列表页常见
+/// 5~10s 一次 ⇒ 6~12 次/分），限额必须明显高于它，否则正常浏览就被误拦；
+/// 而脚本化刷取、失控的自动刷新、被泄露会话的批量拉取会远超 30 次/分，正好被按住。
+///
+/// 为什么只读也要限：这些端点不是"查一下内存"——执行用户 SQL、导出整表、拉
+/// journald、跑 apt/docker 子进程，单次成本与一次小写入相当，且都能被无限重放。
+const READ_LIMIT: usize = 30;
+
 /// key 数硬上限（同 LoginGuard 的 `MAX_KEYS` 思路）：防止被构造出无限多 key。
 /// 真实场景 = 用户数 × 动作数，10k 足够。
 const MAX_KEYS: usize = 10_000;
@@ -54,6 +64,11 @@ impl ActionLimiter {
     /// 默认档位（10 次 / 60 秒）
     pub fn heavy() -> Self {
         Self::new(LIMIT, WINDOW)
+    }
+
+    /// 只读高成本档位（30 次 / 60 秒）
+    pub fn read() -> Self {
+        Self::new(READ_LIMIT, WINDOW)
     }
 
     /// 放行返回 `Ok(())` 并记账；超限返回 `Err(retry_after_secs)`（**不记账**）。
@@ -116,6 +131,18 @@ impl Default for ActionLimiter {
 /// ```
 pub fn check_heavy(state: &crate::routes::Shared, user: &str, action: &str) -> crate::error::ApiResult<()> {
     state.limits.check(user, action).map_err(|wait| {
+        crate::error::ApiError::too_many_requests(wait)
+    })
+}
+
+/// 只读高成本端点的入口（档位更宽松，见 [`READ_LIMIT`]）。
+///
+/// 用法同 [`check_heavy`]，放在权限校验之后、真正干活之前：
+/// ```ignore
+/// crate::ratelimit::check_read(&state, &s.username, "db.rows")?;
+/// ```
+pub fn check_read(state: &crate::routes::Shared, user: &str, action: &str) -> crate::error::ApiResult<()> {
+    state.read_limits.check(user, action).map_err(|wait| {
         crate::error::ApiError::too_many_requests(wait)
     })
 }
@@ -186,6 +213,46 @@ mod tests {
             assert!(
                 code.contains(&needle),
                 "{who} 缺少限流接线（应当有 `{needle}?;`）。删掉它不会让任何行为测试变红，\
+                 所以这条断言是唯一防线。"
+            );
+        }
+    }
+
+    /// 只读档位必须真的比写档位宽松：若两者相同，轮询式只读端点会被误拦，
+    /// 用户会看到"点了没反应"的 429（而写操作几乎不会连点到 10 次/分）。
+    #[test]
+    fn read_tier_is_more_permissive_than_heavy() {
+        assert!(
+            ActionLimiter::read().limit > ActionLimiter::heavy().limit,
+            "只读档位必须比写档位宽松，否则前端轮询会被自己的正常访问打爆"
+        );
+        assert_eq!(ActionLimiter::read().window, ActionLimiter::heavy().window);
+        // 也必须**真的有限**：等于 usize::MAX 等于没限
+        assert!(ActionLimiter::read().limit < 1_000, "只读档位必须有实际上界");
+    }
+
+    /// ⭐⭐ 与 `heavy_handlers_are_actually_wired` 同源：删掉 handler 里那一行，
+    /// **没有任何行为测试会变红**（少一层保护，功能照常），只能源码级断言。
+    #[test]
+    fn read_handlers_are_actually_wired() {
+        let cases: [(&str, &str, &str); 6] = [
+            (include_str!("routes/databases.rs"), "db.rows", "databases::rows"),
+            (include_str!("routes/databases.rs"), "db.export", "databases::export_csv"),
+            (include_str!("routes/services/mod.rs"), "service.journal", "services::journal"),
+            (include_str!("routes/services/packages.rs"), "pkg.upgradable", "services::packages_upgradable"),
+            (include_str!("routes/containers.rs"), "container.list", "containers::list"),
+            (include_str!("routes/sites/conf.rs"), "site.logs", "sites::logs"),
+        ];
+        for (src, action, who) in cases {
+            let code: String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let needle = format!("check_read(&state, &s.username, \"{action}\")");
+            assert!(
+                code.contains(&needle),
+                "{who} 缺少只读限流接线（应当有 `{needle}?;`）。删掉它不会让任何行为测试变红，\
                  所以这条断言是唯一防线。"
             );
         }

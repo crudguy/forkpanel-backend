@@ -843,6 +843,9 @@ pub async fn rows(
     Query(q): Query<RowsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_VIEW)?;
+    // 只读限流：这里是**执行用户给的 SQL**（全表扫描也是一句话的事），
+    // 且能被无限重放，成本与一次小写入相当——不设限等于把库开放给"刷"。
+    crate::ratelimit::check_read(&state, &s.username, "db.rows")?;
     validate_ident(&db, "db")?;
     validate_ident(&table, "table")?;
     let page = q.page.unwrap_or(1).max(1);
@@ -880,6 +883,8 @@ pub async fn export_csv(
     AxPath((conn, db, table)): AxPath<(i64, String, String)>,
 ) -> ApiResult<Response> {
     crate::auth::require(&s, perm::DB_VIEW)?;
+    // 导出整表（上限 EXPORT_MAX_ROWS 行）比翻页更贵，同样要限。
+    crate::ratelimit::check_read(&state, &s.username, "db.export")?;
     validate_ident(&db, "db")?;
     validate_ident(&table, "table")?;
     let t = load_target(&state, conn, Some(&db)).await?;
