@@ -202,7 +202,13 @@ pub async fn login(
     let permissions = auth::permissions_for_role_resolved(&state, &role).await;
     let allowed_roots: Vec<String> = serde_json::from_str(&roots).unwrap_or_default();
     let sid = auth::generate_sid();
-    state.sessions.insert(sid.clone(), Session {
+    // 先构造会话值再插入，**插入后不回读**。
+    //
+    // 旧写法是 `insert(...); let s = sessions.get(&sid).unwrap();`——而 `get()` 会按
+    // `expires_at > now` 判过期并顺手删除。`[security] session_idle = "0s"` 是**合法
+    // 字符串**（解析成功、不触发 dur_or 的回落警告），插入时 `expires_at == now`，
+    // 回读必为 None ⇒ **每次登录都 panic**（一次配置即可自锁死面板）。
+    let sess = Session {
         user_id: uid,
         username: req.username.clone(),
         role,
@@ -211,11 +217,11 @@ pub async fn login(
         // 登录这一刻的来源 IP，之后所有审计记录都带它（见 Session::ip）
         ip: ip.clone(),
         created_at: 0, last_seen: 0, expires_at: 0,
-    });
+    };
+    state.sessions.insert(sid.clone(), sess.clone());
 
-    // 审计：登录成功
-    let s = state.sessions.get(&sid).unwrap();
-    audit(&state, &s, "auth.login", &req.username, "ok").await;
+    // 审计：登录成功（用刚构造的会话，不回读）
+    audit(&state, &sess, "auth.login", &req.username, "ok").await;
 
     let csrf = auth::generate_csrf_token();
     let mut h = HeaderMap::new();
@@ -690,6 +696,34 @@ mod tests {
             "429 分支必须调用 record_failure 才算「拦下也计数」（P2-11）；\
              否则被打回的尝试不推进计数，攻击者可用 1 req/s 长期在线爆破。\
              当前块内容：\n{block}"
+        );
+    }
+
+    /// **源码级守卫**：登录审计不得回读刚插入的会话。
+    ///
+    /// `SessionCache::get()` 会按 `expires_at > now` 判过期并顺手删除；而 `insert` 设
+    /// `expires_at = now + idle_timeout`。`[security] session_idle = "0s"` 是**合法**
+    /// 字符串（解析成功、不触发 dur_or 的回落警告），此时回读必为 None ⇒ 旧写法的
+    /// `.unwrap()` 会让**每次登录 panic**（一次配置即可自锁死面板）。
+    /// 纯函数单测抓不到 handler 里的那行调用，只能盯源码。
+    #[test]
+    fn login_audit_does_not_refetch_the_session() {
+        let src = include_str!("auth.rs");
+        // 先剔掉测试段：本断言的字符串里就写着 `sessions.get(&sid).unwrap()`，
+        // 不剔会自己命中自己（「判据指向错」类恒绿）。
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        let joined: Vec<&str> = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+        let joined = joined.join("\n");
+        assert!(
+            !joined.contains("sessions.get(&sid).unwrap()"),
+            "登录路径不得回读刚插入的会话：0 秒 session_idle 下回读为 None ⇒ panic"
+        );
+        assert!(
+            joined.contains("audit(&state, &sess, \"auth.login\""),
+            "登录审计必须使用刚构造的会话值（不回读）"
         );
     }
 }

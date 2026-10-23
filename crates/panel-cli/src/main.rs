@@ -216,6 +216,9 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Doctor => {
             let layout0 = build_layout(&os, None);
             let cfg = load_cfg(&cli, &layout0)?;
+            // 与 serve 同一套启动前校验（TLS 假控制 / 0 秒会话时长）：否则
+            // `panel doctor` 报全绿、serve 却起不来，而模板恰恰叫用户"改完跑 doctor"。
+            cfg.validate_implemented()?;
             let layout = build_layout(&os, Some(&cfg));
             let tier = detect_tier(&*os, &cfg);
             let checks = doctor::run(&*os, &layout, &layout.sqlite_path(), tier, &cfg.db.synchronous);

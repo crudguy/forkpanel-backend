@@ -189,6 +189,24 @@ impl Config {
                  请在前置反向代理（nginx / caddy）终结 TLS 后转发到本面板，或删除该段。",
             ));
         }
+        // 会话时长：解析失败已有 `dur_or` 响亮回落（刻意不让服务起不来），
+        // 但 **0 秒是合法字符串**（"0s"/"0m"）会静默通过 ⇒ 会话刚建即失效，
+        // 且旧登录路径（回读后 unwrap）会因此 panic。0 必须拒绝。
+        for (key, val) in [
+            ("session_idle", &self.security.session_idle),
+            ("session_absolute", &self.security.session_absolute),
+        ] {
+            if let Ok(d) = parse_duration(val) {
+                if d.is_zero() {
+                    return Err(PanelError::Validation {
+                        field: "security",
+                        reason: format!(
+                            "`{key} = \"{val}\"` 必须大于 0 秒（0 会让登录后的会话立刻失效）"
+                        ),
+                    });
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -302,6 +320,30 @@ mod tests {
     #[test]
     fn config_without_tls_passes_validation() {
         assert!(Config::default().validate_implemented().is_ok());
+    }
+
+    /// 0 秒会话时长是**合法字符串**（解析成功，不触发 dur_or 的回落警告），
+    /// 但会让会话刚建即失效（旧登录路径还会因回读 unwrap 而 panic）。必须启动前拒绝。
+    #[test]
+    fn zero_session_timeout_is_rejected_not_silently_accepted() {
+        let mut c = Config::default();
+        assert!(c.validate_implemented().is_ok(), "默认 30m/12h 必须放行");
+
+        c.security.session_idle = "0s".into();
+        let m = c.validate_implemented().unwrap_err().to_string();
+        assert!(m.contains("session_idle"), "须点名是哪一项：{m}");
+        assert!(m.contains("大于 0"), "须说明正确取值：{m}");
+
+        c.security.session_idle = "30m".into();
+        c.security.session_absolute = "0h".into();
+        assert!(c.validate_implemented().is_err(), "session_absolute=0h 也必须拒绝");
+
+        // 无法解析的值**不归这里管**：dur_or 会响亮回落，不能因它拒绝启动（既有设计）。
+        c.security.session_absolute = "45min".into();
+        assert!(
+            c.validate_implemented().is_ok(),
+            "解析失败交给 dur_or 回落并告警，不应拒绝启动"
+        );
     }
 
     /// 模板不得再宣传不存在的 `--features tls` 路径（那是这次假控制的源头）。
