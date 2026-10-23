@@ -393,6 +393,9 @@ fn run(cli: Cli) -> Result<()> {
                     eprintln!("════════════════════════════════════════════════════════");
                 }
 
+                // 非回环监听必须当场说清楚：面板 root 运行 + 明文 HTTP，
+                // 暴露面是安全边界而不是配置细节（见 warn_if_exposed 的注释）。
+                warn_if_exposed(&addr);
                 println!("监听 {addr}（档位 {tier:?}）");
 
                 let listener = tokio::net::TcpListener::bind(addr).await
@@ -1093,6 +1096,34 @@ fn detect_tier(os: &dyn panel_os::OsAdapter, cfg: &Config) -> Tier {
     cfg.tier(mem_mb, cpus)
 }
 
+/// 该监听地址是否**非回环**（即暴露到本机之外）。
+///
+/// 抽成纯函数是为了让"该不该警告"可断言——直接写在启动流程里就成了不可测的副作用，
+/// 而这类"看起来有防护其实没触发"的检查正是最容易静默失效的地方。
+fn is_non_loopback_bind(addr: &std::net::SocketAddr) -> bool {
+    !addr.ip().is_loopback()
+}
+
+/// 非回环监听的启动横幅。
+///
+/// 为什么必须说：面板**以 root 运行**，且本构建**不提供 HTTPS 监听**（serve 永远是
+/// 明文 `axum::serve`）。把它绑到 0.0.0.0 或局域网地址，等于把 root 权限的操作入口
+/// 直接放到网上——凭据会明文过网。此前启动只打印一行"监听 {addr}"，与监听回环时
+/// 完全一样，用户无从察觉。
+fn warn_if_exposed(addr: &std::net::SocketAddr) {
+    if !is_non_loopback_bind(addr) {
+        return;
+    }
+    eprintln!("════════════════════════════════════════════════════════");
+    eprintln!("[panel] ⚠ [security] 监听非回环地址 {addr}");
+    eprintln!("  面板以 root 运行，且本构建不提供 HTTPS：此处监听是明文 HTTP。");
+    eprintln!("  若这台机器能被局域网/公网访问，root 权限的操作入口即已暴露。");
+    eprintln!("  · 需要远程访问：优先 ssh -L 2083:127.0.0.1:2083 端口转发；");
+    eprintln!("  · 确需直接监听：务必前置反向代理终结 TLS，并用防火墙限制来源 IP；");
+    eprintln!("  · 只想本机访问：把 [server] localhost_only 设为 true（它会强制覆盖 bind）。");
+    eprintln!("════════════════════════════════════════════════════════");
+}
+
 fn init_tracing() {
     let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
     let _ = tracing_subscriber::fmt()
@@ -1143,6 +1174,36 @@ mod wiring_guard_tests {
     /// 日志层若加在它之前（或退回 build_router 内），未匹配请求（404 / SPA miss）
     /// 会整条绕过日志层。冒烟实测过这个形态：每个 404 都无日志行、其余全有行。
     /// 判据用 `find` 下标比较——源码出现顺序即 builder 调用顺序，层序即包裹关系。
+    /// 判据真机回归：回环不告警、非回环必须告警。
+    /// `0.0.0.0` 是最容易踩的一种——很多人以为它"只是本机"，实际是全网可达。
+    #[test]
+    fn non_loopback_bind_is_detected() {
+        let a = |s: &str| s.parse::<std::net::SocketAddr>().unwrap();
+        assert!(!super::is_non_loopback_bind(&a("127.0.0.1:2083")), "回环不得告警");
+        assert!(!super::is_non_loopback_bind(&a("[::1]:2083")), "IPv6 回环不得告警");
+        assert!(super::is_non_loopback_bind(&a("0.0.0.0:2083")), "0.0.0.0 是全网可达，必须告警");
+        assert!(super::is_non_loopback_bind(&a("192.168.1.5:2083")), "局域网地址必须告警");
+        assert!(super::is_non_loopback_bind(&a("[::]:2083")), "IPv6 未指定地址必须告警");
+    }
+
+    /// ⭐⭐ 接线守卫：`warn_if_exposed` 掉调用后，启动流程照常工作、所有行为测试
+    /// 全绿，只是"暴露到网上的提醒"从此消失——只能源码级钉住。
+    #[test]
+    fn serve_warns_when_listening_outside_loopback() {
+        let src = include_str!("main.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        let code: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("warn_if_exposed(&addr)"),
+            "serve 启动必须调用 warn_if_exposed(&addr)：面板 root 运行且无 HTTPS，\
+             非回环监听必须在启动日志里说清楚"
+        );
+    }
+
     #[test]
     fn request_log_is_the_outermost_layer_of_the_serve_chain() {
         let src = include_str!("main.rs");
