@@ -27,8 +27,10 @@ rusqlite   = { workspace = true }
 # 静态资源内嵌：运行期零 Node、零外部文件依赖
 rust-embed = { version = "8", features = ["mime-guess", "compression"] }
 
-# 可选 TLS。默认关闭：多数部署由前置 nginx/Caddy 终止 TLS，
-# 关闭可省下 rustls 及其依赖带来的数百 KB 体积。
+# ⚠ `tls` 目前是**未接线的占位特性**：全仓没有任何 `#[cfg(feature = "tls")]` 代码，
+# 启用它不会带来 HTTPS；`[server].tls` 会被 Config::validate_implemented() 拒绝启动。
+# 是否真正实现「面板自身 TLS」仍待决策（见 docs/audit-2026-10-17.md「待拍板」）。
+# 多数部署由前置 nginx/Caddy 终止 TLS，故默认关闭（也省下 rustls 数百 KB 体积）。
 axum-server = { version = "0.7", optional = true }
 rustls      = { version = "0.23", optional = true }
 rustls-pemfile = { version = "2", optional = true }

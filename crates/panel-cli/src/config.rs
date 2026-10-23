@@ -173,6 +173,24 @@ impl Config {
             _ => Tier::detect(total_mem_mb, cpus),
         }
     }
+
+    /// 启动前校验：拒绝「配置了但本构建未实现」的项 —— **配置项假控制**。
+    ///
+    /// 目前只有 `[server] tls`：字段存在、旧模板还宣传过"`--features tls` 构建即可"，
+    /// 但**代码里读 `tls` 的地方为零**（`axum_server`/`RustlsConfig`/`TlsAcceptor` 全仓
+    /// 无引用），serve 永远是明文 `axum::serve`。配置了却静默忽略 = 让用户以为有
+    /// HTTPS、实际同端口明文——比不提供 TLS 危险得多（凭据会明文过网）。
+    /// 故宁可拒绝启动，也不留一个"看起来生效"的假开关。
+    pub fn validate_implemented(&self) -> Result<()> {
+        if self.server.tls.is_some() {
+            return Err(PanelError::Unsupported(
+                "config [server].tls 不被支持：本构建无任何 TLS 实现，serve 只提供 http。\
+                 配置它会被静默忽略＝让你以为有 HTTPS、实际是明文。\
+                 请在前置反向代理（nginx / caddy）终结 TLS 后转发到本面板，或删除该段。",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// 解析 "30m" / "12h" / "90s" 形式的时长。**唯一解析入口**，勿在别处另写。
@@ -216,10 +234,10 @@ port = 2083
 # 前置反代后请保持 true：面板本身不暴露到公网
 localhost_only = true
 
-# [server.tls]
-# cert = "{cfg}/tls/fullchain.pem"
-# key  = "{cfg}/tls/privkey.pem"
-# 需以 --features tls 构建；默认关闭以省下 rustls 带来的体积
+# 本面板**不提供 HTTPS 监听**：serve 只有 http。TLS 请在前置反向代理
+# （nginx / caddy）终结后转发到本面板。
+# 不要配置 [server.tls]：该字段是历史占位、当前构建没有任何 TLS 实现，
+# 配了会被拒绝启动（宁可报错，也不让你以为有 HTTPS 而实际是明文）。
 
 # [paths]
 # config = "{cfg}"
@@ -265,6 +283,44 @@ mod tests {
         assert!(c.addr().unwrap().ip().is_loopback(), "localhost_only 必须覆盖 bind");
     }
 
+    /// 配置项假控制：`[server] tls` 配了却没有任何 TLS 实现。
+    /// 必须**拒绝启动**并给出可执行出路，而不是静默忽略（那会让人以为有 HTTPS）。
+    #[test]
+    fn tls_config_is_rejected_not_silently_ignored() {
+        let mut c = Config::default();
+        c.server.tls = Some(Tls {
+            cert: "/x/fullchain.pem".into(),
+            key: "/x/privkey.pem".into(),
+        });
+        let m = c.validate_implemented().unwrap_err().to_string();
+        assert!(m.contains("tls"), "须点名字段：{m}");
+        assert!(m.contains("反向代理"), "须给出可执行出路：{m}");
+        assert!(m.contains("明文"), "须说明真实后果（明文）：{m}");
+    }
+
+    /// 反向对照：没配 tls 的正常配置必须放行——否则就是"一律拒绝"的过度拦截。
+    #[test]
+    fn config_without_tls_passes_validation() {
+        assert!(Config::default().validate_implemented().is_ok());
+    }
+
+    /// 模板不得再宣传不存在的 `--features tls` 路径（那是这次假控制的源头）。
+    #[test]
+    fn template_does_not_advertise_a_working_tls_path() {
+        use std::path::PathBuf;
+        let t = template(
+            &PathBuf::from("/opt/cfg"),
+            &PathBuf::from("/opt/data"),
+            &PathBuf::from("/opt/sites"),
+        );
+        assert!(!t.contains("--features tls"), "模板不得宣传不存在的构建特性");
+        assert!(
+            !t.contains("[server.tls]\ncert"),
+            "模板不得给出可直接启用的 tls 配置块"
+        );
+        assert!(t.contains("反向代理"), "模板须把用户指向反向代理终结 TLS");
+    }
+
     #[test]
     fn unknown_fields_are_rejected() {
         let s = "[server]\nport = 2083\nnope = 1\n";
@@ -276,9 +332,11 @@ mod tests {
         use std::path::PathBuf;
         let t = template(&PathBuf::from("/opt/cfg"), &PathBuf::from("/opt/data"),
                          &PathBuf::from("/opt/sites"));
-        assert!(t.contains("/opt/data"), "data 路径应来自 PathLayout");
-        assert!(t.contains("/opt/sites"));
-        assert!(t.contains("/opt/cfg/tls/fullchain.pem"));
+        // 三条路径都必须来自 PathLayout 注入（[paths] 段）。此前这里靠 [server.tls]
+        // 的 cert/key 行证明 {cfg} 注入——TLS 假控制修复后该段已删除，改断言 [paths] 本身。
+        assert!(t.contains("config = \"/opt/cfg\""), "config 路径应来自 PathLayout");
+        assert!(t.contains("data = \"/opt/data\""), "data 路径应来自 PathLayout");
+        assert!(t.contains("site_root = \"/opt/sites\""), "site_root 路径应来自 PathLayout");
         // 用不含引号+斜杠的片段断言，避免把路径字面量写进测试
         assert!(!t.contains("var/lib"), "模板不应出现任何平台写死的路径");
         assert!(!t.contains("etc/panel"));

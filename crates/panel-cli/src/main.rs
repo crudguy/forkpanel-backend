@@ -237,6 +237,9 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Serve => {
             let layout0 = build_layout(&os, None);
             let cfg = load_cfg(&cli, &layout0)?;
+            // 配置项假控制闸门：`[server] tls` 无实现，配了必须拒绝启动而不是静默明文。
+            // 放在任何副作用（建库 / 起调度器 / bind）之前——失败时机器状态零改动。
+            cfg.validate_implemented()?;
             let layout = build_layout(&os, Some(&cfg));
             // 关键修复：把配置感知的路径布局注入适配器。否则运行期
             // `site_root()` 等 [paths] 覆盖不生效（adapter 仍用默认 /var/www），
@@ -1100,6 +1103,19 @@ mod wiring_guard_tests {
         assert!(
             prod.contains("backups::sweep_due(&state)"),
             "注册的实现必须真的调用 sweep_due"
+        );
+    }
+
+    /// `[server].tls` 的拒绝必须**接在 serve 启动路径上**，而不只是"有个函数"。
+    /// 只测 `validate_implemented()` 的纯逻辑不够——把 serve 里那行调用删掉，单测
+    /// 照样全绿，运行时又回到"配了 TLS 却静默明文"（配置项假控制）。
+    #[test]
+    fn tls_fake_control_is_wired_into_serve() {
+        let src = include_str!("main.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        assert!(
+            prod.contains("cfg.validate_implemented()?;"),
+            "serve 启动路径必须调用 validate_implemented()，否则 [server].tls 会被静默忽略"
         );
     }
 }
