@@ -10,6 +10,7 @@ use axum::{
     Json,
 };
 use panel_core::{PanelError, Result};
+use rusqlite::OptionalExtension;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -63,6 +64,21 @@ pub async fn cancel(
     AxPath(id): AxPath<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::TASK_MANAGE)?;
+    // 先确认任务存在且**处于可取消状态**：`TaskRunner::cancel` 只 UPDATE ...
+    // WHERE state IN ('queued','running') 且**丢弃 rows_changed**，对不存在的 id 也返回 Ok
+    // ⇒ 不做这层检查，"取消一个不存在的任务"会**报成功**（canceled: true），
+    // "取消一个已结束的任务"同样报成功——两种假成功（UI 会显示"已取消"）。
+    let st = state.pool.with(move |conn| {
+        conn.query_row("SELECT state FROM task_runs WHERE id = ?1", rusqlite::params![id], |r| r.get::<_, String>(0))
+            .optional()
+            .map_err(|e| PanelError::Database(e.to_string()))
+    }).await?;
+    let Some(st) = st else {
+        return Err(ApiError::not_found(format!("task {id}")));
+    };
+    if !matches!(st.as_str(), "queued" | "running") {
+        return Err(ApiError::conflict(format!("任务已结束（{st}），无法取消")));
+    }
     // 只置状态位；任务体在检查点优雅退出（强杀会留下半个副作用）
     state.tasks.cancel(id).await.map_err(ApiError::from)?;
     audit(&state, &s, "task.cancel", &id.to_string(), "ok").await;
@@ -84,9 +100,16 @@ pub async fn output(
     let path = state.pool.with(move |conn| {
         conn.query_row("SELECT output_path FROM task_runs WHERE id = ?1",
                        rusqlite::params![id], |r| r.get::<_, Option<String>>(0))
+            .optional()
             .map_err(|e| PanelError::Database(e.to_string()))
     }).await?;
 
+    // 任务不存在 ⇒ 404（与 `GET /tasks/{id}` 同一口径）。此前把"行不存在"当成
+    // 数据库错误（60000），而"任务存在但没有输出文件"才是 200 + 空 lines——
+    // 两种情况混在一起，调用方分不清"任务没了"和"任务没输出"。
+    let Some(path) = path else {
+        return Err(ApiError::not_found(format!("task {id}")));
+    };
     let Some(p) = path else {
         return Ok(ok(serde_json::json!({ "id": id, "lines": [], "note": "无输出文件" })));
     };

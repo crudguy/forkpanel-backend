@@ -8,7 +8,7 @@
 # （恒绿比没门禁更危险）。故 audit 单独成一个目标，CI 里单独一个 job——
 # advisory-db 托管在 GitHub，网络抖动时不该连带拖红主门禁。
 
-.PHONY: check guards audit test embed-fresh e2e-files e2e-backups e2e-containers e2e-cron e2e-databases e2e-sites e2e-firewall e2e-rbac e2e-security e2e-all e2e-ui
+.PHONY: check guards audit test embed-fresh e2e-files e2e-backups e2e-containers e2e-cron e2e-databases e2e-sites e2e-firewall e2e-rbac e2e-security e2e-all e2e-ui e2e-observe
 
 # 主门禁：静态守卫 + 全量测试（离线可跑，确定性高）
 check: guards lint embed-fresh test
@@ -139,6 +139,13 @@ e2e-all:
 #   make e2e-ui
 e2e-ui:
 	bash ci/e2e-ui.sh
+
+# 可观测与轻管理面 E2E（系统概览 / 指标 / 日志 / 通知 / 便签 / 任务中心）。
+# 只读为主：便签走完整生命周期（结尾删净）；通知 read-all 与任务 cancel **不碰**
+# （前者改用户可见状态、后者会打断真实任务）。不进 check。
+#   make e2e-observe
+e2e-observe:
+	bash ci/e2e-observe.sh
 
 test:
 	cargo test --workspace

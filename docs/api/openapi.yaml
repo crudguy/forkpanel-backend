@@ -3630,16 +3630,21 @@ paths:
   /api/v1/tasks/{id}/cancel:
     post:
       tags: [tasks]
-      summary: 取消（终止子进程组）
+      summary: 取消任务（任务体在检查点优雅退出，不强杀子进程组）
       security: [cookieAuth, csrfHeader]
-      parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID；表按名称索引（ID 随重建变化，名称通常保留），不强制 Docker 可达" }]
-      responses: { '204': { description: ok } }
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer }, description: "task_runs 的行 id（整数）——不是容器名；只有 queued/running 可取消" }]
+      responses:
+        '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { id: { type: integer }, canceled: { type: boolean } } } } } } } }
+        '404': { description: 任务不存在 }
+        '409': { description: 任务已结束（queued/running 之外），无法取消 }
   /api/v1/tasks/{id}/output:
     get:
       tags: [tasks]
       summary: 任务输出尾部读取
-      parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID；表按名称索引（ID 随重建变化，名称通常保留），不强制 Docker 可达" }]
-      responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: string } } } } } } }
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer }, description: "task_runs 的行 id（整数）——不是容器名" }]
+      responses:
+        '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { id: { type: integer }, lines: { type: array, items: { type: string } }, note: { type: string } } } } } } } }
+        '404': { description: 任务不存在 }
 
   # ───────── 设置 / 用户 / 审计 ─────────
   /api/v1/settings:

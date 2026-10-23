@@ -204,7 +204,7 @@
   校验，见 `panel-os` 的 `rendered_config_passes_real_nginx_syntax_check`）。
 - **能力驱动 UI**：未支持能力一律 EmptyState/置灰 + 原因，绝不假装可用。
 
-## 真机 E2E 脚本（九域，`ci/e2e-*.sh`）
+## 真机 E2E 脚本（十域，`ci/e2e-*.sh`）
 
 对**运行中的真实后端**打请求的脚本化验收，弥补"单测只覆盖纯逻辑、覆盖不到
 路由注册 + 能力位门禁 + OS provider 真实落盘"的空白。
@@ -220,11 +220,12 @@
 | `e2e-firewall` | 能力位、读端点、apply 拒绝（端口/CIDR/动作）+ **SSH 失联保护冲突** | **不写真实 iptables/nft、不改启停、不删规则** | 17 |
 | `e2e-rbac` | 用户/角色 CRUD、owner 与自锁守卫（403）、**防提权**（第二会话：仅 `user.manage` 的用户不能授予自己没有的权限）、内置角色保留、被引用角色不可删、部署级设置拒绝 PATCH、审计 `user.create`/`role.create` 真写入 | 不建 owner、不动真实用户 | 63 |
 | `e2e-security` | WAF 模板校验与 CRUD（profile/限速/burst/IP 列表）、拦截事件过滤、告警阈值与窗宽越界、安全基线（只读 + 错误确认词 10001）、在线会话（恰一 current、差集识别并吊销自己新建的会话 204） | **绝不用正确确认词调 `baseline/apply`**（会写回 sshd）；告警只原值回写；只吊销本次新建的会话 | 40 |
+| `e2e-observe` | 系统概览与指标（overview 字段齐全、realtime/history、`gran` 非法 10001）、日志源与读取（行形状、histogram、未知源 404、grep 超长 10001）、通知（未读数、只碰不存在的 id）、本机便签完整生命周期、任务中心（详情/输出/不存在 404） | 通知 read-all 与任务 cancel **不碰**（前者改用户可见状态、后者会打断真实任务）；日志 download 不落文件 | 46 |
 
-合计 **331 条断言**。运行方式：
+合计 **377 条断言**。运行方式：
 
 ```bash
-make e2e-all                                    # 九域串行跑完并聚合（上线前整机自检）
+make e2e-all                                    # 十域串行跑完并聚合（上线前整机自检）
 make e2e-containers BASE=http://127.0.0.1:2084  # 单域
 ```
 
@@ -238,7 +239,7 @@ make e2e-containers BASE=http://127.0.0.1:2084  # 单域
 
 ### 浏览器级 UI 冒烟（`ci/e2e-ui.sh`，20 条断言）
 
-九域 E2E 全部打在 **API** 上；前端 74 个 UI 文件（32 views + 42 components）此前
+十域 E2E 全部打在 **API** 上；前端 74 个 UI 文件（32 views + 42 components）此前
 **没有任何渲染测试**（vitest 只收 `src/**/*.test.ts` 且无 vue 插件）。而本项目踩过的
 最深一坑正是这一类——**新增子组件忘了 import ⇒ 静默不渲染**（Vue 把未知标签当普通
 元素渲染出空内容，仅 console warning；vue-tsc / build / 单测全绿），后端 E2E 永远

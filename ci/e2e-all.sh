@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# 真机 E2E 汇总 runner：一次跑完九域，聚合结果。
+# 真机 E2E 汇总 runner：一次跑完十域，聚合结果。
 #
 # ## 为什么需要
-# 九域各有独立脚本（`ci/e2e-*.sh`）。单个 `make e2e-<域>` 适合调一个域；上线前要
+# 十域各有独立脚本（`ci/e2e-*.sh`）。单个 `make e2e-<域>` 适合调一个域；上线前要
 # "整机跑一遍"时，需要一条命令给出**全局**结论。本脚本只做编排与聚合，不重复任何
 # 断言——断言仍由各域脚本负责（单一事实源，改口径只改一处）。
 #
 # ## 用法
 #   ci/e2e-all.sh [base_url] [--stop-on-fail]
 #     base_url 默认 http://127.0.0.1:2083（或 PANEL_E2E_BASE）
-#     --stop-on-fail  首个失败即停（默认跑完全部九域再统一汇报）
+#     --stop-on-fail  首个失败即停（默认跑完全部十域再统一汇报）
 #   凭据：PANEL_E2E_USER / PANEL_E2E_PASS（默认 admin / DevPreview2026x）
 #
 # ## 纪律
-#  1. **串行**：九个脚本打同一个后端，并行会互相干扰任务队列 / 审计 / 限流与临时对象。
+#  1. **串行**：十个脚本打同一个后端，并行会互相干扰任务队列 / 审计 / 限流与临时对象。
 #  2. **skip 不冒充通过**：后端不可达时首个脚本打印 `[skip]`，本脚本立即停止并明确
 #     告知"未验证任何东西"，而不是把剩下六个也跑成 skip 佯装跑过（恒绿守卫之戒）。
 #  3. **退出码是权威信号**：PASS/FAIL 数字仅用于汇报；某域退出码非 0 即判失败，
@@ -37,11 +37,11 @@ B="${B:-${PANEL_E2E_BASE:-http://127.0.0.1:2083}}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # 顺序：只读/低副作用在前，写操作在后；中途失败时前面的结论仍然可信。
-SCRIPTS=(e2e-files e2e-backups e2e-containers e2e-cron e2e-databases e2e-sites e2e-firewall e2e-rbac e2e-security)
+SCRIPTS=(e2e-files e2e-backups e2e-containers e2e-cron e2e-databases e2e-sites e2e-firewall e2e-rbac e2e-security e2e-observe)
 declare -A LABEL=(
   [e2e-files]="文件" [e2e-backups]="备份" [e2e-containers]="容器"
   [e2e-cron]="计划任务" [e2e-databases]="数据库" [e2e-sites]="站点"
-  [e2e-firewall]="防火墙" [e2e-rbac]="权限与设置" [e2e-security]="WAF 与安全"
+  [e2e-firewall]="防火墙" [e2e-rbac]="权限与设置" [e2e-security]="WAF 与安全" [e2e-observe]="可观测"
 )
 
 say() { printf '%s\n' "$*"; }
@@ -58,7 +58,7 @@ for s in "${SCRIPTS[@]}"; do
   if printf '%s\n' "$out" | grep -q '^\[skip\]'; then
     SKIPPED=1
     say ""
-    say "!! [$s] 后端不可达 —— 九个域都会 skip，提前结束；**本次未验证任何东西**。"
+    say "!! [$s] 后端不可达 —— 十个域都会 skip，提前结束；**本次未验证任何东西**。"
     break
   fi
 
@@ -97,5 +97,5 @@ if [ "$BAD" -ne 0 ]; then
   say "  结论：有域失败（见上表 [FAIL] 行）。"
   exit 1
 fi
-say "  结论：九域全部通过。"
+say "  结论：十域全部通过。"
 exit 0
