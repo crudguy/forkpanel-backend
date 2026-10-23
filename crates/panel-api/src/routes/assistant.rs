@@ -10,6 +10,12 @@
 //! **护栏**：助手**只读**。Findings 里的 `action` 只有 `navigate`（跳转视图）
 //! 一种——不携带任何可自动执行的语义；任何处置动作仍由用户在对应视图内
 //! 走既有端点与权限。响应也不是流式（SSE 留给 LLM 接入后再上）。
+//!
+//! **外发纪律（P0-2）**：叙事层会把诊断数据 POST 到管理员配置的第三方端点，
+//! 因此三条闸门缺一不可——① **独立开关** `assistant.llm_narrative`，缺省关，
+//! 关时 `settings::llm_config()` 直接返回 None（不外发任何数据）；
+//! ② **发送前脱敏**（`redact_for_llm`：IPv4/邮箱/密钥样式键值/Bearer）；
+//! ③ **披露**：会外发什么由 `settings::NARRATIVE_NOTE` 单一维护并原样展示。
 
 use crate::auth::perm;
 use crate::error::{ok, ApiResult};
@@ -444,11 +450,190 @@ fn brief(ctx: &Ctx) -> ContextBrief {
 /// 超时即视为「叙事不可用」，回退纯规则报告（不影响 findings/summary）。
 const NARRATIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
+// ───────────────────────── 外发脱敏（P0-2） ─────────────────────────
+
+/// 密钥样式键值的关键词（大小写不敏感）。命中后**保留键名、替换值**——
+/// 键名本身（"api_key"）不敏感，敏感的是后面的凭证。
+const SECRET_KWS: &[&str] = &[
+    "api_key", "api-key", "apikey", "access_key", "access-key",
+    "secret_key", "secret-key", "private_key", "private-key",
+    "auth_token", "token", "secret", "password", "passwd", "pwd",
+    "authorization", "credentials", "credential", "key",
+];
+
+/// 认证 Scheme 词：值恰为其中之一时，继续吃掉下一个 token
+/// （`Authorization: Bearer xyz` 的值以空白分两段，只吃一段会漏掉真凭证）。
+fn is_auth_scheme(v: &str) -> bool {
+    v.eq_ignore_ascii_case("bearer") || v.eq_ignore_ascii_case("basic")
+        || v.eq_ignore_ascii_case("token") || v.eq_ignore_ascii_case("apikey")
+        || v.eq_ignore_ascii_case("key")
+}
+
+/// 键值"值"的终止符（引号已在调用方单独处理）。
+fn is_value_terminator(c: char) -> bool {
+    matches!(c, ',' | ';' | ')' | ']' | '}')
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'
+}
+
+fn matches_ci(ch: &[char], i: usize, kw: &str) -> bool {
+    let kw: Vec<char> = kw.chars().collect();
+    if i + kw.len() > ch.len() { return false; }
+    ch[i..i + kw.len()].iter().zip(kw.iter()).all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+/// `Bearer <token>`（大小写不敏感）。返回 token 结束位置（不含）。
+fn bearer_at(ch: &[char], i: usize) -> Option<usize> {
+    if i > 0 && is_word_char(ch[i - 1]) { return None; }
+    if !matches_ci(ch, i, "bearer") { return None; }
+    let mut j = i + 6;
+    while j < ch.len() && (ch[j] == ' ' || ch[j] == '\t') { j += 1; }
+    let tok = j;
+    while j < ch.len() && !ch[j].is_whitespace() { j += 1; }
+    (j > tok).then_some(j)
+}
+
+/// 密钥样式键值。返回 `(值起始, 值结束)`——调用方原样复制 `[i, 值起始)`
+/// （键名 + 分隔符），把值替换为 `<redacted>`。
+fn secret_kv_at(ch: &[char], i: usize) -> Option<(usize, usize)> {
+    if i > 0 && is_word_char(ch[i - 1]) { return None; }
+    for kw in SECRET_KWS {
+        if !matches_ci(ch, i, kw) { continue; }
+        let mut j = i + kw.chars().count();
+        // 键名后紧跟字母 ⇒ 是更长的标识符（"tokens:"），不是密钥键
+        if j < ch.len() && ch[j].is_ascii_alphabetic() { continue; }
+        while j < ch.len() && (ch[j] == ' ' || ch[j] == '\t') { j += 1; }
+        if j >= ch.len() || (ch[j] != '=' && ch[j] != ':') { continue; }
+        j += 1;
+        while j < ch.len() && (ch[j] == ' ' || ch[j] == '\t') { j += 1; }
+        let vstart = j;
+        if j < ch.len() && (ch[j] == '"' || ch[j] == '\'') {
+            // 引号值：整体吃到配对引号（"p@ss w0rd" 中间有空白也不能漏）
+            let q = ch[j];
+            j += 1;
+            while j < ch.len() && ch[j] != q { j += 1; }
+            if j < ch.len() { j += 1; }
+        } else {
+            while j < ch.len() && !ch[j].is_whitespace() && !is_value_terminator(ch[j]) { j += 1; }
+            let val: String = ch[vstart..j].iter().collect();
+            if is_auth_scheme(&val) {
+                while j < ch.len() && ch[j].is_whitespace() { j += 1; }
+                while j < ch.len() && !ch[j].is_whitespace() && !is_value_terminator(ch[j]) { j += 1; }
+            }
+        }
+        if j > vstart { return Some((vstart, j)); }
+        return None; // "password:" 后没有值——不是泄漏，原样放过
+    }
+    None
+}
+
+/// IPv4（每段 ≤255，四段）。返回结束位置（不含）。
+fn ipv4_at(ch: &[char], i: usize) -> Option<usize> {
+    // 前边界：不从更长数字/版本串的中段开始匹配
+    if i > 0 && (ch[i - 1].is_ascii_digit() || ch[i - 1] == '.') { return None; }
+    let mut j = i;
+    let mut groups = 0;
+    while groups < 4 {
+        let mut n: u32 = 0;
+        let mut digits = 0;
+        while j < ch.len() && ch[j].is_ascii_digit() && digits < 3 {
+            n = n * 10 + (ch[j] as u32 - '0' as u32);
+            j += 1;
+            digits += 1;
+        }
+        if digits == 0 || n > 255 { return None; }
+        groups += 1;
+        if groups == 4 { break; }
+        if j >= ch.len() || ch[j] != '.' { return None; }
+        j += 1;
+    }
+    // 后边界："1.2.3.4.5" 不是 IP，不整体吃
+    if j < ch.len() && (ch[j].is_ascii_digit() || ch[j] == '.') { return None; }
+    Some(j)
+}
+
+/// 邮箱（local@domain，域名须含点且不以点/连字符收尾）。返回结束位置（不含）。
+fn email_at(ch: &[char], i: usize) -> Option<usize> {
+    if i > 0 && is_word_char(ch[i - 1]) { return None; }
+    let mut j = i;
+    while j < ch.len()
+        && (ch[j].is_ascii_alphanumeric() || matches!(ch[j], '.' | '_' | '%' | '+' | '-'))
+    {
+        j += 1;
+    }
+    if j == i || j >= ch.len() || ch[j] != '@' { return None; }
+    j += 1;
+    let dom_start = j;
+    let mut last_dot = None;
+    while j < ch.len() && (ch[j].is_ascii_alphanumeric() || ch[j] == '.' || ch[j] == '-') {
+        if ch[j] == '.' { last_dot = Some(j); }
+        j += 1;
+    }
+    match last_dot {
+        Some(p) if p > dom_start && p + 1 < j && ch[j - 1] != '.' && ch[j - 1] != '-' => Some(j),
+        _ => None,
+    }
+}
+
+/// 发送给第三方 LLM 前的脱敏。**纯函数、零新增依赖**（本仓无 regex，也不为它开
+/// 依赖口子——直接依赖有预算，且这四类形态手写判定比引正则更可控）。
+///
+/// 覆盖四类高危形态（journald error 行的常见泄漏）：
+/// 1. IPv4——内网地址拓扑；
+/// 2. 邮箱——账号 / PII；
+/// 3. `api_key=…` / `token: …` 等密钥样式键值（键名保留、值替换）；
+/// 4. `Bearer <token>`——HTTP 认证头（含 `Authorization: Bearer x` 两段值）。
+///
+/// **刻意不覆盖**：绝对路径与主机名。路径是诊断的核心证据（哪个站点的日志、
+/// 哪个二进制在报错），主机名在单机面板场景基本就是机器自己的名字；为它们脱敏
+/// 会让叙事层基本失效。披露文案（`settings::NARRATIVE_NOTE`）如实列出覆盖范围，
+/// 不夸大"已完全脱敏"。
+///
+/// 取舍原则：**宁可多脱、不可漏脱**。版本号 "8.2.4.1" 被误伤成 `<ip>` 可以接受
+/// （叙事仍然通顺），漏一个内网 IP 或一个密钥就是真泄漏。
+pub(crate) fn redact_for_llm(s: &str) -> String {
+    let ch: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < ch.len() {
+        if let Some(end) = bearer_at(&ch, i) {
+            out.push_str("Bearer <redacted>");
+            i = end;
+            continue;
+        }
+        if let Some((vstart, vend)) = secret_kv_at(&ch, i) {
+            out.extend(ch[i..vstart].iter());
+            out.push_str("<redacted>");
+            i = vend;
+            continue;
+        }
+        if let Some(end) = email_at(&ch, i) {
+            out.push_str("<email>");
+            i = end;
+            continue;
+        }
+        if let Some(end) = ipv4_at(&ch, i) {
+            out.push_str("<ip>");
+            i = end;
+            continue;
+        }
+        out.push(ch[i]);
+        i += 1;
+    }
+    out
+}
+
 /// 把结构化诊断拼成给 LLM 的纯数据提示词。**只含我们真实采集到的字段**——
 /// 系统提示明确要求不得编造诊断中没有的数据，从源头杜绝幻觉式臆测。
+/// 所有携带原始数据的字段出盒前经 `redact_for_llm` 脱敏（P0-2）。
 fn build_prompt(scope: &str, summary: &str, findings: &[Finding]) -> String {
+    // 出盒前脱敏：summary 与 evidence 是唯二携带原始数据的字段（进程 cmdline、
+    // 日志原文都在 evidence 里）。title/suggestion 是规则生成的固定文案，
+    // 一并过脱敏只是廉价保险。
     let mut s = String::new();
-    s.push_str(&format!("诊断范围：{scope}\n一句话结论：{summary}\n"));
+    s.push_str(&format!("诊断范围：{scope}\n一句话结论：{}\n", redact_for_llm(summary)));
     if findings.is_empty() {
         s.push_str("未发现异常项。\n");
     } else {
@@ -461,7 +646,8 @@ fn build_prompt(scope: &str, summary: &str, findings: &[Finding]) -> String {
             };
             s.push_str(&format!(
                 "- [{}] {}。证据：{}。建议：{}\n",
-                sev, f.title, f.evidence.join("；"), f.suggestion
+                sev, redact_for_llm(&f.title), redact_for_llm(&f.evidence.join("；")),
+                redact_for_llm(&f.suggestion)
             ));
         }
     }
@@ -676,5 +862,71 @@ mod tests {
         assert!(p.contains("发现 1 项严重"), "应含一句话结论");
         assert!(p.contains("mining_frenzy"), "应含真实证据（进程点名）");
         assert!(p.contains("不要编造"), "应约束 LLM 不得编造数据");
+    }
+
+    #[test]
+    fn redact_for_llm_covers_the_four_leak_shapes() {
+        // ① IPv4（端口等上下文保留）；四段点串的后边界防误伤
+        assert_eq!(redact_for_llm("连接 10.0.0.5:443 失败"), "连接 <ip>:443 失败");
+        assert_eq!(redact_for_llm("从 10.0.0.1 到 10.0.0.2 不通"), "从 <ip> 到 <ip> 不通");
+        assert_eq!(redact_for_llm("版本 1.2.3.4.5 发布"), "版本 1.2.3.4.5 发布");
+        // ② 邮箱（域名须含点；无点的本地账号不误判为邮箱）
+        assert_eq!(redact_for_llm("联系 admin@example.com 处理"), "联系 <email> 处理");
+        assert_eq!(redact_for_llm("root@localhost 本地账号"), "root@localhost 本地账号");
+        // ③ 密钥样式键值：键名保留、值替换（大小写不敏感；引号值整体吃）
+        assert_eq!(redact_for_llm("api_key=sk-live-12345"), "api_key=<redacted>");
+        assert_eq!(redact_for_llm("password: hunter2"), "password: <redacted>");
+        assert_eq!(redact_for_llm("TOKEN=abc"), "TOKEN=<redacted>");
+        assert_eq!(redact_for_llm(r#"secret="p@ss w0rd""#), r#"secret=<redacted>"#);
+        // 键名后紧跟字母 ⇒ 是更长的标识符，不是密钥键
+        assert_eq!(redact_for_llm("tokens: 12"), "tokens: 12");
+        // 有键无值不是泄漏，原样放过
+        assert_eq!(redact_for_llm("password:"), "password:");
+        // ④ Bearer：Authorization 两段值整体吃；裸 Bearer 也吃
+        assert_eq!(
+            redact_for_llm("Authorization: Bearer abc123"),
+            "Authorization: <redacted>"
+        );
+        assert_eq!(redact_for_llm("bearer xyz 拒绝"), "Bearer <redacted> 拒绝");
+    }
+
+    #[test]
+    fn redact_for_llm_keeps_diagnostic_signal() {
+        // 路径与主机名**刻意不脱敏**——它们是诊断的核心证据（哪个日志、哪台机器）。
+        // 这条测试钉住取舍：谁把这里改成脱敏，先改披露文案再改。
+        let line = "nginx: [error] open() /var/log/nginx/error.log failed on web-01.corp";
+        assert_eq!(redact_for_llm(line), line);
+        assert_eq!(
+            redact_for_llm("CPU 使用率 92%，内存可用 5%"),
+            "CPU 使用率 92%，内存可用 5%"
+        );
+    }
+
+    #[test]
+    fn narrative_prompt_is_redacted_before_leaving_the_box() {
+        // 端到端：build_prompt 是唯一出盒载荷（generate_narrative 只发它），
+        // 证据里的四类高危形态一样都不许原样离开本机。
+        let f = Finding {
+            id: "log.errors",
+            severity: Severity::Warn,
+            title: "近期错误日志".into(),
+            evidence: vec![
+                "sshd[42]: Failed password for root from 10.0.0.5 port 22".into(),
+                "app: smtp relay to admin@example.com rejected, api_key=sk-live-9f8e7d".into(),
+            ],
+            suggestion: "检查 /var/log/auth.log 与发信配置".into(),
+            action: None,
+        };
+        let p = build_prompt("log", "内网 10.0.0.5 有暴力破解痕迹", std::slice::from_ref(&f));
+        assert!(!p.contains("10.0.0.5"), "IP 必须脱敏");
+        assert!(!p.contains("admin@example.com"), "邮箱必须脱敏");
+        assert!(!p.contains("sk-live-9f8e7d"), "密钥必须脱敏");
+        assert!(
+            p.contains("<ip>") && p.contains("<email>") && p.contains("<redacted>"),
+            "应有脱敏占位符"
+        );
+        // 诊断信号仍在——脱敏脱到叙事失效同样是失败
+        assert!(p.contains("sshd") && p.contains("Failed password"), "进程与事件类型要保留");
+        assert!(p.contains("/var/log/auth.log"), "路径是诊断证据，刻意不脱敏");
     }
 }

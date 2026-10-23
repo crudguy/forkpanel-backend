@@ -1232,6 +1232,8 @@ components:
             endpoint:     { type: [string, "null"], description: assistant.llm_endpoint }
             model:        { type: [string, "null"], description: assistant.llm_model }
             api_key_set:  { type: boolean, description: assistant.llm_api_key 是否已设置（永不明文） }
+            narrative:     { type: boolean, description: assistant.llm_narrative 开关；false（缺省）时后端不外发任何诊断数据，diagnose 回退纯规则报告 }
+            narrative_note: { type: string, description: 开启后会外发什么的披露文案（后端单一维护，前端原样展示，不得自行改写） }
         deployment:
           type: object
           description: 部署级只读展示（改 config.toml 并重启）
@@ -1252,8 +1254,8 @@ components:
       properties:
         settings:
           type: object
-          description: 键值对；白名单=assistant.llm_endpoint/llm_model/llm_api_key；值 null=清除该键
-          additionalProperties: { type: [string, "null"] }
+          description: 键值对；白名单=assistant.llm_endpoint/llm_model/llm_api_key/llm_narrative；值 null=清除该键
+          additionalProperties: { type: [string, boolean, "null"] }
     DashboardCardPref:
       type: object
       required: [id, visible]
@@ -3655,11 +3657,12 @@ paths:
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/SettingsReport' } } } } } } }
     patch:
       tags: [settings]
-      summary: 修改 runtime 设置（当前仅 AI 助手 LLM 三键；api_key 经主密钥加密，GET 永不明文）
+      summary: 修改 runtime 设置（当前仅 AI 助手 LLM 四键；api_key 经主密钥加密，GET 永不明文）
       description: |
         白名单：`assistant.llm_endpoint`（http(s) URL）/ `assistant.llm_model` /
-        `assistant.llm_api_key`（值 null = 清除）。部署级键（read_only/tier/
-        max_login_attempts/session_idle_timeout）返回 400——请改 config.toml 并重启。
+        `assistant.llm_api_key`（值 null = 清除）/ `assistant.llm_narrative`
+        （布尔；false = 关，缺省即关——开启才会把脱敏后的诊断数据发往配置的 Endpoint）。
+        部署级键（read_only/tier/max_login_attempts/session_idle_timeout）返回 400——请改 config.toml 并重启。
       security: [cookieAuth, csrfHeader]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SettingsPatch' } } } }
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/SettingsReport' } } } } } } }

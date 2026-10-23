@@ -123,7 +123,7 @@
 
 | 方法 + 路径 | 文档要求 | 后端状态 | 备注 | 前端视图 |
 |---|---|---|---|---|
-| GET `/settings` / PATCH `/settings` | 面板设置 | ✅ | **三段诚实模型**：runtime（AI 助手 LLM 三键，api_key 主密钥加密、GET 永不明文）可改即生效；deployment（read_only/tier）只读展示；reserved 种子键如实标注未接线。PATCH 部署级键 400 | SettingsView |
+| GET `/settings` / PATCH `/settings` | 面板设置 | ✅ | **三段诚实模型**：runtime（AI 助手 LLM 四键——endpoint / model / api_key / narrative 独立开关；api_key 主密钥加密、GET 永不明文）可改即生效；narrative 缺省关，关时后端不外发任何诊断数据；deployment（read_only/tier）只读展示；reserved 种子键如实标注未接线。PATCH 部署级键 400 | SettingsView |
 | GET/POST `/users` + PATCH/DELETE `/users/{id}` | 用户管理 | ✅ | 含降级/自操作守卫全套（13 项守卫冒烟通过） | UsersView |
 | GET `/audit` | 审计（分页/过滤） | ✅ | | AuditView |
 
@@ -139,7 +139,7 @@
 |---|---|---|---|
 | GET `/containers`、`/containers/images`；POST `/{id}/start\|stop\|restart`；DELETE `/{id}` | 容器（#47） | ✅ | 能力位看**守护进程可达性**（socket EACCES→daemon_unreachable 501）；参数注入白名单（禁首字符 `-`）；**创建容器不做**（等价任意代码执行，待专项） |
 | GET `/api/v1/terminal`（WS） | Web 终端（#51） | ✅ | PTY 收敛 `spawn_pty`；八道卫士升级前判定；Origin 同源替代 CSRF；空闲 15min SIGHUP；并发 ≤4 |
-| POST `/api/v1/assistant/diagnose` | AI 助手（#52） | ✅ | 内置规则诊断（8 规则 + 关键词路由）；只读护栏（action 仅 navigate）；LLM 层待接入 |
+| POST `/api/v1/assistant/diagnose` | AI 助手（#52） | ✅ | 内置规则诊断（8 规则 + 关键词路由）；只读护栏（action 仅 navigate）；LLM 叙事层已接线但独立开关缺省关（P0-2：开=脱敏后外发+披露，关=纯规则报告） |
 | `/api/v1/backups` CRUD + `/{id}/run` + `/{id}/remote/artifacts` + `/{id}/artifacts/{name}` | 备份计划（#49） | ✅ | panel=独立连接快照 / site=tar.gz / **db=按引擎导出（.db / .sql）**；**cron 由 `backup.sweep` 每分钟调度（只推进不补跑）**；**keep_count 自动清理 ✅**；**备份前空间水位检查 ✅**（估算值 + 64 MiB 余量，加密按 2 倍峰值；mysql/pg 估不出则跳过，**查不到可用空间一律放行**）；**产物可下载 ✅**；**远端可读（清单 + 从远端恢复）✅，S3 列表自动翻页 ✅**（ListObjectsV2 单次上限 1000，不翻页会让远端看起来只有 1000 个产物）；**restore ✅**（site 与 db：确认词 + 产物名白名单 + 自动先备份当前态 + 归档逃逸/范围校验；**恢复后校验落盘结果 ✅**（逐条比对归档文件是否真在站点目录下，一个都没落盘/只找回一部分 → 任务置 failed，不静默报成功）；panel 库走 `panel restore-db`，在线恢复仍 🟡）|
 | `/api/v1/security/baseline` | 安全基线（#48） | ✅ | 见 §9 |
 | GET `/api/v1/backups/system`、`/backups/system/{name}` | 系统自动备份（面板库每日快照） | ✅ | 列表 + 下载（`^panel-[0-9]+\\.db$` 白名单 + canonicalize 父目录校验）；响应回**实际生效**的 `keep`（config.toml `[db] backup_keep`）与 `daily_backup`——此前卡片只写"由 backup_keep 控制"却不给值，改成 3 份的机器上仍在暗示 7；现由后端守卫 + 前端源码守卫双向钉住 |

@@ -2,7 +2,11 @@
 //!
 //! **诚实三段模型**——settings 表的 8 个种子行当前**全部是死数据**（无运行时
 //! 消费点），绝不能伪装成"可改即生效"：
-//! - `runtime`：真正可改且立即生效的键（当前 = AI 助手 LLM 三键）
+//! - `runtime`：真正可改且立即生效的键（当前 = AI 助手 LLM 四键：endpoint / model /
+//!   api_key / **narrative 独立开关**）。开关关闭时 `llm_config()` 返回 `None`
+//!   ⇒ 诊断不外发任何数据（与未配置同路，回退纯规则报告）；开启时每次诊断会把
+//!   指标摘要 + 规则结论 + 最近 20 条 error 级日志（**发送前脱敏**，见
+//!   `assistant::redact_for_llm`）POST 到管理员配置的端点。
 //! - `deployment`：部署级配置（read_only / tier / max_login_attempts / session_idle /
 //!   session_absolute / audit_retention_days / audit_max_rows / localhost_only /
 //!   db_daily_backup / db_synchronous / db_backup_keep），**只读展示**实际生效值，
@@ -30,9 +34,17 @@ use crate::extract::PanelJson;
 const K_LLM_ENDPOINT: &str = "assistant.llm_endpoint";
 const K_LLM_MODEL: &str = "assistant.llm_model";
 const K_LLM_API_KEY: &str = "assistant.llm_api_key";
+/// LLM 叙事层独立开关（布尔）。**缺省 = 关**：外发第三方端点必须显式同意，
+/// 不搞「配齐三键即自动外发」——那等于把隐私决定藏在连接参数里。
+const K_LLM_NARRATIVE: &str = "assistant.llm_narrative";
 
-/// runtime 白名单：PATCH 只接受这三个键。
-const RUNTIME_KEYS: [&str; 3] = [K_LLM_ENDPOINT, K_LLM_MODEL, K_LLM_API_KEY];
+/// runtime 白名单：PATCH 只接受这四个键。
+const RUNTIME_KEYS: [&str; 4] = [K_LLM_ENDPOINT, K_LLM_MODEL, K_LLM_API_KEY, K_LLM_NARRATIVE];
+
+/// 开启叙事后**会外发什么**的披露文案。由后端单一维护、前端原样展示——
+/// 文案与 `assistant::redact_for_llm` 的实际覆盖范围一一对应，杜绝
+/// 「文档说已脱敏、代码没脱敏」的漂移。
+pub const NARRATIVE_NOTE: &str = "开启后，每次诊断会把以下内容发送到上方配置的 Endpoint：CPU/内存/磁盘等指标摘要、规则诊断结论，以及最近 20 条 error 级系统日志原文（发送前脱敏 IP 地址、邮箱与密钥样式文本；路径与主机名不脱敏——它们是诊断的核心证据）。数据离开本机后不再受面板控制。关闭时仅使用内置规则诊断，不外发任何数据。";
 
 /// 部署级键：在 settings 表里只有死种子，实际生效值来自 config.toml/env。
 const DEPLOYMENT_KEYS: [&str; 11] = [
@@ -60,6 +72,21 @@ pub struct LlmRuntime {
     model: Option<String>,
     /// 只回布尔，**绝不回明文**
     api_key_set: bool,
+    /// LLM 叙事层独立开关（缺省 false）。false 时 llm_config() 返回 None。
+    narrative: bool,
+    /// 开启后会外发什么的披露文案（单一事实源，前端原样渲染）
+    narrative_note: &'static str,
+}
+
+/// 叙事开关读取：表内值为 JSON 字符串 "true" 才算开；缺省/其余一律关。
+/// 纯函数（不吃 state）——开关语义必须有单测盯着，见 tests。
+fn narrative_on(table: &std::collections::BTreeMap<String, String>) -> bool {
+    table
+        .get(K_LLM_NARRATIVE)
+        .and_then(|j| serde_json::from_str::<Value>(j).ok())
+        .and_then(|v| v.as_str().map(str::to_string))
+        .as_deref()
+        == Some("true")
 }
 
 #[derive(Debug, Serialize)]
@@ -80,10 +107,18 @@ pub struct LlmConfig {
     pub api_key: String,
 }
 
-/// 读取已保存的 LLM 配置；三键任一缺失或 api_key 解密失败 → `None`（优雅降级）。
+/// 读取已保存的 LLM 配置；三键任一缺失、api_key 解密失败、**或叙事开关未开启**
+/// → `None`（优雅降级：diagnose 回退纯规则报告，不外发任何数据）。
+///
+/// 开关放在最前判：关的时候连 api_key 都不必解密。门控收敛在这一处，
+/// 调用方（assistant::diagnose）无需各自记得查开关——「配了密钥却忘接线」
+/// 与「接了线却忘让开关生效」两类假控制都由此规避。
 /// 复用本模块的 `load_table` 与 `plain_api_key`，密钥处理集中在此一处。
 pub async fn llm_config(state: &Shared) -> ApiResult<Option<LlmConfig>> {
     let table = load_table(state).await?;
+    if !narrative_on(&table) {
+        return Ok(None);
+    }
     let endpoint = table
         .get(K_LLM_ENDPOINT)
         .and_then(|j| serde_json::from_str::<Value>(j).ok())
@@ -127,6 +162,8 @@ pub async fn get(
         endpoint: sval(K_LLM_ENDPOINT),
         model: sval(K_LLM_MODEL),
         api_key_set: table.contains_key(K_LLM_API_KEY),
+        narrative: narrative_on(&table),
+        narrative_note: NARRATIVE_NOTE,
     };
 
     // deployment：只读展示实际生效值（不取自 settings 表）
@@ -206,7 +243,8 @@ pub async fn patch(
         match (k.as_str(), v) {
             (K_LLM_ENDPOINT, Value::Null)
             | (K_LLM_MODEL, Value::Null)
-            | (K_LLM_API_KEY, Value::Null) => ops.push((k.as_str(), None)), // null = 清除
+            | (K_LLM_API_KEY, Value::Null)
+            | (K_LLM_NARRATIVE, Value::Null) => ops.push((k.as_str(), None)), // null = 清除
             (K_LLM_ENDPOINT, Value::String(url)) => {
                 let url = url.trim();
                 // 与「测试连接」共用同一条约束（valid_endpoint），避免两条路径漂移
@@ -236,6 +274,9 @@ pub async fn patch(
                 }
                 ops.push((k.as_str(), Some(key.to_string())));
             }
+            // 叙事开关：布尔原样落库（"true"/"false" JSON 字符串）。
+            // null = 清除 ⇒ 回落缺省（关）——隐私开关不允许有第三种残留状态。
+            (K_LLM_NARRATIVE, Value::Bool(b)) => ops.push((k.as_str(), Some(b.to_string()))),
             (_, other) => {
                 return Err(ApiError::bad_request("settings", format!("`{k}` 期望 string 或 null，得到 {other}")));
             }
@@ -596,6 +637,94 @@ mod tests {
         // 数回显字符而不是字节：detail 里有中文，String::len() 是字节数。
         let d = status_detail(401, &"x".repeat(5000));
         assert_eq!(d.chars().filter(|c| *c == 'x').count(), 200, "回显须截断到 200 字符：{d}");
+    }
+
+    /// P0-2：叙事开关的纯函数语义。缺省/坏值/false 一律关，只有显式 "true" 开——
+    /// 隐私开关不允许"配了密钥就默认外发"，也不允许坏值被当成开。
+    #[test]
+    fn narrative_switch_defaults_off_and_only_true_opens() {
+        let mut t = std::collections::BTreeMap::new();
+        assert!(!narrative_on(&t), "缺省必须关：外发第三方端点要显式同意");
+        t.insert(K_LLM_NARRATIVE.to_string(), "\"false\"".into());
+        assert!(!narrative_on(&t));
+        t.insert(K_LLM_NARRATIVE.to_string(), "\"true\"".into());
+        assert!(narrative_on(&t));
+        t.insert(K_LLM_NARRATIVE.to_string(), "not-json".into());
+        assert!(!narrative_on(&t), "坏值不得当成开");
+        t.insert(K_LLM_NARRATIVE.to_string(), "\"TRUE\"".into());
+        assert!(!narrative_on(&t), "大小写不将就：只认小写 true");
+    }
+
+    /// 往 settings 表写一行（测试辅助）。
+    async fn set_setting(state: &Shared, k: &str, v: &str) {
+        let k = k.to_string();
+        let v = v.to_string();
+        state
+            .db
+            .exec(move |conn| {
+                conn.execute(
+                    "INSERT INTO settings(key, value_json) VALUES(?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+                    rusqlite::params![k, v],
+                )
+                .map_err(|e| PanelError::Database(e.to_string()))?;
+                Ok(panel_db::WriteAck { rows_changed: 1 })
+            })
+            .await
+            .expect("写 settings");
+    }
+
+    /// P0-2 回归（真门控）：三键齐配 + 开关关 ⇒ `llm_config()` 返回 None（不外发）；
+    /// 开 ⇒ Some 且密钥解出明文。直接打库——纯函数测试自持实现的假绿在这里不成立。
+    ///
+    /// 负向对照：删掉 `llm_config` 里的 `narrative_on` 早退，①②两条即红
+    /// （开关关仍返回 Some = 未经同意就外发）。
+    #[tokio::test]
+    async fn llm_config_is_gated_by_the_narrative_switch() {
+        let dir = std::env::temp_dir().join(format!("panel-llmsw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("t.db");
+        let tier = panel_core::Tier::Nano;
+        {
+            let mut c = panel_db::open(&db_path, tier, "NORMAL").unwrap();
+            panel_db::migrate::apply(&mut c).unwrap();
+        }
+        let writer = std::sync::Arc::new(
+            panel_db::WriterActor::spawn(db_path.clone(), tier, "NORMAL").unwrap());
+        let pool = std::sync::Arc::new(panel_db::ReadPool::new(&db_path, tier).unwrap());
+        let tasks = std::sync::Arc::new(panel_task::TaskRunner::new(
+            writer.clone(), tier, dir.join("tasks"), db_path.clone(), "NORMAL".to_string()));
+        let metrics = std::sync::Arc::new(std::sync::Mutex::new(
+            panel_db::aggregator::Aggregator::new(tier)));
+        let master = panel_core::crypto::MasterKey::from_bytes(&[7u8; 32]).unwrap();
+        let os: std::sync::Arc<dyn panel_os::OsAdapter> =
+            std::sync::Arc::new(panel_os::mock::MockOsAdapter::new());
+        let state = std::sync::Arc::new(crate::AppState::new(
+            os, writer, pool, tasks, metrics, tier, Some(master), false, 5,
+            std::time::Duration::from_secs(1800), std::time::Duration::from_secs(43_200),
+            90, 50_000, true, true, "NORMAL".to_string(), 7));
+
+        // 三键齐配（api_key 走后门：主密钥加密 + enc: 前缀，与 PATCH 落库格式一致）
+        let blob = master.encrypt(b"sk-test").unwrap();
+        let hex: String = blob.iter().map(|b| format!("{b:02x}")).collect();
+        set_setting(&state, K_LLM_ENDPOINT, &serde_json::to_string("http://127.0.0.1:1/v1").unwrap()).await;
+        set_setting(&state, K_LLM_MODEL, &serde_json::to_string("m").unwrap()).await;
+        set_setting(&state, K_LLM_API_KEY, &serde_json::to_string(&format!("enc:{hex}")).unwrap()).await;
+
+        // ① 开关缺省（无该键）⇒ None
+        assert!(llm_config(&state).await.unwrap().is_none(), "缺省不得外发");
+        // ② 开关显式 false ⇒ None
+        set_setting(&state, K_LLM_NARRATIVE, "\"false\"").await;
+        assert!(llm_config(&state).await.unwrap().is_none(), "关闭不得外发");
+        // ③ 开关 true ⇒ Some，端点透传、密钥解开
+        set_setting(&state, K_LLM_NARRATIVE, "\"true\"").await;
+        let cfg = llm_config(&state).await.unwrap().expect("开启后应返回配置");
+        assert_eq!(cfg.endpoint, "http://127.0.0.1:1/v1");
+        assert_eq!(cfg.model, "m");
+        assert_eq!(cfg.api_key, "sk-test", "密钥应能解开");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
