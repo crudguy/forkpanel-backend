@@ -355,7 +355,19 @@ fn run(cli: Cli) -> Result<()> {
 
                 let app = panel_api::routes::build_router(state.clone())
                     .route("/healthz", axum::routing::get(embed::healthz))
-                    .fallback(embed::static_handler);
+                    .fallback(embed::static_handler)
+                    // 请求级结构化日志：**最后加 = 最外层**。必须加在 `.fallback()`
+                    // 之后——axum 的 `.fallback()` 会整体替换既有 fallback 路由，且
+                    // 新 fallback 不被此前任何 `.layer()` 包裹；本层若加在它之前
+                    // （或退回 build_router 内），未匹配请求（404 / SPA miss）会整条
+                    // 绕过日志层（冒烟实测：每个 404 都无行、其余全有行）。/healthz
+                    // 也由此一并覆盖；panic 被内层 CatchPanic 转成 500 后回流经过
+                    // 本层，`status=500` 同样有行。全链只此一个挂点，双挂会每请求
+                    // 两行——次序与唯一性由下方 `wiring_guard_tests` 钉住。
+                    .layer(axum::middleware::from_fn_with_state(
+                        state.sessions.clone(),
+                        panel_api::middleware::request_log,
+                    ));
 
                 let addr = cfg.addr()?;
 
@@ -1122,6 +1134,63 @@ mod wiring_guard_tests {
         assert!(
             prod.contains("cfg.validate_implemented()?;"),
             "serve 启动路径必须调用 validate_implemented()，否则 [server].tls 会被静默忽略"
+        );
+    }
+
+    /// **生产 serve 链的最外层必须是 request_log**。axum 语义：`.fallback()` 会
+    /// 整体替换既有 fallback 路由，且新 fallback 不被此前任何 `.layer()` 包裹——
+    /// 生产链在 build_router 之后还要 `.fallback(embed::static_handler)` 兜 SPA，
+    /// 日志层若加在它之前（或退回 build_router 内），未匹配请求（404 / SPA miss）
+    /// 会整条绕过日志层。冒烟实测过这个形态：每个 404 都无日志行、其余全有行。
+    /// 判据用 `find` 下标比较——源码出现顺序即 builder 调用顺序，层序即包裹关系。
+    #[test]
+    fn request_log_is_the_outermost_layer_of_the_serve_chain() {
+        let src = include_str!("main.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        let mount = "axum::middleware::from_fn_with_state(";
+        let at = prod
+            .find(mount)
+            .unwrap_or_else(|| panic!("serve 链必须挂 request_log 层（请求级结构化日志）: {mount}"));
+        let fb_at = prod
+            .find(".fallback(embed::static_handler)")
+            .expect("serve 链必须设 static_handler 兜底（SPA 回退）");
+        let hz_at = prod
+            .find(".route(\"/healthz\"")
+            .expect("serve 链必须挂 /healthz");
+        assert!(
+            fb_at < at,
+            "request_log 必须加在 `.fallback(embed::static_handler)` 之后：否则未匹配请求（404 / SPA miss）绕过日志层，不留日志行"
+        );
+        assert!(
+            hz_at < at,
+            "request_log 必须加在 `/healthz` 之后：否则健康检查请求不留日志行"
+        );
+    }
+
+    /// **全链只许一个挂点**。build_router 内若也挂 request_log，同一请求会落两行
+    /// 日志（外层一次 + 内层一次）——行数翻倍，对账与排障反而更难。挂点唯一化后
+    /// 由 main.rs 一处装配；routes.rs 的生产段（剔注释行后）不允许再出现。
+    /// 剔注释是必须的：routes.rs 接线段有大段注释解释"为什么不挂这里"，
+    /// 不剔就会把解释性文字当成挂点（判据指向错 ⇒ 恒绿）。
+    #[test]
+    fn request_log_is_mounted_exactly_once() {
+        let src = include_str!("main.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        assert_eq!(
+            prod.matches("panel_api::middleware::request_log").count(),
+            1,
+            "serve 链里 request_log 必须恰好一个挂点（双挂 = 每请求两行日志）"
+        );
+        let routes = include_str!("../../panel-api/src/routes.rs");
+        let routes_prod = routes.split("#[cfg(test)]").next().unwrap_or("");
+        let code: String = routes_prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("request_log"),
+            "build_router 不得再挂 request_log：生产链已在 main.rs 最外层挂载，双挂 = 每请求两行日志"
         );
     }
 }

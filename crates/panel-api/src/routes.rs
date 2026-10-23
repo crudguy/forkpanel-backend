@@ -439,6 +439,14 @@ pub fn build_router(state: Shared) -> Router {
         // panic 兜底：**最后加 = 最外层**，才能盖住内层中间件与所有 handler（含 fallback）。
         // 不加这层时 handler panic 会让连接任务崩溃，客户端看到的是空响应/连接重置。
         .layer(tower_http::catch_panic::CatchPanicLayer::custom(crate::panic_guard::handle_panic))
+        // ⚠ 请求级结构化日志（request_log）**不挂在本函数里**：生产 serve 链在
+        // main.rs 中还会 `.fallback(embed::static_handler)` 做 SPA 兜底，按 axum
+        // 语义那次 `.fallback()` 会**整体替换**本函数设的 fallback 路由，且新
+        // fallback 不被此前任何 `.layer()` 包裹——日志层若挂在这里，未匹配请求
+        // （404 / SPA miss）会整条绕过它、不留日志行（冒烟实测：每个 404 都无行）。
+        // 故 request_log 由 main.rs 挂成生产链**最外层**（兜底与 /healthz 之后），
+        // 且全链只许一个挂点（双挂 = 每请求两行）；次序与唯一性由 main.rs 的
+        // `wiring_guard_tests` 两个守卫钉住。
         .with_state(state)
 }
 

@@ -1,4 +1,4 @@
-//! 中间件（设计方案 §1.3）：会话注入、写操作 CSRF + 权限、安全响应头、请求体限流。
+//! 中间件（设计方案 §1.3）：会话注入、写操作 CSRF + 权限、安全响应头、请求体限流、请求级结构化日志。
 //!
 //! 分层纪律：中间件不写业务逻辑，只做"能不能进"与"要不要记"。
 
@@ -8,9 +8,8 @@ use crate::{
     AppState,
 };
 use axum::{
-    body::Body,
     extract::{Request, State},
-    http::{header, HeaderMap, Method, StatusCode},
+    http::{header, HeaderMap, Method},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -134,8 +133,116 @@ pub async fn read_only_guard(
 
 pub type SharedSessions = Arc<SessionCache>;
 
-#[allow(dead_code)]
-fn _unused(_: StatusCode, _: Body) {}
+// ═══════════════════════ 请求级结构化日志 ═══════════════════════
+
+/// 请求级结构化日志（复盘 🟡 项）。每条请求一行，落 stderr（serve 启动时
+/// stderr 已重定向进日志文件；systemd 部署下进 journald）：
+///
+/// ```text
+/// [panel] [http] method=GET path=/api/v1/version status=200 dur_ms=3 user=admin rid=-
+/// ```
+///
+/// # 字段取舍（都是有意为之，不是漏写）
+///
+/// - **不记 query string / body / Header**：token 与 PII 最常挂在这些地方
+///   （下载链接、Bearer 头），请求日志要能默认开启而不泄密；
+/// - **不记客户端 IP**：serve 未接线 `ConnectInfo`，`X-Forwarded-For` 在无
+///   反向代理时等于客户端自填——记了是污染不是证据。登录 IP 已由审计日志
+///   （`audit()` 的 `actor_ip`）留底，爆破追溯走那条线；
+/// - **`user` 只读内存会话缓存**（`SessionCache::get`，不查库、不 restore）：
+///   本层是**最外层**，看不到 `require_auth` 插进请求扩展的 Session
+///   （Request 已 move 给内层），故独立解析一次 cookie。缓存未命中
+///   （刚重启、会话待重建）时记 `-`——绝不为一行日志放大读流量；
+/// - **panic 也有行**：本层套在 `CatchPanicLayer` 之外，panic 被转成结构化
+///   500 后回流经过本层记 `status=500`；panic 详情另有一行 `[PANIC]`
+///   （见 `panic_guard`）；
+/// - **SSE / WebSocket 只有一条**：在流建立时落行（`dur_ms` 是建立耗时），
+///   后续帧由 hyper 在本层之下驱动，不会按事件刷屏。
+///
+/// # 为什么不引入 tracing
+///
+/// panel-api 现有日志设施就是 `eprintln!`（依赖预算纪律：零新依赖）。且
+/// tracing 事件在未装 subscriber 的上下文（库用法、测试）里被**静默丢弃**——
+/// "看着配了、其实什么都没记"正是本项目反复踩过的假控制形态。
+pub async fn request_log(
+    State(state): State<Arc<SessionCache>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let started = std::time::Instant::now();
+    let method = req.method().as_str().to_string();
+    // 只取 path：HTTP 请求行不允许空格/控制字符，path 天然没有日志注入面
+    // （与 rid / username 不同，那两个必须过 sanitize_log_field）。
+    let path = req.uri().path().to_string();
+    let rid = req
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| sanitize_log_field(v, RID_MAX_LEN))
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "-".to_string());
+    let user = session_cookie_user(&state, req.headers());
+    let res = next.run(req).await;
+    let line = format_request_line(
+        &method,
+        &path,
+        res.status().as_u16(),
+        started.elapsed().as_millis(),
+        user.as_deref(),
+        &rid,
+    );
+    eprintln!("{line}");
+    res
+}
+
+/// `x-request-id` 上限：只是关联用，UUID 36 字符封顶。
+const RID_MAX_LEN: usize = 64;
+/// username 上限：与 `validate_username` 的 64 对齐。
+const USER_MAX_LEN: usize = 64;
+
+/// 从 cookie 解析会话并取 username。**只读内存缓存**：不查库、不 restore。
+///
+/// 与 `require_auth` 的分工：那个负责"能不能进"（失败即 401，必要时查库重建
+/// 会话）；这个只负责"这条请求是谁"——取不到就记 `-`，日志永不放大读流量。
+/// 收 `&SessionCache` 而非 `&AppState`：中间件只依赖它，窄依赖让测试面
+/// （无需整个 AppState 夹具）与运行时成本都变小。
+fn session_cookie_user(cache: &SessionCache, headers: &HeaderMap) -> Option<String> {
+    let sid = extract_cookie(headers, "panel_sid")?;
+    let session = cache.get(&sid)?;
+    Some(sanitize_log_field(&session.username, USER_MAX_LEN))
+}
+
+/// 日志字段消毒：空白与控制字符 → `_`，并按**字符**截断（不会切坏 UTF-8）。
+///
+/// 为什么必须做：`x-request-id` 是客户端每请求可随意填的 Header；
+/// `validate_username` 又只限长度不限字符集——直接拼进日志行，等于允许
+/// 客户端**注入伪造字段甚至伪造整行**（如 `rid=" status=200"` 会多出一个
+/// 假 token，`\n` 会多出一行假日志）。堵住空白 + 控制字符即同时堵死
+/// "伪造 token"与"伪造换行"两条路径；中文等非空白字符原样保留
+/// （用户名可能是中文，替换成 `_` 只会丢信息）。
+fn sanitize_log_field(s: &str, max_len: usize) -> String {
+    s.chars()
+        .map(|c| if c.is_whitespace() || c.is_control() { '_' } else { c })
+        .take(max_len)
+        .collect()
+}
+
+/// 纯格式化：与中间件分离，字段顺序 / 缺省值 / 消毒都能做**精确字符串断言**
+/// （项目纪律：断言要精确到结构，`contains` 那种过宽断言证明不了格式）。
+fn format_request_line(
+    method: &str,
+    path: &str,
+    status: u16,
+    dur_ms: u128,
+    user: Option<&str>,
+    rid: &str,
+) -> String {
+    let user = user.filter(|u| !u.is_empty()).unwrap_or("-");
+    let rid = if rid.is_empty() { "-" } else { rid };
+    format!(
+        "[panel] [http] method={method} path={path} status={status} dur_ms={dur_ms} user={user} rid={rid}"
+    )
+}
 
 #[cfg(test)]
 mod tests {
@@ -167,4 +274,114 @@ mod tests {
         assert_eq!(BODY_LIMIT_JSON, 1_048_576);
         assert!(BODY_LIMIT_UPLOAD > BODY_LIMIT_JSON);
     }
+
+    // ═══════════════ 请求级结构化日志 ═══════════════
+
+    /// 格式规格锁：字段顺序、缺省值（无会话 → `user=-`、空 rid → `rid=-`）。
+    /// 精确到整行 eq——字段被删/换序/改名必须红。
+    #[test]
+    fn request_log_line_format_and_defaults() {
+        assert_eq!(
+            format_request_line("GET", "/api/v1/version", 200, 3, Some("admin"), "-"),
+            "[panel] [http] method=GET path=/api/v1/version status=200 dur_ms=3 user=admin rid=-"
+        );
+        assert_eq!(
+            format_request_line("POST", "/api/v1/auth/login", 401, 0, None, ""),
+            "[panel] [http] method=POST path=/api/v1/auth/login status=401 dur_ms=0 user=- rid=-"
+        );
+        // 匿名公开端点同样有行（user=-），不是只记登录用户
+        assert_eq!(
+            format_request_line("GET", "/api/v1/version", 200, 12, None, "req-42"),
+            "[panel] [http] method=GET path=/api/v1/version status=200 dur_ms=12 user=- rid=req-42"
+        );
+    }
+
+    /// 消毒钉死两条注入路径：伪造 token（空格）与伪造整行（换行/转义序列）。
+    #[test]
+    fn sanitize_log_field_blocks_token_and_line_injection() {
+        assert_eq!(sanitize_log_field("abc status=200", 64), "abc_status=200");
+        assert_eq!(sanitize_log_field("a\nb", 64), "a_b");
+        assert_eq!(sanitize_log_field("a\rb", 64), "a_b");
+        assert_eq!(sanitize_log_field("a\tb", 64), "a_b");
+        assert_eq!(sanitize_log_field("a\x1b[31mb", 64), "a_[31mb");
+        // 值里带 `=` 不构成注入（解析方 splitn(2)，仍是同一个 token 的值）
+        assert_eq!(sanitize_log_field("a=b", 64), "a=b");
+        // 截断按字符：不会切坏 UTF-8，也不会让超长值撑爆日志行
+        assert_eq!(sanitize_log_field("abcdef", 3), "abc");
+        assert_eq!(sanitize_log_field("用户名", 2), "用户");
+        // 非空白字符原样保留：中文用户名不丢信息
+        assert_eq!(sanitize_log_field("管理员", 64), "管理员");
+    }
+
+    /// user 解析：真 SessionCache + 真 cookie。证明三件事——
+    /// 命中 → username（且过消毒）、未命中 → None（记 `-`，不查库）、无 cookie → None。
+    #[test]
+    fn session_cookie_user_reads_memory_cache_only() {
+        let cache = SessionCache::new(
+            std::time::Duration::from_secs(1800),
+            std::time::Duration::from_secs(43_200),
+        );
+        cache.insert(
+            "sid-1".to_string(),
+            Session {
+                user_id: 7,
+                username: "ad min".to_string(), // 带空格：证明消毒真的发生
+                role: "owner".to_string(),
+                permissions: vec![],
+                allowed_roots: vec![],
+                ip: "127.0.0.1".to_string(),
+                created_at: 0,
+                last_seen: 0,
+                expires_at: 0,
+            },
+        );
+        let mut h = HeaderMap::new();
+        h.insert(header::COOKIE, "other=x; panel_sid=sid-1".parse().unwrap());
+        assert_eq!(session_cookie_user(&cache, &h).as_deref(), Some("ad_min"));
+
+        h.insert(header::COOKIE, "panel_sid=no-such-sid".parse().unwrap());
+        assert!(
+            session_cookie_user(&cache, &h).is_none(),
+            "缓存未命中必须记 `-`：不能为一行日志去查库/重建会话"
+        );
+
+        assert!(session_cookie_user(&cache, &HeaderMap::new()).is_none());
+    }
+
+    /// 中间件行为：真 axum Router + 真 Next 链，响应必须**原样透传**
+    /// （状态码与 body 都不许被日志层碰坏）。
+    ///
+    /// 自带负向对照：把返回改成硬编码响应（或忘了 `res`）即红。
+    #[tokio::test]
+    async fn request_log_passes_response_through_unchanged() {
+        use axum::body::Body;
+        use axum::http::StatusCode;
+        use axum::{routing::get, Router};
+        use tower::ServiceExt;
+
+        async fn ping() -> (StatusCode, &'static str) {
+            (StatusCode::OK, "pong")
+        }
+
+        let cache = std::sync::Arc::new(SessionCache::new(
+            std::time::Duration::from_secs(1800),
+            std::time::Duration::from_secs(43_200),
+        ));
+        let app = Router::new()
+            .route("/ping", get(ping))
+            .layer(axum::middleware::from_fn_with_state(cache, request_log));
+
+        let res = app
+            .oneshot(Request::builder().uri("/ping").body(Body::empty()).unwrap())
+            .await
+            .expect("中间件不应阻断请求");
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
+        assert_eq!(&body[..], b"pong", "响应体必须原样透传");
+    }
+
+    // 注：request_log 的接线 / 次序守卫已移至 panel-cli 的 main.rs
+    // `wiring_guard_tests`——生产 serve 链在 main.rs 里又设了一次 SPA fallback
+    // （`.fallback(embed::static_handler)`），日志层挂在本库 build_router 上罩不住
+    // 它；完整论述见 routes.rs 接线段注释。
 }
