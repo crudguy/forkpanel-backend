@@ -107,6 +107,19 @@ impl Default for ActionLimiter {
     }
 }
 
+
+/// handler 里的一行式入口：超限转成 429（`retry_after` 秒），并带上动作名便于排障。
+///
+/// 用法（放在权限校验之后、真正干活之前）：
+/// ```ignore
+/// crate::ratelimit::check_heavy(&state, &s.username, "pkg.install")?;
+/// ```
+pub fn check_heavy(state: &crate::routes::Shared, user: &str, action: &str) -> crate::error::ApiResult<()> {
+    state.limits.check(user, action).map_err(|wait| {
+        crate::error::ApiError::too_many_requests(wait)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,16 +202,4 @@ mod tests {
         // 同一用户换个动作：不受影响
         assert!(l.check_at("alice", "backup", at(t0, 1)).is_ok());
     }
-}
-
-/// handler 里的一行式入口：超限转成 429（`retry_after` 秒），并带上动作名便于排障。
-///
-/// 用法（放在权限校验之后、真正干活之前）：
-/// ```ignore
-/// crate::ratelimit::check_heavy(&state, &s.username, "pkg.install")?;
-/// ```
-pub fn check_heavy(state: &crate::routes::Shared, user: &str, action: &str) -> crate::error::ApiResult<()> {
-    state.limits.check(user, action).map_err(|wait| {
-        crate::error::ApiError::too_many_requests(wait)
-    })
 }

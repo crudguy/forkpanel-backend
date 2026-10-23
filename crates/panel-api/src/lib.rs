@@ -189,6 +189,14 @@ impl<T: serde::Serialize> Envelope<T> {
 /// 把 `ApiResult<T>` 转成 HTTP 响应（IntoResponse 在 error.rs 中实现）
 pub type HandlerResult<T> = ApiResult<T>;
 
+
+#[allow(dead_code)]
+fn _assert_send_sync() {
+    fn is<T: Send + Sync>() {}
+    is::<AppState>();
+    is::<ApiError>();
+}
+
 #[cfg(test)]
 mod read_only_tests {
     use super::read_only_from;
@@ -210,11 +218,4 @@ mod read_only_tests {
         }
         assert!(!read_only_from(false));
     }
-}
-
-#[allow(dead_code)]
-fn _assert_send_sync() {
-    fn is<T: Send + Sync>() {}
-    is::<AppState>();
-    is::<ApiError>();
 }

@@ -359,7 +359,11 @@ mod tests {
         assert_eq!(max_clients(Tier::Standard), 50);
     }
 
+    // ⚠ 这是**常量规格锁**（改常量即红），不是恒真断言：clippy 的
+    // `assertions_on_constants` 对"两个 const 比较"一律报警，但它看不出我们
+    // 恰恰要锁住这些常量不被悄悄改掉。
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn backlog_is_small() {
         // 低配机器上缓冲区必须小：64 条 × 事件大小，避免慢客户端拖垮内存
         assert!(BACKLOG <= 128);

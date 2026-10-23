@@ -606,6 +606,23 @@ pub async fn rename(
 #[derive(Debug, Deserialize)]
 pub struct ChmodReq { pub path: String, pub mode: String, pub recursive: Option<bool> }
 
+/// 解析并校验 chmod 的八进制模式。
+///
+/// **抽成独立函数是为了让测试真的能测它**：此前校验内联在 handler 里，测试只能
+/// 断言 `0o4755 > 0o777` 这种字面量算术（恒真，压根没碰到生产代码）——测试名写着
+/// "setuid 被拒"，实际什么都没测。handler 与测试共用同一份实现，杜绝"测试自持实现"。
+///
+/// 范围检查（> 0o777 即拒）同时承担**拒绝 setuid/setgid 位**的职责：
+/// 0o4755 / 0o2755 都超出 0o777 ⇒ 提权位进不来。
+fn parse_mode(raw: &str) -> ApiResult<u32> {
+    let mode = u32::from_str_radix(raw.trim_start_matches("0o"), 8)
+        .map_err(|_| ApiError::bad_request("mode", "must be octal, e.g. 644"))?;
+    if mode > 0o777 {
+        return Err(ApiError::bad_request("mode", "out of range"));
+    }
+    Ok(mode)
+}
+
 pub async fn chmod(
     State(state): State<Shared>, Auth(s): Auth, PanelJson(req): PanelJson<ChmodReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
@@ -613,11 +630,7 @@ pub async fn chmod(
     let p = resolve(&state, &s, &req.path)?;
 
     // 只接受八进制。绝不接受 "u+x" 这类符号模式——解析符号模式会引入不必要的复杂度与歧义。
-    let mode = u32::from_str_radix(req.mode.trim_start_matches("0o"), 8)
-        .map_err(|_| ApiError::bad_request("mode", "must be octal, e.g. 644"))?;
-    if mode > 0o777 {
-        return Err(ApiError::bad_request("mode", "out of range"));
-    }
+    let mode = parse_mode(&req.mode)?;
 
     // 不允许设置 setuid/setgid 位：这是提权向量，面板不该提供
     let op = panel_os::PermissionOp::Posix {
@@ -860,7 +873,11 @@ pub async fn action(
 mod tests {
     use super::*;
 
+    // ⚠ 这是**常量规格锁**（改常量即红），不是恒真断言：clippy 的
+    // `assertions_on_constants` 对"两个 const 比较"一律报警，但它看不出我们
+    // 恰恰要锁住这些常量不被悄悄改掉。
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn read_cap_is_bounded() {
         assert!(MAX_READ_BYTES <= 8 * 1024 * 1024, "单次读取上限不应过大");
         assert!(MAX_READ_BYTES >= 512 * 1024, "太小会让编辑器频繁分块");
@@ -1006,9 +1023,13 @@ mod tests {
 
     #[test]
     fn setuid_bits_are_rejected_by_range_check() {
-        // 0o4755 含 setuid，超过 0o777 应被拒
-        assert!(0o4755u32 > 0o777);
-        assert!(0o2755u32 > 0o777);
+        // 真·调用被测函数：此前这里只断言 `0o4755 > 0o777`（字面量算术，**恒真**，
+        // 从没碰到任何生产代码）——测试名写着"setuid 被拒"，实际什么都没测。
+        assert!(parse_mode("4755").is_err(), "0o4755 含 setuid，必须被范围检查拒掉");
+        assert!(parse_mode("2755").is_err(), "0o2755 含 setgid，必须被范围检查拒掉");
+        assert!(parse_mode("755").is_ok(), "合法八进制应通过");
+        assert!(parse_mode("0o755").is_ok(), "0o 前缀应被接受");
+        assert!(parse_mode("999").is_err(), "非八进制串应被拒");
     }
 
     #[test]

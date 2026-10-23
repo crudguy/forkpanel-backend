@@ -158,7 +158,11 @@ mod tests {
         assert!(!auth::csrf_ok(Some("abc"), None));
     }
 
+    // ⚠ 这是**常量规格锁**（改常量即红），不是恒真断言：clippy 的
+    // `assertions_on_constants` 对"两个 const 比较"一律报警，但它看不出我们
+    // 恰恰要锁住这些常量不被悄悄改掉。
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn body_limits_are_bounded() {
         assert_eq!(BODY_LIMIT_JSON, 1_048_576);
         assert!(BODY_LIMIT_UPLOAD > BODY_LIMIT_JSON);

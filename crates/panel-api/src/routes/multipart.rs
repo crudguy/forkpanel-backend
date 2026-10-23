@@ -403,7 +403,11 @@ mod tests {
         assert_eq!(names.last().unwrap(), &part_name(11));
     }
 
+    // ⚠ 这是**常量规格锁**（改常量即红），不是恒真断言：clippy 的
+    // `assertions_on_constants` 对"两个 const 比较"一律报警，但它看不出我们
+    // 恰恰要锁住这些常量不被悄悄改掉。
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn chunk_size_must_fit_the_relaxed_body_limit() {
         // 分片路由挂在放宽了 body 上限的 router 上（file_upload_r）。若 CHUNK_SIZE
         // 超过该上限，**每一片都会在进 handler 之前被 axum 拒掉**，而且表现为

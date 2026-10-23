@@ -527,6 +527,24 @@ pub async fn test_llm(
     Ok(ok(resp))
 }
 
+
+/// 把 Duration 渲染成 config.toml 同款 "30m"/"12h"/"90s"（deployment 段展示用）。
+fn fmt_dur(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    if s % 3600 == 0 { format!("{}h", s / 3600) }
+    else if s % 60 == 0 { format!("{}m", s / 60) }
+    else { format!("{}s", s) }
+}
+
+fn tier_str(t: panel_core::Tier) -> String {
+    match t {
+        panel_core::Tier::Nano => "nano",
+        panel_core::Tier::Small => "small",
+        panel_core::Tier::Standard => "standard",
+    }
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,21 +614,4 @@ mod tests {
         let d = err_detail(&e);
         assert!(d.contains("无法建立连接"), "分类失准：{d}");
     }
-}
-
-/// 把 Duration 渲染成 config.toml 同款 "30m"/"12h"/"90s"（deployment 段展示用）。
-fn fmt_dur(d: std::time::Duration) -> String {
-    let s = d.as_secs();
-    if s % 3600 == 0 { format!("{}h", s / 3600) }
-    else if s % 60 == 0 { format!("{}m", s / 60) }
-    else { format!("{}s", s) }
-}
-
-fn tier_str(t: panel_core::Tier) -> String {
-    match t {
-        panel_core::Tier::Nano => "nano",
-        panel_core::Tier::Small => "small",
-        panel_core::Tier::Standard => "standard",
-    }
-    .to_string()
 }

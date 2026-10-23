@@ -357,7 +357,11 @@ mod tests {
         assert!(!is_sensitive_path(Path::new("/var/log/forkpanel/panel.log")));
     }
 
+    // ⚠ 这是**常量规格锁**（改常量即红），不是恒真断言：clippy 的
+    // `assertions_on_constants` 对"两个 const 比较"一律报警，但它看不出我们
+    // 恰恰要锁住这些常量不被悄悄改掉。
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn remove_cap_is_conservative() {
         assert!(MAX_REMOVE_ENTRIES >= 10_000, "上限太低会阻碍正常删除");
         assert!(MAX_REMOVE_ENTRIES <= 200_000, "上限太高起不到保护 IO 的作用");
