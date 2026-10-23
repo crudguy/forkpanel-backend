@@ -8,7 +8,7 @@
 # （恒绿比没门禁更危险）。故 audit 单独成一个目标，CI 里单独一个 job——
 # advisory-db 托管在 GitHub，网络抖动时不该连带拖红主门禁。
 
-.PHONY: check guards audit test embed-fresh e2e-files e2e-backups e2e-containers e2e-cron e2e-databases
+.PHONY: check guards audit test embed-fresh e2e-files e2e-backups e2e-containers e2e-cron e2e-databases e2e-sites
 
 # 主门禁：静态守卫 + 全量测试（离线可跑，确定性高）
 check: guards embed-fresh test
@@ -84,6 +84,16 @@ e2e-cron:
 #   make e2e-databases BASE=http://127.0.0.1:2084
 e2e-databases:
 	bash ci/e2e-databases.sh "$(BASE)"
+
+# 站点（sites）E2E：对运行中的 dev 后端打真实请求，覆盖能力位门禁 + 只读端点 +
+# 创建校验闸门 + 一条纯 DB 生命周期 + SSL 诚实 501 闸门。
+# ⚠ dev 主机 nginx 真实在场，故**绝不**调用 apply/reload/conf_put/停用（会 reload 真实
+# nginx，破坏性），也不用 self-signed 签证书（会落盘）。只测拒绝分支 + 纯 DB CRUD。
+# 与 e2e-* 同理**不进 `check`**。人工在真机跑，输出 36 条断言。
+#   make e2e-sites
+#   make e2e-sites BASE=http://127.0.0.1:2084
+e2e-sites:
+	bash ci/e2e-sites.sh "$(BASE)"
 
 test:
 	cargo test --workspace
