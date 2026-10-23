@@ -8,7 +8,7 @@
 # （恒绿比没门禁更危险）。故 audit 单独成一个目标，CI 里单独一个 job——
 # advisory-db 托管在 GitHub，网络抖动时不该连带拖红主门禁。
 
-.PHONY: check guards audit test embed-fresh e2e-files e2e-backups e2e-containers e2e-cron e2e-databases e2e-sites e2e-firewall e2e-all
+.PHONY: check guards audit test embed-fresh e2e-files e2e-backups e2e-containers e2e-cron e2e-databases e2e-sites e2e-firewall e2e-rbac e2e-all
 
 # 主门禁：静态守卫 + 全量测试（离线可跑，确定性高）
 check: guards embed-fresh test
@@ -105,7 +105,13 @@ e2e-sites:
 e2e-firewall:
 	bash ci/e2e-firewall.sh "$(BASE)"
 
-# 七域 E2E 汇总：一次串行跑完并聚合（上线前的整机自检）。
+# 权限与设置 E2E（用户 / 角色 / RBAC 防提权 / 设置 / 审计）——面板权限最高的一面。
+# 造临时用户/角色并另开会话验证防提权，trap 兜底清理（先用户后角色）。不进 check。
+#   make e2e-rbac
+e2e-rbac:
+	bash ci/e2e-rbac.sh "$(BASE)"
+
+# 八域 E2E 汇总：一次串行跑完并聚合（上线前的整机自检）。
 # 只做编排与聚合，断言仍由各域脚本负责；后端不可达时明确 [skip] 不再继续，
 # 某域退出码非 0 即判失败（退出码是权威信号）。
 #   make e2e-all

@@ -204,7 +204,7 @@
   校验，见 `panel-os` 的 `rendered_config_passes_real_nginx_syntax_check`）。
 - **能力驱动 UI**：未支持能力一律 EmptyState/置灰 + 原因，绝不假装可用。
 
-## 真机 E2E 脚本（七域，`ci/e2e-*.sh`）
+## 真机 E2E 脚本（八域，`ci/e2e-*.sh`）
 
 对**运行中的真实后端**打请求的脚本化验收，弥补"单测只覆盖纯逻辑、覆盖不到
 路由注册 + 能力位门禁 + OS provider 真实落盘"的空白。
@@ -218,11 +218,12 @@
 | `e2e-databases` | 6 条连接校验拒绝、SQLite 浏览全链路（库→schema→表→行→CSV 导出）、只读 SQL 闸门、生命周期 | 不碰 mysql/pg（需远端） | 42 |
 | `e2e-sites` | 能力位、读端点、7 条创建拒绝、纯 DB 生命周期、SSL `http-01`/`dns-01` 诚实 501 | **不 apply/reload 真实 nginx、不签证书** | 36 |
 | `e2e-firewall` | 能力位、读端点、apply 拒绝（端口/CIDR/动作）+ **SSH 失联保护冲突** | **不写真实 iptables/nft、不改启停、不删规则** | 17 |
+| `e2e-rbac` | 用户/角色 CRUD、owner 与自锁守卫（403）、**防提权**（第二会话：仅 `user.manage` 的用户不能授予自己没有的权限）、内置角色保留、被引用角色不可删、部署级设置拒绝 PATCH、审计 `user.create`/`role.create` 真写入 | 不建 owner、不动真实用户 | 63 |
 
-合计 **228 条断言**。运行方式：
+合计 **291 条断言**。运行方式：
 
 ```bash
-make e2e-all                                    # 七域串行跑完并聚合（上线前整机自检）
+make e2e-all                                    # 八域串行跑完并聚合（上线前整机自检）
 make e2e-containers BASE=http://127.0.0.1:2084  # 单域
 ```
 
