@@ -27,19 +27,15 @@ rusqlite   = { workspace = true }
 # 静态资源内嵌：运行期零 Node、零外部文件依赖
 rust-embed = { version = "8", features = ["mime-guess", "compression"] }
 
-# ⚠ `tls` 目前是**未接线的占位特性**：全仓没有任何 `#[cfg(feature = "tls")]` 代码，
-# 启用它不会带来 HTTPS；`[server].tls` 会被 Config::validate_implemented() 拒绝启动。
-# 是否真正实现「面板自身 TLS」仍待决策（见 docs/audit-2026-10-17.md「待拍板」）。
-# 多数部署由前置 nginx/Caddy 终止 TLS，故默认关闭（也省下 rustls 数百 KB 体积）。
-axum-server = { version = "0.7", optional = true }
-rustls      = { version = "0.23", optional = true }
-rustls-pemfile = { version = "2", optional = true }
-tokio-rustls = { version = "0.26", optional = true }
+# 面板本体**不提供 HTTPS 监听**（serve 只有 http）：TLS 由前置 nginx/Caddy 终结。
+# 历史上有过一个 `tls` 占位特性（axum-server / rustls / rustls-pemfile / tokio-rustls），
+# 但**从未接线**（全仓零个 `#[cfg(feature = "tls")]`）——已删除，避免"启用它就能开
+# HTTPS"的误解。`[server].tls` 字段仍在，但配了会被 Config::validate_implemented()
+# 拒绝启动（bc4b7ac）。若将来真要实现面板自身 TLS，请连同依赖与 serve 分支一起加。
 
 # 开发期从磁盘读取 web/dist，避免每次改前端都重编译二进制
 [features]
 default = []
-tls = ["axum-server", "rustls", "rustls-pemfile", "tokio-rustls"]
 dev-assets = []
 
 [[bin]]
