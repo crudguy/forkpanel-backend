@@ -953,7 +953,7 @@ components:
         enabled:     { type: boolean, default: true }
         last_run_at: { type: [integer, "null"] }
         last_result: { type: [string, "null"] }
-        encrypt:     { type: boolean, default: false, description: "产物静态加密（AES-256-GCM 分块容器，见 panel-os/backup.rs）；主密钥来自 /etc/panel/master.key 且不落库。加密会抬高恢复门槛——主密钥丢失等于备份全废，故默认关闭，由用户显式选择" }
+        encrypt:     { type: boolean, default: false, description: "产物静态加密（AES-256-GCM 分块容器，见 panel-os/backup.rs）；主密钥来自 /var/lib/forkpanel/master.key 且不落库。加密会抬高恢复门槛——主密钥丢失等于备份全废，故默认关闭，由用户显式选择" }
         remote_kind:  { type: [string, "null"], enum: [webdav, s3, null], description: "远端副本类型；null=仅本地。本地备份挡不住整机故障（磁盘坏、误删、机房事故），异地那份才是真兜底" }
         remote_url:   { type: [string, "null"], description: "webdav: 目标目录 URL；s3: endpoint（如 https://s3.example.com）。仅 http/https" }
         remote_bucket: { type: [string, "null"], description: "s3: bucket 名（s3 必填）" }
@@ -2788,7 +2788,7 @@ paths:
       description: |
         `remote`（可选）配置远端副本。启用远端时**在创建时就把全部字段校验完**——
         地址 / 协议 / bucket / 凭据配对任何一处不对即 400，不会留到第一次执行时才在后台报错。
-        凭据落库前用主密钥（/etc/panel/master.key）AES-256-GCM 加密，**永不回读**。
+        凭据落库前用主密钥（/var/lib/forkpanel/master.key）AES-256-GCM 加密，**永不回读**。
       security: [cookieAuth, csrfHeader]
       requestBody:
         required: true

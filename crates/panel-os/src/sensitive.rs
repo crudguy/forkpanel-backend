@@ -40,12 +40,14 @@ const DENY_EXACT: &[&str] = &[
     "/etc/profile", "/etc/bash.bashrc", "/etc/environment",
     // 定时任务本体（root 的 crontab = 定时以 root 执行任意命令）
     "/etc/crontab",
+    // 面板主密钥：改坏=全部备份与凭据无法解密（位于数据目录，非 /etc）
+    "/var/lib/forkpanel/master.key",
 ];
 
 /// 前缀匹配（整个目录 / 一族文件）
 const DENY_PREFIX: &[&str] = &[
     // 既有：SSH / TLS 私钥 / 面板自身数据
-    "/etc/ssh/", "/etc/ssl/private/", "/etc/panel/",
+    "/etc/ssh/", "/etc/ssl/private/", "/etc/forkpanel/",
     "/root/.ssh/", "/proc/", "/sys/", "/dev/",
     // sudo 片段（drop-in 与主文件等价）
     "/etc/sudoers.d/",
@@ -120,6 +122,19 @@ mod tests {
         ] {
             assert!(deny(p), "必须拒绝: {p}");
         }
+    }
+
+    /// 安装布局统一为 forkpanel 后缀后，黑名单必须保护**真实**目录，而不是历史遗留的
+    /// `/etc/panel`（那个目录在按 install.sh 部署时根本不存在）。主密钥尤其关键：
+    /// 它在数据目录 `/var/lib/forkpanel/master.key`，此前未被任何黑名单项覆盖。
+    #[test]
+    fn forkpanel_install_tree_and_master_key_are_denied() {
+        // 安装树（config 目录整体拒绝，含任意子文件）
+        assert!(deny("/etc/forkpanel/ssl/key.pem"));
+        // 主密钥：数据目录里的面板根密钥
+        assert!(deny("/var/lib/forkpanel/master.key"), "面板主密钥必须在黑名单内");
+        // 反向：站点文件等日常路径仍可写
+        assert!(!deny("/var/www/site/index.html"));
     }
 
     /// 反向：常见运维文件**必须可写**，否则文件管理器失去一大半用途。

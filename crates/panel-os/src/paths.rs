@@ -54,10 +54,10 @@ pub struct LinuxPathLayout {
 impl Default for LinuxPathLayout {
     fn default() -> Self {
         Self {
-            prefix: PathBuf::from("/etc/panel"),
+            prefix: PathBuf::from("/etc/forkpanel"),
             site_root: PathBuf::from("/var/www"),
-            data_dir: PathBuf::from("/var/lib/panel"),
-            log_dir: PathBuf::from("/var/log/panel"),
+            data_dir: PathBuf::from("/var/lib/forkpanel"),
+            log_dir: PathBuf::from("/var/log/forkpanel"),
         }
     }
 }
@@ -105,7 +105,7 @@ pub struct WindowsPathLayout { program_data: PathBuf }
 
 #[cfg(feature = "os-windows")]
 impl Default for WindowsPathLayout {
-    fn default() -> Self { Self { program_data: PathBuf::from(r"C:\ProgramData\panel") } }
+    fn default() -> Self { Self { program_data: PathBuf::from(r"C:\ProgramData\forkpanel") } }
 }
 
 #[cfg(feature = "os-windows")]

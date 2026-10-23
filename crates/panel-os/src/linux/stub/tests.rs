@@ -526,13 +526,13 @@ use super::*;
     fn render_force_https_with_tls_adds_redirect_and_ssl() {
         let mut s = spec_static();
         s.force_https = true;
-        s.tls_cert = Some(PathBuf::from("/etc/panel/ssl/example.com.crt"));
-        s.tls_key = Some(PathBuf::from("/etc/panel/ssl/example.com.key"));
+        s.tls_cert = Some(PathBuf::from("/etc/forkpanel/ssl/example.com.crt"));
+        s.tls_key = Some(PathBuf::from("/etc/forkpanel/ssl/example.com.key"));
         let out = render_nginx(&s);
         assert!(out.contains("return 301 https://$host$request_uri;"), "{out}");
         assert!(out.contains("listen 443 ssl;"), "{out}");
-        assert!(out.contains("ssl_certificate     /etc/panel/ssl/example.com.crt;"), "{out}");
-        assert!(out.contains("ssl_certificate_key /etc/panel/ssl/example.com.key;"), "{out}");
+        assert!(out.contains("ssl_certificate     /etc/forkpanel/ssl/example.com.crt;"), "{out}");
+        assert!(out.contains("ssl_certificate_key /etc/forkpanel/ssl/example.com.key;"), "{out}");
         // 80 只应出现在重定向块一次，主块不再监听 80
         assert_eq!(out.matches("listen 80;").count(), 1, "{out}");
     }
@@ -850,8 +850,8 @@ use super::*;
     #[test]
     fn tls_hardening_emits_protocols_ciphers_and_hsts_only_when_enabled() {
         let mut s = spec_static();
-        s.tls_cert = Some(PathBuf::from("/etc/panel/ssl/example.com.crt"));
-        s.tls_key = Some(PathBuf::from("/etc/panel/ssl/example.com.key"));
+        s.tls_cert = Some(PathBuf::from("/etc/forkpanel/ssl/example.com.crt"));
+        s.tls_key = Some(PathBuf::from("/etc/forkpanel/ssl/example.com.key"));
         s.tls_min = Some("TLSv1.3".into());
         s.tls_profile = Some("strict".into());
         let out = render_nginx(&s);
@@ -1276,18 +1276,18 @@ use super::*;
     #[test]
     fn caddy_tls_site_uses_https_and_tls_directive() {
         let mut s = spec_static();
-        s.tls_cert = Some(PathBuf::from("/etc/panel/tls/example.crt"));
-        s.tls_key = Some(PathBuf::from("/etc/panel/tls/example.key"));
+        s.tls_cert = Some(PathBuf::from("/etc/forkpanel/tls/example.crt"));
+        s.tls_key = Some(PathBuf::from("/etc/forkpanel/tls/example.key"));
         let out = render_caddy(&s);
         assert!(out.contains("https://example.com, https://www.example.com {"), "有证书应 https（多域名）：{out}");
-        assert!(out.contains("tls /etc/panel/tls/example.crt /etc/panel/tls/example.key"), "应 tls 指令：{out}");
+        assert!(out.contains("tls /etc/forkpanel/tls/example.crt /etc/forkpanel/tls/example.key"), "应 tls 指令：{out}");
     }
 
     #[test]
     fn caddy_force_https_with_tls_adds_http_redirect_block() {
         let mut s = spec_static();
-        s.tls_cert = Some(PathBuf::from("/etc/panel/tls/example.crt"));
-        s.tls_key = Some(PathBuf::from("/etc/panel/tls/example.key"));
+        s.tls_cert = Some(PathBuf::from("/etc/forkpanel/tls/example.crt"));
+        s.tls_key = Some(PathBuf::from("/etc/forkpanel/tls/example.key"));
         s.force_https = true;
         let out = render_caddy(&s);
         // 手动 tls 不会自动重定向，须显式 http 块 301 → https；{host} 占位符覆盖多域名
@@ -1318,14 +1318,14 @@ use super::*;
     #[test]
     fn caddy_tls_protocols_and_hsts_on_tls_site() {
         let mut s = spec_static();
-        s.tls_cert = Some(PathBuf::from("/etc/panel/tls/example.crt"));
-        s.tls_key = Some(PathBuf::from("/etc/panel/tls/example.key"));
+        s.tls_cert = Some(PathBuf::from("/etc/forkpanel/tls/example.crt"));
+        s.tls_key = Some(PathBuf::from("/etc/forkpanel/tls/example.key"));
         s.tls_min = Some("TLSv1.2".into());
         s.hsts = true;
         s.hsts_max_age = 31536000;
         s.hsts_include_sub = true;
         let out = render_caddy(&s);
-        assert!(out.contains("tls /etc/panel/tls/example.crt /etc/panel/tls/example.key {"), "tls 块：{out}");
+        assert!(out.contains("tls /etc/forkpanel/tls/example.crt /etc/forkpanel/tls/example.key {"), "tls 块：{out}");
         assert!(out.contains("protocols tls1.2 tls1.3"), "TLS 下限→protocols：{out}");
         assert!(out.contains("header Strict-Transport-Security \"max-age=31536000; includeSubDomains\""), "HSTS：{out}");
     }
@@ -1414,15 +1414,15 @@ use super::*;
         // 全部按「用户填满了」构造——置灰的承诺就是「填了也不生效」
         s.auth_basic = true;
         s.auth_user = Some("alice".into());
-        s.auth_file = Some(PathBuf::from("/etc/panel/htpasswd/x"));
+        s.auth_file = Some(PathBuf::from("/etc/forkpanel/htpasswd/x"));
         s.rewrite_preset = Some("wordpress".into());
         s.rewrite_custom = Some("try_files $uri $uri/ /index.php?$args;".into());
         s.lb_policy = Some("least_conn".into());
         s.proxy_connect_timeout = 5;
         s.proxy_send_timeout = 5;
         s.proxy_read_timeout = 5;
-        s.access_log = Some(PathBuf::from("/var/log/panel/x.access.log"));
-        s.error_log = Some(PathBuf::from("/var/log/panel/x.error.log"));
+        s.access_log = Some(PathBuf::from("/var/log/forkpanel/x.access.log"));
+        s.error_log = Some(PathBuf::from("/var/log/forkpanel/x.error.log"));
         s.error_log_level = Some("warn".into());
         s.tls_profile = Some("strict".into());
         s.custom_conf = Some("location /static/ { expires 7d; }".into());
@@ -1567,7 +1567,7 @@ use super::*;
     /// provider 真机校验用的 provider 实例。**关键：data_dir 必须指向可写目录。**
     ///
     /// `validate()` 会在 `paths.tmp_dir()` 下建临时目录跑 `nginx -t` / `caddy validate`，
-    /// 而 `LinuxPathLayout::default()` 的 data_dir 是 `/var/lib/panel`——**root 755**，
+    /// 而 `LinuxPathLayout::default()` 的 data_dir 是 `/var/lib/forkpanel`——**root 755**，
     /// 非 root 跑测试会在 `create_dir_all` 这一步就 `Permission denied (os error 13)`。
     /// 此前这两个真机测试在本沙箱/CI 恒红，一直被误读成"`nginx -t` 需要 root"；
     /// 实测根因是 tmp 目录不可写（wrapper 本身已把 pid / error_log / 五个 temp 路径

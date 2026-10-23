@@ -156,7 +156,7 @@ impl AppState {
     /// 需要写入/读取真实秘密（SSL 私钥、数据库口令）时调用；无主密钥则拒绝。
     pub fn require_secret_key(&self) -> ApiResult<MasterKey> {
         self.master_key.ok_or_else(|| {
-            ApiError::unsupported("secret storage unavailable: master key not loaded (检查 /etc/panel/master.key 权限 0600)")
+            ApiError::unsupported("secret storage unavailable: master key not loaded (检查 /var/lib/forkpanel/master.key 权限 0600)")
         })
     }
 }

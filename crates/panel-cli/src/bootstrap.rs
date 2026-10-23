@@ -248,11 +248,11 @@ mod tests {
 
     #[test]
     fn healthcheck_units_have_no_restart_and_fire_every_minute() {
-        let (svc, timer) = healthcheck_units("panel", std::path::Path::new("/var/lib/panel/scripts/healthcheck.sh"));
+        let (svc, timer) = healthcheck_units("panel", std::path::Path::new("/var/lib/forkpanel/scripts/healthcheck.sh"));
         // service 绝不能 Restart：脚本自己实现"两次才重启"，systemd 再叠一层
         // 会把策略变得更激进（一次失败就反复重跑）。
         assert!(svc.contains("Restart=no"), "探活 service 不得自行重试：{svc}");
-        assert!(svc.contains("ExecStart=/var/lib/panel/scripts/healthcheck.sh"), "脚本路径由调用方给：{svc}");
+        assert!(svc.contains("ExecStart=/var/lib/forkpanel/scripts/healthcheck.sh"), "脚本路径由调用方给：{svc}");
         assert!(timer.contains("OnUnitActiveSec=60"), "每分钟探一次：{timer}");
         assert!(timer.contains("Unit=panel-healthcheck.service"), "timer 必须指向探活 service：{timer}");
         // 错过的探活不补跑，否则机器休眠后会在开机时堆积执行
@@ -294,7 +294,7 @@ mod tests {
         assert_eq!(
             line,
             "ReadWritePaths=/srv/fp/data /srv/fp/log /srv/fp/www /srv/fp/conf",
-            "ReadWritePaths 必须与配置 [paths] 一致，不能回落默认 /var/lib/panel 等"
+            "ReadWritePaths 必须与配置 [paths] 一致，不能回落默认 /var/lib/forkpanel 等"
         );
         assert!(u.contains("ExecStart=panel --config /srv/fp/conf/config.toml serve"));
     }

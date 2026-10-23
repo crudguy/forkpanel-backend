@@ -62,7 +62,7 @@ pub struct PlanDto {
     pub enabled: bool,
     pub last_run_at: Option<i64>,
     pub last_result: Option<String>,
-    /// 产物是否静态加密（AES-256-GCM，主密钥来自 /etc/panel/master.key）
+    /// 产物是否静态加密（AES-256-GCM，主密钥来自 /var/lib/forkpanel/master.key）
     pub encrypt: bool,
     /// 远端类型：`None` = 仅本地；`webdav` / `s3`
     pub remote_kind: Option<String>,

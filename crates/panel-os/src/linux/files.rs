@@ -345,7 +345,7 @@ mod tests {
         assert!(is_sensitive_path(Path::new("/etc/ssh/sshd_config")));
         assert!(is_sensitive_path(Path::new("/root/.ssh/authorized_keys")));
         assert!(is_sensitive_path(Path::new("/proc/1/mem")));
-        assert!(is_sensitive_path(Path::new("/etc/panel/config.toml")));
+        assert!(is_sensitive_path(Path::new("/etc/forkpanel/config.toml")));
     }
 
     #[test]
@@ -354,7 +354,7 @@ mod tests {
         assert!(!is_sensitive_path(Path::new("/var/www/index.html")));
         assert!(!is_sensitive_path(Path::new("/var/www/.htaccess")));
         assert!(!is_sensitive_path(Path::new("/etc/nginx/nginx.conf")));
-        assert!(!is_sensitive_path(Path::new("/var/log/panel/panel.log")));
+        assert!(!is_sensitive_path(Path::new("/var/log/forkpanel/panel.log")));
     }
 
     #[test]

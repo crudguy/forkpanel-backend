@@ -5,7 +5,7 @@
 -- 生产库本身散落得更广。
 --
 -- 加密复用 panel_core::crypto 的 AES-256-GCM（分块容器，见 panel-os/backup.rs），
--- 主密钥来自 /etc/panel/master.key 且**不落库**——因此即使库文件泄露，
+-- 主密钥来自 /var/lib/forkpanel/master.key 且**不落库**——因此即使库文件泄露，
 -- 也解不开产物。
 --
 -- 默认 0（不加密）：加密会抬高恢复门槛（主密钥丢失 = 备份全废），

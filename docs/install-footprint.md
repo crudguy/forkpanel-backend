@@ -63,7 +63,7 @@ tmp/  cache/  log/  临时 / 缓存 / 内部日志
 ```
 /var/www/<站点名>/                  站点文件（web 用户可读）
 /etc/nginx/conf.d/panel-<slug>.conf  nginx drop-in 配置（不动系统主配置）
-/var/log/panel/web/<slug>.access.log 站点访问日志
+/var/log/forkpanel/web/<slug>.access.log 站点访问日志
 ```
 
 > ⚠️ 注意两个位置：**站点文件不在 `/var/lib/forkpanel` 里**；**nginx 也不是面板装的**。

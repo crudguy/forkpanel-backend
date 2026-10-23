@@ -496,8 +496,8 @@ fn mock_stacks() -> &'static std::sync::Mutex<Vec<ComposeStackSpec>> {
 fn mock_stack_view(spec: &ComposeStackSpec) -> ComposeStack {
     ComposeStack {
         project: spec.project.clone(),
-        dir: format!("/var/lib/panel/compose-stacks/{}", spec.project),
-        config_file: format!("/var/lib/panel/compose-stacks/{}/compose.yaml", spec.project),
+        dir: format!("/var/lib/forkpanel/compose-stacks/{}", spec.project),
+        config_file: format!("/var/lib/forkpanel/compose-stacks/{}/compose.yaml", spec.project),
         services: spec.services.clone(),
         // mock 没有真实文件可比对，恒为 false（"面板自己写的就是最新的"）
         externally_modified: false,
@@ -737,9 +737,9 @@ impl SecurityProvider for MockSecurity {
 pub struct MockPathLayout;
 
 impl crate::PathLayout for MockPathLayout {
-    fn config_dir(&self) -> PathBuf { PathBuf::from("/mock/etc/panel") }
-    fn data_dir(&self) -> PathBuf { PathBuf::from("/mock/var/lib/panel") }
-    fn log_dir(&self) -> PathBuf { PathBuf::from("/mock/var/log/panel") }
+    fn config_dir(&self) -> PathBuf { PathBuf::from("/mock/etc/forkpanel") }
+    fn data_dir(&self) -> PathBuf { PathBuf::from("/mock/var/lib/forkpanel") }
+    fn log_dir(&self) -> PathBuf { PathBuf::from("/mock/var/log/forkpanel") }
     fn cache_dir(&self) -> PathBuf { self.data_dir().join("cache") }
     fn tmp_dir(&self) -> PathBuf { self.data_dir().join("tmp") }
     fn site_root(&self) -> PathBuf { PathBuf::from("/mock/var/www") }

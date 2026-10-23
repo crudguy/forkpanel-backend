@@ -15,7 +15,7 @@ pub struct Config {
     #[serde(default)]
     pub server: Server,
 
-    /// 目录覆盖。留空则使用平台默认（Linux: /etc/panel、/var/lib/panel …）
+    /// 目录覆盖。留空则使用平台默认（Linux: /etc/forkpanel、/var/lib/forkpanel …）
     #[serde(default)]
     pub paths: PathsOverride,
 
