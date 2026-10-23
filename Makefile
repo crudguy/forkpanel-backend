@@ -8,7 +8,7 @@
 # （恒绿比没门禁更危险）。故 audit 单独成一个目标，CI 里单独一个 job——
 # advisory-db 托管在 GitHub，网络抖动时不该连带拖红主门禁。
 
-.PHONY: check guards audit test embed-fresh e2e-files e2e-backups e2e-containers
+.PHONY: check guards audit test embed-fresh e2e-files e2e-backups e2e-containers e2e-cron
 
 # 主门禁：静态守卫 + 全量测试（离线可跑，确定性高）
 check: guards embed-fresh test
@@ -64,6 +64,16 @@ e2e-backups:
 #   make e2e-containers BASE=http://127.0.0.1:2084
 e2e-containers:
 	bash ci/e2e-containers.sh "$(BASE)"
+
+# 计划任务 E2E：对运行中的 dev 后端打真实请求，覆盖能力位下发 + 读端点（列表/预览/详情/
+# 历史）+ 创建/改写的全套校验闸门（拒绝分支，零残留）+ 一次真实的「创建 → 改 → 执行 →
+# 校验产物 → 删除」生命周期（实际写本机 root crontab，结尾回收，trap 兜底）。
+# 与 e2e-* 同理**不进 `check`**：CI 无 crontab 二进制时读/写端点会诚实 501，脚本只验证
+# 能力位 reason 已下发而非假装通过。人工在真机跑，输出 34 条断言。
+#   make e2e-cron
+#   make e2e-cron BASE=http://127.0.0.1:2084
+e2e-cron:
+	bash ci/e2e-cron.sh "$(BASE)"
 
 test:
 	cargo test --workspace
