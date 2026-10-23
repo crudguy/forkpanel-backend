@@ -11,10 +11,15 @@
 //! ## 收录标准（谁该进黑名单）
 //! 进黑名单的判据是「**改坏它会立刻让机器不可登录、不可启动，或以 root 身份执行
 //! 任意代码**」。据此收录：认证与账号数据库、sudo/PAM、动态链接器预加载、
-//! 定时任务、systemd 单元、init 脚本。
+//! 定时任务、systemd 单元、init 脚本、防火墙持久化配置（nftables/iptables/ufw，
+//! 写坏=下次重放时网络全锁）、fail2ban 配置（action 规则以 root 执行命令）、
+//! 内核参数与模块加载（sysctl 的 core_pattern 可指向程序、modprobe.d 的
+//! install 行可执行任意命令）、root 的登录壳脚本（与 /etc/profile 同族）。
 //!
 //! 反过来说，**不进**黑名单的也要有理由：`/etc/hosts`、`/etc/resolv.conf`、
-//! `/etc/hostname` 属于常见运维改动且坏了可恢复，保留可写。
+//! `/etc/hostname` 属于常见运维改动且坏了可恢复，保留可写；**非 root 用户自己
+//! 的 `~/.bashrc` 同样保留可写**——那份脚本只以该用户身份执行，不构成提权向量
+//! （root 的才是，故只精确收 `/root/` 下那几个启动文件名）。
 //!
 //! ## 事故记录（2026-10-21）
 //! 故障注入时用面板的 `PUT /files/write` 直接覆盖了 `/etc/passwd`（返回 200），
@@ -42,6 +47,21 @@ const DENY_EXACT: &[&str] = &[
     "/etc/crontab",
     // 面板主密钥：改坏=全部备份与凭据无法解密（位于数据目录，非 /etc）
     "/var/lib/forkpanel/master.key",
+    // 防火墙持久化：netfilter-persistent / nftables.service 在启动时重放这些
+    // 文件，写坏（或写成 deny-all）= 下次重启网络全锁，远程不可登录
+    "/etc/nftables.conf",
+    "/etc/default/ufw",             // ufw 开关与默认策略（ENABLED/DEFAULT_*_POLICY）
+    // TCP wrappers：一条 `ALL: ALL` 即可拒掉包括 SSH 在内的全部登录
+    "/etc/hosts.allow", "/etc/hosts.deny",
+    // 内核参数：kernel.core_pattern 可写成「|/路径」= 任意程序以 root 执行；
+    // 其余参数（如 pid_max）可让系统迅速不可用
+    "/etc/sysctl.conf",
+    // 开机加载的内核模块：列 .ko 路径 = 下次启动即以内核身份执行任意代码
+    "/etc/modules",
+    // root 的登录/交互壳启动脚本：与 /etc/profile 同族，但只对 root 生效
+    // （非 root 用户自己的 ~/.bashrc 不在此列，理由见模块头）
+    "/root/.bashrc", "/root/.bash_profile", "/root/.bash_login",
+    "/root/.profile", "/root/.bash_logout",
 ];
 
 /// 前缀匹配（整个目录 / 一族文件）
@@ -67,12 +87,28 @@ const DENY_PREFIX: &[&str] = &[
     "/etc/profile.d/",
     // 资源限制与安全策略（可让 root 进程被内核杀掉 / 提权）
     "/etc/security/",
+    // 防火墙持久化目录：iptables-persistent 从 rules.v4/v6 重放；ufw 规则树
+    "/etc/iptables/", "/etc/ufw/",
+    // fail2ban 配置树：action.d 的命令模板与 jail 内联 action 都以 root 执行。
+    // filter.d 等只读文件一并拒绝——整树拒绝比逐文件区分更可审计，且面板文件页
+    // 本就不是 fail2ban 的编辑入口（真要在面板里改请走「终端」或 SSH）。
+    "/etc/fail2ban/",
+    // 内核参数 drop-in（与 /etc/sysctl.conf 等价）
+    "/etc/sysctl.d/",
+    // 开机模块加载：modules-load.d 列 .ko；modprobe.d 的 install 行可执行任意命令
+    "/etc/modules-load.d/", "/etc/modprobe.d/",
+    // AppArmor profile：enforce 档语法错误会让依赖它的服务起不来（不可启动）
+    "/etc/apparmor.d/",
 ];
 
 /// 后缀匹配（任何用户下的同名文件）
 const DENY_SUFFIX: &[&str] = &[
     "/authorized_keys",
+    // OpenSSH 旧式公钥文件（AuthorizedKeysFile 的兼容名），与上一行等价
+    "/authorized_keys2",
     "/.ssh/id_rsa", "/.ssh/id_ecdsa", "/.ssh/id_ed25519", "/.ssh/identity",
+    // OpenSSH 默认私钥名补齐：id_dsa（旧算法）与两个 FIDO 变体（_sk 后缀）
+    "/.ssh/id_dsa", "/.ssh/id_ecdsa_sk", "/.ssh/id_ed25519_sk",
 ];
 
 /// 按**字符串**判定敏感（平台无关，供 linux 与 mock 共用）。
@@ -146,6 +182,9 @@ mod tests {
             "/etc/nginx/nginx.conf",          // 站点配置由面板自己生成/编辑
             "/etc/crontab.bak",               // 不是 crontab 本体
             "/etc/passwdx",                   // 不是 passwd
+            "/etc/sysctl.conf.bak",           // 备份不是本体（同 crontab.bak）
+            "/root/.bashrc.bak",              // 备份不会被 shell 执行
+            "/home/www/.bashrc",              // 非 root 用户自己的 rc：不构成提权
         ] {
             assert!(!deny(p), "不该拒绝: {p}");
         }
@@ -159,5 +198,53 @@ mod tests {
         assert!(deny("/etc/cron.d/job"));
         assert!(!deny("/etc/cronx"));        // 不是 /etc/cron.d/
         assert!(!deny("/etc/systemddir"));   // 不是 /etc/systemd/
+        assert!(!deny("/etc/ufwx/rules"));    // 不是 /etc/ufw/
+        assert!(!deny("/etc/fail2ban.conf")); // 不是 /etc/fail2ban/（目录前缀）
+        assert!(!deny("/etc/modulesfoo"));    // 不是 /etc/modules（精确匹配）
+    }
+
+    /// 复盘 P0-1 补齐的缺口。收录标准见模块头：防火墙持久化（写坏=网络全锁）、
+    /// fail2ban（action 以 root 执行）、内核参数与模块（core_pattern / modprobe
+    /// install 可执行任意代码）、root 登录壳脚本、SSH 同名公私钥文件。
+    #[test]
+    fn firewall_kernel_and_root_shell_configs_are_denied() {
+        for p in [
+            // 防火墙持久化：重放时写坏 = 网络全锁
+            "/etc/nftables.conf",
+            "/etc/iptables/rules.v4",
+            "/etc/iptables/rules.v6",
+            "/etc/default/ufw",
+            "/etc/ufw/ufw.conf",
+            "/etc/ufw/user.rules",
+            // TCP wrappers：一条规则拒掉全部登录
+            "/etc/hosts.allow",
+            "/etc/hosts.deny",
+            // fail2ban：action.d 命令模板 / jail 内联 action 都以 root 执行
+            "/etc/fail2ban/jail.local",
+            "/etc/fail2ban/action.d/iptables-multiport.conf",
+            "/etc/fail2ban/filter.d/sshd.conf",
+            // 内核参数与模块加载
+            "/etc/sysctl.conf",
+            "/etc/sysctl.d/99-panel.conf",
+            "/etc/modules",
+            "/etc/modules-load.d/evil.conf",
+            "/etc/modprobe.d/evil.conf",
+            // AppArmor：enforce 档坏 = 依赖服务起不来
+            "/etc/apparmor.d/usr.sbin.sshd",
+            // root 的登录/交互壳脚本：bash 启动即执行
+            "/root/.bashrc",
+            "/root/.bash_profile",
+            "/root/.bash_login",
+            "/root/.profile",
+            "/root/.bash_logout",
+            // SSH 公私钥同名文件（旧式 authorized_keys2 + 默认私钥名补齐）
+            "/root/.ssh/authorized_keys2",
+            "/home/www/.ssh/authorized_keys2",
+            "/root/.ssh/id_dsa",
+            "/home/a/.ssh/id_ecdsa_sk",
+            "/home/a/.ssh/id_ed25519_sk",
+        ] {
+            assert!(deny(p), "必须拒绝: {p}");
+        }
     }
 }

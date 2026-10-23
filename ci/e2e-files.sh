@@ -187,6 +187,31 @@ r=$(get "/files/stat?path=$ROOT"); chk "临时目录已消失" "$(echo "$r" | jc
 n=$(get /files/trash | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["data"]["items"]))')
 chk "回收站残留 0 条" "$n" "0"
 
+say "=== 13. 敏感路径黑名单（复盘 P0-1：新条目必须真机被拒）==="
+# 读侧回归：/etc/shadow 是黑名单始祖条目（2026-10-21 事故现场）
+r=$(get "/files/read?path=/etc/shadow"); chk "读 /etc/shadow 被拒(10003)" "$(echo "$r" | jcode)" "10003"
+# 写侧：ensure_not_sensitive 在任何 OS 操作之前，且 resolve_new 只要求根存在、
+# 不要求父目录存在——故这些路径即便本机没有也必然 10003（不落盘、机器无关）。
+# 每个新类别各取一条：fail2ban 树 / nftables / sysctl / root rc / hosts.allow /
+# iptables 持久化 / ufw 规则 / modprobe.d / apparmor.d / modules-load.d / authorized_keys2
+for p in /etc/fail2ban/jail.local /etc/nftables.conf /etc/sysctl.conf /root/.bashrc /etc/hosts.allow /etc/iptables/rules.v4 /etc/ufw/user.rules /etc/modprobe.d/zz-e2e.conf /etc/apparmor.d/zz-e2e /etc/modules-load.d/zz-e2e.conf /root/.ssh/authorized_keys2; do
+  r=$(put /files/write "{\"path\":\"$p\",\"content\":\"x\"}"); chk "写 $p 被拒(10003)" "$(echo "$r" | jcode)" "10003"
+done
+# 反向：普通 /etc 文件必须仍可写——防"补齐缺口"变成"过度收宽"把日常运维堵死。
+# （文件带 PID 后缀、测完即删，宿主机不留残留）
+r=$(put /files/write "{\"path\":\"/etc/hosts.e2e-$$\",\"content\":\"x\"}"); chk "写 /etc/hosts.e2e-$$ 放行" "$(echo "$r" | jcode)" "0"
+r=$(post /files/delete "{\"path\":\"/etc/hosts.e2e-$$\"}"); chk "删反向样本" "$(echo "$r" | jcode)" "0"
+# list 标记：/etc/ssh 整目录在黑名单内，列出的每个条目都应带 sensitive=true
+lcode=$(get "/files/list?path=/etc/ssh" | jcode)
+if [ "$lcode" = "0" ]; then
+  lm=$(get "/files/list?path=/etc/ssh" | python3 -c 'import sys,json
+es=json.load(sys.stdin)["data"]["entries"]
+print("all-sensitive" if es and all(e["sensitive"] for e in es) else "not-all")')
+  chk "list /etc/ssh 全部标记 sensitive" "$lm" "all-sensitive"
+else
+  say "  · [skip] /etc/ssh 不可列（code=$lcode），跳过 list 标记断言"
+fi
+
 say ""
 say "──────── E2E 结果：PASS=$PASS  FAIL=$FAIL ────────"
 [ "$FAIL" -eq 0 ] || exit 1

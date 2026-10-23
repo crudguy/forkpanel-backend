@@ -123,7 +123,8 @@ ForkPanel 做了四层：
    > 已修复并加了回归测试（`read_write_paths_track_configured_layout`）。
 2. **数据目录 0700**，主密钥单独存放且不进任何备份。
 3. **敏感文件黑名单**（`panel-os::sensitive`）：账号库、sudo/PAM、`ld.so.preload`、
-   cron、systemd 全部拒绝通过文件接口读写。
+   cron、systemd、防火墙持久化（nftables/iptables/ufw）、fail2ban、内核参数与
+   模块加载（sysctl/modprobe）、root 登录壳脚本，全部拒绝通过文件接口读写。
 4. **路径不可硬编码**：业务层出现 `/etc`、`/var`、`/www` 字面量 CI 直接红。
 
 ### 可维护性
