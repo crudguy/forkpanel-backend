@@ -8,7 +8,7 @@
 # （恒绿比没门禁更危险）。故 audit 单独成一个目标，CI 里单独一个 job——
 # advisory-db 托管在 GitHub，网络抖动时不该连带拖红主门禁。
 
-.PHONY: check guards audit test embed-fresh e2e-files e2e-backups
+.PHONY: check guards audit test embed-fresh e2e-files e2e-backups e2e-containers
 
 # 主门禁：静态守卫 + 全量测试（离线可跑，确定性高）
 check: guards embed-fresh test
@@ -52,6 +52,18 @@ e2e-files:
 #   make e2e-backups BASE=http://127.0.0.1:2084
 e2e-backups:
 	bash ci/e2e-backups.sh "$(BASE)"
+
+# 容器（Docker）E2E：需要**运行中的 dev 后端**（默认 127.0.0.1:2083）且宿主 Docker
+# 守护进程可达（能力位 container.manage 按 daemon socket 可达性判定，由后端进程身份决定）。
+#
+# 与 e2e-files / e2e-backups 同理**不进 `check`**：CI 无 docker 守护进程时读端点会诚实 501，
+# 脚本只验证能力位 reason 已下发而非假装通过。人工在真机跑，输出 15 条断言，覆盖容器读端点
+# （列举/镜像/资源/网络/卷/Compose/Stack）+ 能力位下发 + 创建安全闸门（缺确认词 / 特权 /
+# 敏感挂载 / 非法名 / 错确认词），全部卡在 docker 之前的 validate_create，零残留。
+#   make e2e-containers
+#   make e2e-containers BASE=http://127.0.0.1:2084
+e2e-containers:
+	bash ci/e2e-containers.sh "$(BASE)"
 
 test:
 	cargo test --workspace
