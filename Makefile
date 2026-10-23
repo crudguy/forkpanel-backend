@@ -8,7 +8,7 @@
 # （恒绿比没门禁更危险）。故 audit 单独成一个目标，CI 里单独一个 job——
 # advisory-db 托管在 GitHub，网络抖动时不该连带拖红主门禁。
 
-.PHONY: check guards audit test embed-fresh e2e-files e2e-backups e2e-containers e2e-cron e2e-databases e2e-sites e2e-firewall e2e-rbac e2e-security e2e-all
+.PHONY: check guards audit test embed-fresh e2e-files e2e-backups e2e-containers e2e-cron e2e-databases e2e-sites e2e-firewall e2e-rbac e2e-security e2e-all e2e-ui
 
 # 主门禁：静态守卫 + 全量测试（离线可跑，确定性高）
 check: guards embed-fresh test
@@ -124,6 +124,14 @@ e2e-security:
 #   make e2e-all BASE=http://127.0.0.1:2084
 e2e-all:
 	bash ci/e2e-all.sh "$(BASE)"
+
+# 浏览器级 UI 渲染冒烟（**前端**真机验收）：用 agent-browser 驱动真实浏览器，
+# 断言关键页面真的渲染出了内容（"忘 import 子组件 ⇒ 静默不渲染"这类坑只有浏览器能抓）。
+# 刻意**不进 e2e-all**：它需要浏览器 + 前端 dev server，与后端 API 级 E2E 是不同层，
+# 混在一起会让 API 门禁依赖浏览器环境。
+#   make e2e-ui
+e2e-ui:
+	bash ci/e2e-ui.sh
 
 test:
 	cargo test --workspace

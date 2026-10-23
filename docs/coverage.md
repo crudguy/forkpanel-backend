@@ -236,6 +236,24 @@ make e2e-containers BASE=http://127.0.0.1:2084  # 单域
 - **不进 `make check`**：CI 无真机服务，脚本只会走 `[skip]` 分支——那是恒绿，
   比没有守卫更危险。人工在真机跑。
 
+### 浏览器级 UI 冒烟（`ci/e2e-ui.sh`，20 条断言）
+
+九域 E2E 全部打在 **API** 上；前端 74 个 UI 文件（32 views + 42 components）此前
+**没有任何渲染测试**（vitest 只收 `src/**/*.test.ts` 且无 vue 插件）。而本项目踩过的
+最深一坑正是这一类——**新增子组件忘了 import ⇒ 静默不渲染**（Vue 把未知标签当普通
+元素渲染出空内容，仅 console warning；vue-tsc / build / 单测全绿），后端 E2E 永远
+抓不到，只有拿浏览器看 DOM 才能发现。
+
+`ci/e2e-ui.sh` 用 agent-browser 驱动真实浏览器：登录 → 概览（标题 + **数据驱动**卡片
+「共 N 个」+ 顶栏 CPU 实时值）→ 容器页 6 个 Tab 逐一断言**边界引导 banner 真实在 DOM
+里** → 用户 / 设置 / 备份 / 文件 / 日志 / 数据库各页主区非空且内容可辨认。
+
+- **只读浏览**：不点任何写操作按钮，不建 / 删资源。
+- 断言看 **DOM 文本**，不看 HTTP 200（200 只说明路由通了）。
+- 需要浏览器（agent-browser）与前端 dev server（默认 5173，代理 `/api`→2083）；
+  缺任一则**显式 `[skip]`**，不假装通过。
+- 刻意**不进 `make e2e-all`**：它是浏览器层，与 API 层混在一起会让 API 门禁依赖浏览器环境。
+
 > 本节不改变上文 🟠 项的结论：nginx `reload`、ufw 真实下发、真实容器创建、ACME、
 > fail2ban 仍**未被脚本覆盖**（破坏性或需公网/外部条件）。脚本只验证这些能力的
 > **只读面与拒绝分支**；cron / databases(SQLite) / backups / files 的**非破坏性真实
