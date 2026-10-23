@@ -8,7 +8,7 @@
 # （恒绿比没门禁更危险）。故 audit 单独成一个目标，CI 里单独一个 job——
 # advisory-db 托管在 GitHub，网络抖动时不该连带拖红主门禁。
 
-.PHONY: check guards audit test embed-fresh e2e-files
+.PHONY: check guards audit test embed-fresh e2e-files e2e-backups
 
 # 主门禁：静态守卫 + 全量测试（离线可跑，确定性高）
 check: guards embed-fresh test
@@ -42,6 +42,16 @@ audit:
 #   make e2e-files BASE=http://127.0.0.1:2084
 e2e-files:
 	bash ci/e2e-files.sh "$(BASE)"
+
+# 备份 E2E：需要**运行中的 dev 后端**（默认 127.0.0.1:2083）。
+#
+# 与 e2e-files 同理**不进 `check`**：CI 里没有服务，脚本只会走 [skip] 分支——那是恒绿，
+# 比没有门禁更危险。它要求人工在真机跑，输出 23 条断言，覆盖备份计划的
+# 列举/创建/校验/执行/产物/下载/恢复闸门/清理 + 系统保留份数跨端点对账。
+#   make e2e-backups
+#   make e2e-backups BASE=http://127.0.0.1:2084
+e2e-backups:
+	bash ci/e2e-backups.sh "$(BASE)"
 
 test:
 	cargo test --workspace
