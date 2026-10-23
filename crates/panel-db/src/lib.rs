@@ -23,6 +23,7 @@ use panel_core::{PanelError, Result, Tier};
 use rusqlite::{Connection, OpenFlags};
 use std::{
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     sync::Arc,
     time::Duration,
 };
@@ -156,16 +157,67 @@ impl FlushPolicy {
     }
 }
 
+/// 写队列容量（背压阈值）：满则 `exec` 的 `send().await` **挂起调用方**（不是丢弃）。
+///
+/// 对用户表现为"请求卡住"，而此前**完全不可观测**——排障时只能看到"面板没响应"，
+/// 无从判断是写堵了还是别的。故这里把深度记下来并告警（见 [`WriterActor::queue_depth`]）。
+pub const WRITE_QUEUE_CAPACITY: usize = 256;
+
+/// 告警线（占容量比例）：越过它说明写请求已开始堆积。
+/// 取比例而非绝对值：容量调整时阈值自动跟随，不会出现"改了容量忘了改阈值"。
+const QUEUE_WARN_RATIO: f32 = 0.75;
+
+/// 告警节流间隔（秒）。积压期间**每个请求打一行**会把日志刷爆，反而让人看不见别的
+/// 异常——这是"告警噪音等于没告警"的典型形态。
+const QUEUE_WARN_MIN_INTERVAL_SECS: u64 = 60;
+
+/// 越过告警线的深度（容量 × 0.75，至少 1）。
+pub fn queue_warn_threshold(capacity: usize) -> usize {
+    ((capacity as f32) * QUEUE_WARN_RATIO).max(1.0) as usize
+}
+
+/// 此刻是否该打告警行（纯函数：把"日志打没打"变成可断言的行为，而不是不可测的副作用）。
+pub(crate) fn should_warn_queue(depth: usize, capacity: usize, last_warn: Option<u64>, now: u64) -> bool {
+    if depth < queue_warn_threshold(capacity) {
+        return false;
+    }
+    match last_warn {
+        // 从未告警过（或时钟回拨导致 now 早于上次）：立刻报一次
+        None => true,
+        Some(t) => now.saturating_sub(t) >= QUEUE_WARN_MIN_INTERVAL_SECS,
+    }
+}
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// 单写 actor：**进程内唯一持有写连接的组件**。
 pub struct WriterActor {
     tx: mpsc::Sender<(WriteOp, oneshot::Sender<Result<WriteAck>>)>,
+    /// 已入队、尚未被 actor 取走的写操作数（近似值，见 `exec` 注释）
+    depth: Arc<AtomicUsize>,
+    /// 进程内见过的最大深度：排障时"曾经堵到多少"比"现在多少"更有用
+    /// （堵往往发生在没人盯着的瞬间，等你看时已回落）。
+    peak: Arc<AtomicUsize>,
+    /// 上次告警的 unix 秒（0 = 从未），仅用于节流
+    last_warn: Arc<AtomicU64>,
 }
 
 impl WriterActor {
     pub fn spawn(path: PathBuf, tier: Tier, synchronous: &str) -> Result<Self> {
         let mut conn = open(&path, tier, synchronous)?;
-        let (tx, mut rx) = mpsc::channel::<(WriteOp, oneshot::Sender<Result<WriteAck>>)>(256);
+        let (tx, mut rx) =
+            mpsc::channel::<(WriteOp, oneshot::Sender<Result<WriteAck>>)>(WRITE_QUEUE_CAPACITY);
         let policy = FlushPolicy::for_tier(tier);
+        let depth = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let last_warn = Arc::new(AtomicU64::new(0));
+        // actor 线程只负责"取走即减"，不做峰值/告警判断（那是入队侧的事）
+        let depth_in = depth.clone();
 
         // 阻塞型 SQLite 调用放在专用线程，不占用 tokio 的异步工作线程
         std::thread::Builder::new()
@@ -180,6 +232,7 @@ impl WriterActor {
                         Some(v) => v,
                         None => break,   // 所有 sender 已释放 → 退出
                     };
+                    depth_in.fetch_sub(1, Ordering::Relaxed);
                     batch.push(first);
 
                     // 攒批：直到满足数量阈值或时间窗口。
@@ -193,7 +246,10 @@ impl WriterActor {
                         let now = std::time::Instant::now();
                         if now >= deadline { break; }
                         match rx.try_recv() {
-                            Ok(v) => batch.push(v),
+                            Ok(v) => {
+                                depth_in.fetch_sub(1, Ordering::Relaxed);
+                                batch.push(v);
+                            }
                             Err(mpsc::error::TryRecvError::Empty) => {
                                 std::thread::sleep((deadline - now).min(Duration::from_millis(1)));
                             }
@@ -258,7 +314,7 @@ impl WriterActor {
             })
             .map_err(|e| PanelError::Internal(format!("spawn writer: {e}")))?;
 
-        Ok(Self { tx })
+        Ok(Self { tx, depth, peak, last_warn })
     }
 
     /// 提交写操作并等待结果。
@@ -271,10 +327,59 @@ impl WriterActor {
     where
         F: FnOnce(&Connection) -> Result<WriteAck> + Send + 'static,
     {
+        // 入队前 +1：表示"已提交但还没被 actor 取走"的积压。
+        // actor 侧取走一条才 -1，故这里是**近似值**（不含正在执行的那批）——
+        // 判断"是否堵了"足够，不追求精确计数（那要给每次写入加同步开销）。
+        let depth = self.depth.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        self.peak.fetch_max(depth, Ordering::Relaxed);
+        self.warn_if_backlogged(depth);
+
         let (reply, rx) = oneshot::channel();
-        self.tx.send((Box::new(op), reply)).await
-            .map_err(|_| PanelError::Internal("writer actor gone".into()))?;
+        if let Err(_send_err) = self.tx.send((Box::new(op), reply)).await {
+            // actor 已退出：撤销这次记账，否则 depth 永远降不回去（告警会一直刷）
+            self.depth.fetch_sub(1, Ordering::Relaxed);
+            return Err(PanelError::Internal("writer actor gone".into()));
+        }
         rx.await.map_err(|_| PanelError::Internal("writer actor dropped reply".into()))?
+    }
+
+    /// 当前队列深度（近似值，见 `exec` 注释）
+    pub fn queue_depth(&self) -> usize {
+        self.depth.load(Ordering::Relaxed)
+    }
+
+    /// 进程内见过的峰值深度
+    pub fn peak_queue_depth(&self) -> usize {
+        self.peak.load(Ordering::Relaxed)
+    }
+
+    /// 队列容量（背压阈值）
+    pub fn queue_capacity(&self) -> usize {
+        WRITE_QUEUE_CAPACITY
+    }
+
+    /// 越过告警线时打一行，并按 `QUEUE_WARN_MIN_INTERVAL_SECS` 节流。
+    fn warn_if_backlogged(&self, depth: usize) {
+        let now = unix_secs();
+        let last = self.last_warn.load(Ordering::Relaxed);
+        let last_opt = if last == 0 { None } else { Some(last) };
+        if !should_warn_queue(depth, WRITE_QUEUE_CAPACITY, last_opt, now) {
+            return;
+        }
+        // compare_exchange：并发入队时只有一个写者更新成功，天然去重（一行而不是 N 行）
+        if self
+            .last_warn
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            eprintln!(
+                "[panel] ⚠ [db] 写队列积压 depth={depth}/{}（峰值 {}）：写请求已开始排队，\
+                 再往上调用方会被背压挂起（表现为请求卡住）。常见诱因是事务内慢操作，\
+                 见 WriterActor::exec 的纪律注释。",
+                WRITE_QUEUE_CAPACITY,
+                self.peak.load(Ordering::Relaxed)
+            );
+        }
     }
 }
 
@@ -408,6 +513,47 @@ mod backup_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 阈值必须随容量走：改了容量而阈值不变，告警就会一直不响（或一直响）。
+    #[test]
+    fn queue_warn_threshold_scales_with_capacity() {
+        assert_eq!(queue_warn_threshold(256), 192);
+        assert_eq!(queue_warn_threshold(64), 48);
+        // 极小容量也要有告警线（至少 1），否则 depth=1 就算堵也永不告警
+        assert!(queue_warn_threshold(1) >= 1);
+    }
+
+    #[test]
+    fn should_warn_queue_respects_threshold_and_throttle() {
+        let cap = 256;
+        let th = queue_warn_threshold(cap);
+        // ① 低于告警线：永不告警
+        assert!(!should_warn_queue(th - 1, cap, None, 1_000));
+        // ② 首次越线：立刻告警
+        assert!(should_warn_queue(th, cap, None, 1_000));
+        // ③ 刚告过：节流窗口内不再重复
+        assert!(!should_warn_queue(th, cap, Some(1_000), 1_010));
+        // ④ 窗口过后：再报一次（否则积压一直持续却从此静默）
+        assert!(should_warn_queue(th, cap, Some(1_000), 1_000 + QUEUE_WARN_MIN_INTERVAL_SECS));
+    }
+
+    /// 真机回归：写操作执行完后深度必须回落，否则 depth 只增不减 ⇒ 告警永不停止。
+    #[tokio::test]
+    async fn queue_depth_returns_to_zero_after_exec() {
+        let dir = std::env::temp_dir().join(format!("panel-db-qd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("q.db");
+        let w = WriterActor::spawn(db, Tier::Nano, "NORMAL").unwrap();
+        assert_eq!(w.queue_capacity(), WRITE_QUEUE_CAPACITY);
+
+        for _ in 0..5 {
+            w.exec(|_c| Ok(WriteAck { rows_changed: 1 })).await.unwrap();
+        }
+        assert_eq!(w.queue_depth(), 0, "写操作执行完后队列深度必须回落到 0");
+        assert!(w.peak_queue_depth() >= 1, "峰值深度应至少记录到 1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn flush_policy_scales_with_tier() {
