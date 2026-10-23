@@ -436,6 +436,9 @@ pub fn build_router(state: Shared) -> Router {
         .layer(middleware::from_fn(crate::middleware::security_headers))
         // 兜底：未匹配路由返回结构化 404（不暴露路由表）
         .fallback(handler_404)
+        // panic 兜底：**最后加 = 最外层**，才能盖住内层中间件与所有 handler（含 fallback）。
+        // 不加这层时 handler panic 会让连接任务崩溃，客户端看到的是空响应/连接重置。
+        .layer(tower_http::catch_panic::CatchPanicLayer::custom(crate::panic_guard::handle_panic))
         .with_state(state)
 }
 

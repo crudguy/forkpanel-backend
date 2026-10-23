@@ -24,6 +24,7 @@ pub mod ratelimit;
 pub mod extract;
 pub mod error;
 pub mod middleware;
+pub mod panic_guard;
 pub mod remote_store;
 pub mod routes;
 pub mod sse;

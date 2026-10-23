@@ -18,7 +18,10 @@ panel-task = { path = "../panel-task" }
 axum       = { version = "0.8", default-features = false, features = ["http1", "json", "macros", "query", "tokio", "ws"] }
 tokio      = { workspace = true }
 async-trait = { workspace = true }
-tower      = { version = "0.5", features = ["limit"] }
+tower      = { version = "0.5", features = ["limit", "util"] }
+# panic 兜底：CatchPanicLayer 把 handler panic 转成结构化 500（见 src/panic_guard.rs）。
+# 只开 catch-panic 特性、且 tower-http 本就在依赖树里（axum 传递）⇒ 零新增 crate。
+tower-http = { version = "0.6", default-features = false, features = ["catch-panic"] }
 async-stream = "0.3"
 futures-util = "0.3"
 serde      = { workspace = true }
