@@ -867,7 +867,6 @@ components:
         # 只读护栏**（SQLite 只读连接 / PG default_transaction_read_only 会话）。
         # MySQL 装了客户端也依然是 false。前端不得用 engine 自行猜测此值。
         readonly_sql: { type: boolean }
-        tls_mode:   { type: string, enum: [disable, prefer, require], default: prefer }
         remark:     { type: string, description: "对象说明（备注，022）：这个库干嘛的、为何这样配置；无则为空串" }
     # 只读 SQL 控制台的引擎相关文案（默认语句 + 示例）。
     # 放在后端是为了让"哪个引擎长什么样"只有一份：放前端就会与后端口径漂移。
@@ -902,7 +901,6 @@ components:
         username: { type: string, description: "mysql/postgres 必填（连主机账号）；sqlite 为本地文件、可空" }
         password: { type: string, description: "明文传输，后端用主密钥加密存储" }
         default_db: { type: string }
-        tls_mode: { type: string, enum: [disable, prefer, require] }
     DbTable:
       type: object
       properties:

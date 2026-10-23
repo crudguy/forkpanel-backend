@@ -161,5 +161,31 @@ else
   fi
 fi
 
+# ── [G] 受控契约字段必须真的有实现（tls_mode 事故回归，二轮审计 P0-6）──
+# 背景：`DbConnection.tls_mode`（enum disable|prefer|require）曾在契约与 DB 迁移里
+# 都存在，但 **Rust 侧零消费者**；而 `PanelJson` 不 `deny_unknown_fields` ⇒ 用户提交
+# `tls_mode: "require"` 被静默丢弃、还返回成功，实际连库**不强制 TLS**（明文传凭据）。
+# 这是「假控制」最危险的形态：**伪装成已做**。
+#
+# 守卫语义（刻意**不**写成「永远不许出现 tls_mode」——那会锁死演进）：
+#   契约声明了 ⇒ crates/ 里必须有消费者。将来真实现了再加回声明即绿；
+#   只加声明不实现则红。
+echo "== [G] 受控契约字段必须真的有实现 =="
+# 剔注释行：单文件 grep -n 的前缀是 `行号:`，多文件是 `文件名:行号:`（写错前缀会滤不掉）
+BE_TLS=$(grep -nE 'tls_mode' docs/api/openapi.yaml 2>/dev/null \
+  | grep -vE '^[0-9]+:[[:space:]]*#' | grep -c .)
+CRATE_TLS=$(grep -rnE 'tls_mode' crates/ 2>/dev/null \
+  | grep -vE '^[^:]+:[0-9]+:[[:space:]]*(//|///)' | grep -c .)
+if [ "$BE_TLS" -gt 0 ]; then
+  if [ "$CRATE_TLS" -gt 0 ]; then
+    pass "契约声明了 tls_mode，且 crates/ 内确有消费者（${CRATE_TLS} 处）"
+  else
+    fail "契约声明了 tls_mode，但 crates/ 里没有任何消费者——用户会以为强制 TLS，实际明文传输"
+    echo "      修法：接线实现（CONN_SELECT / INSERT / DTO / provider 三引擎分支同步），或从契约删除该字段"
+  fi
+else
+  pass "契约未声明 tls_mode（后端暂无 TLS 实现，不伪装成已支持）"
+fi
+
 echo
 if [ "$FAIL" -eq 0 ]; then echo "PASS：前后端契约一致"; exit 0; else echo "FAIL：契约不一致"; exit 1; fi
