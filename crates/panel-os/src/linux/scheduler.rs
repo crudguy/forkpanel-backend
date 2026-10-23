@@ -214,7 +214,7 @@ impl SchedulerProvider for LinuxScheduler {
         let f: Vec<&str> = expr.split_whitespace().collect();
         if f.len() != 5 {
             return Err(PanelError::Validation {
-                field: "expr".into(),
+                field: "expr",
                 reason: format!("需要 5 段，实际 {} 段", f.len()),
             });
         }
@@ -222,7 +222,7 @@ impl SchedulerProvider for LinuxScheduler {
         for (i, field) in f.iter().enumerate() {
             parse_field(field, bounds[i].0, bounds[i].1)
                 .map_err(|e| PanelError::Validation {
-                    field: "expr".into(),
+                    field: "expr",
                     reason: format!("第 {} 段 `{}` 非法：{}", i + 1, field, e),
                 })?;
         }
@@ -348,7 +348,7 @@ fn parse_field(s: &str, min: u32, max: u32) -> std::result::Result<Vec<u32>, Str
 fn ymd_from_days(z: i64) -> (i32, u32, u32) {
     let z = z + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as i64;
+    let doe = z - era * 146097;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);

@@ -103,6 +103,9 @@ impl AppState {
     /// 的 `[security]`。**曾经三者都硬编码于此**——配置项形同虚设，用户改了毫无效果
     /// 却以为生效（与 `read_only` 同一类"假控制"）。`session_*` 与 `max_login_attempts`
     /// 现由调用方解析后传入 `SessionCache` / `LoginGuard`。
+    // 构造参数多是有意的：AppState 承载部署期一次性注入的全部配置，
+    // 拆成 builder 反而容易漏传（漏传＝用默认值悄悄兜底）。显式豁免。
+    #[allow(clippy::too_many_arguments)]
     pub fn new(os: Arc<dyn panel_os::OsAdapter>, db: Arc<panel_db::WriterActor>,
                pool: Arc<ReadPool>, tasks: Arc<panel_task::TaskRunner>,
                metrics: Arc<std::sync::Mutex<panel_db::aggregator::Aggregator>>,

@@ -107,7 +107,7 @@ pub fn prune_keep_newest(dir: &Path, prefix: &str, keep: usize) -> usize {
         })
         .collect();
     // 新的在前：mtime 降序
-    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    entries.sort_by_key(|a| std::cmp::Reverse(a.0));
     let mut removed = 0;
     for (_, p) in entries.iter().skip(keep) {
         if std::fs::remove_file(p).is_ok() { removed += 1; }

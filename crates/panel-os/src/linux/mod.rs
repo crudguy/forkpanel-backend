@@ -58,17 +58,17 @@ impl LinuxOsAdapter {
             firewall: make_firewall(),
             packages: Arc::new(stub::LinuxPackages::detect()),
             logs: Arc::new(stub::LinuxLogs::detect(paths.clone())),
-            scheduler: Arc::new(scheduler::LinuxScheduler::default()),
+            scheduler: Arc::new(scheduler::LinuxScheduler),
             security: Arc::new(security::LinuxSecurity),
             // webserver 需要路径布局（站点 conf 落盘到 web_conf_dir），故显式注入
             webserver: Arc::new(stub::LinuxWebServer::detect(paths.clone())),
-            databases: Arc::new(stub::LinuxDatabases::default()),
+            databases: Arc::new(stub::LinuxDatabases),
             // 容器探测依赖 socket 路径（走 PathLayout，不硬编码），故注入 paths
             containers: Arc::new(containers::LinuxContainers::detect(paths.clone())),
             // 终端只需探测 shell 是否存在（纯文件检查），无需 paths
             terminal: Arc::new(terminal::LinuxTerminal::detect()),
-            users: Arc::new(stub::LinuxUsers::default()),
-            network: Arc::new(stub::LinuxNetwork::default()),
+            users: Arc::new(stub::LinuxUsers),
+            network: Arc::new(stub::LinuxNetwork),
             storage: Arc::new(stub::LinuxStorage),
             files: Arc::new(files::LinuxFileProvider),
             platform: detect_platform(),

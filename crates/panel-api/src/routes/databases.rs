@@ -52,6 +52,7 @@ pub struct ConnDto {
     /// - `client_ready` 说「浏览/备份的客户端在不在」；
     /// - 这个说「用户自己写 SQL 能不能跑」，判据是**有没有服务端物理只读护栏**
     ///   （SQLite 只读连接 / PG `default_transaction_read_only` 会话）。
+    ///
     /// MySQL 装了客户端也依然是 false——没有护栏，开了就是任意写库入口。
     /// 前端**不得**用 `engine === 'sqlite'` 自己猜这个值：后端加了护栏而前端
     /// 没跟上，用户就白白用不上已能用的功能（置灰是前端单方面的承诺）。
@@ -651,7 +652,7 @@ pub(crate) async fn conn_id_by_name(state: &Shared, name: &str) -> Result<Option
             let mut it = st
                 .query_map([name], |r| r.get::<_, i64>(0))
                 .map_err(|e| PanelError::Database(e.to_string()))?;
-            Ok(it.next().transpose().map_err(|e| PanelError::Database(e.to_string()))?)
+            it.next().transpose().map_err(|e| PanelError::Database(e.to_string()))
         })
         .await
 }
@@ -738,7 +739,7 @@ pub(crate) async fn load_target(state: &Shared, conn: i64, db_override: Option<&
             r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<i64>>(2)?,
             r.get::<_, Option<String>>(3)?, r.get::<_, Option<Vec<u8>>>(4)?, r.get::<_, Option<String>>(5)?,
         ))).map_err(|e| PanelError::Database(e.to_string()))?;
-        Ok(it.next().transpose().map_err(|e| PanelError::Database(e.to_string()))?)
+        it.next().transpose().map_err(|e| PanelError::Database(e.to_string()))
     }).await?
         .ok_or_else(|| ApiError::not_found("connection"))?;
     let (engine_s, host, port, user, pwd_enc, database) = row;
@@ -1468,7 +1469,7 @@ mod tests {
         let f = root.join("dumps").join("x.sql");
         std::fs::write(&f, b"x").unwrap();
 
-        let s = sess("operator", &[&root.to_string_lossy().to_string()]);
+        let s = sess("operator", &[root.to_string_lossy().as_ref()]);
         // create=false：还原源文件必须已存在
         let got = resolve_out(&s, &f.to_string_lossy(), false)
             .unwrap_or_else(|e| panic!("允许根内的源应可解析: {e}"));
@@ -1481,7 +1482,7 @@ mod tests {
         let root = std::env::temp_dir()
             .join(format!("panel-db-deny-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
-        let s = sess("operator", &[&root.to_string_lossy().to_string()]);
+        let s = sess("operator", &[root.to_string_lossy().as_ref()]);
 
         // /etc/passwd 不落在允许根内 —— 绝不能因为绝对路径就放行
         let e = resolve_out(&s, "/etc/passwd", false).unwrap_err();
@@ -1497,7 +1498,7 @@ mod tests {
         let root = std::env::temp_dir()
             .join(format!("panel-db-missing-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
-        let s = sess("operator", &[&root.to_string_lossy().to_string()]);
+        let s = sess("operator", &[root.to_string_lossy().as_ref()]);
         assert!(resolve_out(&s, "nope/ghost.sql", false).is_err(),
             "不存在的源文件必须拒绝解析");
         // 同一路径若作为「待创建产物」则合法

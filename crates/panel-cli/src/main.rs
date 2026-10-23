@@ -408,7 +408,7 @@ fn run(cli: Cli) -> Result<()> {
             // exists"——用户看不出是该删还是该改名。显式说清楚。
             if dest.exists() {
                 return Err(PanelError::Validation {
-                    field: "out".into(),
+                    field: "out",
                     reason: format!("目标已存在：{}（VACUUM INTO 不覆盖，请先删除或换个路径）", dest.display()),
                 });
             }
@@ -446,7 +446,7 @@ fn run(cli: Cli) -> Result<()> {
                 .map_err(|e| PanelError::Database(e.to_string()))?;
             if exists == 0 {
                 return Err(PanelError::Validation {
-                    field: "user".into(),
+                    field: "user",
                     reason: format!("用户 {user} 不存在"),
                 });
             }
@@ -457,7 +457,7 @@ fn run(cli: Cli) -> Result<()> {
                 None => {
                     if !std::io::stdin().is_terminal() {
                         return Err(PanelError::Validation {
-                            field: "pass".into(),
+                            field: "pass",
                             reason: "非交互环境请提供 --pass".into(),
                         });
                     }
@@ -567,7 +567,7 @@ fn run(cli: Cli) -> Result<()> {
                         &sa, std::time::Duration::from_millis(300),
                     ).is_ok() {
                         return Err(PanelError::Validation {
-                            field: "service".into(),
+                            field: "service",
                             reason: format!(
                                 "服务仍在运行（{addr} 可连接）。请先停止 panel 再恢复；\n                                 确认已停机（例如容器内进程名不同）可加 --force"
                             ),
@@ -595,11 +595,11 @@ fn run(cli: Cli) -> Result<()> {
                     p
                 }
                 (Some(_), Some(_)) => return Err(PanelError::Validation {
-                    field: "path".into(),
+                    field: "path",
                     reason: "产物路径与 --remote 只能给一个".into(),
                 }),
                 (None, None) => return Err(PanelError::Validation {
-                    field: "path".into(),
+                    field: "path",
                     reason: "请给产物路径，或用 --remote <计划 id> 从远端副本取回".into(),
                 }),
             };
@@ -609,7 +609,7 @@ fn run(cli: Cli) -> Result<()> {
             let fname = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
             if !is_db_artifact_name(&fname) {
                 return Err(PanelError::Validation {
-                    field: "path".into(),
+                    field: "path",
                     reason: format!("只接受面板库产物（.db / .db.enc），收到：{fname}"),
                 });
             }
@@ -738,6 +738,9 @@ fn run(cli: Cli) -> Result<()> {
 ///
 /// 刻意集中在一处：`builtin_schedules` 里加了名字，这里就必须有对应实现，
 /// 否则调度器会静默跳过（代码里已用 warn 记录这种漏配）。
+// 参数多是有意的：内部任务的注册入口要把调度器/存储/路径/配置/状态一次性交齐，
+// 拆成 builder 只会让调用点更难核对（漏一个依赖＝该任务静默不注册）。
+#[allow(clippy::too_many_arguments)]
 async fn register_internal_jobs(
     sched: &panel_task::InternalScheduler,
     os: &Arc<dyn panel_os::OsAdapter>,
@@ -1001,7 +1004,7 @@ fn create_owner(
         None => {
             if !interactive {
                 return Err(PanelError::Validation {
-                    field: "owner".into(),
+                    field: "owner",
                     reason: "非交互环境请提供 --owner".into(),
                 });
             }
@@ -1015,7 +1018,7 @@ fn create_owner(
     };
     if username.is_empty() || username.len() > 64 {
         return Err(PanelError::Validation {
-            field: "username".into(),
+            field: "username",
             reason: "用户名长度需在 1..=64".into(),
         });
     }
@@ -1026,7 +1029,7 @@ fn create_owner(
         None => {
             if !interactive {
                 return Err(PanelError::Validation {
-                    field: "owner-pass".into(),
+                    field: "owner-pass",
                     reason: "非交互环境请提供 --owner-pass".into(),
                 });
             }

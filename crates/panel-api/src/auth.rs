@@ -381,9 +381,7 @@ impl SessionCache {
         if let Some(s) = self.get(sid) {
             return Some(s);
         }
-        if self.db.is_none() {
-            return None;
-        }
+        self.db.as_ref()?;
         let h = sid_hash(sid);
         let now = now_unix();
         // 注：`.ok().flatten()?` 已解包 Option，故类型注解是**元组**本身
@@ -408,7 +406,7 @@ impl SessionCache {
                         ))
                     })
                     .map_err(|e| PanelError::Database(e.to_string()))?;
-                Ok(it.next().transpose().map_err(|e| PanelError::Database(e.to_string()))?)
+                it.next().transpose().map_err(|e| PanelError::Database(e.to_string()))
             })
             .await
             .ok()
@@ -487,6 +485,7 @@ impl LoginGuard {
     /// 现行为（闸门也计数），用真实 `LoginGuard` 实测：
     /// - 攻击者连点：第 **11** 次即进 15 分钟锁定，2 小时内最多 10 次有效尝试；
     /// - 正常用户手快连错：第 **16** 次被锁 15 分钟。
+    ///
     /// 退避仍按 1→2→4→…→64s 递增，只是不再「卡死在下界」。
     ///
     /// 行为由 `blocked_attempts_still_advance_the_counter` 钉住（旧的反向断言
@@ -495,7 +494,7 @@ impl LoginGuard {
     pub fn check(&self, key: &str) -> Option<u64> {
         let mut m = self.attempts.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
-        let Some(v) = m.get_mut(key) else { return None };
+        let v = m.get_mut(key)?;
         // 只保留 15 分钟窗口内的记录
         v.retain(|t| now.duration_since(*t) < Duration::from_secs(900));
         if v.is_empty() {
@@ -970,7 +969,7 @@ mod tests {
         // 攒到 lock_after(15)：前 14 次纯记录，第 15 次跨过阈值
         for _ in 0..15 { g.record_failure("admin"); }
         let first = g.check("admin").expect("已过 lock_after，必须锁定");
-        assert!(first >= 895 && first <= 900, "刚进入锁定应接近满额 900s，实际 {first}");
+        assert!((895..=900).contains(&first), "刚进入锁定应接近满额 900s，实际 {first}");
 
         // 关键：锁定期间"继续尝试"（429 也计数 ⇒ 每次都会 record_failure）
         sleep(Duration::from_millis(1100));

@@ -126,8 +126,8 @@ pub async fn list(
             let it = st
                 .query_map([limit], row_dto)
                 .map_err(|e| PanelError::Database(e.to_string()))?;
-            Ok(it.collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(|e| PanelError::Database(e.to_string()))?)
+            it.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| PanelError::Database(e.to_string()))
         })
         .await?;
     Ok(ok(items))
@@ -208,7 +208,7 @@ pub async fn remove(
     if n.rows_changed == 0 {
         return Err(ApiError::not_found("notification"));
     }
-    audit(&*state, &s, "notification.delete", &id.to_string(), "ok").await;
+    audit(&state, &s, "notification.delete", &id.to_string(), "ok").await;
     Ok(ok(true))
 }
 

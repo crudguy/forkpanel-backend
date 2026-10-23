@@ -230,7 +230,7 @@ fn parse_panel_rules(text: &str) -> Vec<(u32, String, String)> {
         let line = line.trim();
         // 真实编号在行尾 `# handle N`；用 rsplit_once 取最后一个（handle 必在末尾）
         let Some((rest, hstr)) = line.rsplit_once("# handle ") else { continue };
-        let handle: u32 = match hstr.trim().split_whitespace().next().and_then(|s| s.parse().ok()) {
+        let handle: u32 = match hstr.split_whitespace().next().and_then(|s| s.parse().ok()) {
             Some(h) => h,
             None => continue,
         };
@@ -341,7 +341,7 @@ fn parse_spec(spec: &str) -> PortSpec {
 /// 从表达式抽取源 CIDR（或集合），原样保留（重渲染时回灌）。
 fn extract_source(expr: &str) -> Option<String> {
     let idx = expr.find("saddr")?;
-    let tok = expr[idx + 5..].trim_start().split_whitespace().next()?;
+    let tok = expr[idx + 5..].split_whitespace().next()?;
     Some(tok.to_string())
 }
 
@@ -413,8 +413,7 @@ fn render_spec(spec: &PortSpec) -> String {
 /// 清洗 comment：去掉会破坏 nft 引号的字符，限长。
 fn sanitize_comment(s: &str) -> String {
     s.replace('"', "'")
-        .replace('\n', " ")
-        .replace('\r', " ")
+        .replace(['\n', '\r'], " ")
         .chars()
         .take(200)
         .collect()

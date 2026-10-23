@@ -1288,7 +1288,7 @@ pub(super) fn render_caddy_waf(server_names: &[String], w: &WafSpec) -> String {
         o.push_str(&format!("\trespond @{t}_waf_noua 403\n"));
     }
     if w.rate_per_sec.is_some() {
-        o.push_str(&format!("\t# ⚠ 限速未实装：caddy 标准版无 rate_limit 指令（需第三方 caddy-ratelimit 模块），rate_per_sec/burst 已忽略\n"));
+        o.push_str("\t# ⚠ 限速未实装：caddy 标准版无 rate_limit 指令（需第三方 caddy-ratelimit 模块），rate_per_sec/burst 已忽略\n");
     }
     o
 }

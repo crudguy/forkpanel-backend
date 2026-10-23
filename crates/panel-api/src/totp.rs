@@ -66,7 +66,7 @@ pub fn otpauth_uri(username: &str, secret_b32: &str) -> String {
 const B32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
 pub fn base32_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity((bytes.len() + 4) / 5 * 8);
+    let mut out = String::with_capacity(bytes.len().div_ceil(5) * 8);
     let mut bits = 0u16;
     let mut nbits = 0u8;
     for &b in bytes {

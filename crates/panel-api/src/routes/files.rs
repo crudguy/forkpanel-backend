@@ -262,7 +262,7 @@ pub async fn read(
     Ok(ok(ReadResp {
         path: q.path, content, binary: is_binary,
         size: st.size, offset,
-        has_more: (offset as u64 + buf.len() as u64) < st.size,
+        has_more: (offset + buf.len() as u64) < st.size,
     }))
 }
 

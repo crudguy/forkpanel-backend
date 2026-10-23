@@ -512,16 +512,50 @@ mod tests {
         assert_eq!(v["request_id"], "rid-1");
     }
 
-    #[test]
-    fn router_builds() {
-        // 用内存 mock 适配器验证路由可装配（无需真实 OS 能力）
+    /// **真·装配路由**。
+    ///
+    /// 此前这条测试创建了 mock OS 适配器却**从没用它**，`_assert_router` 也**从未被
+    /// 调用**——整条测试**零断言**，是"看着有测试、其实什么都没测"的典型。
+    /// 现在真的 `build_router`，并打一个**公开端点**证明它能服务请求：
+    /// 路由装配被改坏（漏 merge 某组路由）时这条会红，而旧写法永远绿。
+    #[tokio::test]
+    async fn router_builds_and_serves_a_public_endpoint() {
+        use tower::ServiceExt;
+
         let os: std::sync::Arc<dyn panel_os::OsAdapter> =
             std::sync::Arc::new(panel_os::mock::MockOsAdapter::new());
-        let dir = std::env::temp_dir().join("panel-router-test");
+        // 带 pid：并行跑测试时各用各的目录，避免共用一个 t.db 互相干扰
+        let dir = std::env::temp_dir().join(format!("panel-router-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let db = panel_db::open(&dir.join("t.db"), panel_core::Tier::Nano, "NORMAL").unwrap();
-        let _ = db;
-        // 仅验证 Router 类型可构造（WriterActor 需真实路径，故此处只做类型层校验）
-        fn _assert_router(r: Router) { let _ = r; }
+        let db_path = dir.join("t.db");
+        let tier = panel_core::Tier::Nano;
+        {
+            let mut c = panel_db::open(&db_path, tier, "NORMAL").unwrap();
+            panel_db::migrate::apply(&mut c).unwrap();
+        }
+        let writer = std::sync::Arc::new(
+            panel_db::WriterActor::spawn(db_path.clone(), tier, "NORMAL").unwrap());
+        let pool = std::sync::Arc::new(panel_db::ReadPool::new(&db_path, tier).unwrap());
+        let tasks = std::sync::Arc::new(panel_task::TaskRunner::new(
+            writer.clone(), tier, dir.join("tasks"), db_path.clone(), "NORMAL".to_string()));
+        let metrics = std::sync::Arc::new(std::sync::Mutex::new(
+            panel_db::aggregator::Aggregator::new(tier)));
+        let state = std::sync::Arc::new(crate::AppState::new(
+            os, writer, pool, tasks, metrics, tier, None, false, 5,
+            std::time::Duration::from_secs(1800), std::time::Duration::from_secs(43_200),
+            90, 50_000, true, true, "NORMAL".to_string(), 7));
+
+        let app = crate::routes::build_router(state);
+        let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/version")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("Router 应能处理请求");
+        assert_eq!(res.status(), 200, "/api/v1/version 是公开端点，不该被鉴权或漏装配拦下");
     }
 }

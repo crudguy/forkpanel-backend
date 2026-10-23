@@ -313,7 +313,7 @@ pub struct UpgradablePkg {
 pub fn version_major_jump(a: &str, b: &str) -> bool {
     let major = |v: &str| -> Option<u32> {
         // 剥 epoch：取最后一个 ':' 之后的部分（无 ':' 时即原串）
-        let v = v.split(':').last().unwrap_or(v);
+        let v = v.split(':').next_back().unwrap_or(v);
         // 取开头连续数字段作主版本号（'17+278' → 17，'1.26.3' → 1）
         let digits: String = v.chars().take_while(|c| c.is_ascii_digit()).collect();
         digits.parse::<u32>().ok()
@@ -1272,7 +1272,7 @@ impl SiteRoutes {
     /// 按 prefix 长度降序（同级保持原序，稳定）——渲染顺序即生效顺序。
     pub fn sorted(&self) -> Vec<&SiteRoute> {
         let mut v: Vec<&SiteRoute> = self.routes.iter().collect();
-        v.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
+        v.sort_by_key(|a| std::cmp::Reverse(a.prefix.len()));
         v
     }
 
@@ -1366,6 +1366,7 @@ impl TableKind {
 /// - PG 的 schema 一定可以点进去（下面可能有表），只是当前实现固定读 `public`，
 ///   所以非 `public` 的 schema 是 `false`；
 /// - MySQL 的库恒为 `true`（`SHOW TABLES` 本来就带上库名）。
+///
 /// 把「能否点进去」和「下面有没有东西」混成一个布尔，就是本次要修的那类误导。
 #[derive(Debug, Clone)]
 pub struct DbNode {

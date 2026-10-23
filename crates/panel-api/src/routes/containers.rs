@@ -497,7 +497,7 @@ pub async fn compose_act(
         other => {
             return Err(ApiError::bad_request(
                 "action",
-                &format!("未知动作 `{other}`（只支持 up / stop / restart / down）"),
+                format!("未知动作 `{other}`（只支持 up / stop / restart / down）"),
             ))
         }
     };
@@ -510,7 +510,7 @@ pub async fn compose_act(
         if token != project {
             return Err(ApiError::bad_request(
                 "confirm_token",
-                &format!("停止并删除项目容器需手输项目名 `{project}` 作为确认"),
+                format!("停止并删除项目容器需手输项目名 `{project}` 作为确认"),
             ));
         }
     }
@@ -524,7 +524,7 @@ pub async fn compose_act(
     if action != ComposeAction::Up {
         let projects = state.os.containers().compose_projects_all().await?;
         if !projects.iter().any(|p| p.name == project) {
-            return Err(ApiError::not_found(&format!("compose 项目不存在: {project}")));
+            return Err(ApiError::not_found(format!("compose 项目不存在: {project}")));
         }
     }
 

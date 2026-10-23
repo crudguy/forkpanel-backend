@@ -56,6 +56,7 @@ pub enum Bin {
     ///   不存在用户可控的子命令或选项；
     /// - 容器名/ID 经 `rules::is_valid_container_ref` 白名单校验（含禁止首字符 `-`，防参数注入）；
     /// - **不提供** `docker run`（等价宿主机任意代码执行，需独立风险设计与审批，见 #47 说明）。
+    ///
     /// 注意：docker CLI 连 `/var/run/docker.sock`，即**面板进程身份**决定可达性；
     /// 因此该能力默认大概率不可用（不在 docker 组），能力位据此诚实置灰。
     Docker,
@@ -138,6 +139,8 @@ pub struct CmdOpt {
     /// 以该用户身份执行（降权子进程，设计方案 §1.1-1）
     pub run_as: Option<String>,
     /// 逐行回调，用于任务实时输出
+    // 回调类型天然复杂；抽 type 别名反而更难读，故显式豁免该 lint。
+    #[allow(clippy::type_complexity)]
     pub on_line: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
@@ -253,6 +256,8 @@ fn exit_code(st: &std::process::ExitStatus) -> Option<i32> {
     }
 }
 
+// 回调类型天然复杂（同上，显式豁免）。
+#[allow(clippy::type_complexity)]
 async fn collect(
     r: Option<impl AsyncRead + Unpin>,
     cap: usize,

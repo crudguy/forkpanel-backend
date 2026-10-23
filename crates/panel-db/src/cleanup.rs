@@ -178,7 +178,7 @@ mod tests {
 
     #[test]
     fn prune_runs_on_real_db() {
-        let mut c = Connection::open_in_memory().unwrap();
+        let c = Connection::open_in_memory().unwrap();
         c.execute_batch("CREATE TABLE audit_log(id INTEGER PRIMARY KEY, ts INTEGER)").unwrap();
         let now = now_unix();
         // 插入 1~100 天前的 100 条（刻意不含"今天"，这样保留 90 天时被删的正好是
@@ -188,10 +188,10 @@ mod tests {
                       rusqlite::params![now - i as i64 * 86_400]).unwrap();
         }
         // 保留 90 天 → 删除 91 天之前的记录
-        let ack = prune_audit(&mut c, 90, 50_000).unwrap();
+        let ack = prune_audit(&c, 90, 50_000).unwrap();
         assert_eq!(ack.rows_changed, 10, "100 条中 91~100 天前的 10 条应被删除");
         // 再触发行数上限：必须**精确**收敛到 50，而不是被一次性删光
-        let ack = prune_audit(&mut c, 90, 50).unwrap();
+        let ack = prune_audit(&c, 90, 50).unwrap();
         assert_eq!(ack.rows_changed, 40, "90 行保留 50 ⇒ 只需删 40 行");
         let left: u64 = c.query_row("SELECT count(*) FROM audit_log", [], |r| r.get(0)).unwrap();
         assert_eq!(left, 50, "上限必须精确收敛到 max_rows（原实现会删光整表）");
@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn prune_notifications_by_time_then_by_count() {
-        let mut c = Connection::open_in_memory().unwrap();
+        let c = Connection::open_in_memory().unwrap();
         c.execute_batch(
             "CREATE TABLE notifications(id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, read INTEGER NOT NULL DEFAULT 0)",
         ).unwrap();
@@ -209,11 +209,11 @@ mod tests {
             c.execute("INSERT INTO notifications(ts) VALUES(?1)",
                       rusqlite::params![now - i as i64 * 86_400]).unwrap();
         }
-        let ack = prune_notifications(&mut c, 90, 50_000).unwrap();
+        let ack = prune_notifications(&c, 90, 50_000).unwrap();
         assert_eq!(ack.rows_changed, 10, "91~100 天前的 10 条应被删除");
 
         // 再触发行数上限：保留最新 50 条
-        let ack = prune_notifications(&mut c, 90, 50).unwrap();
+        let ack = prune_notifications(&c, 90, 50).unwrap();
         assert_eq!(ack.rows_changed, 40, "90 行保留 50 ⇒ 只需删 40 行");
         let left: u64 = c.query_row("SELECT count(*) FROM notifications", [], |r| r.get(0)).unwrap();
         assert_eq!(left, 50, "上限必须精确收敛到 max_rows");
@@ -226,7 +226,7 @@ mod tests {
 
     #[test]
     fn prune_notifications_is_noop_when_under_limits() {
-        let mut c = Connection::open_in_memory().unwrap();
+        let c = Connection::open_in_memory().unwrap();
         c.execute_batch(
             "CREATE TABLE notifications(id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, read INTEGER NOT NULL DEFAULT 0)",
         ).unwrap();
@@ -235,7 +235,7 @@ mod tests {
             c.execute("INSERT INTO notifications(ts) VALUES(?1)",
                       rusqlite::params![now - i * 60]).unwrap();
         }
-        let ack = prune_notifications(&mut c, 90, 50_000).unwrap();
+        let ack = prune_notifications(&c, 90, 50_000).unwrap();
         assert_eq!(ack.rows_changed, 0, "未超期未超限时不得删除任何行");
         let left: u64 = c.query_row("SELECT count(*) FROM notifications", [], |r| r.get(0)).unwrap();
         assert_eq!(left, 5);

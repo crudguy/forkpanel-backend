@@ -452,7 +452,7 @@ pub async fn cert_renew(
             let mut it = st
                 .query_map([id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
                 .map_err(db_err)?;
-            Ok(it.next().transpose().map_err(db_err)?)
+            it.next().transpose().map_err(db_err)
         })
         .await?
         .ok_or_else(|| ApiError::not_found("cert"))?;
@@ -758,7 +758,7 @@ pub async fn cert_delete(
                 .prepare("SELECT domains FROM ssl_certs WHERE id = ?1")
                 .map_err(db_err)?;
             let mut it = st.query_map([id], |r| r.get::<_, String>(0)).map_err(db_err)?;
-            Ok(it.next().transpose().map_err(db_err)?)
+            it.next().transpose().map_err(db_err)
         })
         .await?;
 

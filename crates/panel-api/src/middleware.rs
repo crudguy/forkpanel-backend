@@ -22,7 +22,7 @@ pub async fn require_auth(
     mut req: Request,
     next: Next,
 ) -> Response {
-    let sid = extract_cookie(&req.headers(), "panel_sid");
+    let sid = extract_cookie(req.headers(), "panel_sid");
     // 惰性恢复：内存未命中时按 sid_hash 查库重建 —— 面板重启后会话仍有效
     // （库里只有哈希，故只能验证重建，符合「凭据不落库」纪律）
     let session = match sid.as_ref() {

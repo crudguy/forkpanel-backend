@@ -75,7 +75,7 @@ pub struct RemoteTarget {
 fn validate_remote_url(u: &str) -> Result<(), PanelError> {
     crate::webhook::validate_url(u).map_err(|e| match e {
         PanelError::Validation { reason, .. } => PanelError::Validation {
-            field: "remote_url".into(),
+            field: "remote_url",
             reason,
         },
         other => other,
@@ -93,7 +93,7 @@ impl RemoteTarget {
             RemoteKind::S3 => {
                 let bucket = self.bucket.as_deref().filter(|b| !b.is_empty()).ok_or_else(|| {
                     PanelError::Validation {
-                        field: "remote_bucket".into(),
+                        field: "remote_bucket",
                         reason: "S3 需要填写 bucket".into(),
                     }
                 })?;
@@ -234,7 +234,7 @@ impl RemoteTarget {
             RemoteKind::S3 => {
                 let bucket = self.bucket.as_deref().filter(|b| !b.is_empty()).ok_or_else(|| {
                     PanelError::Validation {
-                        field: "remote_bucket".into(),
+                        field: "remote_bucket",
                         reason: "S3 需要填写 bucket".into(),
                     }
                 })?;

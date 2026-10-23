@@ -203,7 +203,7 @@ impl LinuxDatabases {
     fn open_sqlite(t: &DbTarget) -> Result<rusqlite::Connection> {
         use rusqlite::OpenFlags;
         let path = t.database.as_deref().ok_or_else(|| PanelError::Validation {
-            field: "database".into(),
+            field: "database",
             reason: "SQLite 连接需在“库名”中填写 .db 文件路径".into(),
         })?;
         if !std::path::Path::new(path).is_file() {
@@ -369,7 +369,7 @@ pub(super) fn mysql_row_counts_sql(db: &str, names: &[String]) -> String {
 /// 那会牵动 `pg_tables_from_rows` 的列数与既有单测的入参。
 async fn fill_row_counts(
     t: &DbTarget,
-    out: &mut Vec<DbTable>,
+    out: &mut [DbTable],
     sql_of: impl FnOnce(&[String]) -> String,
 ) {
     if out.is_empty() {
@@ -514,12 +514,10 @@ impl DatabaseProvider for LinuxDatabases {
                 let lit = db.replace('\'', "''");
                 let rows = LinuxDatabases::sql_query(
                     t,
-                    &format!(
-                        "SELECT nspname FROM pg_namespace \
+                    "SELECT nspname FROM pg_namespace \
                          WHERE nspname NOT IN ('pg_catalog','information_schema') \
                            AND nspname NOT LIKE 'pg\\_toast%' AND nspname NOT LIKE 'pg\\_temp%' \
-                         ORDER BY nspname"
-                    ),
+                         ORDER BY nspname",
                 )
                 .await;
                 // 查不出来（老版本 PG / 权限）时**不谎报空**：退回「只有一个 public」

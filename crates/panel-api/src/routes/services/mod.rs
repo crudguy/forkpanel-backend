@@ -165,12 +165,8 @@ pub async fn act(
         .map_err(|_| ApiError::bad_request("name", "invalid unit name"))?;
 
     // 高危服务保护：sshd 只允许 restart，不允许 stop（防失联）
-    if name == "sshd" || name == "ssh" {
-        match req.action.as_str() {
-            "stop" => return Err(ApiError::forbidden("service.protected_sshd")),
-            _ => {}
-        }
-    }
+    if (name == "sshd" || name == "ssh")
+        && req.action.as_str() == "stop" { return Err(ApiError::forbidden("service.protected_sshd")) }
 
     let svc = state.os.services();
     match req.action.as_str() {

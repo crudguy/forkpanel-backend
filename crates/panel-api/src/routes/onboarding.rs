@@ -99,17 +99,13 @@ pub struct StepOut {
 /// 绝不因为一个展示层偏好让概览页报错。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 struct Stored {
     checked: Vec<String>,
     dismissed: bool,
     updated_at: Option<i64>,
 }
 
-impl Default for Stored {
-    fn default() -> Self {
-        Self { checked: Vec::new(), dismissed: false, updated_at: None }
-    }
-}
 
 fn now_unix() -> i64 {
     std::time::SystemTime::now()

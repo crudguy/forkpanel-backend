@@ -262,10 +262,7 @@ pub(super) async fn render_spec_for_row(
         },
         // 库里存的是**已校验**的 JSON（写入方validate 过），故这里解析失败即
         // 降级成静态站——宁可显示成"静态"也不能让整个列表页报错。
-        "routed" => match routes_from_json(&row.routes_json)
-            .iter()
-            .cloned()
-            .collect::<Vec<RouteOut>>()
+        "routed" => match routes_from_json(&row.routes_json).to_vec()
             .as_slice()
         {
             [] => panel_os::SiteKind::Static,
@@ -294,7 +291,7 @@ pub(super) async fn render_spec_for_row(
     let has_tls = tls_cert.is_some() && tls_key.is_some();
 
     // 站点独立日志（021）：开启后指向面板自己的日志目录——它也是「下载 / 清空」的目标
-    let (access_log_p, error_log_p) = site_log_paths(state, &domains, row.log_access != 0, row.log_error != 0);
+    let (access_log_p, error_log_p) = site_log_paths(state, domains, row.log_access != 0, row.log_error != 0);
     // 站点独立日志（021）：同上，nginx -t 前确保日志目录存在
     if access_log_p.is_some() || error_log_p.is_some() {
         let _ = std::fs::create_dir_all(site_log_dir(state));
@@ -329,7 +326,7 @@ pub(super) async fn render_spec_for_row(
         ip_deny: nonempty(split_list(&row.ip_deny)),
         auth_basic: row.auth_basic != 0,
         auth_user: row.auth_user.clone(),
-        auth_file: Some(htpasswd_path(state, &domains)).filter(|p| p.is_file()),
+        auth_file: Some(htpasswd_path(state, domains)).filter(|p| p.is_file()),
         lb_policy: Some(row.lb_policy.clone()),
         proxy_connect_timeout: row.proxy_connect_timeout,
         proxy_send_timeout: row.proxy_send_timeout,

@@ -356,7 +356,7 @@ pub fn real_pkg_name(manager: Option<&str>, logical: &str) -> String {
 /// （否则 Debian 上会吐出 `redis-server`，前端按逻辑名渲染的卡片/安装按钮就对不上了）。
 pub fn logical_pkg_name(real: &str) -> Option<&'static str> {
     PKG_NAME_ALIASES.iter()
-        .find(|a| a.1.iter().any(|n| *n == real))
+        .find(|a| a.1.contains(&real))
         .map(|a| a.0)
 }
 

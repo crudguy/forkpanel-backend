@@ -405,9 +405,8 @@ pub(crate) fn parse_apt_policy_versions(out: &str) -> Vec<String> {
         // 形如 "1.26.3-3+deb13u9 500"：两列，第二列是纯数字优先级
         let mut it = t.split_whitespace();
         match (it.next(), it.next(), it.next()) {
-            (Some(v), Some(prio), None) if prio.chars().all(|c| c.is_ascii_digit()) => {
-                if !versions.contains(&v.to_string()) { versions.push(v.to_string()); }
-            }
+            (Some(v), Some(prio), None) if prio.chars().all(|c| c.is_ascii_digit())
+                && !versions.contains(&v.to_string()) => { versions.push(v.to_string()); }
             // 来源行（"500 http://..."）是三列，直接跳过
             _ => {}
         }

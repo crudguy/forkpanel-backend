@@ -90,7 +90,7 @@ use super::*;
     /// 它把 client_present 当参数喂进去，不依赖本机装没装 psql。
     #[test]
     fn linux_readonly_sql_wires_the_matrix_to_client_presence() {
-        let p = LinuxDatabases::default();
+        let p = LinuxDatabases;
         // SQLite：只读连接兜底，与本机装没装 psql 无关
         assert!(p.readonly_sql(DbEngine::Sqlite), "SQLite 必须开放");
         // MySQL：没有服务端只读护栏，恒关（这是最危险的一格）
@@ -116,7 +116,7 @@ use super::*;
             host: Some("127.0.0.1".into()), port: Some(3306),
             user: Some("u".into()), password: None, database: Some("db".into()),
         };
-        let prov: &dyn DatabaseProvider = &LinuxDatabases::default();
+        let prov: &dyn DatabaseProvider = &LinuxDatabases;
         let r = prov.query(&t, "SELECT 1", 10).await;
         assert!(
             matches!(r, Err(panel_core::PanelError::Unsupported(_))),
@@ -1661,7 +1661,7 @@ use super::*;
             host: None, port: None, user: None, password: None,
             database: Some(src.to_string_lossy().into()),
         };
-        let prov: &dyn DatabaseProvider = &LinuxDatabases::default();
+        let prov: &dyn DatabaseProvider = &LinuxDatabases;
         prov
             .backup(&target, unsafe { &SafePath::from_raw(bak.clone()) }, Box::new(|_| {}))
             .await
@@ -1696,7 +1696,7 @@ use super::*;
             host: Some("127.0.0.1".into()), port: Some(3306),
             user: Some("u".into()), password: Some("p".into()), database: Some("db".into()),
         };
-        let prov: &dyn DatabaseProvider = &LinuxDatabases::default();
+        let prov: &dyn DatabaseProvider = &LinuxDatabases;
         let r = prov.backup(&target, unsafe { &SafePath::from_raw(std::env::temp_dir().join("x.sql")) }, Box::new(|_| {}))
             .await;
         assert!(matches!(r, Err(panel_core::PanelError::Unsupported(_))), "缺失客户端应 Unsupported: {r:?}");

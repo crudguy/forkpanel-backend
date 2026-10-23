@@ -118,7 +118,7 @@ impl UserProvider for LinuxUsers {
             let login_allowed = !NOLOGIN.contains(&shell.as_str());
             users.push(SystemUser { name: name.to_string(), uid, gid, shell, login_allowed });
         }
-        users.sort_by(|a, b| a.uid.cmp(&b.uid));
+        users.sort_by_key(|a| a.uid);
         Ok(users)
     }
 }
@@ -135,7 +135,7 @@ mod user_provider_tests {
     /// 枚举本机账户：读真实 /etc/passwd（测试数据 = 线上形态），验证解析与 login_allowed 判定。
     #[tokio::test]
     async fn linux_users_list_parses_passwd() {
-        let users = LinuxUsers::default().list().await.expect("list 不应失败");
+        let users = LinuxUsers.list().await.expect("list 不应失败");
         assert!(!users.is_empty(), "本机应至少枚举到 root 等账户");
 
         let root = users.iter().find(|u| u.name == "root").expect("应有 root 账户");

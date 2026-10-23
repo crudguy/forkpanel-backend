@@ -176,12 +176,12 @@ pub async fn decrypt_file(src: &Path, dst: &Path, key: &MasterKey) -> Result<()>
         let mut magic = [0u8; 8];
         r.read_exact(&mut magic)
             .map_err(|_| PanelError::Validation {
-                field: "archive".into(),
+                field: "archive",
                 reason: "不是面板加密产物（容器头缺失）".into(),
             })?;
         if &magic != ENC_MAGIC {
             return Err(PanelError::Validation {
-                field: "archive".into(),
+                field: "archive",
                 reason: "不是面板加密产物（魔数不匹配）".into(),
             });
         }
@@ -199,9 +199,9 @@ pub async fn decrypt_file(src: &Path, dst: &Path, key: &MasterKey) -> Result<()>
             }
             let len = u32::from_be_bytes(lenb) as usize;
             // 长度合法性先于分配：否则一个损坏的长度字段就能让面板申请巨量内存
-            if len < 12 + GCM_TAG || len > ENC_CHUNK + 12 + GCM_TAG {
+            if !(12 + GCM_TAG..=ENC_CHUNK + 12 + GCM_TAG).contains(&len) {
                 return Err(PanelError::Validation {
-                    field: "archive".into(),
+                    field: "archive",
                     reason: format!("容器块长非法（{len}），文件可能已损坏"),
                 });
             }

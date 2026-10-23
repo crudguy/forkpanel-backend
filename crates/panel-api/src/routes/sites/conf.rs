@@ -200,7 +200,7 @@ pub async fn log_download(
         row.name,
         if kind == "error" { "error" } else { "access" }
     );
-    Ok(axum::response::Response::builder()
+    axum::response::Response::builder()
         .status(200)
         .header("content-type", "text/plain; charset=utf-8")
         .header(
@@ -208,7 +208,7 @@ pub async fn log_download(
             format!("attachment; filename=\"{name}\""),
         )
         .body(axum::body::Body::from(body))
-        .map_err(|e| ApiError::from(PanelError::Internal(e.to_string())))?)
+        .map_err(|e| ApiError::from(PanelError::Internal(e.to_string())))
 }
 
 /// 清空站点日志（021）：截断而非删除——删除会让正在写入的 nginx worker 继续往

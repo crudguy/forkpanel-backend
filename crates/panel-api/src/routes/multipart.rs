@@ -97,7 +97,7 @@ fn part_name(index: usize) -> String {
 }
 
 fn total_chunks(size: u64) -> usize {
-    ((size as usize) + CHUNK_SIZE - 1) / CHUNK_SIZE
+    (size as usize).div_ceil(CHUNK_SIZE)
 }
 
 async fn read_meta_at(dir: &Path) -> Option<UploadMeta> {

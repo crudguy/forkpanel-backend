@@ -432,8 +432,7 @@ session_absolute = "2h"
     fn tier_forcing_and_detection() {
         let c = Config::default();
         assert_eq!(c.tier(256, 1), Tier::Nano);
-        let mut c2 = Config::default();
-        c2.tier = "standard".into();
+        let c2 = Config { tier: "standard".into(), ..Config::default() };
         assert_eq!(c2.tier(256, 1), Tier::Standard, "显式档位必须覆盖探测结果");
     }
 }

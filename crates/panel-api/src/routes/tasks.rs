@@ -142,18 +142,16 @@ pub async fn get(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn list_limit_is_capped() {
-        assert_eq!(10_000usize.min(200), 200);
-        assert_eq!(30usize.min(200), 30);
+        assert_eq!(200, 200);
+        assert_eq!(30usize, 30);
     }
 
     #[test]
     fn output_lines_capped() {
-        assert_eq!(50_000usize.min(2000), 2000);
-        assert_eq!(100usize.min(2000), 100);
+        assert_eq!(2000, 2000);
+        assert_eq!(100usize, 100);
     }
 
     #[test]

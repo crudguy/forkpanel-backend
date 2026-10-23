@@ -245,14 +245,14 @@ fn now_secs() -> i64 {
 pub(crate) async fn apply_ssh_item(key: &str) -> Result<SecurityApplyResult> {
     let Some((directive, value)) = ssh_fix_target(key) else {
         return Err(PanelError::Validation {
-            field: "key".into(),
+            field: "key",
             reason: format!("不支持自动修复的基线项：{key}（仅支持 ssh.permit_root_login / ssh.password_auth / ssh.pubkey_auth）"),
         });
     };
 
     if !crate::cmd::Bin::available(crate::cmd::Bin::Sshd) {
         return Err(PanelError::Validation {
-            field: "sshd".into(),
+            field: "sshd",
             reason: "sshd 不可用，无法校验配置语法 → 拒绝自动修改（避免写错导致无法登录）".into(),
         });
     }

@@ -311,7 +311,7 @@ pub async fn get_job(
         let mut st = conn.prepare(&sql).map_err(|e| PanelError::Database(e.to_string()))?;
         let mut it = st.query_map([id_key.as_str()], cron_meta_row)
             .map_err(|e| PanelError::Database(e.to_string()))?;
-        Ok(it.next().transpose().map_err(|e| PanelError::Database(e.to_string()))?)
+        it.next().transpose().map_err(|e| PanelError::Database(e.to_string()))
     }).await?;
 
     let next = state.os.scheduler().next_fire_times(&j.expression, 3).unwrap_or_default();

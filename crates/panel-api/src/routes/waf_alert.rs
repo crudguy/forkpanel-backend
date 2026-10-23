@@ -153,7 +153,7 @@ pub async fn check_block_alerts(state: &Shared) {
         // （同一批事件在相邻两个 5min 点都 > 阈值）不会重复报；时间桶 dedup_key 保留作二级兜底。
         let recent: bool = {
             let t = title.clone();
-            match state
+            state
                 .pool
                 .with(move |conn| {
                     conn.query_row(
@@ -164,10 +164,7 @@ pub async fn check_block_alerts(state: &Shared) {
                     .map_err(|e| PanelError::Database(e.to_string()))
                 })
                 .await
-            {
-                Ok(v) => v,
-                Err(_) => false,
-            }
+                .unwrap_or_default()
         };
         if recent {
             continue;

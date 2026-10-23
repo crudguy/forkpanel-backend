@@ -333,7 +333,7 @@ pub mod rules {
         // 语法：每个 label 的字符集与首尾约束
         let syntax_ok = labels.iter().all(|label| {
             let n = label.len();
-            n >= 1 && n <= 63
+            (1..=63).contains(&n)
                 && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
                 && !label.starts_with('-') && !label.ends_with('-')
         });

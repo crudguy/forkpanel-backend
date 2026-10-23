@@ -161,7 +161,7 @@ pub fn parse_codename(os_release: &str) -> Option<String> {
 pub fn extract_fingerprints(colons: &str) -> Vec<String> {
     colons.lines()
         .filter_map(|l| l.strip_prefix("fpr:"))
-        .filter_map(|rest| rest.split(':').filter(|s| !s.is_empty()).last())
+        .filter_map(|rest| rest.split(':').rfind(|s| !s.is_empty()))
         .map(|fp| fp.to_ascii_uppercase())
         .collect()
 }
@@ -199,7 +199,7 @@ pub fn build_sources_content(repo: &ThirdPartyRepo, codename: &str) -> String {
 pub async fn current_codename() -> Result<String> {
     let content = tokio::fs::read_to_string("/etc/os-release").await
         .map_err(|e| PanelError::Io(format!("read /etc/os-release: {e}")))?;
-    parse_codename(&content).ok_or_else(|| PanelError::Unsupported("os.codename"))
+    parse_codename(&content).ok_or(PanelError::Unsupported("os.codename"))
 }
 
 fn trunc(s: &str) -> String {

@@ -22,6 +22,12 @@ struct Prev {
     net: HashMap<String, (u64, u64)>,       // iface -> (rx, tx)
 }
 
+impl Default for LinuxMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LinuxMetrics {
     pub fn new() -> Self { Self { prev: Mutex::new(Prev::default()) } }
 }
@@ -62,7 +68,7 @@ impl MetricsProvider for LinuxMetrics {
         let mut list = scan_processes(&mut self.prev.lock().unwrap_or_else(|e| e.into_inner()))?;
         match sort {
             ProcessSort::Cpu => list.sort_by(|a, b| b.cpu_pct.partial_cmp(&a.cpu_pct).unwrap()),
-            ProcessSort::Memory => list.sort_by(|a, b| b.rss_kib.cmp(&a.rss_kib)),
+            ProcessSort::Memory => list.sort_by_key(|a| std::cmp::Reverse(a.rss_kib)),
             ProcessSort::Pid => list.sort_by_key(|p| p.pid),
         }
         // n==0 表示不截断（展示全部进程）；否则截断并兜底上限 8192，防异常大请求。

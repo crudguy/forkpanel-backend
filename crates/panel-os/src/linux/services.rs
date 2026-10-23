@@ -520,6 +520,13 @@ mod tests {
     /// 旧实现同步 `tx.send` 进容量 64 的 channel，消费者要等 `journal()` 返回后才
     /// recv ⇒ 日志 >64 行时死锁（dev 实测 accounts-daemon 139 行，请求挂死 >20s）。
     /// 本测试不依赖 journalctl：直接给 `pump_lines` 200 行，要求立即返回且不丢行。
+    /// ⚠ 下面那层 `async move { pump_lines(..) }` 是**故意**的，不是冗余：
+    /// `pump_lines` 是**同步**函数（内部 spawn 任务后立刻返回 JoinHandle），这层 async
+    /// 块把那次**同步调用**放进 timeout 之内——若它哪天退化成同步灌入，channel 满（64 行）
+    /// 处会阻塞，2s 超时直接失败，正是本测试要抓的回归。
+    /// ⚠ 而 timeout **不能**直接吃 JoinHandle：那会等到任务**完成**，而任务要等我们抽干
+    /// channel 才完成 ⇒ 死锁 + 超时误报。故此处"吐出 awaitable 的 JoinHandle"是有意为之。
+    #[allow(clippy::async_yields_async)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pump_lines_returns_immediately_and_delivers_all() {
         let (tx, mut rx) = mpsc::channel::<String>(64);

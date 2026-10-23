@@ -374,7 +374,7 @@ pub async fn apply(
         None => cur_row.as_ref().map(|r| r.hsts_max_age).unwrap_or(300),
         Some(n) => {
             // 上限取 2 年（RFC 6797 的建议值 31536000 之上再放宽一档）；0 = 立即失效
-            if n < 0 || n > 63_072_000 {
+            if !(0..=63_072_000).contains(&n) {
                 return Err(ApiError::bad_request("hsts_max_age", "max-age 需在 0 ~ 63072000 秒之间"));
             }
             n
@@ -601,7 +601,7 @@ pub async fn apply(
             if !matches!(code, 301 | 302 | 307 | 308) {
                 return Err(ApiError::bad_request("redirect_code", "仅支持 301 / 302 / 307 / 308"));
             }
-            panel_os::SiteKind::Redirect { target, code: code as u16 }
+            panel_os::SiteKind::Redirect { target, code }
         }
         "routed" => {
             let rs = req.routes.clone().ok_or_else(|| {
@@ -611,11 +611,11 @@ pub async fn apply(
             // 路由级 root 约束到 site_root 之内（防路径穿越）：与站点级 root 复用同一条
             // resolve_site_root。空 root 不变（继承 server 级站点 root）。
             for r in routes.routes.iter_mut() {
-                if let panel_os::RouteKind::Static { spa: _, root } = &mut r.kind {
-                    if let Some(rv) = root {
-                        let safe = resolve_site_root(&state, rv, &req.name)?;
-                        *rv = safe.as_path().display().to_string();
-                    }
+                // 模式合并（**不是** let-chain：后者要 1.88+，本项目 MSRV 1.80 用不了）；
+                // 语义与原来两层 if 完全一致：root 为 None 时同样不进入分支。
+                if let panel_os::RouteKind::Static { spa: _, root: Some(rv) } = &mut r.kind {
+                    let safe = resolve_site_root(&state, rv, &req.name)?;
+                    *rv = safe.as_path().display().to_string();
                 }
             }
             panel_os::SiteKind::Routed { routes }
@@ -691,7 +691,7 @@ pub async fn apply(
         let _ = std::fs::create_dir_all(site_log_dir(&state));
     }
     let spec = panel_os::SiteSpec {
-        server_names: domains.iter().map(|d| d.clone()).collect(),
+        server_names: domains.to_vec(),
         root: root.as_path().to_path_buf(),
         listen: vec![80, 443],
         kind,

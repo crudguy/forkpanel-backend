@@ -392,6 +392,8 @@ pub(super) fn validate_routes(routes: &[RouteOut]) -> ApiResult<panel_os::SiteRo
 ///
 /// ⚠ 新增「部署相关」字段（会影响 render 输出的）必须同时加进这里，
 ///   否则改该字段不会触发「未同步」提示（静默分叉复发）。
+// 部署指纹要覆盖**每一个**影响渲染的字段，参数多是有意的（少传一个字段＝静默分叉）。
+#[allow(clippy::too_many_arguments)]
 pub(super) fn deploy_fingerprint(
     name: &str,
     domains_json: &str,
@@ -806,7 +808,7 @@ pub(super) async fn fetch_one(state: &Shared, id: i64) -> Result<Option<RawSite>
                 })
             })
             .map_err(db_err)?;
-            Ok(it.next().transpose().map_err(db_err)?)
+            it.next().transpose().map_err(db_err)
         })
         .await
 }
@@ -869,7 +871,7 @@ pub(super) async fn fetch_one_by_name(state: &Shared, name: &str) -> Result<Opti
                 })
             })
             .map_err(db_err)?;
-            Ok(it.next().transpose().map_err(db_err)?)
+            it.next().transpose().map_err(db_err)
         })
         .await
 }

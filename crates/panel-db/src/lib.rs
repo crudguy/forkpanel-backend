@@ -36,6 +36,7 @@ use tokio::sync::{mpsc, oneshot, Semaphore};
 /// - `journal_mode=WAL` 必须在事务外执行，且**数据目录不能是网络文件系统**
 ///   （启动前由 `panel_os::startup_fs_check` 拦截）。
 /// - `wal_autocheckpoint` **绝不能为 0**：实测关闭后写入 5 万行即让 WAL 涨到 7.71MB 且持续膨胀。
+///
 /// SQLite `synchronous` 合法取值（大小写不敏感）。非法值会在 `open` 时直接报错，
 /// 避免把用户的笔误静默降级成默认档（那种「配了不生效」最隐蔽）。
 pub const SYNCHRONOUS_MODES: &[&str] = &["OFF", "NORMAL", "FULL", "EXTRA"];

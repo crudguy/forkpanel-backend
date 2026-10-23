@@ -11,9 +11,15 @@
 .PHONY: check guards audit test embed-fresh e2e-files e2e-backups e2e-containers e2e-cron e2e-databases e2e-sites e2e-firewall e2e-rbac e2e-security e2e-all e2e-ui
 
 # 主门禁：静态守卫 + 全量测试（离线可跑，确定性高）
-check: guards embed-fresh test
+check: guards lint embed-fresh test
 
 # ci/ 下的静态门禁（layering / 契约 / 权限点 / 包白名单 / openapi 字节一致）
+# 零 lint 门禁：clippy 同时覆盖 rustc 与 clippy 的全部 lint，用 -D warnings 让它们
+# 直接失败。**必须用 clippy 而不是 `cargo build | grep warning`**：cargo 命中缓存后
+# 就不再复现警告 ⇒ 缓存会让"有警告"悄悄变绿；clippy 每次都重新检查。
+lint:
+	cargo clippy --workspace --all-targets -- -D warnings
+
 guards:
 	bash ci/check-layering.sh
 	bash ci/check-api-contract.sh

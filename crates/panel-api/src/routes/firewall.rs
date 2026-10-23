@@ -167,12 +167,11 @@ pub async fn apply(
         };
 
         // ── 失联保护 ──
-        if action != panel_os::Action::Allow && locks_out_ssh(&ports) {
-            if req.allow_lockout_risk != Some(true) {
+        if action != panel_os::Action::Allow && locks_out_ssh(&ports)
+            && req.allow_lockout_risk != Some(true) {
                 return Err(ApiError::conflict(
                     "该规则可能阻断 SSH(22)。确认后请带 allow_lockout_risk=true 重试"));
             }
-        }
 
         // id 必须唯一**并写进 comment**：删除时靠 `panel-managed <id>` 定位规则。
         // 若只写用户备注，两条同名规则会撞 id → 删除命中第一条，删错规则。
@@ -236,7 +235,7 @@ fn locks_out_ssh(ports: &panel_os::PortSpec) -> bool {
         panel_os::PortSpec::All => true,   // 封全部端口必然封掉 22
         panel_os::PortSpec::Single(p) => PROTECTED_PORTS.contains(p),
         panel_os::PortSpec::Range(a, b) => PROTECTED_PORTS.iter().any(|p| p >= a && p <= b),
-        panel_os::PortSpec::List(v) => v.iter().any(|p| locks_out_ssh(p)),
+        panel_os::PortSpec::List(v) => v.iter().any(locks_out_ssh),
     }
 }
 

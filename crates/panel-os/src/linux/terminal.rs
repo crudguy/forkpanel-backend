@@ -23,10 +23,7 @@ impl TerminalProvider for LinuxTerminal {
     fn shell(&self) -> Option<Bin> {
         // 顺序即优先级：bash 的补全、历史、job control 更完整，
         // 回退 sh 只为兼容极简容器镜像。
-        for b in [Bin::Bash, Bin::Sh] {
-            if b.available() { return Some(b); }
-        }
-        None
+        [Bin::Bash, Bin::Sh].into_iter().find(|&b| b.available())
     }
 }
 

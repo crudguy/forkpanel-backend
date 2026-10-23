@@ -133,7 +133,7 @@ async fn fetch_plan_full(state: &Shared, id: i64) -> Result<Option<PlanFull>> {
             let mut it = st
                 .query_map([id], |r| Ok(PlanFull { dto: row_dto(r)?, secret_enc: r.get(16)? }))
                 .map_err(db_err)?;
-            Ok(it.next().transpose().map_err(db_err)?)
+            it.next().transpose().map_err(db_err)
         })
         .await
 }
@@ -147,7 +147,7 @@ async fn site_root_by_name(state: &Shared, name: &str) -> Result<Option<String>>
                 .prepare("SELECT root FROM sites WHERE name = ?1")
                 .map_err(db_err)?;
             let mut it = st.query_map([name], |r| r.get::<_, String>(0)).map_err(db_err)?;
-            Ok(it.next().transpose().map_err(db_err)?)
+            it.next().transpose().map_err(db_err)
         })
         .await
 }
@@ -483,16 +483,16 @@ async fn validate_target(
     dest: &str,
 ) -> Result<(String, String, String)> {
     if !KINDS.contains(&kind) {
-        return Err(PanelError::Validation { field: "kind".into(), reason: format!("仅支持 {KINDS:?}") });
+        return Err(PanelError::Validation { field: "kind", reason: format!("仅支持 {KINDS:?}") });
     }
     let target = target.trim().to_string();
     if target.is_empty() {
-        return Err(PanelError::Validation { field: "target".into(), reason: "target required".into() });
+        return Err(PanelError::Validation { field: "target", reason: "target required".into() });
     }
     // panel 的 target 固定；site 的 target 必须是真实存在的站点（避免备份空目录）
     if kind == "panel" {
         if target != "panel" {
-            return Err(PanelError::Validation { field: "target".into(), reason: "panel 计划的 target 必须为 panel".into() });
+            return Err(PanelError::Validation { field: "target", reason: "panel 计划的 target 必须为 panel".into() });
         }
     } else if kind == "db" {
         // 按连接名落库：页面展示友好；改名后计划会明确报"连接不存在"，
@@ -715,6 +715,8 @@ pub async fn fetch_remote_artifact_cli(
         .or_else(|_| rusqlite::Connection::open(db_path))
         .map_err(|e| PanelError::Database(format!("打开面板库失败: {e}")))?;
 
+    // 远端配置 8 元组：拆成结构体要动多处调用点，收益不抵改动面，显式豁免。
+    #[allow(clippy::type_complexity)]
     let (kind, r_kind, r_url, r_bucket, r_prefix, r_region, r_user, secret_enc): (
         String, Option<String>, Option<String>, Option<String>,
         Option<String>, Option<String>, Option<String>, Option<Vec<u8>>,
@@ -735,18 +737,18 @@ pub async fn fetch_remote_artifact_cli(
 
     if kind != "panel" {
         return Err(PanelError::Validation {
-            field: "plan".into(),
+            field: "plan",
             reason: format!("计划 #{plan_id} 是 kind={kind}，不是面板库备份计划（--remote 只用于恢复面板库）"),
         });
     }
     let Some(kind_s) = r_kind.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
         return Err(PanelError::Validation {
-            field: "remote_kind".into(),
+            field: "remote_kind",
             reason: format!("计划 #{plan_id} 没配远端副本，无处可取"),
         });
     };
     let rk = RemoteKind::parse(kind_s)
-        .ok_or_else(|| PanelError::Validation { field: "remote_kind".into(), reason: format!("未知的远端类型：{kind_s}") })?;
+        .ok_or_else(|| PanelError::Validation { field: "remote_kind", reason: format!("未知的远端类型：{kind_s}") })?;
     let secret = match (&secret_enc, key) {
         (Some(blob), Some(k)) => Some(String::from_utf8(k.decrypt(blob)?).map_err(|_| {
             PanelError::Internal("远端凭据不是合法 UTF-8".into())
@@ -777,7 +779,7 @@ pub async fn fetch_remote_artifact_cli(
     }
     let name = match wanted {
         Some(w) => {
-            if !cands.iter().any(|c| *c == w) {
+            if !cands.contains(&w) {
                 return Err(PanelError::NotFound(format!(
                     "远端没有名为 {w} 的面板库产物；可选：{}",
                     cands.iter().take(5).copied().collect::<Vec<_>>().join("、")
@@ -1032,7 +1034,7 @@ impl BackupJob {
             }
             other => {
                 return Err(PanelError::Validation {
-                    field: "kind".into(),
+                    field: "kind",
                     reason: format!("unsupported backup kind: {other}"),
                 })
             }
@@ -1897,7 +1899,7 @@ impl RestoreJob {
         let entries = panel_os::backup::list_tar_entries(archive).await?;
         if let Some(bad) = entries.iter().find(|e| !panel_os::backup::is_safe_entry(e)) {
             return Err(PanelError::Validation {
-                field: "archive".into(),
+                field: "archive",
                 reason: format!("归档含不安全条目，已中止：{bad}"),
             });
         }
@@ -1910,7 +1912,7 @@ impl RestoreJob {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
         if let Err(reason) = check_archive_scope(&entries, &site_name) {
-            return Err(PanelError::Validation { field: "archive".into(), reason });
+            return Err(PanelError::Validation { field: "archive", reason });
         }
 
         // ② 自动先备份当前态：这是"恢复"唯一的安全网，失败即中止、绝不裸覆盖
@@ -2184,8 +2186,6 @@ mod exec_tests {
     /// 所以日常只用面板库备份时完全看不出来）。
     #[tokio::test]
     async fn verify_accepts_a_real_tar_gz() {
-        use panel_task::TaskBody;
-
         let base = std::env::temp_dir().join(format!("panel-bkverify-gz-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let site = base.join("site/my-site");

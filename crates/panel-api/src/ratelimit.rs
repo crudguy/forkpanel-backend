@@ -136,7 +136,7 @@ mod tests {
             assert!(l.check_at("alice", "pkg.install", at(t0, i)).is_ok(), "第 {i} 次应放行");
         }
         let err = l.check_at("alice", "pkg.install", at(t0, 3)).unwrap_err();
-        assert!(err >= 1 && err <= 60, "retry_after 应落在窗口内，实际 {err}");
+        assert!((1..=60).contains(&err), "retry_after 应落在窗口内，实际 {err}");
     }
 
     #[test]
