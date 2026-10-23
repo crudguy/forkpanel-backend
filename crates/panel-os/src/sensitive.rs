@@ -58,6 +58,9 @@ const DENY_EXACT: &[&str] = &[
     "/etc/sysctl.conf",
     // 开机加载的内核模块：列 .ko 路径 = 下次启动即以内核身份执行任意代码
     "/etc/modules",
+    // 文件系统挂载表：写坏 = 下次重启挂载失败，**机器起不来**，与 nftables.conf
+    // 同族（都是「改坏只在下次启动才暴露」，届时人已在机房外）
+    "/etc/fstab",
     // root 的登录/交互壳启动脚本：与 /etc/profile 同族，但只对 root 生效
     // （非 root 用户自己的 ~/.bashrc 不在此列，理由见模块头）
     "/root/.bashrc", "/root/.bash_profile", "/root/.bash_login",
@@ -77,8 +80,11 @@ const DENY_PREFIX: &[&str] = &[
     // （`/etc/crontab` 本体在精确表；这里只放目录，避免 `crontab.bak` 被误拒）
     "/etc/cron.d/", "/etc/cron.hourly/", "/etc/cron.daily/",
     "/etc/cron.weekly/", "/etc/cron.monthly/", "/var/spool/cron/",
-    // systemd：单元文件可直接指定 ExecStart 为任意命令
-    "/etc/systemd/", "/run/systemd/",
+    // systemd：单元文件可直接指定 ExecStart 为任意命令。
+    // ⚠ 发行版包单元的**真实位置**在 /usr/lib/systemd/（Debian 上 /lib 是 /usr/lib
+    // 的 symlink），/etc/systemd/ 多为管理员覆盖位——只收 /etc 会漏掉整个发行版单元
+    // 目录，往那里写 ExecStart= 同样是以 root 执行任意代码。
+    "/etc/systemd/", "/run/systemd/", "/lib/systemd/", "/usr/lib/systemd/",
     // init / 启动脚本
     "/etc/init.d/", "/etc/init/", "/etc/rcS.d/", "/etc/rc.local",
     // 动态链接器配置目录（主配置在精确表）
@@ -110,6 +116,24 @@ const DENY_SUFFIX: &[&str] = &[
     // OpenSSH 默认私钥名补齐：id_dsa（旧算法）与两个 FIDO 变体（_sk 后缀）
     "/.ssh/id_dsa", "/.ssh/id_ecdsa_sk", "/.ssh/id_ed25519_sk",
 ];
+
+/// 面板库本体是否敏感——**必须按运行时路径判定**，不能只靠常量。
+///
+/// 为什么不能写进 `DENY_EXACT`：`sqlite_path = <data_dir>/panel.db`（`paths.rs:31`），
+/// 而 `[paths].data` 是**可配置项**。写死 `/var/lib/forkpanel/panel.db` 会在任何改过
+/// data 目录的部署上失效，而且失效得无声无息（黑名单看起来还在）。
+///
+/// 收录理由同 `master.key`：覆盖它 = 会话、审计、加密凭据、LLM 配置全毁，
+/// **面板即登录系统立刻不可登录**。
+///
+/// `db_path` 为 `None`（取不到运行时路径）时**一律判定为不敏感**：宁可漏挡一次也不
+/// 误挡整个数据目录——漏挡的那次会在文件页被明确拒绝，误挡会让数据目录变成黑洞。
+pub fn is_panel_db_path(s: &str, db_path: Option<&str>) -> bool {
+    match db_path {
+        Some(db) => !db.is_empty() && s == db,
+        None => false,
+    }
+}
 
 /// 按**字符串**判定敏感（平台无关，供 linux 与 mock 共用）。
 ///
@@ -246,5 +270,40 @@ mod tests {
         ] {
             assert!(deny(p), "必须拒绝: {p}");
         }
+    }
+
+    /// 二轮审计 P0-3~5 补齐的三类缺口（此前只收了 /etc 下的同名物）。
+    #[test]
+    fn second_audit_gaps_are_denied() {
+        // systemd 发行版单元目录：写 ExecStart= 即 root 执行任意代码
+        for p in [
+            "/usr/lib/systemd/system/evil.service",
+            "/lib/systemd/system/evil.service",
+            "/usr/lib/systemd/system/sshd.service",
+        ] {
+            assert!(deny(p), "必须拒绝: {p}");
+        }
+        // 挂载表：写坏 = 不可启动
+        assert!(deny("/etc/fstab"));
+        // 反向：不应误伤
+        assert!(!deny("/etc/fstab.d/foo"));    // 不是 fstab 本体（同 crontab.bak 口径）
+        assert!(!deny("/usr/lib/systemdxx"));   // 不是 /usr/lib/systemd/
+    }
+
+    /// 面板库本体：路径可配 ⇒ 只能按运行时值判定，且**只认这一个文件**。
+    #[test]
+    fn panel_db_is_denied_by_runtime_path() {
+        use super::is_panel_db_path as is_db;
+        assert!(is_db("/var/lib/forkpanel/panel.db", Some("/var/lib/forkpanel/panel.db")));
+        // 自定义数据目录同样生效（写死常量做不到这一点）
+        assert!(is_db("/opt/panel/data/panel.db", Some("/opt/panel/data/panel.db")));
+        // 同目录的其它文件不受影响（数据目录里还有 trash / uploads / 备份产物）
+        assert!(!is_db("/opt/panel/data/master.key", Some("/opt/panel/data/panel.db")));
+        assert!(!is_db("/opt/panel/data/trash/x", Some("/opt/panel/data/panel.db")));
+        // 只认这一个文件，不放宽成「整个数据目录都不可碰」
+        assert!(!is_db("/opt/panel/data/panel.db-journal", Some("/opt/panel/data/panel.db")));
+        // 取不到运行时路径时不误挡
+        assert!(!is_db("/var/lib/forkpanel/panel.db", None));
+        assert!(!is_db("/var/lib/forkpanel/panel.db", Some("")));
     }
 }

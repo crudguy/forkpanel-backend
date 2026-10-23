@@ -132,9 +132,18 @@ pub(crate) fn perm_octal(m: u32) -> String {
     format!("{:o}", m & 0o777)
 }
 
-/// 敏感文件兜底检查
+/// 敏感文件兜底检查。
+///
+/// 两层判定，**缺一不可**：
+/// ① `files().is_sensitive()` —— 静态黑名单（linux 与 mock 共用同一份真值源）；
+/// ② `is_panel_db_path()` —— 面板库本体。它**必须按运行时路径判定**：
+///    `sqlite_path = <data_dir>/panel.db`，而 `[paths].data` 可配，写死常量会在任何
+///    改过数据目录的部署上静默失效。
 pub(crate) fn ensure_not_sensitive(state: &Shared, p: &SafePath) -> Result<()> {
-    if state.os.files().is_sensitive(p) {
+    let db_path = state.os.paths().sqlite_path();
+    if state.os.files().is_sensitive(p)
+        || panel_os::sensitive::is_panel_db_path(&p.as_path().to_string_lossy(), db_path.to_str())
+    {
         return Err(PanelError::PermissionDenied("file.sensitive"));
     }
     Ok(())
@@ -324,6 +333,10 @@ pub async fn mkdir(
     // 目标目录**尚不存在**，必须走 resolve_new(create=true)：resolve 会 canonicalize
     // 目标本身并要求它已存在，否则一律 NotFound(10004) →「新建目录」100% 失败。
     let p = resolve_new(&state, &s, &req.path)?;
+    // ⚠ 建目录同样要过敏感黑名单：/etc/cron.d/、/etc/sudoers.d/、/etc/profile.d/
+    // 等前缀下的 mkdir 是「后续落文件」的铺路步骤。漏掉这里等于黑名单只挡住一半
+    // 写入口（与 2026-10-21 覆盖 /etc/passwd 的事故同族）。
+    ensure_not_sensitive(&state, &p)?;
     state.os.files().create_dir(&p, req.recursive.unwrap_or(true)).await?;
     audit(&state, &s, "file.mkdir", &req.path, "ok").await;
     Ok(ok(serde_json::json!({ "path": req.path })))
@@ -628,6 +641,9 @@ pub async fn chmod(
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FILE_WRITE)?;
     let p = resolve(&state, &s, &req.path)?;
+    // ⚠ chmod 也要过敏感黑名单：把 /etc/ssh/ 下主机私钥、/etc/ssl/private/ 下证书
+    // 改成 0644 同样是扩大暴露面，危害与「写内容」等价。
+    ensure_not_sensitive(&state, &p)?;
 
     // 只接受八进制。绝不接受 "u+x" 这类符号模式——解析符号模式会引入不必要的复杂度与歧义。
     let mode = parse_mode(&req.mode)?;
@@ -1039,5 +1055,70 @@ mod tests {
         assert!(!is_binary(b"hello world"));
         assert!(!is_binary("<h1>中文</h1>".as_bytes()));
         assert!(is_binary(&[0xff, 0xfe, 0xfd]));
+    }
+
+    /// ⭐⭐ **接线守卫**：所有**会改变文件系统状态**的 handler 都必须过敏感黑名单。
+    ///
+    /// 为什么只能源码级断言：`mkdir` 与 `chmod` 此前都漏了 `ensure_not_sensitive`
+    /// （二轮审计 P0-1/P0-2），而**没有任何行为测试会因此变红**——漏掉它只是让
+    /// 「在 /etc/cron.d/ 下建目录」这类操作成功，功能本身照常工作。
+    ///
+    /// ⚠ 判据必须剔 `//` 注释行：本文件里解释敏感黑名单的注释很多，不剔的话
+    /// 「删掉调用、留着注释」照样绿（判据指向错 = 恒绿守卫）。
+    /// ⭐⭐ **动态判定接线守卫**：静态黑名单挡不住「路径可配」的那一个文件——
+    /// `panel.db` 的位置随 `[paths].data` 变。删掉 `is_panel_db_path` 这一行，
+    /// 所有静态黑名单断言**仍然全绿**（它本来就不在黑名单里）。
+    #[test]
+    fn ensure_not_sensitive_also_checks_runtime_panel_db() {
+        let src = include_str!("files.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let code: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let at = code
+            .find("fn ensure_not_sensitive(")
+            .expect("源码里找不到 ensure_not_sensitive（改名后请同步本守卫）");
+        let body = &code[at..(at + 900).min(code.len())];
+        assert!(
+            body.contains("is_panel_db_path"),
+            "ensure_not_sensitive 缺少运行时面板库判定：删掉它不会让任何静态黑名单断言变红"
+        );
+        assert!(
+            body.contains("sqlite_path"),
+            "运行时库路径必须来自 state.os.paths().sqlite_path()，不能写死常量"
+        );
+    }
+
+    #[test]
+    fn every_mutating_file_handler_checks_sensitive() {
+        let src = include_str!("files.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let code: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // 会改变文件系统状态的 handler。
+        // `trash_purge` **不在**此列：它只清理回收站内部（位于数据目录），
+        // 不接触用户传入的路径，故无需敏感判定。
+        for name in [
+            "write", "mkdir", "remove", "trash", "trash_restore", "rename", "chmod", "upload",
+        ] {
+            let needle = format!("pub async fn {name}(");
+            let at = code
+                .find(&needle)
+                .unwrap_or_else(|| panic!("源码里找不到 {name} handler（改名后请同步本守卫）"));
+            let rest = &code[at..];
+            // 截到下一个 handler 为止，避免把相邻函数的调用算进来
+            let end = rest.find("\npub async fn ").unwrap_or(rest.len());
+            let body = &rest[..end];
+            assert!(
+                body.contains("ensure_not_sensitive"),
+                "{name} handler 缺少 `ensure_not_sensitive`：漏掉它不会让任何行为测试变红，\
+                 但黑名单会只挡住一部分写入口（这正是 mkdir/chmod 曾经的状态）"
+            );
+        }
     }
 }
