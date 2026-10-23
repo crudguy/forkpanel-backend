@@ -8,7 +8,7 @@
 # （恒绿比没门禁更危险）。故 audit 单独成一个目标，CI 里单独一个 job——
 # advisory-db 托管在 GitHub，网络抖动时不该连带拖红主门禁。
 
-.PHONY: check guards audit test embed-fresh e2e-files e2e-backups e2e-containers e2e-cron e2e-databases e2e-sites
+.PHONY: check guards audit test embed-fresh e2e-files e2e-backups e2e-containers e2e-cron e2e-databases e2e-sites e2e-firewall
 
 # 主门禁：静态守卫 + 全量测试（离线可跑，确定性高）
 check: guards embed-fresh test
@@ -94,6 +94,16 @@ e2e-databases:
 #   make e2e-sites BASE=http://127.0.0.1:2084
 e2e-sites:
 	bash ci/e2e-sites.sh "$(BASE)"
+
+# 防火墙（firewall）E2E：最高风险模块，故纪律最硬——dev 防火墙后端真实在场
+# （firewall.manage=True，iptables/nft 在 /usr/sbin），本脚本**绝不**提交合法规则 /
+# 带 allow_lockout_risk 封端口 / 调 set_enabled/delete_rule（都会真的改防火墙）。
+# 只测：能力位、只读端点、以及**全部在 snapshot() 之前返回**的拒绝分支（零残留），
+# 每条钉死具体 code（不用 chk_ne，防 URL 写错命中 404 假绿）。不进 `check`。
+#   make e2e-firewall
+#   make e2e-firewall BASE=http://127.0.0.1:2084
+e2e-firewall:
+	bash ci/e2e-firewall.sh "$(BASE)"
 
 test:
 	cargo test --workspace
