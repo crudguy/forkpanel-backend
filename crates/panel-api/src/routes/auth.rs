@@ -159,17 +159,35 @@ pub async fn login(
                 codes.remove(pos);
                 let remain = serde_json::to_string(&codes).unwrap_or_else(|_| "[]".into());
                 let uid2 = uid;
-                let _ = state
+                // ⚠ 写库结果**绝不能吞**：消费记录没落库 = 这个恢复码仍在库里、
+                // 可无限次复用，等于把一次性恢复码变成永久口令，MFA 第二因子被架空。
+                // 曾写作 `let _ = ...` ⇒ 写库失败照样放行且无任何留痕（二轮审计 P0-7）。
+                // 另注意：这里必须用 execute 的**真实行数**构造 WriteAck——原先硬编码
+                // `rows_changed: 1`，即便 UPDATE 一行都没命中也自称成功。
+                match state
                     .db
                     .exec(move |conn| {
                         conn.execute(
                             "UPDATE users SET mfa_recovery_codes = ?1 WHERE id = ?2",
                             rusqlite::params![remain, uid2],
                         )
-                        .map(|_| panel_db::WriteAck { rows_changed: 1 })
+                        .map(|n| panel_db::WriteAck { rows_changed: n })
                         .map_err(|e| panel_core::PanelError::Database(e.to_string()))
                     })
-                    .await;
+                    .await
+                {
+                    Ok(ack) if ack.rows_changed > 0 => {}
+                    Ok(_) => {
+                        eprintln!("[panel] ⚠ [auth] 恢复码消费未命中任何账号，拒绝本次登录");
+                        return Err(ApiError::mfa_recovery_persist_failed());
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[panel] ⚠ [auth] 恢复码消费写库失败，拒绝本次登录（否则该码可无限复用）：{e}"
+                        );
+                        return Err(ApiError::mfa_recovery_persist_failed());
+                    }
+                }
             } else {
                 // 第二因子错误同样计入防暴力（否则可无限爆破 6 位码）
                 state.logins.record_failure(&key);
@@ -726,4 +744,37 @@ mod tests {
             "登录审计必须使用刚构造的会话值（不回读）"
         );
     }
+
+    /// ⭐⭐ **接线守卫**：恢复码消费的写库结果**不得**被 `let _ =` 吞掉。
+    /// 吞掉的后果是该恢复码仍留在库里、可无限次复用（一次性恢复码变永久口令），
+    /// 而**没有任何行为测试会因此变红**——登录照样成功。
+    #[test]
+    fn recovery_code_persist_failure_is_not_swallowed() {
+        let src = include_str!("auth.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let code: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let at = code
+            .find("UPDATE users SET mfa_recovery_codes")
+            .expect("源码里找不到恢复码 UPDATE（改名后请同步本守卫）");
+        // 取该 UPDATE 所在语句块（向后 900 字符，足够覆盖整个 exec 调用）
+        let block = &code[at..(at + 900).min(code.len())];
+        assert!(
+            block.contains("mfa_recovery_persist_failed"),
+            "恢复码写库失败必须拒绝登录：吞掉结果会让该恢复码无限复用，且不留下任何痕迹"
+        );
+        assert!(
+            !block.contains("let _ ="),
+            "恢复码写库不得用 `let _ =` 吞掉结果"
+        );
+        // 真实行数：硬编码 rows_changed: 1 会让「一行都没命中」也自称成功
+        assert!(
+            block.contains("WriteAck { rows_changed: n }"),
+            "WriteAck 必须用 execute 的真实行数，硬编码 1 会让未命中的 UPDATE 也自称成功"
+        );
+    }
+
 }

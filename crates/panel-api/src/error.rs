@@ -55,6 +55,16 @@ impl ApiError {
     pub fn bootstrap_invalid() -> Self {
         Self::new(10011, StatusCode::UNAUTHORIZED, "bootstrap token invalid or expired")
     }
+    /// MFA 恢复码消费**未能落库**（10012）。
+    /// 此时**绝不能放行**：消费记录没写进去 = 这个恢复码仍在库里、可无限次复用，
+    /// 等于把一次性恢复码变成永久口令，MFA 第二因子被架空。
+    pub fn mfa_recovery_persist_failed() -> Self {
+        Self::new(
+            10012,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "mfa recovery code consumed in memory but not persisted; login refused",
+        )
+    }
 }
 
 /// 领域错误 → HTTP 错误的**唯一**映射点，保证错误码在前后端一致
