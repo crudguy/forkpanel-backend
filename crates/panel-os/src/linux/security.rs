@@ -298,21 +298,41 @@ pub(crate) async fn apply_ssh_item(key: &str) -> Result<SecurityApplyResult> {
     .await;
     let ok = matches!(&out, Ok(o) if o.code == Some(0));
     if !ok {
-        let _ = std::fs::copy(&backup, &path); // 回滚
+        // ⚠ 回滚**可能失败**（备份被删、权限变化、磁盘满）。此前用 `let _ =` 吞掉结果，
+        // 而文案却无条件宣称「已自动回滚」——用户据此重启 sshd，就会在磁盘上仍是坏
+        // 配置的情况下把自己锁在门外（二轮审计 P0-9）。
+        let rolled_back = std::fs::copy(&backup, &path).is_ok();
+        if !rolled_back {
+            eprintln!(
+                "[panel] ⚠ [security] sshd 配置校验未通过且**回滚失败**：目标 {} 上仍是未通过校验的配置（备份留在 {}）",
+                path.display(), backup.display()
+            );
+        }
         let why = match out {
             Ok(o) => o.stderr,
             Err(e) => e.to_string(),
         };
         return Err(PanelError::Command {
             bin: "sshd".into(),
-            detail: format!(
-                "配置校验未通过，已自动回滚（原配置已恢复，备份 {}）：{why}",
-                backup.display()
-            ),
+            detail: sshd_validate_failure_detail(rolled_back, &backup.display().to_string(), &why),
         });
     }
 
     Ok(SecurityApplyResult { changed: true, backup: Some(backup), validated: true })
+}
+
+/// sshd 配置校验失败时的错误文案。
+///
+/// ⚠ 文案必须**如实反映回滚是否成功**：无条件宣称「已自动回滚」是最危险的谎报——
+/// 用户会在磁盘上仍是坏配置时重启 sshd。抽成纯函数才能被断言。
+pub(crate) fn sshd_validate_failure_detail(rolled_back: bool, backup: &str, why: &str) -> String {
+    if rolled_back {
+        format!("配置校验未通过，已自动回滚（原配置已恢复，备份 {backup}）：{why}")
+    } else {
+        format!(
+            "配置校验未通过，且**自动回滚失败**：磁盘上仍是这份未通过校验的配置（备份留存在 {backup}）。请勿重启 sshd——先手工恢复备份或修正配置，否则可能锁死 SSH 登录：{why}"
+        )
+    }
 }
 
 #[cfg(test)]
@@ -422,4 +442,23 @@ mod tests {
         let items = ssh_checks(Path::new("/nonexistent/sshd_config"));
         assert!(items.iter().all(|c| !c.applicable), "缺配置应标不适用（而非通过）");
     }
+
+    /// 二轮审计 P0-9：回滚失败时**不得**宣称「已自动回滚」——用户据此重启 sshd
+    /// 会在磁盘上仍是坏配置的情况下把自己锁在门外。
+    #[test]
+    fn sshd_failure_detail_tells_whether_rollback_worked() {
+        let ok_detail = sshd_validate_failure_detail(true, "/tmp/sshd.bak", "syntax error");
+        assert!(ok_detail.contains("已自动回滚"), "回滚成功应如实说明：{ok_detail}");
+        assert!(!ok_detail.contains("回滚失败"), "回滚成功不该出现失败字样：{ok_detail}");
+
+        let bad_detail = sshd_validate_failure_detail(false, "/tmp/sshd.bak", "syntax error");
+        assert!(bad_detail.contains("回滚失败"), "回滚失败必须说出来：{bad_detail}");
+        assert!(
+            !bad_detail.contains("已自动回滚"),
+            "回滚失败却宣称「已自动回滚」= 谎报，用户会重启 sshd 被锁在门外：{bad_detail}"
+        );
+        assert!(bad_detail.contains("请勿重启"), "必须给出行动指引：{bad_detail}");
+        assert!(bad_detail.contains("/tmp/sshd.bak"), "要告诉用户备份在哪：{bad_detail}");
+    }
+
 }
