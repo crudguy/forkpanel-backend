@@ -81,4 +81,15 @@ if [ "${#over[@]}" -gt 0 ]; then
 fi
 
 cnt=$(list_files | grep -c .)
+if [ "$cnt" -eq 0 ]; then
+  # ⚠ P1-8：本轮新加门禁自带洞——扫到 0 个文件仍报「0 个文件均在限额内」PASS。
+  #   目录结构一变 / list_files 异常 ⇒ 恒绿。门禁无法得出结论时绝不能算通过。
+  if [ -n "${CI:-}" ]; then
+    echo "[skip] $(basename "$0")：扫描到 0 个前端文件，门禁无法得出结论（非通过）" >&2
+    exit 0
+  fi
+  echo "✗ $(basename "$0")：扫描到 0 个前端文件——路径探测或 list_files 异常，门禁不能当作通过" >&2
+  echo "   FE_SRC=$FE_SRC；检查前端仓是否并列存放或设 PANEL_FRONTEND_ROOT" >&2
+  exit 1
+fi
 echo "PASS：${cnt} 个前端文件均在限额内（.vue ≤ $VUE_MAX，.ts ≤ $TS_MAX；豁免：${EXEMPT[*]}）"
