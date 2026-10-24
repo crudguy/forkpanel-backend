@@ -56,7 +56,16 @@ echo "== 前端源码目录：$FE_SRC =="
 # ── 抽取后端路由（形如 .route("/api/v1/xxx", get(...))）──
 BACKEND=$(grep -rhoE '"/api/v1/[a-zA-Z0-9/_-]+"' crates/panel-api/src/ 2>/dev/null | tr -d '"' | sort -u)
 if [ -z "$BACKEND" ]; then
-  echo "  · 未从后端提取到路由"; exit 0
+  # ⚠ P1-1：提取为空绝不能静默通过——路由改用非字面量写法 / 目录迁移 / grep 出错，
+  #   都会让 [A][B][F] 三项全跳过仍 PASS（脚本 :51 自己写明「绝不能在此静默通过」）。
+  #   恒绿的门禁比没门禁更危险：必须把「没验」喊出来，而非 exit 0。
+  echo "  · 未从后端提取到任何 /api/v1 路由——提取前提不成立，绝不能当作通过" >&2
+  if [ -n "${CI:-}" ]; then
+    echo "    [skip] 非通过：CI 跳过（前端仓缺失或提取异常）" >&2
+    exit 0
+  fi
+  echo "  ✗ 后端路由提取为空：检查 crates/panel-api/src 路径与路由字面量写法是否变化" >&2
+  exit 1
 fi
 echo "== 后端已声明路由 =="
 echo "$BACKEND" | sed 's/^/      /'
@@ -100,10 +109,13 @@ fi
 
 echo "== [C] 写接口必须受 CSRF 守卫 =="
 # guard_write 中间件必须挂载在写路由之上
-if grep -q "guard_write" crates/panel-api/src/routes.rs; then
+# ⚠ P1-2：必须剔注释行——routes.rs:93 的文档注释里正含 `guard_write`（真实挂载在
+#   :426），不剔注释则删掉真实挂载仍报「✓ 已挂载」，本门禁恒绿。
+if grep -nE "guard_write" crates/panel-api/src/routes.rs 2>/dev/null \
+  | grep -vE '^[0-9]+:[[:space:]]*//' | grep -q .; then
   pass "写操作已挂载 guard_write（CSRF + Origin 校验）"
 else
-  fail "未找到 guard_write 挂载点"
+  fail "未找到 guard_write 挂载点（或仅存于注释中，真实挂载被删）"
 fi
 
 echo "== [D] 版本协商常量一致 =="
