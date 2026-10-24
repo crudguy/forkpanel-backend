@@ -3167,6 +3167,33 @@ paths:
           description: ok，返回每项目一行（data 为 [name, status, config_files]；status 为组合语义串如 running(1) / exited(1)，config_files 为配置文件绝对路径）
           content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { type: object, properties: { name: { type: string }, status: { type: string }, config_files: { type: string } } } } } } } }
         '501': { description: "容器能力不可用，或 Compose 插件缺失（detail.reason：binary_missing / daemon_unreachable / compose_unavailable）。⚠ compose 是 CLI 插件，与 daemon 可达性无关：docker 可用但没装 docker-compose-plugin 时会返回 compose_unavailable（而非 502）" }
+  /api/v1/containers/compose/{project}/act:
+    post:
+      tags: [containers]
+      summary: 对 Compose 项目执行生命周期动作（up / stop / restart / down）
+      description: |
+        action ∈ {up, stop, restart, down}；down 必须手输项目名作为 confirm_token（防停错项目）。
+        up 豁免「项目必须存在于 compose ls」（down 后项目消失、需要 up 重新拉起），其余动作要求项目真实存在。
+        返回 2xx 仅表示动作已下发（compose 异步执行，实际状态以 /compose 列举为准）。
+      security: [cookieAuth, csrfHeader]
+      parameters:
+        - { name: project, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action: { type: string, enum: [up, stop, restart, down] }
+                working_dir: { type: [string, "null"], description: "compose 工作目录（覆盖默认值）；省略则按服务器约定" }
+                confirm_token: { type: [string, "null"], description: "down 动作必填：必须等于 project 名作为确认词" }
+      responses:
+        '200': { description: ok，已下发动作 }
+        '400': { description: 未知 action / down 缺少确认词 }
+        '404': { description: compose 项目不存在（stop / restart / down 要求项目真实存在） }
+        '501': { description: 容器能力不可用，或 Compose 插件缺失 }
   /api/v1/containers/stacks:
     get:
       tags: [containers]
