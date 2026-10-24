@@ -132,18 +132,35 @@ else
 fi
 
 echo "== [7] 前端可移植性与 XSS =="
-if [ -d web/src ]; then
-  # 过滤纯注释行（以 * 或 // 开头）：纪律说明里会提到这些词本身，不能算违规
-  FE_HITS=$(grep -rn -E "v-html|isLinux|navigator\.platform|target_os" web/src 2>/dev/null \
-    | grep -vE ':[0-9]+:[[:space:]]*(\*|//)')
+# ⚠ P1-4：前端已拆为独立仓（../forkpanel-frontend/src），硬编码 `web/src` 永远为假，
+#   规则[7] 永不执行、只打「骨架阶段跳过」——不是 [skip]、不判失败。改为与
+#   check-api-contract.sh 同款目录探测：先前端仓 src，再兜底旧 web/src。
+FE_DIR="${FE_DIR:-$ROOT/../forkpanel-frontend}"
+FE_SRC=""
+for cand in "$FE_DIR/src" "$ROOT/web/src"; do
+  if [ -d "$cand" ]; then FE_SRC="$cand"; break; fi
+done
+if [ -z "$FE_SRC" ]; then
+  if [ -n "${CI:-}" ]; then
+    echo "  [skip] 规则[7]：找不到前端源码（试过 $FE_DIR/src 与 $ROOT/web/src）——CI 跳过（非通过）" >&2
+  else
+    echo "  · 未找到前端源码目录（试过 $FE_DIR/src 与 $ROOT/web/src），规则[7]跳过；本地应并列存放 forkpanel-frontend"
+  fi
+else
+  # 过滤纯注释行（以 * 或 // 开头）：纪律说明里会提到这些词本身，不能算违规；
+  # 接入 allow_filter 7 以便对可信 v-html（如渲染内部 SVG 图标集）加行内豁免。
+  # Icon.vue 的 v-html 渲染**内部可信 SVG 图标集**（ICONS 为前端常量，非用户内容，
+  # 无 XSS 风险），属已知安全用法，按文件路径豁免——Vue 模板自闭合标签内无法放行内
+  # 注释豁免，故在此排除其路径；其余位置的 v-html 仍受规则[7]约束。
+  FE_HITS=$(grep -rn -E "v-html|isLinux|navigator\.platform|target_os" "$FE_SRC" 2>/dev/null \
+    | grep -vE ':[0-9]+:[[:space:]]*(\*|//)' | allow_filter 7 \
+    | grep -v "components/Icon.vue")
   if [ -n "$FE_HITS" ]; then
     note_fail "前端存在平台硬编码或 v-html："
     echo "$FE_HITS" | sed 's/^/      /'
   else
     note_ok "前端无平台判断与 v-html"
   fi
-else
-  echo "  · web/src 不存在（骨架阶段跳过）"
 fi
 
 echo "== [8] 依赖数量预算 =="
