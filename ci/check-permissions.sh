@@ -20,6 +20,8 @@
 #   A. 源文件存在性（缺失即失败，绝不恒绿）
 #   B. 提取非空且规模合理（正则失效多半表现为数量骤降）
 #   C. 前端权限点必须是后端常量的子集（差集为空）
+#   D. 调用点覆盖度：每个 enabled()/can() 的权限参数都必须是**字面量**，
+#      否则该调用点被静默跳过（新形态 ⇒ 门禁照绿但没校验）
 #
 # 用法：./ci/check-permissions.sh [后端仓根] [前端仓根]
 #   前端仓根默认 ../forkpanel-frontend；也可用 PANEL_FRONTEND_ROOT 覆盖。
@@ -89,6 +91,18 @@ MIN=10
 if [ "$BE_N" -lt "$MIN" ]; then
   fail "后端权限常量仅 $BE_N 项（少于阈值 $MIN）：更可能是提取正则失效，而非真的删到这么少"
 fi
+# 声明数对账：下面只按 `"[a-z]+\.[a-z]+"` 抓值，将来出现三段式权限点（`a.b.c`）会
+# **整项抓不到**——BE 悄悄少一项，[C] 的差集基准随之变小（误报还算有声音，
+# 静默变小才是恒绿洞）。用 `pub const` 声明数对账，把"漏形态"喊出来。
+BE_DECL=$(awk '/^pub mod perm \{/,/^\}/' "$BE_SRC" 2>/dev/null \
+  | grep -cE '^[[:space:]]*pub const' || true)
+if [ "${BE_DECL:-0}" -eq 0 ]; then
+  fail "perm 模块里没找到任何 pub const（模块改名/改结构？需同步更新本脚本）"
+elif [ "$BE_DECL" -ne "$BE_N" ]; then
+  fail "perm 模块声明 $BE_DECL 个常量，却只提取到 $BE_N 个值——提取正则漏了某种形态（如三段式权限点）"
+else
+  pass "perm 模块 $BE_DECL 个常量全部被提取（无漏形态）"
+fi
 
 echo
 echo "== [C] 前端权限点必须是后端常量的子集 =="
@@ -103,6 +117,34 @@ else
   else
     pass "前端引用的 $FE_N 个权限点后端全部存在"
   fi
+fi
+
+echo
+echo "== [D] 调用点覆盖度（防「新形态静默漏检」）=="
+# [C] 只认 `enabled(cap, 'x.y')` / `can('x.y')` 的**字面量**参数。一旦有人写成变量
+# 或模板串（`can(perm)` / `can(\`${x}.manage\`)`），那个调用点就被静默跳过：门禁照绿，
+# 而该权限点从此没人校验——与能力位那批同源的「判据指向错」恒绿洞。
+# 这里把**所有**调用点数出来，逐个要求参数里带字面量权限点。
+# 排除：stores/auth.ts（can/enabled 的定义与转发处，参数本就是变量）、
+# *.test.ts（测试数据不是真实调用点，与 check-api-contract.sh 同口径）。
+strip_fe_comments() { grep -vE ':[0-9]+:[[:space:]]*(//|\*|/\*|<!--)' || true; }
+SITES=$(grep -rnE "(^|[^A-Za-z0-9_])(enabled|can)\(" "$FE_DIR" 2>/dev/null \
+  | grep -v "/stores/auth.ts:" | grep -v "\.test\.ts:" | strip_fe_comments || true)
+CALLS=$(printf '%s\n' "$SITES" | grep -oE "(enabled|can)\([^)]*\)" || true)
+N_CALLS=$(count "$CALLS")
+N_LIT=$(printf '%s\n' "$CALLS" | grep -cE "'[a-z]+\.[a-z]+'" || true)
+if [ "$N_CALLS" -eq 0 ]; then
+  fail "未发现任何 enabled()/can() 调用点——提取正则失效？若真没有，[C] 的校验就是空的"
+else
+  pass "前端权限调用点 $N_CALLS 处"
+fi
+if [ "$N_LIT" -ne "$N_CALLS" ]; then
+  UNCOVERED=$(printf '%s\n' "$SITES" | grep -E "(enabled|can)\(" \
+    | grep -vE "(enabled|can)\([^)]*'[a-z]+\.[a-z]+'" || true)
+  fail "以下调用点的权限参数不是字面量，[C] 校验不到（请改字面量，或在此显式加豁免）："
+  printf '%s\n' "$UNCOVERED" | sed 's/^/      /'
+else
+  pass "全部 $N_CALLS 处调用点都是字面量权限点（无静默漏检）"
 fi
 
 echo

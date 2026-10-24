@@ -155,7 +155,20 @@ echo "== [6] 强类型构造点审计 =="
 # 合法构造点：panel-core（强类型定义 + 校验器）、paths.rs（路径沙箱）、mock.rs（桩数据）。
 # 其余一律违规。测试块由 strip_tests.py 剥离（测试构造 fixture 合法）。
 if [ -z "${SKIP_STRIP_RULES:-}" ]; then
-  RAW_HITS=$(python3 ci/strip_tests.py crates 2>/dev/null \
+  # ⚠ 传参必须是**搜索模式**：`strip_tests.py` 第一个位置参数是 pattern
+  #（`--root` 才指定根目录）。此前写成 `strip_tests.py crates`，等于在搜
+  # "任何提到 crates 这个词的行"——规则名与判据完全对不上，属于「判据指向错」，
+  # 只是恰好一直没人写代码注释里带 crates 才没红。
+  # 模式用 `from_raw\(` 而非 `from_raw`：`File::from_raw_fd`（pty 用，合法 std API）
+  # 会被子串匹配误报成违规。
+  RAW_ALL=$(python3 ci/strip_tests.py 'from_raw\(' 2>/dev/null | strip_comments)
+  # 活性自检：提取为空 = 正则/工具链失效，此时下面的差集恒为空 ⇒ 恒绿门禁。
+  # 绝不把"提取器没跑"误当成"无违规"。
+  if [ -z "$RAW_ALL" ]; then
+    note_fail "未提取到任何 from_raw( 调用点（strip_tests.py 失效或强类型构造点全被删？）\
+      ——此处若放行，规则[6] 就变成恒绿门禁"
+  fi
+  RAW_HITS=$(printf '%s\n' "$RAW_ALL" \
     | grep -v "crates/panel-core/src/lib.rs" \
     | grep -v "crates/panel-os/src/paths.rs" \
     | grep -v "crates/panel-os/src/mock.rs")
