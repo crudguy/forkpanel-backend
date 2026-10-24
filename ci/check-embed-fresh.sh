@@ -29,6 +29,12 @@ if [ ! -d "$FE_DIST" ]; then
   exit 0
 fi
 [ -d "$BE_DIST" ] || fail "找不到内嵌目录 $BE_DIST"
+# ⚠ P1-7：原只判 web/dist 目录存在，不判 index.html / assets 数量。若只 `rm -rf
+#   web/dist/*` 没 cp，index.html 缺失、assets 全空，三个比对集合全空 ⇒ 仍 PASS（恒绿）。
+#   必须断言 index.html 存在、且至少引用了若干 asset。
+[ -f "$BE_DIST/index.html" ] || fail "内嵌目录 $BE_DIST 缺少 index.html：可能只 rm 没 cp，请按 embed 五步重做"
+ASSETS=$(grep -oE '/assets/[A-Za-z0-9_.-]+\.(js|css)' "$BE_DIST/index.html" | sort -u)
+[ -n "$ASSETS" ] || fail "内嵌 index.html 未引用任何 /assets/*（异常：构建产物形态不符，或 index.html 损坏）"
 # ── 1) 内嵌 index.html 引用的 asset 必须在 web/dist 里存在 ──
 # ⚠ 必须读**内嵌的** `$BE_DIST/index.html`，不能读前端源码那份：两边都读源码等于
 # 自己跟自己比，恒绿。负向对照实测过——只把内嵌 index.html 换回旧引用时，读源码
@@ -44,7 +50,7 @@ while IFS= read -r a; do
     echo "  ❌ 内嵌 index.html 引用 $a，但 web/dist 里没有这个文件" >&2
     missing=1
   fi
-done < <(grep -oE '/assets/[A-Za-z0-9_.-]+\.(js|css)' "$BE_DIST/index.html" | sort -u)
+done < <(echo "$ASSETS")
 
 [ $missing -eq 0 ] || fail "内嵌 index.html 引用了不存在的 asset。很可能是只换了 index.html 没同步 asset，或漏了 cp：请按 ①pnpm build → ②rm -rf web/dist/* → ③cp -a 前端dist/ → ④touch crates/panel-cli/src/embed.rs → ⑤cargo build 重做。"
 
