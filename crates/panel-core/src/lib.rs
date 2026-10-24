@@ -609,6 +609,10 @@ mod tests {
             assert!(s.sampling_interval_ms() > d.sampling_interval_ms());
             assert!(n.max_sse_clients() < s.max_sse_clients());
             assert!(s.max_sse_clients() < d.max_sse_clients());
+            // 精确值锁（P2-6）：SSE 上限的唯一真值在这里——sse.rs 曾另存一份
+            // 3/10/50 的 match 副本（双真值靠人工同步）。改档位值必须改这里，
+            // 顺手确认消费方仍走本方法（sse.rs 有源码守卫钉住接线方向）。
+            assert_eq!((n.max_sse_clients(), s.max_sse_clients(), d.max_sse_clients()), (3, 10, 50));
             assert!(n.task_concurrency() < s.task_concurrency());
             assert!(s.task_concurrency() < d.task_concurrency());
             // SQLite 的 cache_size 用**负值表示 KiB**（-4000 = 4MiB）⇒ 越负缓存越大。

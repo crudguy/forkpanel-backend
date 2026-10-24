@@ -15,7 +15,6 @@ use axum::{
     },
 };
 use serde::Deserialize;
-use panel_core::Tier;
 use std::{
     convert::Infallible,
     sync::{
@@ -28,10 +27,6 @@ use tokio::sync::mpsc;
 
 /// 当前 SSE 连接数（进程内原子计数，用于档位上限判定）
 pub static SSE_CONNS: AtomicUsize = AtomicUsize::new(0);
-
-pub fn max_clients(t: Tier) -> usize {
-    match t { Tier::Nano => 3, Tier::Small => 10, Tier::Standard => 50 }
-}
 
 /// SSE 连接守卫：离开作用域即把进程内连接计数 -1。
 ///
@@ -66,7 +61,7 @@ pub async fn metrics_stream(
         }
         None => return ApiError::unauthorized().into_response(),
     }
-    let limit = max_clients(state.tier);
+    let limit = state.tier.max_sse_clients();
     if SSE_CONNS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
         if n >= limit { None } else { Some(n + 1) }
     }).is_err() {
@@ -142,7 +137,7 @@ pub async fn task_stream(
     } else {
         return ApiError::unauthorized().into_response();
     }
-    let limit = max_clients(state.tier);
+    let limit = state.tier.max_sse_clients();
     if SSE_CONNS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
         if n >= limit { None } else { Some(n + 1) }
     }).is_err() {
@@ -209,7 +204,7 @@ pub async fn follow_source(
     limit: usize,
 ) -> axum::response::Response {
     let n = limit.clamp(1, 2000);
-    let cap = max_clients(state.tier);
+    let cap = state.tier.max_sse_clients();
     if SSE_CONNS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |k| {
         if k >= cap { None } else { Some(k + 1) }
     }).is_err() {
@@ -311,7 +306,7 @@ pub async fn service_journal_stream(
         Err(_) => return ApiError::bad_request("name", "invalid unit name").into_response(),
     };
 
-    let limit = max_clients(state.tier);
+    let limit = state.tier.max_sse_clients();
     if SSE_CONNS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
         if n >= limit { None } else { Some(n + 1) }
     }).is_err() {
@@ -352,13 +347,6 @@ fn now_unix() -> i64 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn client_limits_match_tier() {
-        assert_eq!(max_clients(Tier::Nano), 3);
-        assert_eq!(max_clients(Tier::Small), 10);
-        assert_eq!(max_clients(Tier::Standard), 50);
-    }
-
     // ⚠ 这是**常量规格锁**（改常量即红），不是恒真断言：clippy 的
     // `assertions_on_constants` 对"两个 const 比较"一律报警，但它看不出我们
     // 恰恰要锁住这些常量不被悄悄改掉。
@@ -367,5 +355,29 @@ mod tests {
     fn backlog_is_small() {
         // 低配机器上缓冲区必须小：64 条 × 事件大小，避免慢客户端拖垮内存
         assert!(BACKLOG <= 128);
+    }
+
+    /// ⭐ **单源守卫**（P2-6）：SSE 档位上限的唯一真值是 `Tier::max_sse_clients()`
+    /// （panel-core）。sse.rs 曾另存一份 3/10/50 的 `match` 副本——两份靠人工同步，
+    /// 改一处漏一处就出事。删副本不会红任何行为测试（值相同），只能源码级断言。
+    #[test]
+    fn sse_limit_has_single_source_of_truth() {
+        // ⚠ 必须先截掉测试段：include_str! 连本守卫自身的源码都包含，
+        // needle 字面量在测试体里出现会让计数虚高 / 误命中（自检踩过）。
+        // sse.rs 只有一个尾部 #[cfg(test)]，split 取生产段是安全的；
+        // 若将来中间插入第二个测试模块，须改为按 fn 定位。
+        let src = include_str!("sse.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        let code: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(code.matches("state.tier.max_sse_clients()").count(), 4,
+            "4 个调用点都必须走 Tier 方法（任何一处改回本地 match 都会重新双真值）");
+        assert!(!code.contains("fn max_clients"),
+            "本地 max_clients 副本不得复活——精确值只在 panel-core::Tier 上");
+        assert!(!code.contains("Tier::Nano => 3"),
+            "3/10/50 的字面量不得再出现在 sse.rs（唯一真值在 panel-core）");
     }
 }
