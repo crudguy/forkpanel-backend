@@ -1,0 +1,12 @@
+[package]
+name = "panel-testutil"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "测试期共享工具（仅供 dev-dependencies）：源码守卫的「生产段」提取器"
+
+# ⚠ 本 crate **只允许**被当作 dev-dependency 引用，且**不许引入任何第三方依赖**。
+# 理由：它是纯 std 的源码文本处理，加依赖就等于把测试工具的成本算进构建图；
+# 也不计入 check-layering.sh 规则[8] 的依赖预算（--edges normal 排除 dev 依赖）。
+[dependencies]

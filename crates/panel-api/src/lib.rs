@@ -267,4 +267,12 @@ pub(crate) mod test_support {
             std::time::Duration::from_secs(1800), std::time::Duration::from_secs(43_200),
             90, 50_000, true, true, "NORMAL".to_string(), 7)
     }
+
+    /// 源码守卫取「**生产段**」：剔注释行 + 剔 `#[cfg(test)]` 包裹的块。
+    ///
+    /// 实现搬到 `panel-testutil`（dev-dependency）：`panel-cli`（binary crate）
+    /// 也有同款接线守卫，够不到本 crate 的 `pub(crate)` 模块——两边各留一份
+    /// 解析器必然漂移成两份语义不同的判据。语义与踩过的坑见 `panel_testutil::
+    /// production_source` 的文档，此处只做转出。
+    pub use panel_testutil::production_source;
 }

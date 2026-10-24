@@ -1164,13 +1164,14 @@ mod wiring_guard_tests {
     /// 只靠名字约定对齐。漏注册时调度器每轮 `jobs.get(name)` 取到 None 就静默跳过
     /// ——页面上配了定时备份却永远不跑，且没有任何报错。
     ///
-    /// 注意先 `.split("#[cfg(test)]")`：本模块自身的断言字符串里就含有
-    /// `sched.register("backup.sweep"`，不剔掉测试段的话，把注册删了测试照样绿
-    /// （正是「判据指向错」那类恒绿守卫）。
+    /// 取生产段必须走 `panel_testutil::production_source`：本模块自身的断言字符串
+    /// 里就含有 `sched.register("backup.sweep"`（判据自引用）—— 不剔测试段，把注册
+    /// 删了照样绿。它**还剔注释行**：实测过把注册整块注释掉、注释里留同名 needle，
+    /// 只 `split("#[cfg(test)]")` 的版本依然全绿（定时备份静默不跑，门禁一声不吭）。
     #[test]
     fn backup_sweep_is_registered_in_serve() {
         let src = include_str!("main.rs");
-        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        let prod = panel_testutil::production_source(src);
         assert!(
             prod.contains("sched.register(\"backup.sweep\", move ||"),
             "builtin_schedules 声明了 backup.sweep，serve 必须注册同名实现，否则定时备份静默不跑"
@@ -1184,11 +1185,11 @@ mod wiring_guard_tests {
     /// **判据必须指向生产代码那一份**：会话回收在 `panel-task` 声明、在 `panel-cli`
     /// 注册，只靠名字约定对齐。漏注册时调度器每轮 `jobs.get(name)` 取到 None 就静默
     /// 跳过——`SessionCache::sweep()` 已实现却永不被调用，会话内存 map 与 sessions
-    /// 表单调增长（P1-9）。同样先 `.split("#[cfg(test)]")` 剔除本模块测试段。
+    /// 表单调增长（P1-9）。同样走 `production_source`（剔测试段 + 剔注释）。
     #[test]
     fn session_sweep_is_registered_in_serve() {
         let src = include_str!("main.rs");
-        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        let prod = panel_testutil::production_source(src);
         assert!(
             prod.contains("sched.register(\"session.sweep\", move ||"),
             "builtin_schedules 声明了 session.sweep，serve 必须注册同名实现，否则会话回收静默不跑"
@@ -1205,7 +1206,7 @@ mod wiring_guard_tests {
     #[test]
     fn tls_fake_control_is_wired_into_serve() {
         let src = include_str!("main.rs");
-        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        let prod = panel_testutil::production_source(src);
         assert!(
             prod.contains("cfg.validate_implemented()?;"),
             "serve 启动路径必须调用 validate_implemented()，否则 [server].tls 会被静默忽略"
@@ -1235,12 +1236,7 @@ mod wiring_guard_tests {
     #[test]
     fn serve_warns_when_listening_outside_loopback() {
         let src = include_str!("main.rs");
-        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
-        let code: String = prod
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let code = panel_testutil::production_source(src);
         assert!(
             code.contains("warn_if_exposed(&addr)"),
             "serve 启动必须调用 warn_if_exposed(&addr)：面板 root 运行且无 HTTPS，\
@@ -1251,7 +1247,7 @@ mod wiring_guard_tests {
     #[test]
     fn request_log_is_the_outermost_layer_of_the_serve_chain() {
         let src = include_str!("main.rs");
-        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        let prod = panel_testutil::production_source(src);
         let mount = "axum::middleware::from_fn_with_state(";
         let at = prod
             .find(mount)
@@ -1280,19 +1276,14 @@ mod wiring_guard_tests {
     #[test]
     fn request_log_is_mounted_exactly_once() {
         let src = include_str!("main.rs");
-        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        let prod = panel_testutil::production_source(src);
         assert_eq!(
             prod.matches("panel_api::middleware::request_log").count(),
             1,
             "serve 链里 request_log 必须恰好一个挂点（双挂 = 每请求两行日志）"
         );
         let routes = include_str!("../../panel-api/src/routes.rs");
-        let routes_prod = routes.split("#[cfg(test)]").next().unwrap_or("");
-        let code: String = routes_prod
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let code = panel_testutil::production_source(routes);
         assert!(
             !code.contains("request_log"),
             "build_router 不得再挂 request_log：生产链已在 main.rs 最外层挂载，双挂 = 每请求两行日志"

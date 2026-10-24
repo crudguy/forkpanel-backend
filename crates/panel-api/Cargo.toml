@@ -44,3 +44,6 @@ reqwest    = { version = "0.13", default-features = false, features = ["json", "
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# 源码守卫的「生产段」提取器（剔注释 + 剥 cfg(test) 块）。共享实现，
+# 避免各 crate 各留一份、语义漂移成「一份挡得住一份挡不住」。
+panel-testutil = { workspace = true }

@@ -33,6 +33,11 @@ rust-embed = { version = "8", features = ["mime-guess", "compression"] }
 # HTTPS"的误解。`[server].tls` 字段仍在，但配了会被 Config::validate_implemented()
 # 拒绝启动（bc4b7ac）。若将来真要实现面板自身 TLS，请连同依赖与 serve 分支一起加。
 
+[dev-dependencies]
+# 源码守卫的「生产段」提取器（剔注释 + 剥 cfg(test) 块）。与 panel-api 共用
+# 一份实现：本项目已实证过「只 split 不剔注释」的守卫能被注释掉的注册骗绿。
+panel-testutil = { workspace = true }
+
 # 开发期从磁盘读取 web/dist，避免每次改前端都重编译二进制
 [features]
 default = []

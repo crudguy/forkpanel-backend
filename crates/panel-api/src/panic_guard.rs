@@ -102,8 +102,9 @@ mod tests {
     /// 上面的单测是自己套的 Router，抓不到"忘了接进生产路由"（本项目的老坑）。
     #[test]
     fn panic_guard_is_wired_into_build_router() {
-        let src = include_str!("routes.rs");
-        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        // 生产段：剔注释 + 剥离测试块（注释里留着 needle 而真实挂载被删时，
+        // 只 split 的旧写法会假绿）
+        let prod = crate::test_support::production_source(include_str!("routes.rs"));
         assert!(
             prod.contains("CatchPanicLayer::custom(crate::panic_guard::handle_panic)"),
             "build_router 必须套 panic 兜底层：否则 handler panic 会掐断连接（前端只看到网络错误）"

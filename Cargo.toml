@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/panel-core", "crates/panel-os", "crates/panel-db", "crates/panel-api", "crates/panel-task", "crates/panel-cli"]
+members = ["crates/panel-core", "crates/panel-os", "crates/panel-db", "crates/panel-api", "crates/panel-task", "crates/panel-cli", "crates/panel-testutil"]
 
 [workspace.package]
 version = "0.1.0"
@@ -16,6 +16,8 @@ panel-db   = { path = "crates/panel-db" }
 panel-api  = { path = "crates/panel-api" }
 panel-task = { path = "crates/panel-task" }
 panel-cli  = { path = "crates/panel-cli" }
+# ⚠ 只作 dev-dependency：源码守卫的「生产段」提取器，不进生产构建图
+panel-testutil = { path = "crates/panel-testutil" }
 
 # 依赖预算（直接依赖）：本骨架 6 个；完整项目目标 30~38 个
 tokio       = { version = "1", features = ["rt-multi-thread", "net", "time", "fs", "process", "sync", "macros", "io-util"] }

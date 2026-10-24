@@ -213,11 +213,9 @@ mod tests {
             (include_str!("routes/sites/ssl.rs"), "ssl.renew", "sites::ssl::cert_renew"),
         ];
         for (src, action, who) in cases {
-            let code: String = src
-                .lines()
-                .filter(|l| !l.trim_start().starts_with("//"))
-                .collect::<Vec<_>>()
-                .join("\n");
+            // 生产段：剔注释行 + 剥离测试块（测试里出现同形 needle 会假绿，
+            // 见 test_support::production_source 的说明）
+            let code = crate::test_support::production_source(src);
             let needle = format!("check_heavy(&state, &s.username, \"{action}\")");
             assert!(
                 code.contains(&needle),
@@ -253,11 +251,9 @@ mod tests {
             (include_str!("routes/sites/conf.rs"), "site.logs", "sites::logs"),
         ];
         for (src, action, who) in cases {
-            let code: String = src
-                .lines()
-                .filter(|l| !l.trim_start().starts_with("//"))
-                .collect::<Vec<_>>()
-                .join("\n");
+            // 生产段：剔注释行 + 剥离测试块（测试里出现同形 needle 会假绿，
+            // 见 test_support::production_source 的说明）
+            let code = crate::test_support::production_source(src);
             let needle = format!("check_read(&state, &s.username, \"{action}\")");
             assert!(
                 code.contains(&needle),

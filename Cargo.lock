@@ -1324,6 +1324,7 @@ dependencies = [
  "panel-db",
  "panel-os",
  "panel-task",
+ "panel-testutil",
  "rand 0.8.8",
  "reqwest",
  "rusqlite",
@@ -1349,6 +1350,7 @@ dependencies = [
  "panel-db",
  "panel-os",
  "panel-task",
+ "panel-testutil",
  "rand 0.8.8",
  "rusqlite",
  "rust-embed",
@@ -1411,6 +1413,10 @@ dependencies = [
  "tokio-util",
  "tracing",
 ]
+
+[[package]]
+name = "panel-testutil"
+version = "0.1.0"
 
 [[package]]
 name = "password-hash"

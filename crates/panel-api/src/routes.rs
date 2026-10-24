@@ -613,12 +613,9 @@ mod tests {
             (include_str!("routes/terminal.rs"), ".get(cap_keys::TERMINAL_MANAGE)", 1, "terminal::ws_handler"),
         ];
         for (src, needle, want, who) in cases {
-            // ⚠ 必须剔除注释行：模块文档里逐字写着这些 needle，不剔会恒真。
-            let code: String = src
-                .lines()
-                .filter(|l| !l.trim_start().starts_with("//"))
-                .collect::<Vec<_>>()
-                .join("\n");
+            // ⚠ 生产段：注释里逐字写着这些 needle，不剔会恒真；测试块里的
+            // 同形调用同样会假绿——两者都由 production_source 一并处理。
+            let code = crate::test_support::production_source(src);
             let got = code.matches(needle).count();
             assert_eq!(
                 got, want,
