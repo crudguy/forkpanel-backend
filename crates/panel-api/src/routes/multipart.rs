@@ -332,11 +332,15 @@ pub async fn complete(
         .await
         .map_err(ApiError::from)?;
 
-    // 字节数不符 = 数据不可信。删掉目标，而不是留下一个"大小不对但看着正常"的文件
+    // 字节数不符 = 数据不可信。删掉目标，而不是留下一个"大小不对但看着正常"的文件。
+    // 删除**失败必须说真话**：否则残留文件还在原地，用户却收到「已放弃」（以为已清理）。
     if written != meta.size {
-        let _ = state.os.files().remove(&target, false).await;
+        let cleanup = match state.os.files().remove(&target, false).await {
+            Ok(()) => "，残留目标已删除".to_string(),
+            Err(e) => format!("，且删除残留目标失败（{e}）——请手动清理 {}", target.as_path().display()),
+        };
         return Err(ApiError::from(PanelError::Internal(format!(
-            "合并后字节数 {written} 与声明 {} 不符，已放弃该次上传",
+            "合并后字节数 {written} 与声明 {} 不符，已放弃该次上传{cleanup}",
             meta.size
         ))));
     }
@@ -371,6 +375,32 @@ pub async fn abort(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ⭐⭐ **谎报警卫**（审计 P2-8）：字节数不符时「已放弃」的文案必须与清理结果一致。
+    ///
+    /// 曾是 `let _ = ...remove(...)`——删除残留失败也照报「已放弃」，用户以为
+    /// 已清理、磁盘上却留着残文件。这类接线改动不会红任何行为测试（mock 的
+    /// remove 恒 Ok，造不出失败路径），只能源码级断言。
+    #[test]
+    fn size_mismatch_cleanup_never_lies() {
+        let src = include_str!("multipart.rs");
+        // multipart.rs 只有一个尾部测试模块（本模块），split 取生产段安全。
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        let code: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // ① 旧谎报形态不得复活
+        assert!(!code.contains("let _ = state.os.files().remove(&target"),
+            "清理结果被丢弃——字节数不符时删除失败会谎报「已放弃」");
+        // ② 清理结果必须分支处理
+        assert!(code.contains("match state.os.files().remove(&target, false).await"),
+            "remove 结果必须 match：成功与失败要走不同文案");
+        // ③ 失败文案必须给出可操作的出路（手动清理 + 路径）
+        assert!(code.contains("请手动清理"),
+            "删除失败的文案必须说真话并给出手动清理路径");
+    }
 
     #[test]
     fn upload_id_charset_is_locked_down() {
