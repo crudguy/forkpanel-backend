@@ -34,7 +34,10 @@ bad() { printf '  ✗ %s\n' "$1" >&2; fail=1; }
 active_match() { # $1=ERE 模式, 其余=文件
   local pat="$1"; shift
   # shellcheck disable=SC2086
-  grep -nE "$pat" "$@" 2>/dev/null | grep -vE '^[^:]*:[0-9]+:[[:space:]]*#' | grep -q .
+  # ⚠ P1-3：注释过滤式必须区分 Rust 属性 `#[...]` 与真实注释。原 `^...:#` 会把
+  #   `#[cfg(feature = "tls")]` 这类属性行当注释剔掉，导致该检查恒绿（永远找不到
+  #   ⇒ 误报"无 tls 代码"）。改为：剔 `//` 注释（含 ///）和 `#` 注释，但保留 `#[`（属性）。
+  grep -nE "$pat" "$@" 2>/dev/null | grep -vE '^[^:]*:[0-9]+:[[:space:]]*(//|#[^\[])' | grep -q .
 }
 
 echo "== 文档 ↔ 代码一致性 =="
