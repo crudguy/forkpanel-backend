@@ -409,8 +409,18 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
         .unwrap_or_else(|| "f".into());
     let tmp = dir.join(format!(".panel-tmp-{}.{}", std::process::id(), name));
     std::fs::write(&tmp, data).map_err(|e| PanelError::Io(format!("write tmp: {e}")))?;
-    if let Ok(f) = std::fs::File::open(&tmp) {
-        let _ = f.sync_all();
+    // 同步落盘，避免 rename 后数据仍在页缓存（断电丢失）。两层 `let _ =` 会让
+    // "已保存"谎报 durability（打开/fsync 失败都无声）——与 files.rs 的写入同口径，
+    // 失败必须可见（rename 仍照常提交，不会误导成"保存失败"）。
+    match std::fs::File::open(&tmp) {
+        Ok(f) => {
+            if let Err(sync_err) = f.sync_all() {
+                tracing::warn!("compose.yaml 落盘 sync_all 失败（断电可能丢失）{tmp:?}: {sync_err}");
+            }
+        }
+        Err(open_err) => {
+            tracing::warn!("落盘前打开临时文件失败，无法 sync {tmp:?}: {open_err}");
+        }
     }
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);

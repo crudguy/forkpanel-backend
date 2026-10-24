@@ -633,6 +633,7 @@ pub async fn install(
     PanelJson(req): PanelJson<InstallReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::CONTAINER_MANAGE)?;
+    crate::ratelimit::check_heavy(&state, &s.username, "container.install")?;
     // 仅 docker 二进制缺失时允许安装；已装但 daemon 不可达是权限/服务问题，无需重装
     match state.os.containers().unavailable_reason() {
         None => return Err(ApiError::bad_request("docker", "Docker 已安装且守护进程可达，无需安装")),

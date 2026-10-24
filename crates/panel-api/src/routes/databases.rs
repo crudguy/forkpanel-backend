@@ -422,6 +422,7 @@ pub async fn backup(
     State(state): State<Shared>, Auth(s): Auth, PanelJson(req): PanelJson<BackupReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_MANAGE)?;
+    crate::ratelimit::check_heavy(&state, &s.username, "db.backup")?;
 
     // 输出路径必须在允许根内（防把备份写到 /etc 覆盖配置）。
     // create=true：产物此刻尚不存在。`..` 逃逸由沙箱兜底，允许输出到允许根下的子目录。
@@ -532,6 +533,7 @@ pub async fn restore(
     PanelJson(req): PanelJson<RestoreReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_MANAGE)?;
+    crate::ratelimit::check_heavy(&state, &s.username, "db.restore")?;
 
     let word = crate::routes::backups::RESTORE_CONFIRM_WORD;
     if req.confirm_token.trim() != word {

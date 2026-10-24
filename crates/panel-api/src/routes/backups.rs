@@ -1561,6 +1561,7 @@ pub async fn restore(
     PanelJson(req): PanelJson<RestoreReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::BACKUP_MANAGE)?;
+    crate::ratelimit::check_heavy(&state, &s.username, "backup.restore")?;
     if !state.capabilities.get(cap_keys::BACKUP_MANAGE).map(|c| c.supported).unwrap_or(false) {
         return Err(ApiError::unsupported("backup.manage"));
     }
@@ -2002,7 +2003,13 @@ fn prune_old_artifacts(dest: &std::path::Path, plan_id: i64, keep: i64) -> Vec<S
             .map(|e| e.file_name().to_string_lossy().to_string())
             .filter(|n| n.starts_with(&prefix))
             .collect(),
-        Err(_) => return Vec::new(),
+        // 读目录失败：修复"恢复旧产物裁剪静默空转"缺陷——否则 keep_count 失效、
+        // 旧产物堆积到磁盘写满也无信号。这里只告警并返回空（调用方据此认为"无需删除"），
+        // 不让备份主流程翻红，但把失败打进日志。
+        Err(e) => {
+            eprintln!("[warn] 备份裁剪 read_dir 失败 {dest:?}: {e}（跳过本次裁剪）");
+            return Vec::new();
+        }
     };
     if names.len() <= keep {
         return Vec::new();

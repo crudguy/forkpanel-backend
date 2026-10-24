@@ -838,7 +838,9 @@ pub async fn patch(
         // 停用：撤站点 + 停单元 + 删单元文件（对称清理，不留孤儿）
         remove_site(&state, &s, &cur).await;
         let unit = unit_of(&next.name)?;
-        let _ = state.os.services().stop(&unit).await;
+        if let Err(stop_err) = state.os.services().stop(&unit).await {
+            eprintln!("[warn] app.patch 停用：停单元 {unit} 失败（仍继续删单元文件）: {stop_err}");
+        }
         state.os.services().remove_unit(&unit).await?;
         // ⚠ **不**清空 domains：停用只是「不托管」，不是「销毁」。
         //   清掉的话用户之后想重新启用会发现域名全丢、还得重填（本次实机就踩到：
@@ -865,7 +867,9 @@ pub async fn delete(
     // 刻意**不回滚已完成的清理**：下一次删除（幂等）会继续清。
     remove_site(&state, &s, &app).await;
     let unit = unit_of(&app.name)?;
-    let _ = state.os.services().stop(&unit).await;
+    if let Err(stop_err) = state.os.services().stop(&unit).await {
+        eprintln!("[warn] app.delete：停单元 {unit} 失败（仍继续删单元文件）: {stop_err}");
+    }
     state.os.services().remove_unit(&unit).await?;
     delete_row(&state, id).await?;
 
@@ -882,6 +886,7 @@ pub async fn act(
     PanelJson(req): PanelJson<ActReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SERVICE_MANAGE)?;
+    crate::ratelimit::check_heavy(&state, &s.username, "app.act")?;
     let Some(app) = fetch_one(&state, id).await? else {
         return Err(ApiError::not_found("app"));
     };

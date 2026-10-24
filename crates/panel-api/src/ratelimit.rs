@@ -195,13 +195,22 @@ mod tests {
     /// 教训的同类：只能源码级断言。写法参照 auth.rs 的 LoginGuard 接线守卫。
     #[test]
     fn heavy_handlers_are_actually_wired() {
-        let cases: [(&str, &str, &str); 6] = [
+        let cases: [(&str, &str, &str); 14] = [
             (include_str!("routes/services/packages.rs"), "pkg.install", "services::install"),
             (include_str!("routes/services/packages.rs"), "pkg.upgrade", "services::package_upgrade"),
             (include_str!("routes/services/packages.rs"), "pkg.remove", "services::package_remove"),
             (include_str!("routes/containers.rs"), "image.pull", "containers::pull"),
             (include_str!("routes/backups.rs"), "backup.run", "backups::run"),
             (include_str!("routes/cron.rs"), "cron.run", "cron::run"),
+            // —— 以下 8 个是审计发现的"漏接限流"端点（C 组 P1-19）——
+            (include_str!("routes/backups.rs"), "backup.restore", "backups::restore"),
+            (include_str!("routes/databases.rs"), "db.backup", "databases::backup"),
+            (include_str!("routes/databases.rs"), "db.restore", "databases::restore"),
+            (include_str!("routes/containers.rs"), "container.install", "containers::install"),
+            (include_str!("routes/apps.rs"), "app.act", "apps::act"),
+            (include_str!("routes/sites/apply.rs"), "site.apply", "sites::apply"),
+            (include_str!("routes/sites/ssl.rs"), "ssl.apply", "sites::ssl::ssl_apply"),
+            (include_str!("routes/sites/ssl.rs"), "ssl.renew", "sites::ssl::cert_renew"),
         ];
         for (src, action, who) in cases {
             let code: String = src

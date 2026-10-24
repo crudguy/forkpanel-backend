@@ -159,8 +159,19 @@ impl FileProvider for LinuxFileProvider {
                 p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "f".into())));
             std::fs::write(&tmp, &data)
                 .map_err(|e| PanelError::Io(format!("write tmp: {e}")))?;
-            // 同步落盘，避免 rename 后数据仍在页缓存（断电丢失）
-            if let Ok(f) = std::fs::File::open(&tmp) { let _ = f.sync_all(); }
+            // 同步落盘，避免 rename 后数据仍在页缓存（断电丢失）。
+            // 老实现两层 `let _ =` 让"已保存"谎报 durability（打开/fsync 失败都无声）。
+            // 现在改用 warn 让失败可见（rename 仍照常提交，不会误导成"保存失败"）。
+            match std::fs::File::open(&tmp) {
+                Ok(f) => {
+                    if let Err(sync_err) = f.sync_all() {
+                        tracing::warn!("文件落盘 sync_all 失败（断电可能丢失）{tmp:?}: {sync_err}");
+                    }
+                }
+                Err(open_err) => {
+                    tracing::warn!("落盘前打开临时文件失败，无法 sync {tmp:?}: {open_err}");
+                }
+            }
             std::fs::rename(&tmp, &p).map_err(|e| {
                 let _ = std::fs::remove_file(&tmp);
                 PanelError::Io(format!("rename: {e}"))

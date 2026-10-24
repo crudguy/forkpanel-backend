@@ -387,12 +387,14 @@ impl TaskRunner {
                 Err(_) => return,   // 闸门关闭（正在 shutdown）
             };
             let progress = Progress::new(id, bus.clone());
-            let _ = writer.exec(move |conn| {
+            if let Err(e) = writer.exec(move |conn| {
                 conn.execute("UPDATE task_runs SET state='running' WHERE id=?1",
                              rusqlite::params![id])
                     .map_err(|e| PanelError::Database(e.to_string()))?;
                 Ok(panel_db::WriteAck { rows_changed: 1 })
-            }).await;
+            }).await {
+                tracing::error!("任务 {id} 置 running 写库失败（前端可能一直显示排队中）: {e}");
+            }
 
             let outcome = match tokio::time::timeout(timeout, body.run(progress.clone())).await {
                 Ok(Ok(o)) => o,
@@ -409,14 +411,16 @@ impl TaskRunner {
             let st = outcome.state.as_str().to_string();
             let ec = outcome.exit_code;
             let op = outcome.output_path.map(|p| p.display().to_string());
-            let _ = writer.exec(move |conn| {
+            if let Err(e) = writer.exec(move |conn| {
                 conn.execute(
                     "UPDATE task_runs SET state=?1, progress=100, finished_at=?2, exit_code=?3, output_path=?4
                      WHERE id=?5",
                     rusqlite::params![st, now_unix(), ec, op, id],
                 ).map_err(|e| PanelError::Database(e.to_string()))?;
                 Ok(panel_db::WriteAck { rows_changed: 1 })
-            }).await;
+            }).await {
+                tracing::error!("任务 {id} 写终态（{}）失败（前端可能一直显示运行中）: {e}", outcome.state.as_str());
+            }
 
             bus.publish(TaskEvent::Finished { id, state: outcome.state, kind: rkind });
         });

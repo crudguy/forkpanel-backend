@@ -182,6 +182,7 @@ pub async fn ssl_apply(
     PanelJson(req): PanelJson<SslApplyReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SSL_MANAGE)?;
+    crate::ratelimit::check_heavy(&state, &s.username, "ssl.apply")?;
     // 无 Web 服务器底座时拒发证书：证书没有进程可加载，只会制造
     // "已配置"却永远不生效的假象（与 create/apply 同一守卫，防绕过 UI）。
     if !state
@@ -432,6 +433,7 @@ pub async fn cert_renew(
     AxPath(id): AxPath<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SSL_MANAGE)?;
+    crate::ratelimit::check_heavy(&state, &s.username, "ssl.renew")?;
     // 续期同样是"签发一张证书"，无底座时一并拒绝——否则旧证书可被续成一个
     // 永远不生效的新证书，把"已配置"的假象重新造出来。
     if !state

@@ -203,7 +203,9 @@ pub async fn apply(
         Ok(r) => r,
         Err(e) => {
             // 失败自动回滚：把快照恢复回去
-            let _ = state.os.firewall().restore_snapshot(&snapshot).await;
+            if let Err(rollback_err) = state.os.firewall().restore_snapshot(&snapshot).await {
+                eprintln!("[warn] firewall.apply 失败，回滚快照也失败（规则可能处于半应用状态）: {rollback_err}");
+            }
             return Err(ApiError::from(e));
         }
     };
@@ -310,7 +312,9 @@ pub async fn delete_rule(
             Ok(ok(serde_json::json!({ "deleted": id })))
         }
         Err(e) => {
-            let _ = state.os.firewall().restore_snapshot(&snapshot).await;
+            if let Err(rollback_err) = state.os.firewall().restore_snapshot(&snapshot).await {
+                eprintln!("[warn] firewall.rule.delete 失败，回滚快照也失败（规则可能处于半应用状态）: {rollback_err}");
+            }
             Err(ApiError::from(e))
         }
     }

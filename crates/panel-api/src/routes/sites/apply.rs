@@ -291,6 +291,7 @@ pub async fn apply(
     PanelJson(req): PanelJson<ApplyReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SITE_MANAGE)?;
+    crate::ratelimit::check_heavy(&state, &s.username, "site.apply")?;
     if !state
         .capabilities
         .get(cap_keys::WEBSERVER_MANAGE)
