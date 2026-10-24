@@ -76,9 +76,10 @@ struct Cli {
     #[arg(long, global = true)]
     tier: Option<String>,
 
-    #[arg(long, global = true)]
-    json: bool,
-
+    // ⚠ `--json` **不能**声明为 global：global 意味着每个子命令都收下它，
+    // 而真正输出 JSON 的只有 `capabilities`——`panel doctor --json` 会静默打印
+    // 人类可读文本（用户以为拿到了机器可读结果）。宁可让 clap 直接报错，
+    // 也不要"收下参数却不生效"（配置项假控制那类 bug 的命令行版本）。
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -141,7 +142,12 @@ enum Cmd {
         #[arg(long)] uninstall: bool,
     },
     /// 打印能力矩阵（供脚本判断环境）
-    Capabilities,
+    /// 输出本机能力位清单（唯一实现 `--json` 的子命令）
+    Capabilities {
+        /// 以 JSON 输出（供脚本消费）
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() {
@@ -732,9 +738,9 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
 
-        Cmd::Capabilities => {
+        Cmd::Capabilities { json } => {
             let caps = os.capabilities();
-            if cli.json {
+            if json {
                 println!("{}", serde_json::to_string_pretty(&caps).unwrap_or_default());
             } else {
                 for (k, c) in &caps {
@@ -1288,6 +1294,33 @@ mod wiring_guard_tests {
             !code.contains("request_log"),
             "build_router 不得再挂 request_log：生产链已在 main.rs 最外层挂载，双挂 = 每请求两行日志"
         );
+    }
+}
+
+#[cfg(test)]
+mod cli_flags_tests {
+    use super::*;
+
+    /// ⭐⭐ `--json` 曾是 `#[arg(long, global = true)]`：任何子命令都收下它，但只有
+    /// `capabilities` 真的输出 JSON ⇒ `panel doctor --json` 静默打印人类可读文本，
+    /// 脚本拿到一堆散文还以为解析成功了（命令行版「配置项假控制」）。
+    /// 现在它只在实现了的子命令上声明，未实现处 clap 直接报错——宁可响亮失败，
+    /// 不要"收下参数却不生效"。
+    #[test]
+    fn json_flag_is_only_accepted_where_it_is_implemented() {
+        let ok = Cli::try_parse_from(["panel", "capabilities", "--json"]);
+        assert!(ok.is_ok(), "capabilities 必须接受 --json（唯一实现了的子命令）");
+        let ok_plain = Cli::try_parse_from(["panel", "capabilities"]);
+        assert!(ok_plain.is_ok(), "不带 --json 也要能跑");
+
+        for cmd in ["doctor", "migrate", "vacuum", "serve"] {
+            let r = Cli::try_parse_from(["panel", cmd, "--json"]);
+            assert!(
+                r.is_err(),
+                "`panel {cmd} --json` 必须被 clap 拒绝：该子命令没实现 JSON 输出，\
+                 收下参数却不生效比直接报错更危险"
+            );
+        }
     }
 }
 
