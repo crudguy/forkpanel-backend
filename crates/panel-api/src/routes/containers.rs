@@ -843,39 +843,63 @@ mod tests {
     /// 只能去 CLI 救。判据用源码断言——这个分支在 handler 里、依赖真实 docker，
     /// 单测无法驱动整个 handler。
     ///
-    /// ⚠ 判据必须是**结构**而不是"文中出现过 Up"：
-    /// 第一版写成 `window.contains("action != ComposeAction::Up")`，
-    /// 负向对照（把条件改成 `... || true`，等价于永不豁免）**照样绿**——
-    /// 因为被改坏的文本里那个子串还在。这就是"断言恒绿"的典型形态。
-    /// 现在改为：存在性检查那几行必须**完整被包在** `if action != ComposeAction::Up {`
-    /// 里，即该行紧接在 `compose_projects_all()` 之前。
+    /// ⚠ 判据必须是**结构**而不是"附近出现过 Up"：
+    /// 第一版写成 `window.contains("action != ComposeAction::Up")`；第二版改成
+    /// "存在性检查**前 200 字符内**出现 `if action != ComposeAction::Up {`"——
+    /// 两版都过不了负向对照：把豁免条件挪走（或写成 `if x { }` 之类的同形块、
+    /// 让存在性检查落到块外），判据照样绿，因为"出现过"证明不了"包住了"。
+    /// 现在按**花括号配对**算出该 if 块的实际区间，断言存在性检查落在区间内。
     #[test]
     fn compose_up_is_exempt_from_existence_check() {
-        let src = include_str!("containers.rs");
-        let code: Vec<&str> = src
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect();
-        let joined = code.join("\n");
+        // 生产段（剔注释 + 剥测试模块）：本守卫自身的断言字符串就在测试段里，
+        // 不剥掉会让"判据指向错"——把生产实现改坏、测试文本还留着 needle 照样绿。
+        let joined = crate::test_support::production_source(include_str!("containers.rs"));
 
         // 定位存在性检查（调用 compose_projects_all 做名字比对的唯一处）
         let check_at = joined
             .find("let projects = state.os.containers().compose_projects_all().await?;")
             .expect("存在性检查必须存在");
-        // 它前面 200 字符内必须出现**精确的**豁免条件
-        let from = check_at.saturating_sub(200);
-        let before = &joined[from..check_at];
+
+        // 定位豁免条件，并按**花括号配对**算出它真正包住的字符区间
+        let if_needle = "if action != ComposeAction::Up {";
+        let if_at = joined.find(if_needle).unwrap_or_else(|| {
+            panic!("必须存在 `{if_needle}` 豁免分支：down 之后项目从 compose ls 消失，\
+                    up 若也要求「在 ls 里找得到」，用户就永久无法从面板重新拉起（死锁）")
+        });
+        let bytes = joined.as_bytes();
+        let mut depth = 0usize;
+        let mut block_end = None;
+        let mut i = if_at;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        block_end = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        let block_end = block_end.expect("`if action != ComposeAction::Up {` 的块必须闭合");
         assert!(
-            before.contains("if action != ComposeAction::Up {"),
-            "存在性检查必须被 `if action != ComposeAction::Up {{` **精确**包裹\
-             （不是任何包含 Up 字样的表达式）。否则 down 之后无法再 up，形成死锁。\n\
-             检查前文：\n{before}"
+            if_at < check_at && check_at < block_end,
+            "存在性检查必须**落在** `if action != ComposeAction::Up {{` 的块区间内\
+             （找到条件不等于包住了它）。当前：if@{if_at} 块尾@{block_end} 检查@{check_at}\n\
+             否则 down 之后无法再 up，形成死锁。\n上下文：\n{}",
+            &joined[if_at..(block_end + 1).min(joined.len())]
         );
-        // 再加一条负向：不得出现会抵消豁免的短路/恒真写法
+
+        // 再钉一条负向：豁免条件本身不得被短路/恒真写法抵消（那等于没豁免）
+        let cond_end = joined[if_at..].find('{').expect("if 条件必须有块") + if_at;
+        let cond = &joined[if_at..cond_end];
         assert!(
-            !before.contains("|| true") && !before.contains("&& false"),
+            !cond.contains("|| true") && !cond.contains("&& false"),
             "豁免条件不得被 || true / && false 之类的写法抵消（那等于没豁免）。\n\
-             检查前文：\n{before}"
+             当前条件：{cond}"
         );
     }
 }
