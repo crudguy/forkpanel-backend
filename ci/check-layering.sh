@@ -30,41 +30,75 @@ allow_filter() {
   grep -vE "ci-allow-layering\[$1\]: .+" || true
 }
 
+# ───────────────────────────────────────────────────────────────
+# P1-5 前提断言：strip_tests.py 工具链必须可用且能真正执行。
+# 规则 [1][2][3][6] 依赖它提取生产代码中的违规点；若 python3 缺失、
+# 脚本不存在或执行抛异常，四条规则会"空命中=恒绿"，虚假保证比没有门禁更危险。
+# 这里集中探测一次：工具不可用 ⇒ 本地强制失败 / CI 跳过（非通过），
+# 绝不把"提取器没跑"误当成"无违规"。
+# ───────────────────────────────────────────────────────────────
+STRIP_ERR=""
+if ! command -v python3 >/dev/null 2>&1; then
+  STRIP_ERR="python3 不可用"
+elif [ ! -x "ci/strip_tests.py" ]; then
+  STRIP_ERR="ci/strip_tests.py 不存在或不可执行"
+elif ! python3 ci/strip_tests.py 'NEVER_MATCH_PATTERN_XYZ_12345' >/dev/null 2>&1; then
+  # 冒烟测试：用一个必不匹配的模式跑一次完整扫描，确认脚本能真正执行
+  # （imports / 正则编译 / 目录遍历都正常），而非静默异常退出。
+  STRIP_ERR="ci/strip_tests.py 执行异常（exit=$?）"
+fi
+SKIP_STRIP_RULES=""
+if [ -n "$STRIP_ERR" ]; then
+  SKIP_STRIP_RULES=1
+  if [ -n "${CI:-}" ]; then
+    echo "  [skip] 规则[1][2][3][6]：strip_tests.py 工具链不可用（$STRIP_ERR）——CI 跳过（非通过）" >&2
+  else
+    echo "  ✗ 规则[1][2][3][6]：$STRIP_ERR ——本地强制失败（门禁不可用=不通过）"
+    FAIL=1
+  fi
+fi
+
 echo "== [1] 子进程出口唯一性 =="
 # 除 panel-os/src/cmd.rs 外，任何 crate 都不得直接 spawn 进程。
 # 走 strip_tests.py：本规则管的是**生产代码**，测试里直接跑外部二进制
 # （例如用真实 nginx 校验渲染结果）不属于违规。与 [2] 共用同一套剥离逻辑——
 # 各条规则各自 grep、各自加 -v 绕过，正是把豁免面散开的开始。
-SPAWN_HITS=$(python3 ci/strip_tests.py 'Command::new|tokio\.process|std::process::Command' 2>/dev/null \
-  | grep -v "crates/panel-os/src/cmd.rs" | allow_filter 1 || true)
-if [ -n "$SPAWN_HITS" ]; then
-  note_fail "发现 cmd.rs 之外的进程调用："
-  echo "$SPAWN_HITS" | sed 's/^/      /'
-else
-  note_ok "全部进程调用收敛在 panel-os/src/cmd.rs"
+if [ -z "${SKIP_STRIP_RULES:-}" ]; then
+  SPAWN_HITS=$(python3 ci/strip_tests.py 'Command::new|tokio\.process|std::process::Command' 2>/dev/null \
+    | grep -v "crates/panel-os/src/cmd.rs" | allow_filter 1 || true)
+  if [ -n "$SPAWN_HITS" ]; then
+    note_fail "发现 cmd.rs 之外的进程调用："
+    echo "$SPAWN_HITS" | sed 's/^/      /'
+  else
+    note_ok "全部进程调用收敛在 panel-os/src/cmd.rs"
+  fi
 fi
 
 echo "== [2] 禁止 shell 解释 =="
-SHELL_HITS=$(python3 ci/strip_tests.py 'sh -c|bash -c|/bin/sh|"-c"' 2>/dev/null \
-  | grep -v "crates/panel-os/src/cmd.rs" | strip_comments | allow_filter 2)
-if [ -n "$SHELL_HITS" ]; then
-  note_fail "存在 shell 调用（命令注入高危）："
-  echo "$SHELL_HITS" | sed 's/^/      /'
-else
-  note_ok "无 sh -c / bash -c"
+if [ -z "${SKIP_STRIP_RULES:-}" ]; then
+  SHELL_HITS=$(python3 ci/strip_tests.py 'sh -c|bash -c|/bin/sh|"-c"' 2>/dev/null \
+    | grep -v "crates/panel-os/src/cmd.rs" | strip_comments | allow_filter 2)
+  if [ -n "$SHELL_HITS" ]; then
+    note_fail "存在 shell 调用（命令注入高危）："
+    echo "$SHELL_HITS" | sed 's/^/      /'
+  else
+    note_ok "无 sh -c / bash -c"
+  fi
 fi
 
 echo "== [3] OS 路径硬编码 =="
 # 业务层（panel-core 及未来的 panel-service / panel-api）不得出现 Linux 绝对路径
 # panel-os/src/linux/** 是平台实现本身，允许；paths.rs 是布局定义，允许
 # 豁免整个 panel-os：敏感路径黑名单、平台默认目录、平台实现本身都属于平台知识。
-PATH_HITS=$(python3 ci/strip_tests.py '"/(etc|var|proc|usr|run|sys|opt|home|root)/' 2>/dev/null \
-  | grep -v "crates/panel-os/")
-if [ -n "$PATH_HITS" ]; then
-  note_fail "业务层出现硬编码路径（mock 与 tests 已豁免）："
-  echo "$PATH_HITS" | sed 's/^/      /'
-else
-  note_ok "业务层无硬编码 Linux 路径"
+if [ -z "${SKIP_STRIP_RULES:-}" ]; then
+  PATH_HITS=$(python3 ci/strip_tests.py '"/(etc|var|proc|usr|run|sys|opt|home|root)/' 2>/dev/null \
+    | grep -v "crates/panel-os/")
+  if [ -n "$PATH_HITS" ]; then
+    note_fail "业务层出现硬编码路径（mock 与 tests 已豁免）："
+    echo "$PATH_HITS" | sed 's/^/      /'
+  else
+    note_ok "业务层无硬编码 Linux 路径"
+  fi
 fi
 
 echo "== [4] 平台条件编译位置 =="
@@ -120,15 +154,17 @@ echo "== [6] 强类型构造点审计 =="
 # from_raw 是 unsafe 构造，只允许出现在校验器/沙箱内部
 # 合法构造点：panel-core（强类型定义 + 校验器）、paths.rs（路径沙箱）、mock.rs（桩数据）。
 # 其余一律违规。测试块由 strip_tests.py 剥离（测试构造 fixture 合法）。
-RAW_HITS=$(python3 ci/strip_tests.py crates 2>/dev/null \
-  | grep -v "crates/panel-core/src/lib.rs" \
-  | grep -v "crates/panel-os/src/paths.rs" \
-  | grep -v "crates/panel-os/src/mock.rs")
-if [ -n "$RAW_HITS" ]; then
-  note_fail "from_raw 出现在校验器之外："
-  echo "$RAW_HITS" | sed 's/^/      /'
-else
-  note_ok "强类型构造点受控"
+if [ -z "${SKIP_STRIP_RULES:-}" ]; then
+  RAW_HITS=$(python3 ci/strip_tests.py crates 2>/dev/null \
+    | grep -v "crates/panel-core/src/lib.rs" \
+    | grep -v "crates/panel-os/src/paths.rs" \
+    | grep -v "crates/panel-os/src/mock.rs")
+  if [ -n "$RAW_HITS" ]; then
+    note_fail "from_raw 出现在校验器之外："
+    echo "$RAW_HITS" | sed 's/^/      /'
+  else
+    note_ok "强类型构造点受控"
+  fi
 fi
 
 echo "== [7] 前端可移植性与 XSS =="
@@ -165,17 +201,31 @@ fi
 
 echo "== [8] 依赖数量预算 =="
 if command -v cargo >/dev/null 2>&1; then
-  # 统计**去重后**的第三方直接依赖：
-  #  - `--edges normal` 排除 dev/build 依赖（测试工具不应占用生产依赖预算）；
-  #  - `grep -v '^panel-'` 排除内部 workspace crate（它们是第一方代码，不是"依赖"）；
-  #  - 按成员去重——`cargo tree --depth 1` 会为每个 member 重复列出同一依赖，
-  #    不清重会把"被多个 crate 共用的依赖"翻倍计数，虚高到顶格、误导"预算已满"。
-  # 口径对应 docs 里的"直接依赖预算 ≤ 38"（第三方、去重、生产）。
-  N=$(cargo tree --edges normal --depth 1 2>/dev/null \
-        | grep '^[├└]' | sed 's/^[├└]── //' | sed 's/ v[0-9].*//' \
-        | grep -v '^panel-' | sort -u | wc -l)
-  echo "  · 第三方直接依赖（去重、生产）约 ${N} 个（预算 ≤ 38）"
-  [ "$N" -gt 38 ] && note_fail "直接依赖超出预算" || note_ok "依赖数量在预算内"
+  # P1-6 前提断言：cargo tree 必须真正执行成功，否则不得把 N=0 当成"在预算内"。
+  # 断网 / workspace 损坏 / 依赖未下载等都会导致 cargo tree 失败，
+  # 旧写法 2>/dev/null 吞掉错误，N=0 ⇒ 静默放行——恒绿洞。
+  TREE_OUT=$(cargo tree --edges normal --depth 1 2>/tmp/cargo_tree.err)
+  TREE_RC=$?
+  if [ "$TREE_RC" -ne 0 ]; then
+    if [ -n "${CI:-}" ]; then
+      echo "  [skip] 规则[8]：cargo tree 执行失败（exit=$TREE_RC）——CI 跳过（非通过）" >&2
+    else
+      echo "  ✗ 规则[8]：cargo tree 执行失败（exit=$TREE_RC）——本地强制失败（门禁不可用=不通过）"
+      FAIL=1
+    fi
+    cat /tmp/cargo_tree.err 2>/dev/null | sed 's/^/      /' || true
+  else
+    # 统计**去重后**的第三方直接依赖：
+    #  - `--edges normal` 排除 dev/build 依赖（测试工具不应占用生产依赖预算）；
+    #  - `grep -v '^panel-'` 排除内部 workspace crate（它们是第一方代码，不是"依赖"）；
+    #  - 按成员去重——`cargo tree --depth 1` 会为每个 member 重复列出同一依赖，
+    #    不清重会把"被多个 crate 共用的依赖"翻倍计数，虚高到顶格、误导"预算已满"。
+    # 口径对应 docs 里的"直接依赖预算 ≤ 38"（第三方、去重、生产）。
+    N=$(printf '%s\n' "$TREE_OUT" | grep '^[├└]' | sed 's/^[├└]── //' | sed 's/ v[0-9].*//' \
+          | grep -v '^panel-' | sort -u | wc -l)
+    echo "  · 第三方直接依赖（去重、生产）约 ${N} 个（预算 ≤ 38）"
+    [ "$N" -gt 38 ] && note_fail "直接依赖超出预算" || note_ok "依赖数量在预算内"
+  fi
 else
   echo "  · 未检测到 cargo（跳过）"
 fi
