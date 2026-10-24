@@ -11,6 +11,7 @@
 use crate::{auth::perm, error::{ok, ApiError, ApiResult}, routes::{audit, Auth, Shared}};
 use axum::extract::{Path as AxPath, Query, State};
 use axum::Json;
+use panel_core::cap_keys;
 use panel_os::{ProcessSignal, ProcessSort};
 use serde::Deserialize;
 
@@ -23,6 +24,13 @@ pub async fn list(
     Query(q): Query<ProcQ>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SYSTEM_VIEW)?;
+    // 能力门：前端 ProcessesView 整页置灰读的就是这一位（auth.supported(PROCESS_LIST)）。
+    // 模块 doc 承诺的「能力缺失 = 明确告知（501）」此前没有代码兑现——不支持时
+    // provider 直接报错，前端拿到的是 500 语义的失败而非可预期的 501，
+    // 用户看到「加载失败」而不是「当前环境不支持进程管理」。
+    if !state.capabilities.get(cap_keys::PROCESS_LIST).map(|c| c.supported).unwrap_or(false) {
+        return Err(ApiError::unsupported("process.list"));
+    }
     let sort = match q.sort.as_deref() {
         Some("mem") => ProcessSort::Memory,
         Some("pid") => ProcessSort::Pid,
@@ -66,4 +74,78 @@ pub async fn kill(
     state.os.processes().signal(pid, sig).await?;
     audit(&state, &s, "process.kill", &format!("{pid}:{label}"), "ok").await;
     Ok(ok(serde_json::json!({ "killed": pid, "signal": label })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sess(permissions: &[&str]) -> crate::auth::Session {
+        crate::auth::Session {
+            user_id: 1, username: "tester".into(), role: "admin".into(),
+            permissions: permissions.iter().map(|s| s.to_string()).collect(),
+            allowed_roots: vec![], ip: "unknown".into(),
+            created_at: 0, last_seen: 0, expires_at: 0,
+        }
+    }
+
+    /// 强制 PROCESS_LIST 为指定能力位的 mock 态（其余照 mock 默认）。
+    fn state_with(cap: panel_core::Capability) -> std::sync::Arc<crate::AppState> {
+        let mut st = crate::test_support::mock_app_state();
+        st.capabilities.insert(cap_keys::PROCESS_LIST.into(), cap);
+        std::sync::Arc::new(st)
+    }
+
+    /// 二轮审计 P1-22：前端 ProcessesView 整页置灰读的就是
+    /// `auth.supported(PROCESS_LIST)`（"当前环境不支持进程管理"），后端必须同口径。
+    ///
+    /// 修复前 `list` **没有能力门**——模块 doc 承诺「能力缺失 = 明确告知（501）」
+    /// 却没有代码兑现：不支持时 provider 直接报错，用户看到的是「加载失败」
+    /// （500 语义）而非可预期的 501，置灰与后端双双落空。
+    #[tokio::test]
+    async fn list_returns_501_when_process_list_unsupported() {
+        let state = state_with(panel_core::Capability::no("forced_no"));
+        let err = list(
+            State(state),
+            Auth(sess(&[perm::SYSTEM_VIEW])),
+            Query(ProcQ { sort: None, limit: None }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::NOT_IMPLEMENTED,
+            "必须是 501，不能是 provider 深处报错的 500");
+        assert_eq!(err.code, 10009, "必须走 unsupported 错误码");
+    }
+
+    /// **阳性对照**（防恒绿/恒红）：能力位 yes 时门必须放行。
+    /// 若把条件写反（`if supported { return 501 }`），上面那条照样绿、这条红。
+    #[tokio::test]
+    async fn list_serves_when_process_list_supported() {
+        let state = state_with(panel_core::Capability::yes("procfs"));
+        let res = list(
+            State(state),
+            Auth(sess(&[perm::SYSTEM_VIEW])),
+            Query(ProcQ { sort: Some("mem".into()), limit: Some(3) }),
+        )
+        .await;
+        assert!(res.is_ok(), "能力位 yes 时 list 应正常服务: {:?}",
+            res.err().map(|e| e.message));
+    }
+
+    /// 能力位**缺键**（map 里根本没有 PROCESS_LIST）同样必须 501：
+    /// `unwrap_or(false)` 不容许「查不到就当支持」——那正是静默失同步的入口。
+    #[tokio::test]
+    async fn list_returns_501_when_capability_key_absent() {
+        let mut st = crate::test_support::mock_app_state();
+        st.capabilities.remove(cap_keys::PROCESS_LIST);
+        let state = std::sync::Arc::new(st);
+        let err = list(
+            State(state),
+            Auth(sess(&[perm::SYSTEM_VIEW])),
+            Query(ProcQ { sort: None, limit: None }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, 10009, "缺键必须按不支持处理");
+    }
 }

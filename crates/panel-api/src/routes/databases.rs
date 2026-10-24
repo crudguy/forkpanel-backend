@@ -24,7 +24,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use panel_core::{PanelError, Result, SafePath};
+use panel_core::{cap_keys, PanelError, Result, SafePath};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -87,10 +87,35 @@ fn conn_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ConnRow> {
     ))
 }
 
+/// 数据库**页级**能力门：前端 DatabasesView 整页置灰读的就是这一位
+/// （`auth.supported(CAP.DBMS_MANAGE)` ⇒ "未检测到可用的数据库引擎"）。
+///
+/// `DBMS_MANAGE=no` 意味着**任何引擎都不可用**（连内建 SQLite 都没有，见
+/// Linux 适配器 `supports(DbEngine::Sqlite)` 分支）——此时一切库操作都必须
+/// 诚实 501，而不是让 provider 在更深处报一个语义模糊的错，更不是让前端
+/// 单方面置灰、后端照常服务（置灰是前端单方面的承诺，P1-22）。
+///
+/// 与 containers.rs 的 `ensure_supported` 同构：reason 透出，前端无需再猜。
+/// 连接级的引擎判定（MySQL/PG 未实装）不在这里——那是逐连接的事。
+fn ensure_dbms(state: &Shared) -> std::result::Result<(), ApiError> {
+    let cap = state.capabilities.get(cap_keys::DBMS_MANAGE);
+    if cap.map(|c| c.supported).unwrap_or(false) {
+        return Ok(());
+    }
+    let reason = cap
+        .and_then(|c| c.reason.clone())
+        .unwrap_or_else(|| "unknown".into());
+    Err(ApiError::unsupported("dbms.manage").with_detail(serde_json::json!({
+        "capability": cap_keys::DBMS_MANAGE,
+        "reason": reason,
+    })))
+}
+
 pub async fn list(
     State(state): State<Shared>, Auth(s): Auth,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_VIEW)?;
+    ensure_dbms(&state)?;
 
     let rows = state.pool.with(|conn| {
         let mut st = conn.prepare(CONN_SELECT)
@@ -146,6 +171,7 @@ pub async fn create(
     State(state): State<Shared>, Auth(s): Auth, PanelJson(req): PanelJson<CreateReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_MANAGE)?;
+    ensure_dbms(&state)?;
 
     // 库名校验（强类型构造点，防 `db; DROP`）
     if !panel_core::rules::is_valid_db_name(&req.name) {
@@ -211,6 +237,7 @@ pub async fn update(
     PanelJson(req): PanelJson<UpdateReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_MANAGE)?;
+    ensure_dbms(&state)?;
     let cur = fetch_conn(&state, id)
         .await?
         .ok_or_else(|| ApiError::not_found("连接不存在"))?;
@@ -276,6 +303,7 @@ pub async fn delete(
     AxPath(id): AxPath<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_MANAGE)?;
+    ensure_dbms(&state)?;
     let exists: bool = state
         .pool
         .with(move |conn| {
@@ -385,6 +413,7 @@ pub async fn update_remark(
     PanelJson(req): PanelJson<ConnRemarkReq>,
 ) -> ApiResult<StatusCode> {
     crate::auth::require(&s, perm::DB_MANAGE)?;
+    ensure_dbms(&state)?;
     let id: i64 = state
         .pool
         .with(move |c| {
@@ -422,6 +451,7 @@ pub async fn backup(
     State(state): State<Shared>, Auth(s): Auth, PanelJson(req): PanelJson<BackupReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_MANAGE)?;
+    ensure_dbms(&state)?;
     crate::ratelimit::check_heavy(&state, &s.username, "db.backup")?;
 
     // 输出路径必须在允许根内（防把备份写到 /etc 覆盖配置）。
@@ -533,6 +563,7 @@ pub async fn restore(
     PanelJson(req): PanelJson<RestoreReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_MANAGE)?;
+    ensure_dbms(&state)?;
     crate::ratelimit::check_heavy(&state, &s.username, "db.restore")?;
 
     let word = crate::routes::backups::RESTORE_CONFIRM_WORD;
@@ -792,6 +823,7 @@ pub async fn databases_of(
     State(state): State<Shared>, Auth(s): Auth, AxPath(conn): AxPath<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_VIEW)?;
+    ensure_dbms(&state)?;
     let t = load_target(&state, conn, None).await?;
     let dbs = state.os.databases().databases(&t).await?;
     Ok(ok(dbs))
@@ -802,6 +834,7 @@ pub async fn tables(
     AxPath((conn, db)): AxPath<(i64, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_VIEW)?;
+    ensure_dbms(&state)?;
     validate_ident(&db, "db")?;
     let t = load_target(&state, conn, Some(&db)).await?;
     let engine = engine_str(t.engine);
@@ -830,6 +863,7 @@ pub async fn schemas(
     AxPath((conn, db)): AxPath<(i64, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_VIEW)?;
+    ensure_dbms(&state)?;
     validate_ident(&db, "db")?;
     let t = load_target(&state, conn, Some(&db)).await?;
     let list = state.os.databases().schemas(&t, &db).await?;
@@ -845,6 +879,7 @@ pub async fn rows(
     Query(q): Query<RowsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_VIEW)?;
+    ensure_dbms(&state)?;
     // 只读限流：这里是**执行用户给的 SQL**（全表扫描也是一句话的事），
     // 且能被无限重放，成本与一次小写入相当——不设限等于把库开放给"刷"。
     crate::ratelimit::check_read(&state, &s.username, "db.rows")?;
@@ -885,6 +920,7 @@ pub async fn export_csv(
     AxPath((conn, db, table)): AxPath<(i64, String, String)>,
 ) -> ApiResult<Response> {
     crate::auth::require(&s, perm::DB_VIEW)?;
+    ensure_dbms(&state)?;
     // 导出整表（上限 EXPORT_MAX_ROWS 行）比翻页更贵，同样要限。
     crate::ratelimit::check_read(&state, &s.username, "db.export")?;
     validate_ident(&db, "db")?;
@@ -1073,6 +1109,7 @@ pub async fn sql_meta(
     AxPath(conn): AxPath<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_VIEW)?;
+    ensure_dbms(&state)?;
     let t = load_target(&state, conn, None).await?;
     let eng = match t.engine {
         panel_os::DbEngine::MySql => "mysql",
@@ -1101,6 +1138,7 @@ pub async fn query(
     AxPath(conn): AxPath<i64>, PanelJson(req): PanelJson<QueryReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_VIEW)?;
+    ensure_dbms(&state)?;
     validate_read_only_sql(&req.sql)?;
     // 不额外要求 db 参数：SQL 自带库/表限定，再传一个库名只会让语义含糊
     let t = load_target(&state, conn, None).await?;
@@ -1725,5 +1763,58 @@ mod tests {
         assert!(!note.is_empty());
         // 能力：矩阵里恒 false（这才是真正的门控）
         assert!(!panel_os::db_console_open(panel_os::DbEngine::MySql, true));
+    }
+}
+
+#[cfg(test)]
+mod capability_gate_tests {
+    use super::*;
+
+    fn sess(permissions: &[&str]) -> crate::auth::Session {
+        crate::auth::Session {
+            user_id: 1, username: "tester".into(), role: "admin".into(),
+            permissions: permissions.iter().map(|s| s.to_string()).collect(),
+            allowed_roots: vec![], ip: "unknown".into(),
+            created_at: 0, last_seen: 0, expires_at: 0,
+        }
+    }
+
+    fn state_with(cap: panel_core::Capability) -> std::sync::Arc<crate::AppState> {
+        let mut st = crate::test_support::mock_app_state();
+        st.capabilities.insert(cap_keys::DBMS_MANAGE.into(), cap);
+        std::sync::Arc::new(st)
+    }
+
+    /// 二轮审计 P1-22 **同类第二实例**：前端 DatabasesView 整页置灰读
+    /// `auth.supported(DBMS_MANAGE)`（"未检测到可用的数据库引擎"），而后端 14 个
+    /// handler 此前**零能力门**——Linux 上该位恒 yes 所以从未暴露，但换平台报 no 时
+    /// 前端置灰、后端照常服务，正是「置灰是前端单方面的承诺」。
+    ///
+    /// 断言透出的 detail.reason：前端 tooltip 直接展示它，不许在中途丢掉。
+    #[tokio::test]
+    async fn list_returns_501_when_dbms_unsupported() {
+        let state = state_with(panel_core::Capability::no("no_engine"));
+        let err = list(State(state), Auth(sess(&[perm::DB_VIEW])))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::NOT_IMPLEMENTED,
+            "必须是 501，不能落进 provider 的 500");
+        assert_eq!(err.code, 10009);
+        assert_eq!(
+            err.detail.as_ref()
+                .and_then(|d| d.get("reason"))
+                .and_then(|r| r.as_str()),
+            Some("no_engine"),
+            "detail.reason 必须透出，前端置灰原因直接用它"
+        );
+    }
+
+    /// 阳性对照：能力位 yes 时门必须放行（新库无连接 ⇒ 空列表也是 Ok）。
+    #[tokio::test]
+    async fn list_serves_when_dbms_supported() {
+        let state = state_with(panel_core::Capability::yes("sqlite"));
+        let res = list(State(state), Auth(sess(&[perm::DB_VIEW]))).await;
+        assert!(res.is_ok(), "能力位 yes 时 list 应正常服务: {:?}",
+            res.err().map(|e| e.message));
     }
 }

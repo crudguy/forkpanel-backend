@@ -227,3 +227,44 @@ mod read_only_tests {
         assert!(!read_only_from(false));
     }
 }
+
+/// 测试专用的 AppState 构造（mock 适配器 + 每调用一份的临时库）。
+///
+/// **为什么放在 lib.rs**：能力门行为守卫（二轮审计 P1-22）要在多个路由模块里
+/// 复用同一套构造；各模块各抄一份必然漂移。返回的是**未包 Arc 的所有权值**——
+/// `capabilities` 字段全 pub，调用方先按用例强制改判（如 `Capability::no`），
+/// 再 `Arc::new` 包起来递给 handler，无需包装适配器即可做「强制能力位」测试。
+///
+/// 目录名带**进程内原子序号**（不只是 pid）：同一进程的多个测试并发跑时，
+/// 纯 pid 后缀会互相 `remove_dir_all` 踩塌对方的库。
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub fn mock_app_state() -> crate::AppState {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("panel-captest-{}-{}", std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let db_path = dir.join("t.db");
+        let tier = panel_core::Tier::Nano;
+        {
+            let mut c = panel_db::open(&db_path, tier, "NORMAL").unwrap();
+            panel_db::migrate::apply(&mut c).unwrap();
+        }
+        let writer = std::sync::Arc::new(
+            panel_db::WriterActor::spawn(db_path.clone(), tier, "NORMAL").unwrap());
+        let pool = std::sync::Arc::new(panel_db::ReadPool::new(&db_path, tier).unwrap());
+        let tasks = std::sync::Arc::new(panel_task::TaskRunner::new(
+            writer.clone(), tier, dir.join("tasks"), db_path.clone(), "NORMAL".to_string()));
+        let metrics = std::sync::Arc::new(std::sync::Mutex::new(
+            panel_db::aggregator::Aggregator::new(tier)));
+        let os: std::sync::Arc<dyn panel_os::OsAdapter> =
+            std::sync::Arc::new(panel_os::mock::MockOsAdapter::new());
+        crate::AppState::new(
+            os, writer, pool, tasks, metrics, tier, None, false, 5,
+            std::time::Duration::from_secs(1800), std::time::Duration::from_secs(43_200),
+            90, 50_000, true, true, "NORMAL".to_string(), 7)
+    }
+}

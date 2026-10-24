@@ -566,4 +566,66 @@ mod tests {
             .expect("Router 应能处理请求");
         assert_eq!(res.status(), 200, "/api/v1/version 是公开端点，不该被鉴权或漏装配拦下");
     }
+
+    /// ⭐⭐ **能力门接线普查**（二轮审计 P1-22）。
+    ///
+    /// **不变量**：前端 `auth.supported(CAP.X)` 置灰的每一个**条件能力位**，
+    /// 后端都必须有对应门——置灰是前端单方面的承诺，后端没有同口径 501 时，
+    /// 「置灰」与「实际可用」双向脱节：适配器一旦改判（如 caddy render 实装、
+    /// 新平台缺 procfs），前端静默置灰而后端照常服务，用户白白用不上功能。
+    ///
+    /// 为什么用计数而非 `contains`：删掉任一门都不会让任何行为测试变红
+    /// （功能照常，只是少一层保护）——与 `heavy_handlers_are_actually_wired`
+    /// 同一类「只能源码级断言」的接线。**精确计数**同时钉住两个方向：
+    /// 少一个（门被删）与多一个（新端点接了门）都必须显式改这里，
+    /// 逼一次「口径是否还一致」的主动复核，而不是静默漂移。
+    ///
+    /// needle 统一带 `.get(` 前缀：`cap_keys::X` 还会出现在错误载荷里
+    /// （如 `unsupported(cap_keys::TERMINAL_MANAGE)`、containers 的 detail），
+    /// 那些不是门。**恒 yes 的位**（METRICS_READ / FILE_READ / FILE_WRITE /
+    /// CONTAINER_VIEW / USER_MANAGE / PROCESS_SIGNAL，适配器写死 yes）
+    /// 不在表内——它们的前端置灰分支是死代码，后端加门也是死代码；
+    /// 若哪天把它们改成条件位，**必须**同时加门并登记进本表。
+    #[test]
+    fn capability_gates_census() {
+        // (文件, needle, 期望出现次数, 说明)
+        let cases: [(&str, &str, usize, &str); 21] = [
+            (include_str!("routes/services/mod.rs"), ".get(cap_keys::SERVICE_MANAGE)", 4, "services::*"),
+            (include_str!("routes/services/packages.rs"), ".get(cap_keys::PACKAGE_INSTALL)", 5, "packages::*"),
+            (include_str!("routes/services/packages.rs"), ".get(cap_keys::PACKAGE_UPGRADE)", 2, "packages::*"),
+            (include_str!("routes/firewall.rs"), ".get(cap_keys::FIREWALL_MANAGE)", 4, "firewall::*"),
+            (include_str!("routes/firewall.rs"), ".get(cap_keys::FAIL2BAN)", 3, "firewall::*"),
+            (include_str!("routes/cron.rs"), ".get(cap_keys::SCHEDULER_MANAGE)", 7, "cron::* 每个 handler 一道"),
+            (include_str!("routes/containers.rs"), ".get(cap_keys::CONTAINER_MANAGE)", 1, "ensure_supported helper 内一道"),
+            (include_str!("routes/containers.rs"), "ensure_supported(&state)?", 11, "11 个 handler 的接线"),
+            (include_str!("routes/processes.rs"), ".get(cap_keys::PROCESS_LIST)", 1, "processes::list（P1-22 修复）"),
+            (include_str!("routes/databases.rs"), ".get(cap_keys::DBMS_MANAGE)", 1, "ensure_dbms helper 内一道"),
+            (include_str!("routes/databases.rs"), "ensure_dbms(&state)?", 14, "14 个 handler 的接线（P1-22 同类实例）"),
+            (include_str!("routes/sites/crud.rs"), ".get(cap_keys::WEBSERVER_MANAGE)", 3, "create / update 翻转 / delete"),
+            (include_str!("routes/sites/apply.rs"), ".get(cap_keys::WEBSERVER_MANAGE)", 2, "apply / reload"),
+            (include_str!("routes/sites/conf.rs"), ".get(cap_keys::WEBSERVER_MANAGE)", 3, "conf::*"),
+            (include_str!("routes/sites/conf.rs"), ".get(cap_keys::LOGS_READ)", 1, "sites::logs"),
+            (include_str!("routes/logs.rs"), ".get(cap_keys::LOGS_READ)", 1, "logs::*"),
+            (include_str!("routes/sites/ssl.rs"), ".get(cap_keys::WEBSERVER_MANAGE)", 2, "ssl::*"),
+            (include_str!("routes/sites/ssl.rs"), ".get(cap_keys::SSL_ACME)", 4, "ssl_apply / renew / sweep / 设置"),
+            (include_str!("routes/sites/ssl.rs"), ".get(cap_keys::SSL_SELFSIGNED)", 2, "ssl_apply / cert_renew"),
+            (include_str!("routes/backups.rs"), ".get(cap_keys::BACKUP_MANAGE)", 3, "backups::*"),
+            (include_str!("routes/terminal.rs"), ".get(cap_keys::TERMINAL_MANAGE)", 1, "terminal::ws_handler"),
+        ];
+        for (src, needle, want, who) in cases {
+            // ⚠ 必须剔除注释行：模块文档里逐字写着这些 needle，不剔会恒真。
+            let code: String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let got = code.matches(needle).count();
+            assert_eq!(
+                got, want,
+                "{who}：`{needle}` 应恰好出现 {want} 次，实际 {got} 次。\
+                 少了＝能力门被删（前端置灰失去后端口径，静默失同步）；\
+                 多了＝新端点接了门或写法变了——先确认口径，再改这里。"
+            );
+        }
+    }
 }

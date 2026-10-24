@@ -6,7 +6,6 @@ use crate::{
     routes::{Auth, Shared},
 };
 use axum::{extract::{Query, State}, Json};
-use panel_core::cap_keys;
 use serde::Serialize;
 use serde_json::json;
 
@@ -261,6 +260,3 @@ pub async fn directories(State(state): State<Shared>, Auth(s): Auth) -> ApiResul
         "groups": groups,
     })))
 }
-
-#[allow(dead_code)]
-fn _cap_keys_used() -> &'static str { cap_keys::METRICS_READ }
