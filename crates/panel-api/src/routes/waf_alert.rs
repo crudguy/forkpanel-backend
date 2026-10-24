@@ -109,11 +109,16 @@ pub async fn put_alert(
 
 /// 阈值检查：由采集任务（`waf.collect`）在采集后调用。近窗内每站拦截数超阈值即推一条通知。
 ///
-/// **永不中断采集**：配置读取/计数失败即静默跳过（告警是旁路，不该让采集中断）。
+/// **永不中断采集**：配置读取/计数失败只记日志后跳过，不向上传播（告警是旁路，
+/// 不该让采集中断）。⚠ 但"不中断"不等于"不吭声"——失败原因必须落到日志，
+/// 否则告警长期不响而无人知晓（曾只有计数分支打日志、配置分支静默 return）。
 pub async fn check_block_alerts(state: &Shared) {
     let (enabled, threshold, window_min) = match load_cfg(state).await {
         Ok(v) => v,
-        Err(_) => return,
+        Err(e) => {
+            eprintln!("[panel] 告警检查读取配置失败：{e}");
+            return;
+        }
     };
     if enabled == 0 || threshold < 1 || window_min < 1 {
         return;
@@ -188,6 +193,34 @@ pub async fn check_block_alerts(state: &Shared) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ⭐⭐ 接线守卫：`check_block_alerts` 是**旁路**（失败不能中断采集），所以它的
+    /// 失败根本不会冒泡到响应里——删掉那行 eprintln 之后，行为测试全绿、界面无感，
+    /// 只有"告警该响的时候不响"这一个用户可见后果，且无人知晓。只能源码级钉住。
+    /// 判据取**生产段**（剔注释 + 剥本测试模块）：守卫自身的 needle 就在测试段里。
+    #[test]
+    fn alert_check_never_swallows_errors_silently() {
+        let prod = crate::test_support::production_source(include_str!("waf_alert.rs"));
+        // ① 禁止 `Err(_)` 这类把原因丢掉的 catch-all（想忽略就写明原因并记日志）
+        assert!(
+            !prod.contains("Err(_)"),
+            "告警检查不得用 Err(_) 吞掉错误原因：旁路失败不冒泡，静默 = 告警长期不响而无人知晓"
+        );
+        // ② 两处错误出口都必须打日志（按函数名定位到本函数体，避免全文件误命中）
+        let body_at = prod
+            .find("pub async fn check_block_alerts")
+            .expect("check_block_alerts 必须存在");
+        let body = &prod[body_at..];
+        for (needle, what) in [
+            ("告警检查读取配置失败", "读配置失败"),
+            ("告警检查读取失败", "读拦截计数失败"),
+        ] {
+            assert!(
+                body.contains(needle),
+                "check_block_alerts 的{what}分支必须记日志（当前静默 return）：缺 {needle}"
+            );
+        }
+    }
 
     #[test]
     fn alert_level_escalates_at_triple() {
