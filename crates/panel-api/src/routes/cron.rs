@@ -455,6 +455,19 @@ struct CronRunTask {
     pool: std::sync::Arc<panel_db::ReadPool>,
 }
 
+/// 把外部命令的退出码翻译成「任务结局」：`(exit_code, status_text, failed)`。
+///
+/// ⚠ `None` 表示**超时被杀或被信号终止**（`cmd.rs` 的语义），**绝不能当成 0**：
+/// 此前写作 `out.code.unwrap_or(0)` ⇒ 被强杀的脚本被记成 `TaskState::Ok` +
+/// `exit 0`，列表页显示「ok」，用户以为脚本跑完了（二轮审计 P0-8）。
+pub(crate) fn run_outcome(code: Option<i32>) -> (i32, String, bool) {
+    match code {
+        Some(0) => (0, "ok".to_string(), false),
+        Some(c) => (c, format!("exit {c}"), true),
+        None => (-1, "killed：超时或被信号终止（未取得退出码）".to_string(), true),
+    }
+}
+
 #[async_trait::async_trait]
 impl panel_task::TaskBody for CronRunTask {
     async fn run(&self, progress: panel_task::Progress) -> Result<panel_task::TaskOutcome> {
@@ -528,11 +541,10 @@ impl panel_task::TaskBody for CronRunTask {
 
         let (task_state, exit_code, status_text, failed) = match &r {
             Ok(out) => {
-                let code = out.code.unwrap_or(0);
-                (if code == 0 { panel_task::TaskState::Ok } else { panel_task::TaskState::Failed },
-                 code,
-                 if code == 0 { "ok".to_string() } else { format!("exit {code}") },
-                 code != 0)
+                // ⚠ `None`（超时被杀）必须判失败，绝不能当 0（详见 run_outcome 注释）
+                let (code, text, bad) = run_outcome(out.code);
+                (if bad { panel_task::TaskState::Failed } else { panel_task::TaskState::Ok },
+                 code, text, bad)
             }
             Err(e) => {
                 let msg = e.to_string();
@@ -547,13 +559,19 @@ impl panel_task::TaskBody for CronRunTask {
             .map(|d| d.as_secs() as i64).unwrap_or(0);
         let job_id = self.job_id.clone();
         let last_status = status_text.clone();   // 闭包内消费一份，原件留给下方 Webhook 载荷
-        let _ = self.db.exec(move |conn| {
+        // ⚠ 回写失败**必须留痕**：吞掉的话列表页会继续显示上一次的结果，
+        // 用户据此判断「这次没跑」或「跑成功了」都是错的（二轮审计 P0-8 同源）。
+        // 不阻断主流程——写状态失败不该推翻任务本身的结局。
+        let write_res = self.db.exec(move |conn| {
             conn.execute(
                 "UPDATE cron_jobs SET last_run_at = ?2, last_status = ?3 WHERE name = ?1",
                 rusqlite::params![job_id, now, last_status],
             ).map_err(|e| PanelError::Database(e.to_string()))?;
             Ok(panel_db::WriteAck { rows_changed: 1 })
         }).await;
+        if let Err(e) = write_res {
+            eprintln!("[panel] ⚠ [cron] 回写 last_run_at/last_status 失败（列表页会继续显示上一次的结果）：{e}");
+        }
 
         progress.set(100, if failed { "执行结束（失败）" } else { "执行结束" }).await;
 
@@ -757,4 +775,24 @@ mod tests {
         assert!(truncate(&"x".repeat(5000), 2000).len() < 2100);
         assert_eq!(truncate("hi", 2000), "hi");
     }
+
+    /// 二轮审计 P0-8：被超时强杀的脚本**绝不能**记成成功。
+    #[test]
+    fn run_outcome_treats_missing_code_as_failure() {
+        let (code, text, bad) = run_outcome(Some(0));
+        assert_eq!((code, bad), (0, false), "退出码 0 才是成功");
+        assert_eq!(text, "ok");
+
+        let (code, text, bad) = run_outcome(Some(3));
+        assert_eq!((code, bad), (3, true));
+        assert!(text.contains("3"), "文案要带真实退出码：{text}");
+
+        // ⚠ 核心断言：None（超时被杀/被信号终止）必须判失败。
+        // 曾是 `unwrap_or(0)` ⇒ 记成「成功 + exit 0」，用户以为脚本跑完了。
+        let (code, text, bad) = run_outcome(None);
+        assert!(bad, "未取得退出码必须判为失败，绝不能当成 0");
+        assert_ne!(code, 0, "退出码绝不能是 0（会让列表页显示 ok）");
+        assert!(text.contains("killed") || text.contains("终止"), "文案要说清是被终止：{text}");
+    }
+
 }
