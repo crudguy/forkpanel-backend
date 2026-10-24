@@ -510,9 +510,16 @@ impl panel_task::TaskBody for PackageTask {
         let mut output_path = None;
         let lines_snapshot: Vec<String> = panel_core::sync::lock_recover(&buf).clone();
         if !lines_snapshot.is_empty() {
-            let p = std::env::temp_dir().join(format!("panel-task-{}.log", progress.id()));
+            // 日志写进专属子目录而非 temp_dir 根（与 cron 任务体一致）：id 递增
+            // → 每次都是新文件，若散落在 /tmp 根既无法定向清理，也会污染临时目录；
+            // 写后按前缀裁剪，避免无限增长（P1-13）。读取端按 output_path 完整路径跟随。
+            let dir = std::env::temp_dir().join(panel_task::TASK_LOG_DIRNAME);
+            let _ = tokio::fs::create_dir_all(&dir).await;
+            let p = dir.join(format!("{}{}.log", panel_task::TASK_LOG_PREFIX, progress.id()));
             if tokio::fs::write(&p, lines_snapshot.join("\n")).await.is_ok() {
-                output_path = Some(p);
+                output_path = Some(p.clone());
+                // 只保留最近若干份（清理失败不影响任务结果，函数内部静默）
+                panel_os::prune_keep_newest(&dir, panel_task::TASK_LOG_PREFIX, panel_task::TASK_LOG_KEEP);
             }
         }
 

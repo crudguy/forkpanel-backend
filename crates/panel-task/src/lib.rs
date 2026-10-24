@@ -29,6 +29,22 @@ pub mod scheduler;
 use panel_core::{PanelError, Result, Tier};
 pub use progress::{Progress, ProgressBus, TaskEvent};
 pub use scheduler::{builtin_schedules, InternalScheduler, Schedule};
+
+// ═══════════════════════════ 任务日志落盘策略 ═══════════════════════════
+//
+// 各任务体（备份 / 软件包 / 内部 cron）把"缓冲落盘"写到这里，供任务中心页直接
+// 读取（`/tasks/{id}/output`）。集中定义是**单一事实源**：三处写入端必须一致，
+// 否则会出现 A 写子目录、B 写 /tmp 根、裁剪只扫一边——日志无限增长（P1-13）。
+//
+// 子目录而非 temp_dir 根：只扫这个小目录做裁剪，直接扫 /tmp 会把机器上成千上万
+// 无关文件一起 stat 一遍。
+/// 任务日志的专属子目录（相对 `std::env::temp_dir()`）。
+pub const TASK_LOG_DIRNAME: &str = "panel-cron-logs";
+/// 任务日志文件前缀：`<前缀><任务id>.log`。
+pub const TASK_LOG_PREFIX: &str = "panel-task-";
+/// 保留最近多少份任务日志（够回溯最近的失败即可，避免无限增长）。
+pub const TASK_LOG_KEEP: usize = 50;
+
 use panel_db::WriterActor;
 use std::{
     collections::HashMap,

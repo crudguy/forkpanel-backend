@@ -90,6 +90,14 @@ pub fn builtin_schedules(tier: panel_core::Tier) -> Vec<Schedule> {
             kind: ScheduleKind::Every(Duration::from_secs(60)),
             jitter_sec: 20,
         },
+        // 会话过期回收（P1-9）：sessions 内存 map 与 sessions 表此前单调增长——
+        // `SessionCache::sweep()` 已实现却从未被调用。挂上唯一消费者：每 5 分钟
+        // 清理一次过期会话（按 expires_at 判，与登录/访问续期口径一致）。
+        Schedule {
+            name: "session.sweep",
+            kind: ScheduleKind::Every(Duration::from_secs(300)),
+            jitter_sec: 30,
+        },
     ];
     // nano 档位不做每日备份：512MB 机器上 VACUUM INTO 的 IO 与内存开销不划算
     if !matches!(tier, panel_core::Tier::Nano) {
@@ -133,6 +141,7 @@ impl InternalScheduler {
         for s in schedules {
             let jobs = self.jobs.clone();
             let token = self.token.clone();
+
             let last_run = self.last_run.clone();
             let jitter = s.jitter_sec;
             let kind = s.kind;
@@ -159,8 +168,9 @@ impl InternalScheduler {
                         g.get(name).cloned()
                     };
                     if let Some(f) = f {
-                        // 任务失败只记录，不让调度器退出（清理失败不该导致采样停止）
-                        if let Err(e) = f().await {
+                        // 任务失败只记录，不让调度器退出（清理失败不该导致采样停止）；
+                        // 同时用超时包裹，避免任一 job 挂住导致该 schedule 永久停摆（P1-10）。
+                        if let Err(e) = run_job_with_timeout(name, &f, INTERNAL_JOB_TIMEOUT).await {
                             tracing::warn!(task = name, "内部任务失败: {e}");
                         }
                         last_run.lock().await.insert(name, now_unix());
@@ -175,6 +185,28 @@ impl InternalScheduler {
     /// 上次成功执行的时间（供运维排查）
     pub async fn last_run_of(&self, name: &str) -> Option<i64> {
         self.last_run.lock().await.get(name).copied()
+    }
+}
+
+/// 内部任务单次执行的最长时限（P1-10）。任一 job 卡住（不返回、不报错）原本会让该
+/// schedule 永久停摆——定时备份/清理从此不再执行，界面与 stderr 都看不出异常。
+/// 超时即中断该次执行并记录 error，调度循环继续，下一周期再试。
+/// 10 分钟对指标采样/清理/扫描绰绰有余；对耗时的每日备份（VACUUM INTO）也是合理上限，
+/// 真卡住时能在可接受窗口内释放，而不是永远挂着。
+const INTERNAL_JOB_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// 带超时的单次任务执行（P1-10 核心）。返回 job 自身的结果；超时则返回错误。
+async fn run_job_with_timeout(name: &str, f: &JobFn, timeout: Duration) -> Result<()> {
+    match tokio::time::timeout(timeout, f()).await {
+        Ok(r) => r,
+        Err(_) => {
+            tracing::error!(
+                task = name,
+                timeout_secs = timeout.as_secs(),
+                "内部任务超时（可能被挂住），已中断并继续调度"
+            );
+            Err(panel_core::PanelError::Internal(format!("internal job {name} timed out")))
+        }
     }
 }
 
@@ -306,5 +338,37 @@ mod tests {
         let v = builtin_schedules(panel_core::Tier::Standard);
         assert!(v.iter().any(|s| s.jitter_sec > 0),
                 "至少部分任务需要错峰，避免同一秒集体触发");
+    }
+
+    /// 会话过期回收必须挂在内置调度上：否则 `SessionCache::sweep()` 已实现却永不被调用，
+    /// 会话内存 map 与 sessions 表单调增长（P1-9）。
+    #[test]
+    fn session_sweep_is_in_builtin() {
+        let v = builtin_schedules(panel_core::Tier::Standard);
+        assert!(v.iter().any(|s| s.name == "session.sweep"),
+            "session.sweep 必须在 builtin_schedules 中声明");
+        let d = v.iter().find(|s| s.name == "session.sweep")
+            .map(|s| match s.kind { ScheduleKind::Every(d) => d.as_secs(), _ => 0 })
+            .unwrap_or(0);
+        assert!(d > 0 && d <= 600, "session.sweep 周期应 <= 10min，实际 {d}s");
+        // 所有档位都要有（会话回收与内存大小无关）
+        assert!(builtin_schedules(panel_core::Tier::Nano)
+            .iter().any(|s| s.name == "session.sweep"));
+    }
+
+    /// 超时包裹必须真的中断挂住的 job（P1-10 核心）。用极短超时验证分支。
+    #[tokio::test]
+    async fn run_job_times_out_hung_future() {
+        let f: JobFn =
+            std::sync::Arc::new(|| Box::pin(std::future::pending::<panel_core::Result<()>>()));
+        let r = run_job_with_timeout("hung", &f, Duration::from_millis(1)).await;
+        assert!(r.is_err(), "挂住的 job 必须被超时中断（不能永久停摆）");
+    }
+
+    #[tokio::test]
+    async fn run_job_runs_fast_future_ok() {
+        let f: JobFn = std::sync::Arc::new(|| Box::pin(async { Ok(()) }));
+        let r = run_job_with_timeout("ok", &f, Duration::from_secs(10)).await;
+        assert!(r.is_ok(), "正常完成的 job 不应被超时");
     }
 }

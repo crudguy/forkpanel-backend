@@ -954,8 +954,13 @@ fn ensure_free_space(job: &BackupJob) -> Result<()> {
 /// 此前失败只 `eprintln!` + 通知，任务页点开是空白输出（实测 task 30：
 /// state=failed、output_path=null、lines=[]，用户只能去翻服务端日志）。
 fn write_failure_log(task_id: i64, what: &str, msg: &str) -> std::path::PathBuf {
-    let p = std::env::temp_dir().join(format!("panel-task-{task_id}.log"));
+    // 失败日志同样写进专属子目录 + 裁剪（与成功路径、cron 任务体一致，P1-13）：
+    // 此前直接散落到 /tmp 根、且永不清理，机器重启间隔一长就堆积。
+    let dir = std::env::temp_dir().join(panel_task::TASK_LOG_DIRNAME);
+    let _ = std::fs::create_dir_all(&dir);
+    let p = dir.join(format!("{}{task_id}.log", panel_task::TASK_LOG_PREFIX));
     let _ = std::fs::write(&p, format!("{what} #{task_id} 失败\n{msg}\n"));
+    panel_os::prune_keep_newest(&dir, panel_task::TASK_LOG_PREFIX, panel_task::TASK_LOG_KEEP);
     p
 }
 

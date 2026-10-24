@@ -10,10 +10,7 @@
 //! 绝不为了让某个客户端跟上而拖慢任务本身。
 
 use super::TaskKind;
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::sync::Arc;
 use tokio::sync::broadcast;
 
 /// 广播通道容量。慢消费者超出即丢弃（不阻塞任务）。
@@ -29,31 +26,34 @@ pub enum TaskEvent {
 }
 
 /// 全局任务事件总线
+///
+/// 进度/日志/终态事件通过广播通道推送；订阅者连接数由通道自身维护
+/// （见 [`Self::listener_count`]）。**不缓存"最近一次进度"**——此前确有
+/// `latest: HashMap<id, percent>` 字段，但 `subscribe()` 从不读取它、也从未被任何
+/// 调用者消费，只是随每个任务 id 单调增长（无回收的无界 map，P1-12）。新订阅者从
+/// 连接后的下一条事件开始接收；全局流本就承载所有任务，无需按任务回放。
 pub struct ProgressBus {
     tx: broadcast::Sender<TaskEvent>,
-    /// 最近一次进度：新订阅者立即拿到当前值，避免"连上来要等下一次更新"
-    latest: Arc<Mutex<HashMap<i64, u8>>>,
 }
 
 impl ProgressBus {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(BUS_CAP);
-        Self { tx, latest: Arc::new(Mutex::new(HashMap::new())) }
+        Self { tx }
     }
 
     pub fn publish(&self, ev: TaskEvent) {
-        if let TaskEvent::Progress { id, percent, .. } = &ev {
-            self.latest.lock().unwrap_or_else(|e| e.into_inner()).insert(*id, *percent);
-        }
         // 无接收者时 send 返回 Err，这是正常的（没人订阅就不需要推送）
         let _ = self.tx.send(ev);
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<TaskEvent> { self.tx.subscribe() }
 
-    /// 当前订阅者数量（用于判断是否值得继续推送）
+    /// 当前订阅者数量（用于判断是否值得继续推送）。
+    /// 直接取自 broadcast 通道内部计数，反映真实连接数——
+    /// 此前误把"最近进度 map 的长度"当订阅者数，语义完全错位（P1-12）。
     pub fn listener_count(&self) -> usize {
-        self.latest.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.tx.receiver_count()
     }
 }
 
@@ -127,11 +127,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn latest_percent_is_remembered() {
+    async fn listener_count_tracks_subscribers() {
         let bus = Arc::new(ProgressBus::new());
-        let p = Progress::new(7, bus.clone());
-        p.set_percent(42).await;
-        assert_eq!(bus.latest.lock().unwrap().get(&7).copied(), Some(42));
+        assert_eq!(bus.listener_count(), 0, "无订阅者时计数为 0");
+        let _rx = bus.subscribe();
+        assert_eq!(bus.listener_count(), 1, "新增订阅后计数 +1");
+        let _rx2 = bus.subscribe();
+        assert_eq!(bus.listener_count(), 2, "每个订阅者都被真实计数");
     }
 
     #[tokio::test]

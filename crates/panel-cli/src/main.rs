@@ -818,6 +818,24 @@ async fn register_internal_jobs(
         }).await;
     }
 
+    // ── 会话过期回收（P1-9）：sessions 内存 map 与 sessions 表此前单调增长——
+    // `SessionCache::sweep()` 已实现却从未被调用。挂上唯一消费者：每 5 分钟清理
+    // 一次过期会话（按 expires_at 判，与登录/访问续期口径一致）。
+    {
+        let state = state.clone();
+        sched.register("session.sweep", move || {
+            let state = state.clone();
+            async move {
+                // sweep 同步、内部自行向 DB 派发清理；返回清理条数仅用于日志
+                let n = state.sessions.sweep();
+                if n > 0 {
+                    tracing::info!("会话过期回收：清理 {n} 个过期会话");
+                }
+                Ok(())
+            }
+        }).await;
+    }
+
     // ── 1m 聚合：nano 档位是 no-op（不落盘）──
     {
         let writer = writer.clone();
@@ -921,8 +939,16 @@ async fn register_internal_jobs(
                 std::fs::create_dir_all(&backup_dir).ok();
                 let ts = now_unix();
                 let dest = backup_dir.join(format!("panel-{ts}.db"));
-                // 独立连接备份：写者把 op 包在事务里，事务内不能 VACUUM INTO
-                panel_db::backup_file(&db_path, &dest)?;
+                // 独立连接备份：写者把 op 包在事务里，事务内不能 VACUUM INTO。
+                // VACUUM INTO 是同步阻塞调用（实测占死 2~3 个 worker 线程数秒），
+                // 用 spawn_blocking 丢到阻塞线程池，避免卡住 tokio 的异步 worker
+                // 导致同进程内其它周期任务一起停摆（P1-11）。
+                let db_path_bk = db_path.clone();
+                let dest_bk = dest.clone();
+                let bak = tokio::task::spawn_blocking(move || panel_db::backup_file(&db_path_bk, &dest_bk))
+                    .await
+                    .map_err(|e| panel_core::PanelError::Internal(format!("每日备份线程崩溃（join 失败）: {e}")))?;
+                bak.map_err(|e| panel_core::PanelError::Internal(format!("每日备份失败: {e}")))?;
                 let pruned = panel_api::routes::backups::prune_daily_db(&backup_dir, keep);
                 if !pruned.is_empty() {
                     tracing::info!("每日备份已裁剪 {} 份旧文件（保留 {keep}）", pruned.len());
@@ -1152,6 +1178,24 @@ mod wiring_guard_tests {
         assert!(
             prod.contains("backups::sweep_due(&state)"),
             "注册的实现必须真的调用 sweep_due"
+        );
+    }
+
+    /// **判据必须指向生产代码那一份**：会话回收在 `panel-task` 声明、在 `panel-cli`
+    /// 注册，只靠名字约定对齐。漏注册时调度器每轮 `jobs.get(name)` 取到 None 就静默
+    /// 跳过——`SessionCache::sweep()` 已实现却永不被调用，会话内存 map 与 sessions
+    /// 表单调增长（P1-9）。同样先 `.split("#[cfg(test)]")` 剔除本模块测试段。
+    #[test]
+    fn session_sweep_is_registered_in_serve() {
+        let src = include_str!("main.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        assert!(
+            prod.contains("sched.register(\"session.sweep\", move ||"),
+            "builtin_schedules 声明了 session.sweep，serve 必须注册同名实现，否则会话回收静默不跑"
+        );
+        assert!(
+            prod.contains("state.sessions.sweep()"),
+            "注册的实现必须真的调用 SessionCache::sweep()"
         );
     }
 
