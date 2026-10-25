@@ -43,10 +43,12 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (26, include_str!("../../../migrations/026_waf_templates.sql")),
     (27, include_str!("../../../migrations/027_waf_block_events.sql")),
     (28, include_str!("../../../migrations/028_waf_alert_cfg.sql")),
+    // 029：删除零引用的 api_tokens（P2-2）——留着等于宣称支持 API 令牌
+    (29, include_str!("../../../migrations/029_drop_api_tokens.sql")),
 ];
 
 /// 当前 schema 版本
-pub const LATEST: u32 = 28;
+pub const LATEST: u32 = 29;
 
 pub fn apply(conn: &mut Connection) -> Result<u32> {
     conn.execute_batch(
@@ -284,6 +286,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(apply(&mut c).unwrap(), LATEST, "漂移不得让 apply 失败");
+    }
+
+    /// 二轮审计 P2-2：api_tokens 曾"schema 里有、代码里没人读"（假控制）。
+    ///
+    /// 两侧都钉住，缺一侧就是空判据：
+    /// - 先单独跑 001 确认历史迁移**确实建出了**这张表（否则"不存在"可能是
+    ///   "从来就没有"，判据自己就是空的——改历史迁移正是这种骗法）；
+    /// - 再跑完整迁移确认它**真的被删掉**，并顺带确认别的表还在（删错表的
+    ///   话这一条会先红）。
+    #[test]
+    fn api_tokens_is_created_by_001_and_dropped_by_latest() {
+        fn has_table(c: &Connection, name: &str) -> bool {
+            c.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [name],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0) > 0
+        }
+
+        let mut before = Connection::open_in_memory().unwrap();
+        let v1 = MIGRATIONS.iter().find(|(v, _)| *v == 1).unwrap().1;
+        before.execute_batch(v1).unwrap();
+        assert!(has_table(&before, "api_tokens"),
+            "001 必须仍建出 api_tokens（历史迁移不得改写，否则下面那条「不存在」是空的）");
+
+        let mut c = Connection::open_in_memory().unwrap();
+        apply(&mut c).unwrap();
+        assert!(!has_table(&c, "api_tokens"), "029 必须删掉 api_tokens");
+        assert!(has_table(&c, "sessions"), "别的表不受影响（顺带证明上面不是空判据）");
     }
 
     #[test]
