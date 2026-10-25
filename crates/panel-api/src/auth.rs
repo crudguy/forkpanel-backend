@@ -188,18 +188,31 @@ pub struct SessionCache {
     inner: Mutex<HashMap<String, Session>>,
     idle_timeout: Duration,
     absolute_timeout: Duration,
+    /// 会话状态落库的节流间隔（秒），由 `idle_timeout` 推导（见 [`persist_secs`]）。
+    persist_secs: i64,
     /// 持久化后端：会话落 `sessions` 表（该表 001 即已定义，**此前无人使用**）。
     /// 有它 → 面板重启后会话仍在（不再全员登出）；`None` → 纯内存（测试/无 DB）。
     db: Option<std::sync::Arc<panel_db::WriterActor>>,
 }
 
-/// 「最后活跃」落库的节流窗口（秒）。
+/// 会话状态落库节流间隔的上下限（秒）。
 ///
 /// 每请求都写一次会把 `sessions` 表变成写热点（每次 API 调用一次事务），
-/// 而会话列表的「空闲时长」只需要分钟级精度——60s 的误差换掉 1~2 个数量级的
-/// 写放大。节流条件写在 SQL 的 WHERE 里，**库本身就是节流状态**，不必在内存
-/// 里再存一份"上次同步时间"（那要多一把锁 + 一套失效清理）。
-const LAST_SEEN_SYNC_SECS: i64 = 60;
+/// 而会话列表的「空闲时长」只需要分钟级精度——节流用分钟级的误差换掉
+/// 1~2 个数量级的写放大。节流条件写在 SQL 的 WHERE 里，**库本身就是节流状态**，
+/// 不必在内存里再存一份"上次同步时间"（那要多一把锁 + 一套失效清理）。
+const PERSIST_MAX_SECS: i64 = 60;
+const PERSIST_MIN_SECS: i64 = 1;
+
+/// 节流间隔 = idle_timeout / 4，夹到 [1s, 60s]。
+///
+/// **必须随 idle_timeout 缩放，不能写死 60s**：持久化滞后会反过来吃掉滑动续期——
+/// idle=1m 时按 60s 节流，刚落库的 `expires_at` 立刻就到期，`sweep()` 会把此刻
+/// 正在被使用的会话行删掉 ⇒ 面板一重启，活跃用户被登出。取 1/4 是留足余量：
+/// 活跃会话行上的 `expires_at` 至少领先当下 3/4 个 idle 周期。
+fn persist_secs(idle_timeout: Duration) -> i64 {
+    (idle_timeout.as_secs() as i64 / 4).clamp(PERSIST_MIN_SECS, PERSIST_MAX_SECS)
+}
 
 impl SessionCache {
     /// 纯内存（无持久化）。测试与无 DB 场景使用。
@@ -208,6 +221,7 @@ impl SessionCache {
             inner: Mutex::new(HashMap::new()),
             idle_timeout: idle,
             absolute_timeout: absolute,
+            persist_secs: persist_secs(idle),
             db: None,
         }
     }
@@ -218,7 +232,13 @@ impl SessionCache {
         absolute: Duration,
         db: std::sync::Arc<panel_db::WriterActor>,
     ) -> Self {
-        Self { inner: Mutex::new(HashMap::new()), idle_timeout: idle, absolute_timeout: absolute, db: Some(db) }
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            idle_timeout: idle,
+            absolute_timeout: absolute,
+            persist_secs: persist_secs(idle),
+            db: Some(db),
+        }
     }
 
     /// 把 DB 写入丢给 runtime：**绝不持 MutexGuard 跨 await**（本 crate 已踩过两次）。
@@ -248,25 +268,33 @@ impl SessionCache {
                 None => None,
             }
         };
-        // P2-3：命中即把"最后活跃"落库（此前这一列只写不读，重启后一律当成
-        // 刚刚活跃 ⇒ 会话列表对闲置很久的会话谎报"空闲 0 秒"）。
+        // 命中即把「最后活跃 + 滑动续期」节流落库（P2-3 及其姊妹项）。
         if out.is_some() {
-            self.persist_last_seen(sid, now);
+            self.persist_activity(sid, now);
         }
         out
     }
 
-    /// 把"最后活跃"节流落库（P2-3）。节流条件在 SQL 的 WHERE 里，60s 内不重复写。
-    fn persist_last_seen(&self, sid: &str, now: i64) {
+    /// 把「最后活跃 + 滑动续期」节流落库（P2-3 姊妹项）。
+    ///
+    /// 两列必须**一起**写：`expires_at` 是 `sweep()` 判定会话过期的唯一依据
+    /// （`DELETE FROM sessions WHERE expires_at <= now`）。此前滑动续期只改内存，
+    /// 库里的 `expires_at` 恒为 created_at + idle_timeout ⇒ 创建超过 idle_timeout
+    /// 的会话哪怕此刻正在被使用，行也会被删 ⇒ 面板重启后活跃用户被登出。
+    fn persist_activity(&self, sid: &str, now: i64) {
+        // 先取值再进 async 块：Duration / i64 都是 Copy，但借用 &self 进
+        // 'static 的 future 是借不过去的。
+        let secs = self.persist_secs;
+        let exp = now + self.idle_timeout.as_secs() as i64;
         if let Some(db) = self.db.clone() {
             let h = sid_hash(sid);
             self.sync_db(async move {
                 if let Err(e) = db
                     .exec(move |conn| {
                         conn.execute(
-                            "UPDATE sessions SET last_seen_at = ?1 \
-                             WHERE sid_hash = ?2 AND ?1 - last_seen_at >= ?3",
-                            rusqlite::params![now, h, LAST_SEEN_SYNC_SECS],
+                            "UPDATE sessions SET last_seen_at = ?1, expires_at = ?2 \
+                             WHERE sid_hash = ?3 AND ?1 - last_seen_at >= ?4",
+                            rusqlite::params![now, exp, h, secs],
                         )
                         .map(|_| panel_db::WriteAck { rows_changed: 1 })
                         .map_err(|e| PanelError::Database(e.to_string()))
@@ -274,8 +302,8 @@ impl SessionCache {
                     .await
                 {
                     // 旁路失败不向上传播（不该让一次活跃记录失败挡掉业务请求），
-                    // 但必须出声：静默吞掉的话"最后活跃永远不更新"没人会发现。
-                    eprintln!("[panel] 会话最后活跃时间落库失败：{e}");
+                    // 但必须出声：静默吞掉的话"续期永远不更新"没人会发现。
+                    eprintln!("[panel] 会话活跃状态落库失败：{e}");
                 }
             });
         }
@@ -403,13 +431,18 @@ impl SessionCache {
         drop(m);
         if let Some(db) = self.db.clone() {
             self.sync_db(async move {
-                let _ = db
+                // 删行失败同样不向上传播（清扫是周期任务，不该影响其他任务），
+                // 但必须出声：静默吞掉的话"表只增不减"会伪装成"没有过期会话"。
+                if let Err(e) = db
                     .exec(move |conn| {
                         conn.execute("DELETE FROM sessions WHERE expires_at <= ?1", [now])
                             .map(|_| panel_db::WriteAck { rows_changed: 1 })
                             .map_err(|e| PanelError::Database(e.to_string()))
                     })
-                    .await;
+                    .await
+                {
+                    eprintln!("[panel] 过期会话清理失败：{e}");
+                }
             });
         }
         n
@@ -1132,6 +1165,40 @@ mod tests {
         .ok()
     }
 
+    /// 把行改到"距上次落库 `secs` 秒"的真实状态：`expires_at` 按当时的 idle 一起
+    /// 往前推（保持 `expires_at == last_seen_at + idle` 这个真实关系）。
+    ///
+    /// 不能图省事把两列都减同一个常数——那等于伪造出一个"最后活跃在 600s 前、
+    /// 到期却在 30s 前"的行，任何节流间隔都会放行，用例就测不出间隔差异了。
+    async fn age_row(w: &panel_db::WriterActor, sid: &str, secs: i64) {
+        let h = sid_hash(sid);
+        let last = now_unix() - secs;
+        let exp = last + T_IDLE;
+        w.exec(move |conn| {
+            conn.execute(
+                "UPDATE sessions SET last_seen_at = ?1, expires_at = ?2 WHERE sid_hash = ?3",
+                rusqlite::params![last, exp, h],
+            )
+            .map(|_| panel_db::WriteAck { rows_changed: 1 })
+            .map_err(|e| PanelError::Database(e.to_string()))
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn stored_expiry(pool: &panel_db::ReadPool, sid: &str) -> Option<i64> {
+        let h = sid_hash(sid);
+        pool.with(move |conn| {
+            conn.query_row(
+                "SELECT expires_at FROM sessions WHERE sid_hash = ?1", [h],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(|e| PanelError::Database(e.to_string()))
+        })
+        .await
+        .ok()
+    }
+
     /// 等会话行真的落库（`insert` 的写是 spawn 出去的），再"改老"才有意义。
     /// 不等的话：改老会被 insert 晚到的 `INSERT OR REPLACE` 覆盖成 now，
     /// 写入侧用例就会在读到一个"本就是 now"的值时假绿。
@@ -1174,7 +1241,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(got.is_some(),
-            "get() 命中后 last_seen_at 应刷新为当前时间（节流窗口 {LAST_SEEN_SYNC_SECS}s）");
+            "get() 命中后 last_seen_at 应刷新为当前时间（节流窗口 = idle/4，上限 60s）");
     }
 
     /// 恢复侧（正主）：重启后不得再把闲置会话说成"刚刚活跃"。
@@ -1199,5 +1266,54 @@ mod tests {
         assert!(idle >= 595,
             "恢复的会话必须保留库里的最后活跃（实测空闲 {idle}s，应约 600s）。\
              若为 0，说明又拿 now 顶替了 —— 那正是「重启后一律显示空闲 0 秒」的谎报");
+    }
+
+    /// 用例里会话的 idle_timeout：取 4s ⇒ 节流间隔 = 4/4 = 1s。
+    ///
+    /// 这么小是为了让"距上次落库 30s"这种行状态既能被 1s 间隔判定为**该刷新**，
+    /// 又会被写死的 60s 间隔判定为**还没到**（那条注入因此必红）。
+    const T_IDLE: i64 = 4;
+
+    /// 姊妹项：活跃必须让**行**活过 `sweep()`——否则「面板重启 = 全员登出」。
+    ///
+    /// 反面就是这条真实链条：滑动续期只在内存里滑 ⇒ 库里的 `expires_at` 恒为
+    /// created_at + idle_timeout ⇒ `sweep()` 照它删行 ⇒ 此刻正在被使用的会话行
+    /// 没了 ⇒ 重启后无从恢复（P2-3 落库的 last_seen_at 还连坐一起被抹）。
+    #[tokio::test]
+    async fn activity_keeps_the_session_row_alive_through_sweep() {
+        let (w, pool) = temp_db();
+        insert_tester(&w).await;
+        let cache = SessionCache::new_with_db(
+            Duration::from_secs(T_IDLE as u64), Duration::from_secs(86_400), w.clone());
+        let sid = generate_sid();
+        cache.insert(sid.clone(), db_sess());
+        wait_row(&pool, &sid).await;
+        // 30s 前落过库、此后再没落过：这个间隔对 1s 节流早该刷新，对写死的
+        // 60s 节流则"还没到"（那条注入会因此必红）
+        age_row(&w, &sid, 30).await;
+        assert!(stored_expiry(&pool, &sid).await <= Some(now_unix()),
+            "前置条件：行必须先落到 sweep 的删除线以下，否则这条用例恒真");
+
+        assert!(cache.get(&sid).is_some(), "会话应仍命中");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut refreshed = false;
+        while Instant::now() < deadline {
+            if stored_expiry(&pool, &sid).await > Some(now_unix()) {
+                refreshed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(refreshed, "get() 命中后 expires_at 必须被推到未来（滑动续期要落库）");
+
+        cache.sweep();
+        // 清扫是异步删：留一段窗口让它真删，行一消失立刻判红（不必等满窗口）
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        while Instant::now() < deadline {
+            if stored_expiry(&pool, &sid).await.is_none() {
+                panic!("活跃会话的行被 sweep 删掉了 ⇒ 面板重启后这个用户会被登出");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 }
