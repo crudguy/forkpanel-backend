@@ -306,7 +306,8 @@ mod tests {
             .unwrap_or(0) > 0
         }
 
-        let mut before = Connection::open_in_memory().unwrap();
+        // execute_batch 取 &self，这里不需要 mut（-D unused-mut 下会红）
+        let before = Connection::open_in_memory().unwrap();
         let v1 = MIGRATIONS.iter().find(|(v, _)| *v == 1).unwrap().1;
         before.execute_batch(v1).unwrap();
         assert!(has_table(&before, "api_tokens"),
