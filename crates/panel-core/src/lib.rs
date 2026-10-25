@@ -8,6 +8,10 @@ use std::fmt;
 
 pub mod crypto; // 应用层密钥加密（AES-256-GCM，关闭 M0 阻塞项）
 pub mod sync;   // 互斥锁中毒恢复（禁止裸 lock().unwrap()，见 ci/check_lock_unwrap.py）
+// 校验规则判据的唯一事实源（文件内 `#![cfg(test)]`：生产构建里是空模块）。
+// 判据放单独文件而不放在 `mod tests` 里，是为了让"这份文件真被 include_str! 读了"
+// 能被另一处的守卫扫到——判据和守卫同文件的话，守卫会把自己算成消费者。
+mod validation_cases;
 
 // ───────────────────────────── 错误模型 ─────────────────────────────
 
@@ -413,63 +417,119 @@ pub mod rules {
 #[cfg(test)]
 mod tests {
     use super::rules::*;
+    use super::validation_cases::cases;
+
+    // 判据不写在测试里：全部来自 tests-fixtures/validation_cases.json（唯一事实源）。
+    // 增改样本只改那份 JSON——曾因手抄两份而漂移（JSON 侧漏掉私有后缀例外、
+    // invalid 少一半），手抄必然走到这一步。
+
+    /// ⭐⭐ 接线守卫：判据文件 `tests-fixtures/validation_cases.json` 曾**零引用**——
+    /// 消费脚本归档后没人读它，判据被手抄进本文件的测试数组，两份随即漂移
+    /// （JSON 侧漏掉私有后缀例外、invalid 只有一半）。手抄版本改一处漏一处，
+    /// 且**没有任何信号**。这条守卫钉的是"这份 JSON 真被 include_str! 读了"。
+    ///
+    /// 判据与守卫刻意分放两个文件：`include_str!` 在 `validation_cases.rs`
+    /// （本守卫在下面把自己排除掉），否则守卫会把自己的 needle 当成消费者。
+    #[test]
+    fn validation_cases_fixture_has_a_consumer() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let self_path = std::path::Path::new(file!());
+        let mut files = Vec::new();
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(rd) = std::fs::read_dir(dir) else { return };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().and_then(|s| s.to_str()) == Some("rs") {
+                    out.push(p);
+                }
+            }
+        }
+        walk(&root.join("crates"), &mut files);
+        let mut hits: Vec<String> = Vec::new();
+        for f in &files {
+            if f.ends_with(self_path) {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(f) else { continue };
+            for l in text.lines() {
+                if l.contains("include_str!") && l.contains("validation_cases.json") {
+                    hits.push(format!("{}: {}", f.display(), l.trim()));
+                }
+            }
+        }
+        assert!(
+            !hits.is_empty(),
+            "tests-fixtures/validation_cases.json 没有任何 include_str! 消费者：\
+             它一旦没人读就会和测试里的判据静默漂移（上次就漂了：私有后缀例外漏抄、\
+             invalid 少一半）。要删就删文件，别留孤儿。"
+        );
+    }
+
+    /// 判据删空的危害是**静默**的：分组没了 ⇒ 遍历空数组 ⇒ 测试全绿而该规则零覆盖。
+    /// 故钉住分组集合与每组的规模下界（与门禁里"提取非空且规模合理"同纪律）。
+    #[test]
+    fn validation_cases_cover_every_rule() {
+        let all: serde_json::Value =
+            serde_json::from_str(super::validation_cases::CASES_JSON)
+                .expect("validation_cases.json 必须是 {group:{valid,invalid}}");
+        for group in [
+            "unit_name", "domain", "db_name", "system_user",
+            "path_segment", "site_name", "container_ref",
+        ] {
+            let c = super::validation_cases::cases(group);
+            assert!(
+                c.valid.len() >= 2 && c.invalid.len() >= 3,
+                "分组 {group} 判据过少（valid={} invalid={}）：多半是被误删，\
+                 判据一空，对应规则的测试就变成遍历空数组的假绿",
+                c.valid.len(), c.invalid.len()
+            );
+            // 每个分组都必须同时有正反两侧：只留 valid 会放过全部注入样本
+            assert!(!c.valid.is_empty() && !c.invalid.is_empty(), "分组 {group} 缺一侧判据");
+        }
+        // 反过来：JSON 里不该有无人测试的分组（新增规则忘写测试 ⇒ 判据形同虚设）
+        for k in all.as_object().expect("判据文件顶层必须是对象").keys() {
+            assert!(
+                [
+                    "unit_name", "domain", "db_name", "system_user",
+                    "path_segment", "site_name", "container_ref",
+                ]
+                .contains(&k.as_str()),
+                "判据文件里的分组 `{k}` 没有对应测试：加了判据却不测 = 零覆盖"
+            );
+        }
+    }
 
     #[test]
     fn unit_name_rejects_injection() {
-        // 合法：systemd 单元名的真实形态
-        for ok in ["nginx.service", "panel@1.service", "sshd", "mysql_1.service", "a.b-c@d"] {
+        let c = cases("unit_name");
+        for ok in &c.valid {
             assert!(is_valid_unit_name(ok), "应放行: {ok}");
         }
-        // 注入 / 越界 / 超长 必须全部拒绝
-        for bad in [
-            "nginx; rm -rf /", "../../etc/passwd", "$(id)", "`id`", "-bad", "a..b", "",
-            "nginx|cat /etc/shadow", "nginx\nrm -rf /", "unit&id",  // 管道 / 换行 / `&` 注入
-            &"x".repeat(300),                                       // 超长（>256）
-        ] {
+        for bad in &c.invalid {
             assert!(!is_valid_unit_name(bad), "should reject {bad:?}");
         }
     }
 
     #[test]
     fn domain_rules() {
-        // 合法：真实 TLD / 多级 / IP 字面量 / punycode TLD / 私有后缀例外 / 大小写
-        for ok in [
-            "example.com", "a.b.c.example.org", "sub.example.com",
-            "host.lan", "app.local", "svc.internal",          // 私有后缀例外
-            "1.2.3.4", "0.0.0.0", "255.255.255.255",          // IPv4 字面量
-            "example.xn--fiqs8s", "Example.COM",              // punycode TLD / 大小写
-        ] {
+        let c = cases("domain");
+        for ok in &c.valid {
             assert!(is_valid_domain(ok), "应放行: {ok}");
         }
-        // 非法
-        for bad in [
-            "random", "test123", "localhost", "as", "a",       // 单词级（无 TLD）
-            "-a.com", "a-.com", ".com", "exa mple.com",        // label 语法 / 空格
-            "a..b",                                            // 空 label
-            "asdf.qwer", "host.zzz", "example.notreal",        // TLD 不存在（编造）
-            "999.999.999.999", "256.1.1.1", "1.2.3",           // 伪 IP / 段数不足
-            "example.com;rm -rf /",                            // 分号注入
-            "example.com\nSet-Cookie:x",                       // 换行头注入（CRLF）
-            "$(id).com",                                       // 命令替换
-            "a".repeat(254).as_str(), "",                      // 超长 / 空
-        ] {
+        for bad in &c.invalid {
             assert!(!is_valid_domain(bad), "必须拒绝: {bad:?}");
         }
     }
 
     #[test]
     fn db_name_excludes_dash() {
-        // 合法：大小写字母 / 数字 / 下划线（`Panel` 验证大写不被误拒）
-        for ok in ["wp_db1", "Panel", "a"] {
+        let c = cases("db_name");
+        for ok in &c.valid {
             assert!(is_valid_db_name(ok), "应放行: {ok}");
         }
-        // 非法
-        for bad in [
-            "wp-db",                       // '-' 会诱出 MySQL 反引号陷阱，刻意排除
-            "db;drop table", "db'or 1=1--", // SQL 注入
-            "db`x",                        // 反引号（反引号陷阱的元凶字符本身）
-            "", &"d".repeat(65),           // 空 / 超长（>64）
-        ] {
+        for bad in &c.invalid {
             assert!(!is_valid_db_name(bad), "必须拒绝: {bad:?}");
         }
     }
@@ -481,31 +541,22 @@ mod tests {
     /// 路由顺带校验"，规则的边界（如 `_apps` 走 `c == '_'` 分支）应在此处兜住。
     #[test]
     fn system_user_rules() {
-        for ok in ["www-data", "_apps", "nginx1", "root"] {
+        let c = cases("system_user");
+        for ok in &c.valid {
             assert!(is_valid_system_user(ok), "应放行: {ok}");
         }
-        for bad in [
-            "-root",       // 首字符 '-'（CLI 选项注入）
-            "Root",        // 大写（Linux 用户名惯例全小写）
-            "user name",   // 空格
-            "root;id", "user$(id)",  // 注入
-            "", &"u".repeat(33),     // 空 / 超长（>32）
-        ] {
+        for bad in &c.invalid {
             assert!(!is_valid_system_user(bad), "必须拒绝: {bad:?}");
         }
     }
 
     #[test]
     fn path_segment_rejects_traversal() {
-        for ok in ["site-a", "index.html"] {
+        let c = cases("path_segment");
+        for ok in &c.valid {
             assert!(is_valid_path_segment(ok), "应放行: {ok}");
         }
-        for bad in [
-            "..", ".",                    // 上级 / 当前目录
-            "a/b", "a\\b", "a\0b",        // 路径分隔符与 NUL（反斜杠在 Windows 上也是分隔符）
-            "a b", "a;b",                 // 空格破坏 crontab 字段切分；分号可被 shell 解释
-            "", &"s".repeat(256),         // 空 / 超长（>255）
-        ] {
+        for bad in &c.invalid {
             assert!(!is_valid_path_segment(bad), "必须拒绝: {bad:?}");
         }
     }
@@ -515,16 +566,12 @@ mod tests {
     /// site_root（跨站泄露）、空格名会带着注入字符进库。
     #[test]
     fn site_name_rules() {
-        // 合法：字母数字开头，后续可含 . _ -
-        for ok in ["web", "my-site", "site1", "a.b", "api_v2", "Blog2026", "x"] {
+        let c = cases("site_name");
+        for ok in &c.valid {
             assert!(is_valid_site_name(ok), "should accept {ok:?}");
         }
         // 非法：空 / 空格 / 点类 / 越界 / 注入
-        for bad in [
-            "", " ", ".", "..", ".hidden", "-lead", "a/b", "a b",
-            "a;b", "a$(id)", "a`id`", "a\"b", "a\\b",
-            &"x".repeat(64),
-        ] {
+        for bad in &c.invalid {
             assert!(!is_valid_site_name(bad), "should reject {bad:?}");
         }
     }
@@ -532,27 +579,17 @@ mod tests {
     #[test]
     fn container_ref_accepts_id_and_name() {
         // 64 位 hex ID 与 docker 命名规则下的名称都应通过
-        assert!(is_valid_container_ref("3f2a1b0c9d8e7f6a"));
-        assert!(is_valid_container_ref("web-proxy"));
-        assert!(is_valid_container_ref("mysql_8.0"));
-        assert!(is_valid_container_ref("a"));
+        for ok in &cases("container_ref").valid {
+            assert!(is_valid_container_ref(ok), "should accept {ok:?}");
+        }
     }
 
     #[test]
     fn container_ref_rejects_flag_injection_and_traversal() {
         // 首字符 '-' 会被 docker CLI 当选项解析（`docker rm --force`）→ 必须拒绝
-        assert!(!is_valid_container_ref("-f"));
-        assert!(!is_valid_container_ref("--force"));
-        assert!(!is_valid_container_ref("--privileged"));
-        // 其余注入面
-        assert!(!is_valid_container_ref(""));
-        assert!(!is_valid_container_ref("a b"));      // 空格会被当第二个 argv
-        assert!(!is_valid_container_ref("a;b"));
-        assert!(!is_valid_container_ref("a$(id)"));
-        assert!(!is_valid_container_ref("a/b"));
-        assert!(!is_valid_container_ref(".."));
-        assert!(!is_valid_container_ref("a\0b"));
-        assert!(!is_valid_container_ref(&"x".repeat(256)));   // 超长
+        for bad in &cases("container_ref").invalid {
+            assert!(!is_valid_container_ref(bad), "should reject {bad:?}");
+        }
     }
 
     // ───────────── 契约层：错误码 / 档位 / 构造器 ─────────────

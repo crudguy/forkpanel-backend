@@ -14,3 +14,6 @@ aes-gcm = "0.10"
 rand = "0.8"
 
 [dev-dependencies]
+# 校验规则判据文件（tests-fixtures/validation_cases.json）的解析——仅测试期使用，
+# 不计入第三方直接依赖预算（check-layering.sh 规则[8] 用 `--edges normal` 排除 dev）。
+serde_json = { workspace = true }

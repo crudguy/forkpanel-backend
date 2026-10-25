@@ -15,47 +15,48 @@
       "-bad",
       "a..b",
       "",
-      "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
       "nginx|cat /etc/shadow",
       "nginx\nrm -rf /",
-      "unit&id"
+      "unit&id",
+      "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
     ]
   },
   "domain": {
     "valid": [
       "example.com",
       "a.b.c.example.org",
-      "xn--fiqs8s",
-      "s1.example.com",
-      "1.2.3.4"
+      "sub.example.com",
+      "host.lan",
+      "app.local",
+      "svc.internal",
+      "1.2.3.4",
+      "0.0.0.0",
+      "255.255.255.255",
+      "example.xn--fiqs8s",
+      "Example.COM"
     ],
     "invalid": [
+      "random",
+      "test123",
+      "localhost",
+      "as",
+      "a",
       "-a.com",
       "a-.com",
       ".com",
       "exa mple.com",
-      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "",
       "a..b",
+      "asdf.qwer",
+      "host.zzz",
+      "example.notreal",
+      "999.999.999.999",
+      "256.1.1.1",
+      "1.2.3",
       "example.com;rm -rf /",
       "example.com\nSet-Cookie:x",
-      "$(id).com"
-    ]
-  },
-  "system_user": {
-    "valid": [
-      "www-data",
-      "_apps",
-      "nginx1"
-    ],
-    "invalid": [
-      "-root",
-      "root;id",
-      "",
-      "Root",
-      "user name",
-      "uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu",
-      "user$(id)"
+      "$(id).com",
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      ""
     ]
   },
   "db_name": {
@@ -68,25 +69,91 @@
       "wp-db",
       "db;drop table",
       "db'or 1=1--",
-      "",
       "db`x",
+      "",
       "ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    ]
+  },
+  "system_user": {
+    "valid": [
+      "www-data",
+      "_apps",
+      "nginx1",
+      "root"
+    ],
+    "invalid": [
+      "-root",
+      "Root",
+      "user name",
+      "root;id",
+      "user$(id)",
+      "",
+      "uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu"
     ]
   },
   "path_segment": {
     "valid": [
       "site-a",
-      "index.html",
-      "a b"
+      "index.html"
     ],
     "invalid": [
       "..",
       ".",
       "a/b",
-      "a\u0000b",
       "a\\b",
+      "a\u0000b",
+      "a b",
+      "a;b",
       "",
       "ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss"
+    ]
+  },
+  "site_name": {
+    "valid": [
+      "web",
+      "my-site",
+      "site1",
+      "a.b",
+      "api_v2",
+      "Blog2026",
+      "x"
+    ],
+    "invalid": [
+      "",
+      " ",
+      ".",
+      "..",
+      ".hidden",
+      "-lead",
+      "a/b",
+      "a b",
+      "a;b",
+      "a$(id)",
+      "a`id`",
+      "a\"b",
+      "a\\b",
+      "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    ]
+  },
+  "container_ref": {
+    "valid": [
+      "3f2a1b0c9d8e7f6a",
+      "web-proxy",
+      "mysql_8.0",
+      "a"
+    ],
+    "invalid": [
+      "-f",
+      "--force",
+      "--privileged",
+      "",
+      "a b",
+      "a;b",
+      "a$(id)",
+      "a/b",
+      "..",
+      "a\u0000b",
+      "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
     ]
   }
 }
