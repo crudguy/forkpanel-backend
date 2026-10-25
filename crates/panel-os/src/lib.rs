@@ -96,6 +96,15 @@ pub fn adapter_with_overrides(
     }
 }
 
+/// 发信号能力：euid 0 才能作用于他人进程（POSIX）。
+///
+/// 刻意抽成**纯函数**：直接在 `capabilities()` 里调 `is_root()` 的话，CI（非 root）
+/// 恒得到 no，测试只能覆盖一半分支，另一半（root 时 yes）永远跑不到——判据成立与否
+/// 取决于跑测试的人是谁，这本身就是"判据指向错"的一种。
+pub fn signal_capability(is_root: bool) -> Capability {
+    if is_root { Capability::yes("posix") } else { Capability::no("non_root") }
+}
+
 impl OsAdapter for linux::LinuxOsAdapter {
     fn platform(&self) -> PlatformInfo { self.platform.clone() }
 
@@ -107,8 +116,11 @@ impl OsAdapter for linux::LinuxOsAdapter {
         use panel_core::cap_keys as k;
         let mut m = CapabilityMap::new();
         m.insert(k::METRICS_READ.into(), Capability::yes("procfs"));
+        // 进程**列表**与**发信号**是两种权限，必须分开判定：/proc 对所有用户可读，
+        // 但向他人进程发信号要求 euid 0（否则 kill(2) 一律 EPERM）。合一位的后果是
+        // 非 root 部署的杀进程按钮照常可点，点了才失败——正是能力位要提前挡住的事。
         m.insert(k::PROCESS_LIST.into(), Capability::yes("procfs"));
-        m.insert(k::PROCESS_SIGNAL.into(), Capability::yes("posix"));
+        m.insert(k::PROCESS_SIGNAL.into(), signal_capability(is_root()));
         m.insert(k::SERVICE_MANAGE.into(), match self.services.init_system() {
             panel_core::InitSystem::Systemd => Capability::yes("systemd"),
             panel_core::InitSystem::SysV => Capability::yes("sysv"),
@@ -282,5 +294,31 @@ mod tests {
         assert_eq!(p.holds().await.unwrap(), vec!["redis-server".to_string()]);
         // 对未 hold 的包再 unhold：同样幂等成功
         p.set_hold("never-held", false).await.unwrap();
+    }
+
+    /// 二轮审计 P2-5：`process.signal` 按特权判定，与 `process.list` 分流。
+    /// 两条分支都必须跑到——只有一条的测试等于没测另一条。
+    #[test]
+    fn signal_capability_follows_privilege() {
+        let yes = signal_capability(true);
+        assert!(yes.supported, "root 下必须 yes：否则按钮白白置灰，用户用不上能用的功能");
+        let no = signal_capability(false);
+        assert!(!no.supported, "非 root 必须 no：kill 必然 EPERM，不能等用户点了才知道");
+        assert_eq!(no.reason.as_deref(), Some("non_root"),
+            "原因码要能直接给用户看（前端展示 reason），不能是空的");
+    }
+
+    /// 适配器必须**经 `signal_capability()` 判定**，不许直接写死 yes。
+    /// 纯函数那条测试只能证明"函数本身对"，证明不了"适配器真的调了它"——
+    /// 写死 `Capability::yes("posix")` 时，行为测试照样全绿（它们自己往 map 里
+    /// 塞值，与适配器无关），于是能力位退回"登记了但没人读"：后端门与前端
+    /// 置灰双双变成永不触发的死代码。这正是"假控制"的另一种形态。
+    #[test]
+    fn process_signal_is_decided_by_privilege_not_hardcoded() {
+        // 读本文件生产段：注释里逐字写着这个调用，不剔注释就会恒真。
+        let code = panel_testutil::production_source(include_str!("lib.rs"));
+        let got = code.matches("k::PROCESS_SIGNAL.into(), signal_capability(").count();
+        assert_eq!(got, 1,
+            "`process.signal` 必须由 signal_capability() 判定，实际接线 {got} 处。\n\n            少了＝又被写死成常量（能力位退回没人在读的装饰）；\n            多了＝插入点重复——先确认语义，再改这里。");
     }
 }

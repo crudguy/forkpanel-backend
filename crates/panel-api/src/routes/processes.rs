@@ -55,6 +55,12 @@ pub async fn kill(
     body: Option<Json<KillReq>>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SYSTEM_MANAGE)?;
+    // 能力门（二轮审计 P2-5）：与 `list` 同口径，但读的是**信号**这一位。
+    // 列表只读 /proc（任何人可读），发信号却要求 euid 0——两者是不同能力，
+    // 共用一位的后果是：非 root 部署里杀进程按钮照常可点，点了才拿到 EPERM。
+    if !state.capabilities.get(cap_keys::PROCESS_SIGNAL).map(|c| c.supported).unwrap_or(false) {
+        return Err(ApiError::unsupported("process.signal"));
+    }
     let pid: i32 = pid.parse()
         .map_err(|_| ApiError::bad_request("pid", "pid 必须是数字"))?;
 
@@ -89,10 +95,10 @@ mod tests {
         }
     }
 
-    /// 强制 PROCESS_LIST 为指定能力位的 mock 态（其余照 mock 默认）。
-    fn state_with(cap: panel_core::Capability) -> std::sync::Arc<crate::AppState> {
+    /// 把指定能力键强制成给定值（其余照 mock 默认）。
+    fn state_with(key: &str, cap: panel_core::Capability) -> std::sync::Arc<crate::AppState> {
         let mut st = crate::test_support::mock_app_state();
-        st.capabilities.insert(cap_keys::PROCESS_LIST.into(), cap);
+        st.capabilities.insert(key.into(), cap);
         std::sync::Arc::new(st)
     }
 
@@ -104,7 +110,7 @@ mod tests {
     /// （500 语义）而非可预期的 501，置灰与后端双双落空。
     #[tokio::test]
     async fn list_returns_501_when_process_list_unsupported() {
-        let state = state_with(panel_core::Capability::no("forced_no"));
+        let state = state_with(cap_keys::PROCESS_LIST, panel_core::Capability::no("forced_no"));
         let err = list(
             State(state),
             Auth(sess(&[perm::SYSTEM_VIEW])),
@@ -121,7 +127,7 @@ mod tests {
     /// 若把条件写反（`if supported { return 501 }`），上面那条照样绿、这条红。
     #[tokio::test]
     async fn list_serves_when_process_list_supported() {
-        let state = state_with(panel_core::Capability::yes("procfs"));
+        let state = state_with(cap_keys::PROCESS_LIST, panel_core::Capability::yes("procfs"));
         let res = list(
             State(state),
             Auth(sess(&[perm::SYSTEM_VIEW])),
@@ -147,5 +153,87 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.code, 10009, "缺键必须按不支持处理");
+    }
+
+    // ── 以下为二轮审计 P2-5：kill 的 PROCESS_SIGNAL 门 ──
+    // 门在鉴权之后：权限不够该 403，能力不够该 501，两者语义不能混。
+
+    /// 能力位 no ⇒ 501。修复前 `kill` 没有任何能力门：非 root 环境下按钮照常可点，
+    /// 点了才从 kill(2) 拿到 EPERM（500 语义），用户看到的是"操作失败"而不是
+    /// "当前环境不支持"——且与前端置灰双向脱节。
+    #[tokio::test]
+    async fn kill_returns_501_when_process_signal_unsupported() {
+        let state = state_with(cap_keys::PROCESS_SIGNAL, panel_core::Capability::no("non_root"));
+        let err = kill(
+            State(state),
+            Auth(sess(&[perm::SYSTEM_MANAGE])),
+            AxPath("4242".to_string()),
+            Some(Json(KillReq { signal: Some("term".into()) })),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::NOT_IMPLEMENTED,
+            "必须是 501，不能是 signal 深处的 EPERM（500 语义）");
+        assert_eq!(err.code, 10009, "必须走 unsupported 错误码");
+    }
+
+    /// **阳性对照**：能力位 yes 时门必须放行，且真的把信号发出去了。
+    /// 若把条件写反（`if supported { return 501 }`），上面那条照样绿、这条红。
+    #[tokio::test]
+    async fn kill_succeeds_when_process_signal_supported() {
+        let state = state_with(cap_keys::PROCESS_SIGNAL, panel_core::Capability::yes("posix"));
+        let body = kill(
+            State(state),
+            Auth(sess(&[perm::SYSTEM_MANAGE])),
+            AxPath("4242".to_string()),
+            Some(Json(KillReq { signal: Some("hup".into()) })),
+        )
+        .await
+        .expect("能力位 yes 时 kill 应正常放行")
+        .0;
+        // ⚠ `ok()` 会再包一层信封 {code,message,data}，断言必须指向信封里的 data：
+        // 直接取 body["killed"] 恒为 null（as_i64 → None），断言就成了"永远通过的空判据"。
+        assert_eq!(body["data"]["killed"].as_i64(), Some(4242));
+        assert_eq!(body["data"]["signal"].as_str(), Some("hup"), "hup 不能被当成默认的 term");
+    }
+
+    /// 缺键 ⇒ 501：`unwrap_or(false)` 不容许"查不到就当支持"。
+    #[tokio::test]
+    async fn kill_returns_501_when_capability_key_absent() {
+        let mut st = crate::test_support::mock_app_state();
+        st.capabilities.remove(cap_keys::PROCESS_SIGNAL);
+        let state = std::sync::Arc::new(st);
+        let err = kill(
+            State(state),
+            Auth(sess(&[perm::SYSTEM_MANAGE])),
+            AxPath("4242".to_string()),
+            Some(Json(KillReq { signal: None })),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, 10009, "缺键必须按不支持处理");
+    }
+
+    /// **分流不变量**：signal 不可用 ≠ 列表不可用。/proc 对所有人可读，
+    /// 所以真实组合是「能看不能杀」——这一条同时钉住两位没有被合成一位。
+    /// 若哪天把 kill 的门改成读 PROCESS_LIST，这条会红（list 仍服务但 kill 已 501）。
+    #[tokio::test]
+    async fn list_still_serves_while_signalling_is_unsupported() {
+        let mut st = crate::test_support::mock_app_state();
+        st.capabilities.insert(cap_keys::PROCESS_LIST.into(), panel_core::Capability::yes("procfs"));
+        st.capabilities.insert(cap_keys::PROCESS_SIGNAL.into(), panel_core::Capability::no("non_root"));
+        let state = std::sync::Arc::new(st);
+        assert!(list(
+            State(state.clone()),
+            Auth(sess(&[perm::SYSTEM_VIEW])),
+            Query(ProcQ { sort: None, limit: Some(2) }),
+        ).await.is_ok(), "signal 不可用时列表仍应可读（两者是不同能力）");
+        let err = kill(
+            State(state),
+            Auth(sess(&[perm::SYSTEM_MANAGE])),
+            AxPath("4242".to_string()),
+            Some(Json(KillReq { signal: Some("term".into()) })),
+        ).await.unwrap_err();
+        assert_eq!(err.code, 10009, "同一状态下 kill 必须 501");
     }
 }

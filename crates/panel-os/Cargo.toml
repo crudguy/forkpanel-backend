@@ -27,3 +27,5 @@ force-mock = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# 源码级守卫要读本 crate 的生产段（dev-dep 不计入直接依赖预算）
+panel-testutil = { path = "../panel-testutil" }

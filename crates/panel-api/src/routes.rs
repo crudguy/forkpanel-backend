@@ -583,13 +583,15 @@ mod tests {
     /// needle 统一带 `.get(` 前缀：`cap_keys::X` 还会出现在错误载荷里
     /// （如 `unsupported(cap_keys::TERMINAL_MANAGE)`、containers 的 detail），
     /// 那些不是门。**恒 yes 的位**（METRICS_READ / FILE_READ / FILE_WRITE /
-    /// CONTAINER_VIEW / USER_MANAGE / PROCESS_SIGNAL，适配器写死 yes）
+    /// CONTAINER_VIEW / USER_MANAGE，适配器写死 yes）
     /// 不在表内——它们的前端置灰分支是死代码，后端加门也是死代码；
     /// 若哪天把它们改成条件位，**必须**同时加门并登记进本表。
+/// （P2-5 正是把 PROCESS_SIGNAL 从这一档改成条件位的实例：发信号要 euid 0，
+///  而列表只读 /proc——两者从此分流，各自在表内登记，不再共用一位。）
     #[test]
     fn capability_gates_census() {
         // (文件, needle, 期望出现次数, 说明)
-        let cases: [(&str, &str, usize, &str); 21] = [
+        let cases: [(&str, &str, usize, &str); 22] = [
             (include_str!("routes/services/mod.rs"), ".get(cap_keys::SERVICE_MANAGE)", 4, "services::*"),
             (include_str!("routes/services/packages.rs"), ".get(cap_keys::PACKAGE_INSTALL)", 5, "packages::*"),
             (include_str!("routes/services/packages.rs"), ".get(cap_keys::PACKAGE_UPGRADE)", 2, "packages::*"),
@@ -599,6 +601,7 @@ mod tests {
             (include_str!("routes/containers.rs"), ".get(cap_keys::CONTAINER_MANAGE)", 1, "ensure_supported helper 内一道"),
             (include_str!("routes/containers.rs"), "ensure_supported(&state)?", 11, "11 个 handler 的接线"),
             (include_str!("routes/processes.rs"), ".get(cap_keys::PROCESS_LIST)", 1, "processes::list（P1-22 修复）"),
+            (include_str!("routes/processes.rs"), ".get(cap_keys::PROCESS_SIGNAL)", 1, "processes::kill（P2-5 修复）"),
             (include_str!("routes/databases.rs"), ".get(cap_keys::DBMS_MANAGE)", 1, "ensure_dbms helper 内一道"),
             (include_str!("routes/databases.rs"), "ensure_dbms(&state)?", 14, "14 个 handler 的接线（P1-22 同类实例）"),
             (include_str!("routes/sites/crud.rs"), ".get(cap_keys::WEBSERVER_MANAGE)", 3, "create / update 翻转 / delete"),

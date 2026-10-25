@@ -1390,6 +1390,7 @@ dependencies = [
  "async-trait",
  "libc",
  "panel-core",
+ "panel-testutil",
  "rusqlite",
  "serde",
  "serde_json",
