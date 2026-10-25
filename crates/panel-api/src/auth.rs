@@ -193,6 +193,14 @@ pub struct SessionCache {
     db: Option<std::sync::Arc<panel_db::WriterActor>>,
 }
 
+/// 「最后活跃」落库的节流窗口（秒）。
+///
+/// 每请求都写一次会把 `sessions` 表变成写热点（每次 API 调用一次事务），
+/// 而会话列表的「空闲时长」只需要分钟级精度——60s 的误差换掉 1~2 个数量级的
+/// 写放大。节流条件写在 SQL 的 WHERE 里，**库本身就是节流状态**，不必在内存
+/// 里再存一份"上次同步时间"（那要多一把锁 + 一套失效清理）。
+const LAST_SEEN_SYNC_SECS: i64 = 60;
+
 impl SessionCache {
     /// 纯内存（无持久化）。测试与无 DB 场景使用。
     pub fn new(idle: Duration, absolute: Duration) -> Self {
@@ -226,15 +234,50 @@ impl SessionCache {
 
     pub fn get(&self, sid: &str) -> Option<Session> {
         let now = now_unix();
-        let mut m = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        match m.get_mut(sid) {
-            Some(s) if s.expires_at > now && now - s.created_at < self.absolute_timeout.as_secs() as i64 => {
-                s.last_seen = now;
-                s.expires_at = now + self.idle_timeout.as_secs() as i64;
-                Some(s.clone())
+        // ⚠ 锁的作用域刻意收紧到这个块：落库是 spawn，**绝不能持 MutexGuard
+        // 走到 await 边界**（本 crate 已踩过两次）。
+        let out = {
+            let mut m = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            match m.get_mut(sid) {
+                Some(s) if s.expires_at > now && now - s.created_at < self.absolute_timeout.as_secs() as i64 => {
+                    s.last_seen = now;
+                    s.expires_at = now + self.idle_timeout.as_secs() as i64;
+                    Some(s.clone())
+                }
+                Some(_) => { m.remove(sid); None }
+                None => None,
             }
-            Some(_) => { m.remove(sid); None }
-            None => None,
+        };
+        // P2-3：命中即把"最后活跃"落库（此前这一列只写不读，重启后一律当成
+        // 刚刚活跃 ⇒ 会话列表对闲置很久的会话谎报"空闲 0 秒"）。
+        if out.is_some() {
+            self.persist_last_seen(sid, now);
+        }
+        out
+    }
+
+    /// 把"最后活跃"节流落库（P2-3）。节流条件在 SQL 的 WHERE 里，60s 内不重复写。
+    fn persist_last_seen(&self, sid: &str, now: i64) {
+        if let Some(db) = self.db.clone() {
+            let h = sid_hash(sid);
+            self.sync_db(async move {
+                if let Err(e) = db
+                    .exec(move |conn| {
+                        conn.execute(
+                            "UPDATE sessions SET last_seen_at = ?1 \
+                             WHERE sid_hash = ?2 AND ?1 - last_seen_at >= ?3",
+                            rusqlite::params![now, h, LAST_SEEN_SYNC_SECS],
+                        )
+                        .map(|_| panel_db::WriteAck { rows_changed: 1 })
+                        .map_err(|e| PanelError::Database(e.to_string()))
+                    })
+                    .await
+                {
+                    // 旁路失败不向上传播（不该让一次活跃记录失败挡掉业务请求），
+                    // 但必须出声：静默吞掉的话"最后活跃永远不更新"没人会发现。
+                    eprintln!("[panel] 会话最后活跃时间落库失败：{e}");
+                }
+            });
         }
     }
 
@@ -385,11 +428,12 @@ impl SessionCache {
         let h = sid_hash(sid);
         let now = now_unix();
         // 注：`.ok().flatten()?` 已解包 Option，故类型注解是**元组**本身
-        let row: (i64, String, String, String, i64, i64) = pool
+        // P2-3：最后一列是新取的 `last_seen_at`（此前根本不读它）
+        let row: (i64, String, String, String, i64, i64, i64) = pool
             .with(move |conn| {
                 let mut st = conn
                     .prepare(
-                        "SELECT s.user_id, u.username, u.role, u.allowed_roots, s.created_at, s.expires_at \
+                        "SELECT s.user_id, u.username, u.role, u.allowed_roots, s.created_at, s.expires_at, s.last_seen_at \
                          FROM sessions s JOIN users u ON u.id = s.user_id \
                          WHERE s.sid_hash = ?1 AND s.expires_at > ?2 AND u.disabled = 0",
                     )
@@ -403,6 +447,7 @@ impl SessionCache {
                             r.get::<_, String>(3)?,
                             r.get::<_, i64>(4)?,
                             r.get::<_, i64>(5)?,
+                            r.get::<_, i64>(6)?,
                         ))
                     })
                     .map_err(|e| PanelError::Database(e.to_string()))?;
@@ -412,7 +457,7 @@ impl SessionCache {
             .ok()
             .flatten()?;
 
-        let (user_id, username, role, roots_json, created_at, expires_at) = row;
+        let (user_id, username, role, roots_json, created_at, expires_at, last_seen_at) = row;
         let allowed_roots: Vec<String> = serde_json::from_str(&roots_json).unwrap_or_default();
         let s = Session {
             user_id,
@@ -423,7 +468,10 @@ impl SessionCache {
             // 库不存 IP：进程重启后重建的会话丢失来源，诚实标 unknown
             ip: "unknown".into(),
             created_at,
-            last_seen: now,
+            // P2-3：用库里持久化的最后活跃，不能再用 now 顶替——
+            // 那等于替用户编造"刚刚还在用"。库值可能因时钟回拨略大于 now，
+            // 夹一下，别让"未来时刻"进内存（下游 `idle_secs` 已有 max(0) 兜底）。
+            last_seen: last_seen_at.min(now),
             expires_at,
         };
         // 直接放回内存走后续快路径；**不用 insert**——那会重置到期时间并重复写库
@@ -1001,5 +1049,155 @@ mod tests {
         assert_eq!(g.key_count(), 3, "key 数不得超过硬上限");
         assert!(g.check("a").is_none(), "被淘汰的 key 应视为无记录");
         assert!(g.check("d").is_none(), "新 key 正常放行");
+    }
+
+    // ── 二轮审计 P2-3：`sessions.last_seen_at` 只写不读 ⇒ 重启后谎报「空闲 0 秒」──
+    // 两条缺一不可：写入侧不落库，恢复侧读到的永远是创建时的旧值；
+    // 恢复侧不读库，落了库也照样拿 now 顶替（谎报照旧）。
+
+    /// 自增序号：pid 只到"进程"一级，同进程内多个用例并发跑仍会共用目录。
+    static TEMP_DB_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// 临时库（目录 = pid + 序号，逐个用例独占）+ 已跑完迁移的 writer/pool。
+    fn temp_db() -> (std::sync::Arc<panel_db::WriterActor>, std::sync::Arc<panel_db::ReadPool>) {
+        let seq = TEMP_DB_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "panel-auth-db-{}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("t.db");
+        let tier = Tier::Nano;
+        {
+            let mut c = panel_db::open(&db_path, tier, "NORMAL").unwrap();
+            panel_db::migrate::apply(&mut c).unwrap();
+        }
+        (
+            std::sync::Arc::new(
+                panel_db::WriterActor::spawn(db_path.clone(), tier, "NORMAL").unwrap()),
+            std::sync::Arc::new(panel_db::ReadPool::new(&db_path, tier).unwrap()),
+        )
+    }
+
+    /// sessions.user_id 外键指向 users，两个用例都必须先有这个用户。
+    async fn insert_tester(w: &panel_db::WriterActor) {
+        let now = now_unix();
+        w.exec(move |conn| {
+            conn.execute(
+                "INSERT INTO users(id, username, pwd_hash, role, allowed_roots, disabled, created_at) \
+                 VALUES(1, 'tester', 'x', 'admin', '[]', 0, ?1)",
+                rusqlite::params![now],
+            )
+            .map(|_| panel_db::WriteAck { rows_changed: 1 })
+            .map_err(|e| PanelError::Database(e.to_string()))
+        })
+        .await
+        .unwrap();
+    }
+
+    fn db_sess() -> Session {
+        let now = now_unix();
+        Session {
+            user_id: 1, username: "tester".into(), role: "admin".into(),
+            permissions: vec![], allowed_roots: vec![], ip: "unknown".into(),
+            created_at: now, last_seen: now, expires_at: now + 3600,
+        }
+    }
+
+    /// 直接把库里的最后活跃改到 `secs` 秒前（模拟"很久没同步 / 很久没活跃"）。
+    async fn age_last_seen(w: &panel_db::WriterActor, sid: &str, secs: i64) {
+        let h = sid_hash(sid);
+        let old = now_unix() - secs;
+        w.exec(move |conn| {
+            conn.execute(
+                "UPDATE sessions SET last_seen_at = ?1 WHERE sid_hash = ?2",
+                rusqlite::params![old, h],
+            )
+            .map(|_| panel_db::WriteAck { rows_changed: 1 })
+            .map_err(|e| PanelError::Database(e.to_string()))
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn stored_last_seen(pool: &panel_db::ReadPool, sid: &str) -> Option<i64> {
+        let h = sid_hash(sid);
+        pool.with(move |conn| {
+            conn.query_row(
+                "SELECT last_seen_at FROM sessions WHERE sid_hash = ?1", [h],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(|e| PanelError::Database(e.to_string()))
+        })
+        .await
+        .ok()
+    }
+
+    /// 等会话行真的落库（`insert` 的写是 spawn 出去的），再"改老"才有意义。
+    /// 不等的话：改老会被 insert 晚到的 `INSERT OR REPLACE` 覆盖成 now，
+    /// 写入侧用例就会在读到一个"本就是 now"的值时假绿。
+    async fn wait_row(pool: &panel_db::ReadPool, sid: &str) -> i64 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Some(v) = stored_last_seen(pool, sid).await {
+                return v;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("会话行应在 5s 内落库（insert 的异步写）");
+    }
+
+    /// 写入侧：命中即落库（否则恢复时读到的永远是创建时的旧值）。
+    #[tokio::test]
+    async fn activity_persists_last_seen() {
+        let (w, pool) = temp_db();
+        insert_tester(&w).await;
+        let cache = SessionCache::new_with_db(
+            Duration::from_secs(1800), Duration::from_secs(86_400), w.clone());
+        let sid = generate_sid();
+        cache.insert(sid.clone(), db_sess());
+        wait_row(&pool, &sid).await;
+        // 先把它改老：不改的话节流会"正确地"什么都不写，这一条就测不出东西
+        age_last_seen(&w, &sid, 600).await;
+        // 前置条件：改老必须真的生效，否则下面那条刷新断言读到的还是 now（假绿）
+        assert!(stored_last_seen(&pool, &sid).await <= Some(now_unix() - 595),
+            "前置条件：库里的 last_seen_at 必须先被改老，否则刷新断言恒真");
+
+        assert!(cache.get(&sid).is_some(), "会话应命中");
+
+        // 落库是 spawn 出去的异步写：轮询到值刷新为止（带超时，避免偶发卡死）
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut got = None;
+        while Instant::now() < deadline {
+            if let Some(v) = stored_last_seen(&pool, &sid).await {
+                if v >= now_unix() - 5 { got = Some(v); break; }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(got.is_some(),
+            "get() 命中后 last_seen_at 应刷新为当前时间（节流窗口 {LAST_SEEN_SYNC_SECS}s）");
+    }
+
+    /// 恢复侧（正主）：重启后不得再把闲置会话说成"刚刚活跃"。
+    #[tokio::test]
+    async fn restored_session_keeps_its_persisted_last_seen() {
+        let (w, pool) = temp_db();
+        insert_tester(&w).await;
+        let c1 = SessionCache::new_with_db(
+            Duration::from_secs(1800), Duration::from_secs(86_400), w.clone());
+        let sid = generate_sid();
+        c1.insert(sid.clone(), db_sess());
+        wait_row(&pool, &sid).await;
+        age_last_seen(&w, &sid, 600).await;
+        assert!(stored_last_seen(&pool, &sid).await <= Some(now_unix() - 595),
+            "前置条件：库里的 last_seen_at 必须先被改老，否则这条用例恒真");
+
+        // 换一个空缓存 = 模拟面板重启后内存里没有这个会话
+        let c2 = SessionCache::new_with_db(
+            Duration::from_secs(1800), Duration::from_secs(86_400), w.clone());
+        let s = c2.get_or_restore(&sid, &pool).await.expect("应从库里恢复会话");
+        let idle = now_unix() - s.last_seen;
+        assert!(idle >= 595,
+            "恢复的会话必须保留库里的最后活跃（实测空闲 {idle}s，应约 600s）。\
+             若为 0，说明又拿 now 顶替了 —— 那正是「重启后一律显示空闲 0 秒」的谎报");
     }
 }

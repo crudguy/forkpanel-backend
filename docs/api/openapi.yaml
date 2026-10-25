@@ -1149,9 +1149,9 @@ components:
         role:       { type: string }
         ip:         { type: "null", nullable: true }
         created_at: { type: integer }
-        last_seen:  { type: integer }
+        last_seen:  { type: integer, description: 最后活跃；节流 60s 落库，会话跨进程恢复时保留库值而非恢复时刻 }
         expires_at: { type: integer }
-        idle_secs:  { type: integer }
+        idle_secs:  { type: integer, description: now - last_seen；受落库节流影响，最多滞后 60s }
         current:    { type: boolean, description: 是否为发起本次请求的会话 }
 
     # ───────────── 计划任务 ─────────────
