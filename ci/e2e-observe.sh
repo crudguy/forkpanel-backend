@@ -65,6 +65,21 @@ if ! curl -s -m 3 "$B/api/v1/version" > /dev/null; then
   say "[skip] 后端不可达：$B —— 本脚本未验证任何东西（请先启动 dev 服务）"
   exit 0
 fi
+# 能力位是否可用（1=可用）。能力位 key 是**字面量带点**（如 "logs.read"），不是嵌套
+# 结构 ⇒ 不能用点号路径取。
+cap_supported() { # $1 = 能力位 key
+  get /system/capabilities | python3 -c '
+import sys,json
+f=(json.load(sys.stdin)["data"]["features"].get(sys.argv[1]) or {})
+print("1" if f.get("supported") else "0")' "$1"
+}
+cap_reason() { # $1 = 能力位 key
+  get /system/capabilities | python3 -c '
+import sys,json
+f=(json.load(sys.stdin)["data"]["features"].get(sys.argv[1]) or {})
+print(f.get("reason") or "")' "$1"
+}
+
 say "=== 0. 登录 $B ==="
 curl -s -c "$CJ" -X POST "$B/api/v1/auth/login" -H 'Content-Type: application/json' \
   -d "{\"username\":\"$U\",\"password\":\"$P\"}" > /dev/null
@@ -94,6 +109,9 @@ d=json.load(sys.stdin)["data"]; print("ok" if isinstance(d.get("frontend_embedde
 chk "GET /system/users code=0" "$(get /system/users | jcode)" "0"
 
 say "=== 2. 日志源与日志读取（只读 + 拒绝分支）==="
+CAP_LOGS=$(cap_supported "logs.read")
+LOGS_REASON=$(cap_reason "logs.read")
+if [ "$CAP_LOGS" = "1" ]; then
 r=$(get /logs/sources); chk "GET /logs/sources code=0" "$(echo "$r" | jcode)" "0"
 chk "sources 含 backend + 源列表（id/kind/label）" "$(echo "$r" | python3 -c 'import sys,json
 d=json.load(sys.stdin)["data"]; s=d.get("sources") or []
@@ -109,6 +127,13 @@ chk "未知日志源 → 404" "$(get /logs/no_such_source | jcode)" "10004"
 GREP300=$(python3 -c 'print("x"*300)')
 chk "grep 超长(300>256) → 10001" "$(get "/logs/system?grep=$GREP300" | jcode)" "10001"
 
+else
+  # 能力位缺失（CI runner 常无 journald）：**只验诚实 501**，并显式标记本段
+  # 「降级」——不让 CI 绿得让人误以为日志读面也验过了。
+  r=$(get /logs/sources)
+  chk "无日志能力位时 /logs/sources 诚实 501" "$(echo "$r" | jcode)" "10009"
+  say "  [降级] 可观测域·日志段：能力位 logs.read 不可用（reason=${LOGS_REASON:-<none>}）——**日志读面未覆盖**"
+fi
 say "=== 3. 通知（只读 + 只碰不存在的 id）==="
 r=$(get /notifications); chk "GET /notifications code=0" "$(echo "$r" | jcode)" "0"
 chk "通知条目含 id/level/read/title" "$(echo "$r" | python3 -c 'import sys,json

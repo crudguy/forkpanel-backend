@@ -78,6 +78,7 @@ say "  · firewall.manage=$fw_sup  fail2ban.manage=$f2b_sup (reason=${f2b_reason
 # firewall.manage 不可用：读/写端点一律诚实 501。到此为止，不恒绿。
 if [ "$fw_sup" != "True" ]; then
   say "  [warn] firewall.manage 不支持 —— 只验证 501 诚实闸门"
+  say "  [降级] 防火墙：能力位 firewall.manage 不可用（reason=$reason）——**防火墙数据面未覆盖**"
   chk "GET /firewall/status 诚实 501" "$(get /firewall/status | jcode)" "10009"
   chk "GET /firewall/rules 诚实 501" "$(get /firewall/rules | jcode)" "10009"
   chk "POST /firewall/rules 诚实 501" "$(post /firewall/rules '{"rules":[{"ports":"80"}]}' | jcode)" "10009"

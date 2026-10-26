@@ -96,6 +96,7 @@ say "  · reason = ${reason:-<none>}"
 # 只验证能力位已按二进制可达性下发（reason=binary_missing），不强行断言数据。
 if [ "$supported" != "True" ]; then
   say "  [warn] scheduler.manage 不支持（reason=$reason）—— 跳过数据面断言"
+  say "  [降级] 计划任务：能力位 scheduler.manage 不可用——**计划任务数据面未覆盖**（只验了诚实 501）"
   list_code=$(get /cron/jobs | jcode)
   chk "GET /cron/jobs 在 unsupported 时诚实 501" "$list_code" "10009"
   case "$reason" in

@@ -84,6 +84,7 @@ list_http=$(curl -s -o /dev/null -w '%{http_code}' -b "$CJ" "$B/api/v1/container
 if [ "$list_http" != "200" ]; then
   say "  [warn] 容器读端点返回 $list_http（能力位 unsupported，reason=$reason）"
   say "  [warn] 跳过读端点与创建闸门断言（需在 docker 可达的宿主上才能真机验证）"
+  say "  [降级] 容器：能力位 container.manage 不可用（reason=$reason）——**容器数据面未覆盖**"
   # reason 必须是已知机器码，证明能力位确实按 daemon 可达性下发了
   case "$reason" in
     binary_missing|daemon_unreachable) PASS=$((PASS+1)); say "  ✓ 能力位 reason 为已知机器码（$reason）";;
