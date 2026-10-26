@@ -37,10 +37,19 @@ macro_rules! unsupported {
     ($what:expr) => { Err(PanelError::Unsupported($what)) };
 }
 
-/// 安全 PATH 内查找二进制是否存在（与 cmd.rs 的解析目录保持一致）
+/// 安全 PATH 内查找二进制是否**可执行**（与 cmd.rs 的解析目录、判据都保持一致）。
+///
+/// ⚠️ 判据是「普通文件 + 有执行位」，不是裸 `is_file()`。原因见
+/// `crate::cmd::is_executable_file` 的注释：只查存在性时，一个 0 字节普通文件
+/// 顶掉 `/usr/bin/journalctl` 也会被判成"可用"，能力位 supported=true 而真
+/// spawn 时 EACCES——「说能用、一用就炸」比直接置 false 更坑用户。
+///
+/// 保留 `&str` 签名是为了不动各 provider 的调用点；判据本身由 `cmd` 单点提供，
+/// 不存在两份实现漂移的可能。
 fn which(name: &str) -> bool {
     ["/usr/sbin", "/sbin", "/usr/bin", "/bin", "/usr/local/sbin", "/usr/local/bin"]
-        .iter().any(|d| std::path::Path::new(d).join(name).is_file())
+        .iter()
+        .any(|d| crate::cmd::is_executable_file(&std::path::Path::new(d).join(name)))
 }
 
 // ─── 按 provider 拆分为子模块 ───

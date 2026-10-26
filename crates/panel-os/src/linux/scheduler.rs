@@ -464,11 +464,11 @@ impl Capable for LinuxScheduler {
         // crontab 是这套实现唯一的载体：命令不存在，整套能力就不存在。
         // ⚠️ 曾经在能力矩阵里被写死成 `no("not_implemented")`，
         // 结果底下这套完整实现永远走不到，所有 cron 端点都返回 501。
-        const SEARCH: &[&str] = &["/usr/bin", "/bin", "/usr/sbin", "/sbin",
-                                  "/usr/local/bin", "/usr/local/sbin"];
-        let found = SEARCH.iter()
-            .any(|d| std::path::Path::new(d).join("crontab").is_file());
-        if found { Capability::yes("crontab") } else { Capability::no("binary_missing") }
+        //
+        // 判据直接复用 `Bin::Crontab.available()`（= 安全 PATH 内「普通文件 + 有执行位」），
+        // 不再自己拼一份 SEARCH 循环：那样会与 cmd.rs 的目录表、判据两处漂移，
+        // 而且裸 `is_file()` 会把一个不可执行的同名文件误判成可用。
+        if Bin::Crontab.available() { Capability::yes("crontab") } else { Capability::no("binary_missing") }
     }
 }
 

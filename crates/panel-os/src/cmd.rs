@@ -11,7 +11,32 @@
 //! CI 门禁：仓库中除本文件外出现 `Command::new` 即构建失败（ci/check-layering.sh）。
 
 use panel_core::{PanelError, Result};
-use std::{collections::HashMap, ffi::OsString, path::PathBuf, process::Stdio, time::Duration};
+use std::{collections::HashMap, ffi::OsString, path::{Path, PathBuf}, process::Stdio, time::Duration};
+
+/// 该路径是否「一个可执行的普通文件」——能力位判定的**唯一判据**。
+///
+/// 只查存在性是不够的：把 0 字节普通文件放到 `/usr/bin/journalctl` 上，
+/// `is_file()` 仍为 true，能力位会报 supported，真 spawn 时 EACCES。
+///
+/// 判据用 mode 的**任一执行位**（`0o111`）而非按 euid 逐位比对：
+/// 面板以 root 运行，root 有 `CAP_DAC_OVERRIDE` ⇒ 只要有一位可执行就能执行；
+/// 三位全空时 root 同样 EACCES（execve 不受该能力放行）。用 mode 位判断也
+/// 满足「能力探测不执行任何命令」的既有约束。
+#[cfg(unix)]
+pub(crate) fn is_executable_file(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(p) {
+        // metadata（而非 symlink_metadata）会跟随符号链接：/usr/bin/x → /opt/x 是常见布局
+        Ok(m) => m.is_file() && (m.permissions().mode() & 0o111) != 0,
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn is_executable_file(p: &Path) -> bool {
+    p.is_file()
+}
+
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, BufReader},
     process::Command,
@@ -114,6 +139,21 @@ impl Bin {
     }
 
     /// 解析后的绝对路径在构造期确定；找不到就禁用该能力（能力矩阵置 false）
+    ///
+    /// ⚠️ 判定必须**同时满足两条**，只查 `is_file()` 是错的：
+    /// ① 是普通文件（不是目录、不是符号链接指向的目录）；
+    /// ② 当前有效用户对该文件**有执行权限**。
+    ///
+    /// 为什么 ② 不能省：曾把一个 0 字节的普通文件覆盖到 `/usr/bin/journalctl`，
+    /// `is_file()` 照样返回 true ⇒ 能力位报 `supported=true`，
+    /// 而真去 `spawn` 时内核直接 `EACCES`（`spawn failed: Permission denied (os error 13)`），
+    /// 端点 500。这类「能力位说能用、一用就炸」比直接置 false 更坑用户：
+    /// UI 不会置灰，用户以为能用。
+    ///
+    /// 判据用 `mode & 0o111`（任一执行位存在）而不是拿 euid 去逐位比对：
+    /// 本面板以 root 跑，root 有 `CAP_DAC_OVERRIDE`，只要**任一**执行位存在就能执行；
+    /// 而一旦三个执行位全空，root 也会拿到 EACCES（execve 对此不做 DAC 放行）。
+    /// 这正是要拦的那一类。用 mode 位判断也与「不执行任何命令」的既有约束一致。
     fn resolved(self) -> Result<PathBuf> {
         let name = self.as_str();
         // 只在这些目录中查找，避免 PATH 劫持。**只列 Linux 布局**——本面板
@@ -123,7 +163,7 @@ impl Bin {
                                   "/usr/local/sbin", "/usr/local/bin"];
         for dir in SEARCH {
             let p = PathBuf::from(dir).join(name);
-            if p.is_file() { return Ok(p); }
+            if is_executable_file(&p) { return Ok(p); }
         }
         Err(PanelError::Unsupported(name))
     }
@@ -698,5 +738,110 @@ mod tests {
         let d = CmdOpt::default();
         assert_eq!(d.max_output, 1024 * 1024);
         assert_eq!(d.timeout, Duration::from_secs(10));
+    }
+
+    // ── 能力位判据：必须「普通文件 + 有执行位」，不能只查存在性 ──────────────
+    //
+    // 回归背景：曾把一个 0 字节普通文件覆盖到 /usr/bin/journalctl 上，
+    // 裸 is_file() 判成可用 ⇒ 能力位 supported=true ⇒ 端点 500(EACCES)。
+    // 「能力位说能用、一用就炸」比直接置 false 更坑：UI 不置灰，用户以为能用。
+    // 所以此判据必须有测试钉住，否则下一次有人为了"省事"把 is_file 换回来，
+    // 单测也不会红。
+
+    /// 临时目录里造文件，权限显式设置；用进程 pid 保证并发安全。
+    #[cfg(unix)]
+    fn scratch(tag: &str, mode: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("panel-cmd-exec-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let f = dir.join("probe");
+        std::fs::write(&f, b"#!/bin/sh\n").expect("写探针");
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(mode)).expect("设权限");
+        f
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn executable_bit_is_required_not_merely_existence() {
+        // 0755：普通文件 + 有执行位 ⇒ 可用
+        let ok = scratch("x755", 0o755);
+        assert!(is_executable_file(&ok), "0755 应判为可执行");
+        // 0644：存在但不可执行 ⇒ 必须判 false（这就是被修掉的那类误判）
+        let no = scratch("x644", 0o644);
+        assert!(no.is_file(), "前置条件：文件确实存在");
+        assert!(!is_executable_file(&no), "0644 存在但不可执行，必须判 false");
+        // 0000：连读都不行，也必须安全返回 false 而不是 panic
+        let none = scratch("x000", 0o000);
+        assert!(!is_executable_file(&none), "0000 必须判 false");
+        for p in [&ok, &no, &none] {
+            let _ = std::fs::remove_dir_all(p.parent().unwrap());
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn directory_and_missing_path_are_not_executable() {
+        // 目录本身带执行位（进入权限），但**不是**可执行文件 ⇒ 必须 false。
+        // 这条防的是「把目录 bind 到二进制路径」那种遮蔽手法被误判成可用。
+        let dir = std::env::temp_dir().join(format!("panel-cmd-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建目录");
+        assert!(!is_executable_file(&dir), "目录不是可执行文件");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let ghost = std::env::temp_dir().join("panel-cmd-definitely-absent-xyzzy");
+        let _ = std::fs::remove_file(&ghost);
+        assert!(!is_executable_file(&ghost), "不存在的路径必须 false");
+    }
+
+    /// 活性自检：本机真实二进制应当判为可执行；否则上面的断言可能因
+    /// 「函数恒返回 false」而假绿。
+    #[test]
+    #[cfg(unix)]
+    fn real_binary_on_this_host_is_executable() {
+        // 用 /bin/sh 作为夹具：任何 Linux 都有，且一定可执行。
+        let sh = Path::new("/bin/sh");
+        if !sh.exists() {
+            eprintln!("[skip] 本机无 /bin/sh，跳过活性自检");
+            return;
+        }
+        assert!(is_executable_file(sh), "活性自检失败：连 /bin/sh 都判成不可执行");
+    }
+
+    /// 符号链接：判据跟随链接看**目标**（`metadata` 而非 `symlink_metadata`）。
+    /// Debian 的 `/usr/bin/*` 大量是 alternatives 软链，若按链接本身的
+    /// 权限判（链接恒为 0777 且不是 file），会把它们全判成不可用。
+    #[test]
+    #[cfg(unix)]
+    fn symlink_follows_target_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("panel-cmd-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+
+        // 链接 → 可执行目标：应判 true
+        let good = dir.join("good");
+        std::fs::write(&good, b"#!/bin/sh\n").expect("写 good");
+        std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o755)).expect("设 755");
+        let lgood = dir.join("lgood");
+        std::os::unix::fs::symlink(&good, &lgood).expect("建软链");
+
+        // 链接 → 不可执行目标：应判 false（不能因为"链接存在"就放行）
+        let bad = dir.join("bad");
+        std::fs::write(&bad, b"x").expect("写 bad");
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o644)).expect("设 644");
+        let lbad = dir.join("lbad");
+        std::os::unix::fs::symlink(&bad, &lbad).expect("建软链");
+
+        // 断链：目标不存在 ⇒ false
+        let ldangle = dir.join("ldangle");
+        std::os::unix::fs::symlink(dir.join("nope"), &ldangle).expect("建断链");
+
+        assert!(is_executable_file(&lgood), "指向 0755 的软链应判可执行");
+        assert!(!is_executable_file(&lbad), "指向 0644 的软链必须判否");
+        assert!(!is_executable_file(&ldangle), "断链必须判否且不 panic");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
