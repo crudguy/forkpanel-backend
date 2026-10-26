@@ -215,7 +215,7 @@ fn run(cli: Cli) -> Result<()> {
             println!("  配置文件：{}", cfg_path.display());
             println!("  数据目录：{}", layout.data_dir().display());
             println!();
-            println!("可用 owner 账号登录面板（前端 http://127.0.0.1:5173，后端 127.0.0.1:2083）。");
+            println!("可用 owner 账号登录面板（生产 http://127.0.0.1:{}；开发模式前端 http://127.0.0.1:5173）。", cfg.server.port);
             Ok(())
         }
 
@@ -394,7 +394,7 @@ fn run(cli: Cli) -> Result<()> {
                     eprintln!("     {tok}");
                     eprintln!();
                     eprintln!(" 面板地址：http://{addr}");
-                    eprintln!(" 远程访问：ssh -L 2083:127.0.0.1:2083 <user>@<server>");
+                    eprintln!(" 远程访问：ssh -L {}:127.0.0.1:{} <user>@<server>", addr.port(), addr.port());
                     eprintln!(" 令牌过期/丢失：重启 panel serve 重新生成");
                     eprintln!("════════════════════════════════════════════════════════");
                 }
@@ -1150,7 +1150,7 @@ fn warn_if_exposed(addr: &std::net::SocketAddr) {
     eprintln!("[panel] ⚠ [security] 监听非回环地址 {addr}");
     eprintln!("  面板以 root 运行，且本构建不提供 HTTPS：此处监听是明文 HTTP。");
     eprintln!("  若这台机器能被局域网/公网访问，root 权限的操作入口即已暴露。");
-    eprintln!("  · 需要远程访问：优先 ssh -L 2083:127.0.0.1:2083 端口转发；");
+    eprintln!("  · 需要远程访问：优先 ssh -L {}:127.0.0.1:{} 端口转发；", addr.port(), addr.port());
     eprintln!("  · 确需直接监听：务必前置反向代理终结 TLS，并用防火墙限制来源 IP；");
     eprintln!("  · 只想本机访问：把 [server] localhost_only 设为 true（它会强制覆盖 bind）。");
     eprintln!("════════════════════════════════════════════════════════");

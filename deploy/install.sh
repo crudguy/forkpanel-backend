@@ -20,6 +20,17 @@ SITE_ROOT=/var/www
 
 die() { echo "install: $1" >&2; exit 1; }
 
+# 发行版端口随机分配 ≥10000，避免固定 2083 被扫描（参考宝塔面板）
+pick_random_port() {
+  for _ in $(seq 1 30); do
+    p=$(( 10000 + (RANDOM * 32768 + RANDOM) % 55536 ))
+    if ! ss -ltn 2>/dev/null | awk 'NR>1{print $4}' | grep -qE "[:.]${p}\$"; then
+      echo "$p"; return 0
+    fi
+  done
+  echo $(( 10000 + (RANDOM * 32768 + RANDOM) % 55536 )); return 0
+}
+
 [ "$(id -u)" -eq 0 ] || die "需要 root 权限（面板要管理系统服务/防火墙）"
 [ -f "$BIN_SRC" ]   || die "找不到二进制：$BIN_SRC（先 cargo build --release，或显式传入路径）"
 command -v systemctl >/dev/null 2>&1 || die "未检测到 systemd（请用 --config 直接运行 serve，或自行接入进程管理器）"
@@ -35,9 +46,12 @@ echo "· 目录已就绪（数据 0700 / 配置·日志 0750）"
 
 if [ -f "$CONF_FILE" ]; then
   echo "· 配置已存在，保留 $CONF_FILE（升级不覆盖）"
+  PORT=$(grep -oE '^port = [0-9]+' "$CONF_FILE" | grep -oE '[0-9]+' || echo 2083)
 else
+  PORT=$(pick_random_port)
   install -m 0640 "$(dirname "$0")/config.toml" "$CONF_FILE"
-  echo "· 默认配置 → $CONF_FILE"
+  sed -i -E "s/^port = [0-9]+/port = $PORT/" "$CONF_FILE"
+  echo "· 默认配置 → $CONF_FILE（监听端口随机分配为 $PORT）"
 fi
 
 "$BIN_DST" --config "$CONF_FILE" systemd-unit --install >/dev/null
@@ -65,8 +79,8 @@ cat <<EOF
        journalctl -u panel -n 50 --no-pager
 
   3. 打开面板并完成初始化
-       本机： http://127.0.0.1:2083
-       远程： ssh -L 2083:127.0.0.1:2083 <user>@<server>   然后访问 http://127.0.0.1:2083
+       本机： http://127.0.0.1:$PORT
+       远程： ssh -L $PORT:127.0.0.1:$PORT <user>@<server>   然后访问 http://127.0.0.1:$PORT
        页面会自动显示"初始化面板"向导，填入令牌 + 账号 + 口令即可。
 
   备用路径（无浏览器/自动化场景）：

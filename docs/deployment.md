@@ -34,6 +34,8 @@ sudo systemctl start panel
 
 `install.sh` 会：装二进制到 `/usr/local/bin/panel`、建目录（数据 0700 / 配置·日志 0750）、写入 `/etc/forkpanel/config.toml`（已存在则不覆盖）、安装并 enable systemd 单元。**它不建账号。**
 
+> **端口不再固定 2083**：新安装时 `install.sh` 会在 `[10000, 65535]` 随机分配一个监听端口并写进 `config.toml`，安装输出与首启横幅都会打印实际端口（参考宝塔面板，降低被扫描概率）。升级（配置已存在）沿用既有端口。dev/test 默认值仍保留 2083（见 `config.rs` 的 `default_port`），不影响开发环境。
+
 ### 2.2 取令牌
 
 首次启动且库中无 owner 时，服务日志会打印醒目横幅：
@@ -49,8 +51,8 @@ journalctl -u panel -n 50 --no-pager
 
      <32 位十六进制令牌>
 
- 面板地址：http://127.0.0.1:2083
- 远程访问：ssh -L 2083:127.0.0.1:2083 <user>@<server>
+ 面板地址：http://127.0.0.1:<端口>   （<端口> 即下方"监听 …"行与安装输出打印的实际端口，已随机分配）
+ 远程访问：ssh -L <端口>:127.0.0.1:<端口> <user>@<server>
  令牌过期/丢失：重启 panel serve 重新生成
 ════════════════════════════════════════════════════════
 ```
@@ -60,9 +62,9 @@ journalctl -u panel -n 50 --no-pager
 ### 2.3 打开面板
 
 ```bash
-# 远程部署：先建隧道（不要改 localhost_only）
-ssh -L 2083:127.0.0.1:2083 <user>@<server>
-# 本机浏览器访问 http://127.0.0.1:2083
+# 远程部署：先建隧道（不要改 localhost_only）；<端口> 为安装时随机分配的监听端口
+ssh -L <端口>:127.0.0.1:<端口> <user>@<server>
+# 本机浏览器访问 http://127.0.0.1:<端口>
 ```
 
 页面自动探测 `GET /api/v1/auth/status`：无 owner 时显示**初始化面板**向导（令牌 + 用户名 + 口令 + 确认，含实时强度提示），提交成功后切回登录表单。
@@ -348,6 +350,6 @@ sudo ./deploy/uninstall.sh
 | 看不到令牌横幅 | 库中已有 owner（走登录）；或横幅在更早的日志里，`journalctl -u panel --no-pager \| grep 令牌` |
 | 提示令牌无效/过期 | 令牌 30 分钟有效且用过即焚：`systemctl restart panel` 重新生成 |
 | 提交弱口令后进不去 | 已按次序修复（校验先行、令牌最后消费）；若仍出现请查版本 |
-| 端口占用 `Address already in use` | 有残留进程：`ss -ltnp \| grep 2083` 后停用旧实例 |
+| 端口占用 `Address already in use` | 有残留进程：`ss -ltnp \| grep <实际端口>` 后停用旧实例 |
 | 远程打不开 | 先确认隧道已建立，且访问的是本机 `127.0.0.1:2083` |
 | `check_data_dir` 失败 | 数据目录不存在，先建目录再 `serve` |
