@@ -7,11 +7,13 @@ use crate::{
     AppState,
 };
 use axum::{
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{header, HeaderMap, StatusCode},
     Json,
 };
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use crate::extract::PanelJson;
 
@@ -400,6 +402,59 @@ pub async fn bootstrap_status(State(state): State<Shared>) -> ApiResult<Json<ser
     Ok(ok(BootstrapStatus { needs_bootstrap: n == 0, token_active: state.bootstrap.active() }))
 }
 
+/// 取引导令牌的响应（data.token = 一次性引导令牌明文）。
+#[derive(Debug, Serialize)]
+pub struct BootstrapTokenResponse {
+    /// 一次性引导令牌明文（== 内存守卫持有的令牌；仅 localhost 可取，bootstrap 后失效）。
+    pub token: String,
+}
+
+/// **无终端初始化**：首启页「从文件读取令牌」按钮经此端点取令牌。
+///
+/// 安全模型（与令牌落盘联动）：
+/// - 令牌文件 `<data_dir>/bootstrap.token` 由 serve 首启写入，权限 0600、root 拥有；
+/// - 本端点**只接受回环地址的 peer**（非 loopback 一律 403）——远程攻击者即使
+///   能访问端口也拿不到令牌；SSH 隧道 / 本地反代终止在 loopback，故可信；
+/// - 仅在 `needs_bootstrap && token_active` 时返回文件内容；bootstrap 成功后文件即删，
+///   此后返回 404（已初始化的面板不会把令牌留在内存或磁盘上）。
+pub async fn bootstrap_token(
+    State(state): State<Shared>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // ① 第一道闸：非回环请求**一律拒绝**，且不暴露任何引导状态（不区分"已初始化/已过期"）。
+    if !is_loopback(addr) {
+        return Err(ApiError::forbidden(
+            "bootstrap-token is only served to loopback peers",
+        ));
+    }
+    // ② 仅首启未初始化且令牌仍有效时才有东西可取。
+    if owner_count(&state).await? > 0 || !state.bootstrap.active() {
+        return Err(ApiError::not_found("bootstrap token unavailable"));
+    }
+    // ③ 取文件内容（== 内存令牌明文；文件不存在 = 不该发生，仍按 404 处理）。
+    let path = state.os.paths().data_dir().join("bootstrap.token");
+    let tok = std::fs::read_to_string(&path)
+        .map_err(|_| ApiError::not_found("bootstrap token unavailable"))?;
+    let tok = tok.trim();
+    if tok.is_empty() {
+        return Err(ApiError::not_found("bootstrap token unavailable"));
+    }
+    Ok(ok(BootstrapTokenResponse { token: tok.to_string() }))
+}
+
+/// 回环判定（纯函数，便于单测）。IPv4 127.0.0.0/8 与 IPv6 ::1 视为回环；
+/// 链路本地（fe80::/10）、私有地址（192.168/10/172.16）、公网地址**都不是**回环——
+/// 它们绝不能当作"本地可信"放行。
+fn is_loopback(addr: SocketAddr) -> bool {
+    addr.ip().is_loopback()
+}
+
+/// bootstrap 成功后删除令牌文件（0600 的明文令牌不应在初始化后残留磁盘）。
+/// 幂等：文件不存在也 OK（如文件从未写出，或已被别的路径删掉）。
+pub(crate) fn clear_bootstrap_token_file(data_dir: &Path) {
+    let _ = std::fs::remove_file(data_dir.join("bootstrap.token"));
+}
+
 #[derive(Debug, Deserialize)]
 pub struct BootstrapReq {
     pub token: String,
@@ -631,6 +686,10 @@ pub async fn bootstrap(
         Ok(panel_db::WriteAck { rows_changed: 2 })
     }).await.map_err(ApiError::from)?;
 
+    // 初始化完成：磁盘上 0600 的明文令牌文件即删（不应在 owner 创建后残留）。
+    let tok_dir = state.os.paths().data_dir();
+    clear_bootstrap_token_file(&tok_dir);
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -678,6 +737,127 @@ mod tests {
         let mut h2 = HeaderMap::new();
         h2.insert(header::FORWARDED, "for=9.9.9.9".parse().unwrap());
         assert_eq!(client_ip(&h2), "unknown", "不可信头不应被采用");
+    }
+
+    // ── 无终端初始化：引导令牌「仅 localhost 可取」+ bootstrap 后文件即删 ──
+
+    /// 回环判定纯函数：IPv4 127/8 与 IPv6 ::1 视为回环；私有/公网/链路本地都不是回环。
+    #[test]
+    fn is_loopback_discriminates() {
+        assert!(is_loopback("127.0.0.1:1234".parse().unwrap()));
+        assert!(is_loopback("127.255.255.254:1".parse().unwrap()));
+        assert!(is_loopback("[::1]:1234".parse().unwrap()));
+        assert!(!is_loopback("203.0.113.9:1234".parse().unwrap()), "公网地址不是回环");
+        assert!(!is_loopback("192.168.1.5:1234".parse().unwrap()), "私有地址不是回环");
+        assert!(!is_loopback("10.0.0.1:1234".parse().unwrap()), "私有地址不是回环");
+        assert!(!is_loopback("[fe80::1]:1234".parse().unwrap()), "链路本地不是回环");
+    }
+
+    /// 引导令牌文件清理：存在即删，且幂等（不存在也不 panic）—— bootstrap 后磁盘不应残留明文。
+    #[test]
+    fn clear_bootstrap_token_file_removes_it() {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("panel-btc-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("bootstrap.token");
+        std::fs::write(&p, "x").unwrap();
+        assert!(p.exists(), "前置：令牌文件应已写入");
+        clear_bootstrap_token_file(&dir);
+        assert!(!p.exists(), "bootstrap 成功后令牌文件必须被删除");
+        // 幂等：不存在也能调用
+        clear_bootstrap_token_file(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 辅助：带上伪造的 ConnectInfo 打一次 bootstrap_token 端点，返回状态码。
+    async fn call_bootstrap_token(app: &axum::Router, addr: std::net::SocketAddr) -> axum::http::StatusCode {
+        let mut req = axum::http::Request::builder()
+            .uri("/api/v1/auth/bootstrap-token")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        // 绕过 make-service 直接注入 ConnectInfo，模拟真实连接的来源地址。
+        req.extensions_mut().insert(axum::extract::ConnectInfo(addr));
+        let res = tower::ServiceExt::oneshot(app.clone(), req).await.expect("router 应能处理请求");
+        res.status()
+    }
+
+    /// **行为测试**：回环判定在真实 handler 上生效——伪造远端 ConnectInfo → 403；回环 → 取令牌。
+    ///
+    /// 同时验证 bootstrap 成功后令牌文件被删除（文件即删路径）。
+    #[tokio::test]
+    async fn bootstrap_token_endpoint_only_over_loopback() {
+        // 带 pid + 序号：并行跑测试时各用各的目录，避免共用一个 t.db / 令牌文件互相干扰
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!("panel-bte-{}-{}", std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let data_dir = base.join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = base.join("t.db");
+        let tier = panel_core::Tier::Nano;
+        {
+            let mut c = panel_db::open(&db_path, tier, "NORMAL").unwrap();
+            panel_db::migrate::apply(&mut c).unwrap();
+        }
+        let writer = std::sync::Arc::new(
+            panel_db::WriterActor::spawn(db_path.clone(), tier, "NORMAL").unwrap());
+        let pool = std::sync::Arc::new(panel_db::ReadPool::new(&db_path, tier).unwrap());
+        let tasks = std::sync::Arc::new(panel_task::TaskRunner::new(
+            writer.clone(), tier, base.join("tasks"), db_path.clone(), "NORMAL".to_string()));
+        let metrics = std::sync::Arc::new(std::sync::Mutex::new(
+            panel_db::aggregator::Aggregator::new(tier)));
+        let layout = panel_os::paths::LinuxPathLayout::default()
+            .with_overrides(None, None, Some(data_dir.clone()), None);
+        let os = std::sync::Arc::new(
+            panel_os::linux::LinuxOsAdapter::with_paths(std::sync::Arc::new(layout)));
+        let state = std::sync::Arc::new(crate::AppState::new(
+            os, writer, pool, tasks, metrics, tier, None, false, 5,
+            std::time::Duration::from_secs(1800), std::time::Duration::from_secs(43_200),
+            90, 50_000, true, true, "NORMAL".to_string(), 7));
+
+        // 写入与内存一致的令牌，并落盘到 data_dir（与 handler 读取路径同源）
+        let tok = "deadbeefdeadbeefdeadbeefdeadbeef";
+        state.bootstrap.set(tok, std::time::Duration::from_secs(60));
+        let tok_path = state.os.paths().data_dir().join("bootstrap.token");
+        std::fs::write(&tok_path, tok).unwrap();
+        assert!(tok_path.exists(), "前置：令牌文件应已落盘");
+
+        let app = crate::routes::build_router(state.clone());
+
+        // ① 远程 peer → 403（不暴露是否已初始化）
+        let res = call_bootstrap_token(&app, "203.0.113.9:55555".parse().unwrap()).await;
+        assert_eq!(res, axum::http::StatusCode::FORBIDDEN, "非回环请求必须 403");
+
+        // ② 回环 peer + 未初始化 + 令牌有效 + 文件存在 → 200 且返回令牌
+        let res = call_bootstrap_token(&app, "127.0.0.1:55555".parse().unwrap()).await;
+        assert_eq!(res, axum::http::StatusCode::OK, "回环未初始化应返回令牌");
+        let mut req2 = axum::http::Request::builder()
+            .uri("/api/v1/auth/bootstrap-token")
+            .body(axum::body::Body::empty()).unwrap();
+        // 与 call_bootstrap_token 一致：手动 oneshot 必须显式注入回环 ConnectInfo，
+        // 否则 handler 的 ConnectInfo 提取失败、返回空体、JSON 解析直接 panic。
+        req2.extensions_mut().insert(axum::extract::ConnectInfo(
+            "127.0.0.1:55555".parse::<std::net::SocketAddr>().unwrap()));
+        let resp = tower::ServiceExt::oneshot(app.clone(), req2).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(bytes.as_ref()).unwrap();
+        assert_eq!(body["data"]["token"].as_str(), Some(tok), "返回的令牌应等于落盘明文");
+
+        // ③ bootstrap 成功后令牌文件被删
+        super::bootstrap(
+            axum::extract::State(state.clone()),
+            crate::extract::PanelJson(BootstrapReq {
+                token: tok.to_string(),
+                username: "owner".to_string(),
+                password: "Tr0ub4dor&3xy".to_string(),
+            }),
+        ).await.expect("bootstrap 应成功");
+        assert!(!tok_path.exists(), "bootstrap 成功后令牌文件必须被删除");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// **源码级守卫**：429 分支必须真的记一次失败（P2-11）。

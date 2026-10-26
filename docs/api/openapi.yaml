@@ -250,6 +250,10 @@ components:
       properties:
         needs_bootstrap: { type: boolean, description: 数据库尚无 owner 账号 }
         token_active:    { type: boolean, description: 引导令牌是否仍有效（false 需重启 serve 重新生成） }
+    BootstrapTokenResponse:
+      type: object
+      properties:
+        token: { type: string, description: 一次性引导令牌明文（仅 localhost 可取，bootstrap 后失效） }
     LoginRequest:
       type: object
       required: [username, password]
@@ -1396,6 +1400,25 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/BootstrapStatusResponse' } } }
+
+  /api/v1/auth/bootstrap-token:
+    get:
+      tags: [auth]
+      security: []
+      summary: 取引导令牌（仅 localhost，供首启页「从文件读取令牌」）
+      description: |
+        仅当数据库无 owner 且引导令牌有效时返回 data.token（一次性引导令牌明文）。
+        令牌由 serve 首启写入 <data_dir>/bootstrap.token（权限 0600、root 拥有）；本端点
+        **只接受回环地址的 peer**（非 loopback 一律 403），远程攻击者即使能访问端口也取不到。
+        bootstrap 成功后该文件立即删除，此后返回 404。
+      responses:
+        '200':
+          description: ok（data.token 即一次性引导令牌）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/BootstrapTokenResponse' } } }
+        '403': { description: 请求来自非回环地址（10003） }
+        '404': { description: 无 owner 不成立 / 令牌已用或已过期（10004） }
 
   /api/v1/auth/bootstrap:
     post:

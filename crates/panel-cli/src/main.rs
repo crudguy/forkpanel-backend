@@ -46,6 +46,19 @@ fn atomic_replace_db(plain: &std::path::Path, db: &std::path::Path) -> Result<()
     Ok(())
 }
 
+/// 把一次性引导令牌明文落盘（权限 0600、进程用户即属主）。
+///
+/// 目的：让**看不到终端输出**的本地用户也能初始化——首启页「从文件读取令牌」按钮
+/// 经 `GET /api/v1/auth/bootstrap-token`（仅 localhost）取到这里的明文。
+/// 与内存守卫不同，这是磁盘上的明文，故权限必须 0600；面板以 root 运行、进程用户即
+/// 文件属主，同机非 root 进程读不到。文件在 bootstrap 成功后由端点删除。
+fn write_bootstrap_token_file(path: &std::path::Path, tok: &str) -> std::io::Result<()> {
+    std::fs::write(path, tok)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    Ok(())
+}
+
 fn load_master_key(data_dir: &std::path::Path) -> Option<MasterKey> {
     let p = bootstrap::master_key_path(data_dir);
     let bytes = if p.exists() {
@@ -386,6 +399,12 @@ fn run(cli: Cli) -> Result<()> {
                 if has_owner == 0 {
                     let tok = panel_api::auth::generate_bootstrap_token();
                     state.bootstrap.set(&tok, std::time::Duration::from_secs(30 * 60));
+                    // 落盘：让看不到终端的本地用户也能初始化（首启页「从文件读取令牌」按钮）。
+                    // 文件 0600、属 root；bootstrap 成功后删除。落盘失败不阻断 serve（终端打印仍可用）。
+                    let tok_path = layout.data_dir().join("bootstrap.token");
+                    if let Err(e) = write_bootstrap_token_file(&tok_path, &tok) {
+                        eprintln!("[panel] ⚠ 引导令牌落盘失败（终端打印仍可用）：{e}");
+                    }
                     eprintln!();
                     eprintln!("════════════════════════════════════════════════════════");
                     eprintln!(" 首次启动：尚无 owner 账号");
@@ -397,6 +416,9 @@ fn run(cli: Cli) -> Result<()> {
                     eprintln!(" 远程访问：ssh -L {}:127.0.0.1:{} <user>@<server>", addr.port(), addr.port());
                     eprintln!(" 令牌过期/丢失：重启 panel serve 重新生成");
                     eprintln!("════════════════════════════════════════════════════════");
+                } else {
+                    // 防御：owner 已存在却残留令牌文件（上一轮 bootstrap 后崩溃未删干净）。
+                    let _ = std::fs::remove_file(layout.data_dir().join("bootstrap.token"));
                 }
 
                 // 非回环监听必须当场说清楚：面板 root 运行 + 明文 HTTP，
@@ -406,7 +428,9 @@ fn run(cli: Cli) -> Result<()> {
 
                 let listener = tokio::net::TcpListener::bind(addr).await
                     .map_err(|e| PanelError::Internal(format!("bind {addr}: {e}")))?;
-                axum::serve(listener, app).await
+                // 接线 ConnectInfo：引导令牌端点据此判定请求是否来自回环地址，
+                // 拒绝非 localhost 取令牌（远程攻击者即使能访问端口也拿不到）。
+                axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await
                     .map_err(|e| PanelError::Internal(format!("serve: {e}")))
             });
             sched.shutdown();

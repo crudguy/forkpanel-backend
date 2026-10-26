@@ -97,6 +97,7 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/version", get(system::version))
         .route("/api/v1/auth/status", get(auth::bootstrap_status))
         .route("/api/v1/auth/bootstrap", post(auth::bootstrap))
+        .route("/api/v1/auth/bootstrap-token", get(auth::bootstrap_token))
         .route("/api/v1/auth/login", post(auth::login));
 
     // ── 系统与监控 ──
