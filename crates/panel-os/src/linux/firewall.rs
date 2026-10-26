@@ -194,8 +194,6 @@ impl FirewallProvider for LinuxFirewall {
             FirewallBackend::Nftables => Capability::no("仅支持 ufw，当前检测到 nftables"),
             FirewallBackend::Iptables => Capability::no("仅支持 ufw，当前检测到 iptables"),
             FirewallBackend::Firewalld => Capability::no("仅支持 ufw，当前检测到 firewalld"),
-            FirewallBackend::WindowsFirewall => Capability::no("仅支持 ufw，当前为 Windows 防火墙"),
-            FirewallBackend::Pf => Capability::no("仅支持 ufw，当前为 pf"),
         }
     }
 

@@ -119,8 +119,6 @@ fn init_name(i: panel_core::InitSystem) -> &'static str {
         panel_core::InitSystem::Systemd => "systemd",
         panel_core::InitSystem::SysV => "sysv",
         panel_core::InitSystem::OpenRc => "openrc",
-        panel_core::InitSystem::Launchd => "launchd",
-        panel_core::InitSystem::Scm => "scm",
         panel_core::InitSystem::Unknown => "unknown",
     }
 }

@@ -13,8 +13,6 @@ pub mod linux;
 pub mod mock_files;
 pub mod mock;
 pub mod paths;
-/// macOS 平台实现（Phase 1：能编译、能启动、能登录；其余能力诚实 Unsupported）。
-pub mod macos;
 /// 敏感路径黑名单（唯一事实源）。linux 与 mock 两路实现共用。
 pub mod sensitive;
 pub mod tls;
@@ -62,19 +60,21 @@ pub trait OsAdapter: Send + Sync + 'static {
 
 /// 按编译目标选择实现。
 ///
-/// 分支顺序即语义：`force-mock` **优先**于一切真实平台（它的用途就是
-/// "在任意机器上用假数据跑通逻辑"）；macOS 次之；再 Linux；最后兜底 mock。
+/// 分支顺序即语义：`force-mock` **优先**于真实平台（它的用途就是
+/// "在任意机器上用假数据跑通逻辑"）；再 Linux；最后兜底 mock。
+///
+/// **本面板只支持 Linux**：Windows 服务器有原生 IIS、macOS 服务器 Apple 已停更，
+/// 两者都不在支持范围内（老板 2026-10 裁决）。非 Linux 目标不提供真实适配器，
+/// 编到别的 target 上只会拿到 mock——显式如此，而不是留一个从未真机跑过的
+/// "看起来支持"的分支。
 pub fn default_adapter() -> Arc<dyn OsAdapter> {
     #[cfg(feature = "force-mock")]
     { Arc::new(mock::MockOsAdapter::new()) }
 
-    #[cfg(all(target_os = "macos", not(feature = "force-mock")))]
-    { Arc::new(macos::MacOsAdapter::new()) }
-
     #[cfg(all(target_os = "linux", not(feature = "force-mock")))]
     { Arc::new(linux::LinuxOsAdapter::new()) }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos", feature = "force-mock")))]
+    #[cfg(not(any(target_os = "linux", feature = "force-mock")))]
     { Arc::new(mock::MockOsAdapter::new()) }
 }
 
@@ -108,19 +108,13 @@ pub fn adapter_with(ov: PathOverrides) -> Arc<dyn OsAdapter> {
         let _ = ov;
         Arc::new(mock::MockOsAdapter::new())
     }
-    #[cfg(all(target_os = "macos", not(feature = "force-mock")))]
-    {
-        let layout = macos::MacPathLayout::default().with_overrides(
-            ov.config_dir, ov.site_root, ov.data_dir, ov.log_dir);
-        Arc::new(macos::MacOsAdapter::with_paths(Arc::new(layout)))
-    }
     #[cfg(all(target_os = "linux", not(feature = "force-mock")))]
     {
         let layout = paths::LinuxPathLayout::default().with_overrides(
             ov.config_dir, ov.site_root, ov.data_dir, ov.log_dir);
         Arc::new(linux::LinuxOsAdapter::with_paths(Arc::new(layout)))
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", feature = "force-mock")))]
+    #[cfg(not(any(target_os = "linux", feature = "force-mock")))]
     {
         let _ = ov;
         Arc::new(mock::MockOsAdapter::new())
@@ -192,8 +186,6 @@ impl OsAdapter for linux::LinuxOsAdapter {
             Capability::yes(match self.logs.backend() {
                 panel_core::LogBackend::Journald => "journald",
                 panel_core::LogBackend::File => "file",
-                panel_core::LogBackend::EventLog => "eventlog",
-                panel_core::LogBackend::OsLog => "oslog",
             })
         } else {
             Capability::no("no_log_source")

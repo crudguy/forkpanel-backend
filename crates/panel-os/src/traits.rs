@@ -118,7 +118,7 @@ pub struct ProcessInfo {
 
 // ═══════════════════════════ 进程 ═══════════════════════════
 
-/// 信号语义按平台解释（POSIX SIGTERM / Windows CTRL_CLOSE 等），业务层不得假设数值
+/// 信号语义按平台解释（Linux 上为 POSIX 的 TERM / KILL / HUP），业务层不得假设数值
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessSignal { Terminate, Kill, Reload }
 
@@ -641,12 +641,11 @@ pub trait UserProvider: Send + Sync {
 
 // ═══════════════════════════ 存储与权限 ═══════════════════════════
 
-/// 权限变更的**不透明描述**：POSIX 是 mode+uid/gid，Windows 是 ACL，
-/// 业务层不得假设 0o644 或 chown 语义
+/// 权限变更的**不透明描述**：POSIX 是 mode+uid/gid，业务层不得假设
+/// 具体 chmod/chown 语义。本面板只支持 Linux，故不保留 ACL 变体。
 #[derive(Debug, Clone)]
 pub enum PermissionOp {
     Posix { mode: u32, owner: Option<String>, group: Option<String> },
-    Windows { inherit: bool, read_only: bool },
     Noop,
 }
 

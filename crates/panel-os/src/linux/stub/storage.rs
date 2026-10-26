@@ -20,7 +20,6 @@ impl StorageProvider for LinuxStorage {
                 tokio::fs::set_permissions(path.as_path(), std::fs::Permissions::from_mode(mode)).await
                     .map_err(|e| PanelError::Internal(e.to_string()))
             }
-            PermissionOp::Windows { .. } => unsupported!("storage.permissions: not a POSIX platform"),
             PermissionOp::Noop => Ok(()),
         }
     }

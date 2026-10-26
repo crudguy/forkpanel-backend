@@ -846,7 +846,7 @@ pub(crate) fn mem_limit_is_safe(m: &str) -> bool {
 /// 但 UI 提示里会同时给出"加入 docker 组 / 启动 daemon"两条排查建议。
 fn socket_connectable(p: &Path) -> bool {
     if p.as_os_str().is_empty() {
-        return false; // 该平台无 unix socket 概念（如 Windows 命名管道）
+        return false; // 未配置 socket 路径（无从探测，按不可达处理）
     }
     std::os::unix::net::UnixStream::connect(p).is_ok()
 }

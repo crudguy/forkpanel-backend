@@ -83,13 +83,7 @@ pub enum Bin {
     /// 用户脚本的唯一出口：cron/手动触发的 command 是任意 shell 串，
     /// 不能也不该塞进上面的白名单——统一经 `sh -c` 走这里，保留超时与降权。
     Sh,
-    /// macOS 版本查询（`sw_vers -productVersion`）。安全评估：① 专用于 Darwin
-    /// 平台探测，**不接受任何调用方传入的 argv**——参数在 provider 侧写死为
-    /// `-productVersion`；② 只读，无写入/网络；③ 走 cmd 唯一出口，不额外开
-    /// `std::process::Command`（CI 门禁 [1] 强制）。
-    SwVers,
-    /// 内核版本查询（`uname -r`）。两端都在用：Linux 读内核版本、macOS 读
-    /// Darwin 版本。同样只读、argv 写死，仅允许 `-r`/`-s`/`-m` 这类查询开关。
+    /// 内核版本查询（`uname -r`）。只读、argv 写死，仅允许 `-r`/`-s`/`-m` 这类查询开关。
     Uname,
 }
 
@@ -115,25 +109,18 @@ impl Bin {
             Usermod => "usermod",
             Df => "df", Stat => "stat",
             Sh => "sh",
-            SwVers => "sw_vers", Uname => "uname",
+            Uname => "uname",
         }
     }
 
     /// 解析后的绝对路径在构造期确定；找不到就禁用该能力（能力矩阵置 false）
     fn resolved(self) -> Result<PathBuf> {
         let name = self.as_str();
-        // 只在这些目录中查找，避免 PATH 劫持。
-        // macOS 没有 /bin/sbin 之外的 Linux 布局（没有 /usr/local/sbin），
-        // 但 /usr/local/bin、/opt/homebrew/bin 是 Homebrew 的安装位置，必须收进来，
-        // 否则 macOS 上除系统自带二进制外一律判为"不可用"。
-        #[cfg(target_os = "linux")]
+        // 只在这些目录中查找，避免 PATH 劫持。**只列 Linux 布局**——本面板
+        // 不支持其他平台（见 panel-core 平台枚举注释），留别家的路径只会
+        // 让人以为那边也能跑。
         const SEARCH: &[&str] = &["/usr/sbin", "/usr/bin", "/sbin", "/bin",
                                   "/usr/local/sbin", "/usr/local/bin"];
-        #[cfg(target_os = "macos")]
-        const SEARCH: &[&str] = &["/usr/bin", "/bin", "/usr/sbin", "/sbin",
-                                  "/opt/homebrew/bin", "/usr/local/bin"];
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        const SEARCH: &[&str] = &["/usr/bin", "/bin"];
         for dir in SEARCH {
             let p = PathBuf::from(dir).join(name);
             if p.is_file() { return Ok(p); }
@@ -367,61 +354,6 @@ fn truncate(s: &str, n: usize) -> String {
     if s.len() <= n { s.to_string() } else { format!("{}…(truncated)", &s[..n]) }
 }
 
-/// 同步执行一条**只读探测**命令，返回裁剪后的 stdout；任何失败一律 `None`。
-///
-/// 为什么需要它，而不能让调用方自己 `std::process::Command`：
-/// 1. 门禁 [1] 要求全项目子进程只从本文件派出——平台探测也不例外；
-/// 2. `OsAdapter::platform()` 是**同步**签名（结果在构造期缓存），此处不能用
-///    `run().await`，所以必须有一个阻塞版本；
-/// 3. 白名单（`Bin`）+ 固定 PATH + 清环境变量 + stdin 关闭，四项安全属性都集中在
-///    本文件，横出一个"顺便用 std::process"的分支等于把这四项全都绕过。
-///
-/// 只允许给**编译期写死**的只读开关（如 `-productVersion`/`-r`）；不接受
-/// 用户可控 argv。超时由调用方通过 `timeout_ms` 指定，防「探测命令挂死拖住启动」。
-pub fn run_probe_sync(bin: Bin, args: &[&str], timeout_ms: u64) -> Option<String> {
-    let program = bin.resolved().ok()?;
-    // 刻意用 std 的同步 Command（不是上面的 tokio 版）：本函数在同步上下文被调用，
-    // 而且探测命令极短，不值得为它拉起一个 runtime。
-    let mut cmd = std::process::Command::new(program);
-    cmd.args(args);
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::null());
-    cmd.env_clear();
-    // 与 `run()` 同源的安全 PATH；macOS 的 Homebrew 目录不在其中也无妨：
-    // 探测目标（sw_vers/uname）都是系统自带、位于 /usr/bin。
-    cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
-    cmd.env("LANG", "C");
-    cmd.env("LC_ALL", "C");
-    // 探测命令不该等输入，也不该继承任何工作目录语义
-    cmd.current_dir("/");
-
-    // 阻塞等待，但带超时：用后台线程 wait + 主线程 recv_timeout。
-    // 超时就放弃结果（子进程留在后台自生自灭——它是只读探测，不会改系统）。
-    let mut child = cmd.spawn().ok()?;
-    let stdout = child.stdout.take()?;
-    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
-    std::thread::spawn(move || {
-        use std::io::Read;
-        let mut buf = Vec::new();
-        let mut r = stdout;
-        let _ = r.read_to_end(&mut buf);
-        let _ = tx.send(buf);
-    });
-    let handle = std::thread::spawn(move || child.wait());
-    match rx.recv_timeout(std::time::Duration::from_millis(timeout_ms)) {
-        Ok(bytes) => {
-            let _ = handle.join();
-            let s = String::from_utf8_lossy(&bytes).trim().to_string();
-            if s.is_empty() { None } else { Some(s) }
-        }
-        Err(_) => {
-            tracing::warn!("probe {:?} timed out after {timeout_ms}ms", bin);
-            None
-        }
-    }
-}
-
 // ═══════════════════════ 交互式 PTY（Web 终端） ═══════════════════════
 //
 // 为什么必须放在本文件：这里的"全项目唯一子进程出口"是一条硬不变量
@@ -429,47 +361,16 @@ pub fn run_probe_sync(bin: Bin, args: &[&str], timeout_ms: u64) -> Option<String
 
 /// PTY slave 设备名缓冲（内核保证 `/dev/pts/N` 远短于该长度）
 const PTY_NAME_MAX: usize = 128;
-/// 串行化「非可重入的从设备名查询」。
-///
-/// 只在非 Linux 上有意义：Linux 走可重入的 `ptsname_r`，不需要它；macOS/BSD 只有
-/// 返回静态缓冲的 `ptsname`，必须靠它保证两次并发 `open_pty` 不会互相覆盖路径。
-/// 用 cfg 门控而非 `#[allow(dead_code)]`：Linux 上它不该存在，而不是"存在但没用到"。
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-static PTY_NAME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// 子进程环境里的安全 PATH（与 `run()` 保持一致，不复用调用方 PATH）
 const PTY_SAFE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// 把 PTY master 对应的从设备路径写进 `buf`（含结尾 NUL）；失败返回 false。
 ///
-/// Linux 与 BSD 的差别不是风格问题：`ptsname_r` 是 GNU 扩展，在 Darwin 的
-/// libc 里**根本不存在**（编译期就找不到符号），所以只能平台分叉。
+/// 走 `ptsname_r`：它可重入、结果直接写进调用方缓冲，并发 `open_pty` 之间
+/// 不会互相覆盖。本面板只支持 Linux，故不再保留返回静态缓冲的 `ptsname` 分支。
 fn pty_slave_name(master: i32, buf: &mut [libc::c_char; PTY_NAME_MAX]) -> bool {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        // SAFETY: buf 由调用方保证长度 PTY_NAME_MAX，与 len 参数一致
-        unsafe { libc::ptsname_r(master, buf.as_mut_ptr(), buf.len()) == 0 }
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    {
-        // `ptsname` 返回指向 libc 内部静态缓冲的指针；先持锁再拷贝、拷完才放锁，
-        // 这样静态缓冲在被读取的整个窗口内不会被另一次调用重写。
-        // 用 lock_recover：本锁只保护一块可重建的路径缓冲，中毒后继续用是安全的。
-        let _guard = panel_core::sync::lock_recover(&PTY_NAME_LOCK);
-        // SAFETY: master 是调用方刚 unlockpt 成功的有效 fd
-        let p = unsafe { libc::ptsname(master) };
-        if p.is_null() {
-            return false;
-        }
-        // SAFETY: 成功返回时 p 指向 libc 拥有的 NUL 结尾串；strlen 前先截到 buf 容量
-        let len = unsafe { libc::strlen(p) };
-        if len >= buf.len() {
-            return false;
-        }
-        // SAFETY: len < buf.len() 已确认，源串与目标缓冲不重叠
-        unsafe { std::ptr::copy_nonoverlapping(p, buf.as_mut_ptr(), len) };
-        buf[len] = 0;
-        true
-    }
+    // SAFETY: buf 由调用方保证长度 PTY_NAME_MAX，与 len 参数一致
+    unsafe { libc::ptsname_r(master, buf.as_mut_ptr(), buf.len()) == 0 }
 }
 
 /// PTY 的**读半边**：独占 master 原件，交给专门的读任务。
@@ -568,9 +469,7 @@ fn set_winsize(fd: std::os::unix::io::RawFd, cols: u16, rows: u16) -> Result<()>
         ws_row: rows.max(1), ws_col: cols.max(1), ws_xpixel: 0, ws_ypixel: 0,
     };
     // SAFETY: fd 来自本模块持有的 master；ioctl 参数与 TIOCSWINSZ 约定一致
-    // 第二个参数要 `as libc::c_ulong`：BSD/macOS 的 ioctl request 声明为
-    // `c_ulong`(u64)，而 TIOCSWINSZ 常量字面量是 u32，Linux 上能隐式兼容、BSD 上不能。
-    let r = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ as libc::c_ulong, &ws) };
+    let r = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &ws) };
     if r != 0 {
         return Err(PanelError::Io(format!("TIOCSWINSZ 失败: {}", std::io::Error::last_os_error())));
     }
@@ -591,9 +490,7 @@ fn open_pty(cols: u16, rows: u16) -> std::io::Result<(i32, std::fs::File)> {
         if libc::unlockpt(master) != 0 {
             let e = std::io::Error::last_os_error(); libc::close(master); return Err(e);
         }
-        // 取从设备路径：Linux 有可重入的 `ptsname_r`，BSD/macOS **没有**——那边只有
-        // 返回静态缓冲的 `ptsname`。它由 `PTY_NAME_LOCK` 串行化，所以同一时刻
-        // 只有一次调用在用那块静态缓冲（不这样做，两个并发开会话会读到彼此的路径）。
+        // 取从设备路径（`ptsname_r`，可重入，并发开会话互不干扰）。
         let mut name = [0 as libc::c_char; PTY_NAME_MAX];
         if !pty_slave_name(master, &mut name) {
             let e = std::io::Error::last_os_error(); libc::close(master); return Err(e);
@@ -657,8 +554,7 @@ pub fn spawn_pty(shell: Bin, cols: u16, rows: u16, cwd: Option<&std::path::Path>
             }
             if slave_fd > 2 { libc::close(slave_fd); }
             // 接管控制终端；失败不致命（如已存在控制终端），故忽略返回值
-            // request 需转 `c_ulong`，理由同 `set_winsize`
-            libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0);
+            libc::ioctl(0, libc::TIOCSCTTY, 0);
             Ok(())
         });
     }
@@ -706,50 +602,6 @@ mod tests {
         assert_eq!(Bin::Nft.as_str(), "nft");
         assert_eq!(Bin::Systemctl.as_str(), "systemctl");
         assert_eq!(Bin::Bash.as_str(), "bash");
-    }
-
-    /// 探测出口在**两个平台**都必须真的能跑：Linux 上取内核版本，macOS 上取
-    /// Darwin 版本。这条测试的价值是钉住"`Bin::Uname` 在两边的搜索目录里都能
-    /// 解析到"——若把 macOS 的 SEARCH 目录写错（例如只留 /usr/local/bin），
-    /// 在 macOS 上探测会静默返回 None，而能力矩阵看不出来。
-    #[test]
-    fn probe_sync_returns_kernel_version() {
-        if !Bin::Uname.available() {
-            eprintln!("[skip] 本机无 uname，跳过探测出口测试");
-            return;
-        }
-        let v = run_probe_sync(Bin::Uname, &["-r"], 2000)
-            .expect("uname -r 必须返回内容");
-        assert!(!v.trim().is_empty(), "内核版本不应为空串");
-        // 只断言"像个版本"，不钉死具体值（Linux/macOS 都成立）
-        assert!(v.chars().next().unwrap().is_ascii_digit(), "应以数字开头，实际 {v:?}");
-    }
-
-    /// 不存在的 `Bin` 必须返回 `None` 而不是 panic 或空串。
-    /// 用 `sw_vers`：Linux 上必然解析不到，正好像负向样例。
-    #[test]
-    fn probe_sync_returns_none_when_binary_missing() {
-        if Bin::SwVers.available() {
-            eprintln!("[skip] 本机竟有 sw_vers（macOS），跳过缺失分支");
-            return;
-        }
-        assert_eq!(run_probe_sync(Bin::SwVers, &["-productVersion"], 2000), None);
-    }
-
-    /// 超时必须返回 `None` 而不是永久阻塞。
-    /// 用 `sh -c 'sleep 5'` 造一个真会挂住的子进程，超时设 100ms。
-    #[test]
-    fn probe_sync_respects_timeout() {
-        if !Bin::Sh.available() {
-            eprintln!("[skip] 本机无 sh，跳过超时分支");
-            return;
-        }
-        let t0 = std::time::Instant::now();
-        let r = run_probe_sync(Bin::Sh, &["-c", "sleep 5"], 100);
-        let elapsed = t0.elapsed();
-        assert_eq!(r, None, "超时应返回 None");
-        assert!(elapsed < std::time::Duration::from_secs(3),
-                "应在超时后立刻返回，实际耗时 {elapsed:?}");
     }
 
     #[test]

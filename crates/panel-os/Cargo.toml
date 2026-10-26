@@ -20,8 +20,6 @@ serde_json = { workspace = true }
 
 [features]
 default = []
-# Windows 只读能力先行（设计方案 §0.4.2 Step 2）
-os-windows = []
 # 强制使用内存实现（CI / 非 Linux 开发环境）
 force-mock = []
 

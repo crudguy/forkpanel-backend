@@ -1,7 +1,7 @@
 //! panel-core：领域模型、错误类型、能力矩阵、公共类型。
 //!
 //! 纪律：本 crate **不得依赖任何 IO**（无 std::fs / std::process / 网络 / 数据库），
-//! 以便在 Windows/macOS 实现与单元测试中零成本复用。
+//! 以便平台实现与单元测试中零成本复用。
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -95,9 +95,14 @@ impl PanelError {
 // 关键设计：前端**禁止**写 `if (isLinux)`，只能读后端下发的 capabilities 位。
 // 这是"避免硬编码 Linux 假设"在 UI 侧的对应纪律。
 
+// **只支持 Linux**（老板 2026-10 裁决）：Windows 服务器有原生 IIS、macOS 服务器
+// Apple 已停更，两者都不在支持范围。因此下面的平台枚举**只有 Linux 侧变体**——
+// 留着 Windows/Macos 之类的变体等于对外声称"可能支持"，而这些分支从未真机跑过，
+// 属于"假装可移植"。真要加平台时再加变体，而不是预先留着占位。
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Os { Linux, Windows, Macos }
+pub enum Os { Linux }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -106,17 +111,17 @@ pub enum Arch { X86_64, Aarch64, Armv7, X86 }
 /// init 系统 / 服务管理器类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum InitSystem { Systemd, SysV, OpenRc, Launchd, Scm, Unknown }
+pub enum InitSystem { Systemd, SysV, OpenRc, Unknown }
 
 /// 防火墙后端
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum FirewallBackend { Nftables, Iptables, Ufw, Firewalld, Pf, WindowsFirewall, None }
+pub enum FirewallBackend { Nftables, Iptables, Ufw, Firewalld, None }
 
 /// 日志后端
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum LogBackend { Journald, File, EventLog, OsLog }
+pub enum LogBackend { Journald, File }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlatformInfo {

@@ -82,8 +82,6 @@ fn backend_name(b: panel_core::FirewallBackend) -> &'static str {
         panel_core::FirewallBackend::Iptables => "iptables",
         panel_core::FirewallBackend::Ufw => "ufw",
         panel_core::FirewallBackend::Firewalld => "firewalld",
-        panel_core::FirewallBackend::WindowsFirewall => "wf",
-        panel_core::FirewallBackend::Pf => "pf",
         panel_core::FirewallBackend::None => "none",
     }
 }

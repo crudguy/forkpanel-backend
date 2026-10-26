@@ -7,7 +7,7 @@
 //!   是进程内 tokio 定时器，面板停了就不跑。
 //!
 //! # 表达式校验必须由平台实现做
-//! 业务层**绝不**自己解析 cron 五段——Windows 任务计划用 XML，macOS 用 plist。
+//! 业务层**绝不**自己解析 cron 五段——表达式语义属于平台实现，不属于业务层。
 //! 统一走 `SchedulerProvider::validate_expression` + `next_fire_times`。
 
 use crate::{
@@ -142,7 +142,7 @@ fn merge_job(j: panel_os::ScheduledJob, meta: Option<&CronMeta>, next: Vec<i64>)
 #[derive(Debug, Deserialize)]
 pub struct CreateReq {
     pub name: String,
-    /// **平台本地表达式**。Linux 是 cron 五段，Windows/macOS 是别的格式
+    /// **平台本地表达式**（本面板为 cron 五段）
     pub expr: String,
     pub command: String,
     pub user: Option<String>,

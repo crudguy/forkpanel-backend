@@ -37,7 +37,7 @@ impl MemFs {
 
 pub struct MockFiles {
     inner: Arc<Mutex<MemFs>>,
-    /// 模拟 Windows：路径大小写不敏感（用于验证"业务层不做大小写假设"）
+    /// 模拟大小写不敏感的文件系统（用于验证"业务层不做大小写假设"）
     pub case_insensitive: bool,
 }
 

@@ -247,6 +247,28 @@ else
   echo "  · 未检测到 cargo（跳过）"
 fi
 
+echo "== [9] 仅支持 Linux（不重新引入 macOS / Windows） =="
+# 老板 2026-10 裁决：Windows 服务器有原生 IIS、macOS 服务器 Apple 已停更，本面板
+# **只做 Linux**。两类东西一旦回流就说明纪律松了：
+#   ① 平台目录 / 源文件（`src/macos/`、`src/windows/`、`*_win.rs` 等）；
+#   ② 平台条件编译分支（`cfg(target_os = "macos")`、`cfg(windows)`）——它们会
+#      把从未真机跑过的代码路径伪装成"支持"。
+# 注意：判定**必须**剔注释——本仓库大量注释在解释"为什么不支持 macOS"，
+# 按原文匹配会被自己的说明绊倒（[4]/[4c] 踩过同一个坑）。
+PLAT_DIRS=$(find crates -type d \( -name macos -o -name windows -o -name darwin \) 2>/dev/null || true)
+PLAT_FILES=$(find crates -type f -name '*.rs' \( -name '*_win.rs' -o -name '*_win32.rs' \
+             -o -name '*_macos.rs' -o -name '*_darwin.rs' \) 2>/dev/null || true)
+PLAT_CFG=$(grep -rn --include="*.rs" -E \
+  'cfg\([^)]*(target_os[[:space:]]*=[[:space:]]*"(macos|windows|ios|freebsd|openbsd|netbsd|dragonfly)"|\(windows\)|target_family[[:space:]]*=[[:space:]]*"windows")' \
+  crates/ 2>/dev/null | strip_comments | allow_filter 9)
+PLAT_HITS=$(printf '%s\n%s\n%s' "$PLAT_DIRS" "$PLAT_FILES" "$PLAT_CFG" | sed '/^$/d')
+if [ -n "$PLAT_HITS" ]; then
+  note_fail "出现非 Linux 平台代码（本面板只支持 Linux）："
+  echo "$PLAT_HITS" | sed 's/^/      /'
+else
+  note_ok "无非 Linux 平台目录 / 源文件 / 条件编译分支"
+fi
+
 echo
 if [ "$FAIL" -eq 0 ]; then
   echo "PASS：全部架构门禁通过"

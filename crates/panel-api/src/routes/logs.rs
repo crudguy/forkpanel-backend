@@ -68,9 +68,6 @@ fn log_backend_name(b: panel_core::LogBackend) -> &'static str {
     match b {
         panel_core::LogBackend::Journald => "journald",
         panel_core::LogBackend::File => "file",
-        panel_core::LogBackend::EventLog => "eventlog",
-        // LogBackend 的实际变体为 Journald / File / EventLog / OsLog（无 Unified / None）
-        panel_core::LogBackend::OsLog => "oslog",
     }
 }
 

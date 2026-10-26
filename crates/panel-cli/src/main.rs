@@ -1137,17 +1137,16 @@ fn load_cfg(cli: &Cli, layout: &dyn panel_os::PathLayout) -> Result<Config> {
 /// 用配置文件中的覆盖值构造路径布局。
 /// 关键：覆盖之后仍然只通过 `PathLayout` 访问，业务层不出现路径字面量。
 ///
-/// 返回 `Arc<dyn PathLayout>` 而**不是** `LinuxPathLayout`：后者是本 crate 绑死
-/// Linux 的最后一处（业务层其余部分早已只认 trait）。持有具体类型时，macOS/Windows
-/// 目标上 CLI 会拿着 `/etc/forkpanel`、`/var/www` 这类不存在的目录继续跑，
-/// 且编译期毫无提示。
+/// 返回 `Arc<dyn PathLayout>` 而**不是** `LinuxPathLayout`：后者会让 CLI 绑死具体
+/// 实现（业务层其余部分早已只认 trait）。持有具体类型时，布局的构造点就多了一处，
+/// 与适配器内部的布局静默分叉，且编译期毫无提示。
 ///
 /// 构造必须经 `panel_os::layout_with_overrides()`：`adapter_with()` 内部用的是
 /// **同一个工厂**，从而保证"适配器持有的布局"与"CLI 建目录/打印的布局"永远同源。
 /// 此前两处各建一份 `LinuxPathLayout`、靠参数巧合保持一致，任一处改动都会静默分叉。
 ///
-/// `_os` 参数保留但不用：当前各平台布局都不依赖运行时探测（纯配置 + 平台默认值）。
-/// 若将来某平台需要探测（如 Windows 的盘符），在工厂内部实现，**不要**在这里加分支
+/// `_os` 参数保留但不用：布局不依赖运行时探测（纯配置 + 平台默认值）。
+/// 若将来需要探测（如挂载点），在工厂内部实现，**不要**在这里加分支
 /// ——否则平台知识又漏回 CLI 层（CI 门禁 [4] 会拦）。
 fn build_layout(_os: &Arc<dyn panel_os::OsAdapter>, cfg: Option<&Config>) -> Arc<dyn panel_os::PathLayout> {
     let ov = match cfg {

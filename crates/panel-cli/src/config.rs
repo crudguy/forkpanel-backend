@@ -230,8 +230,8 @@ pub fn parse_duration(s: &str) -> Result<std::time::Duration> {
 
 /// 生成默认配置文本。
 ///
-/// 路径默认值**由 PathLayout 注入**而非写死在模板里 —— 这样 Windows/macOS 接入后
-/// 生成的模板自动反映该平台的默认目录。
+/// 路径默认值**由 PathLayout 注入**而非写死在模板里 —— 这样改默认目录只需动
+/// 一个地方，模板不会与被测的布局分叉。
 pub fn template(config_dir: &std::path::Path, data_dir: &std::path::Path,
                 site_root: &std::path::Path) -> String {
     let cfg = config_dir.display();

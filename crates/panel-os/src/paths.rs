@@ -23,10 +23,10 @@ pub trait PathLayout: Send + Sync {
     fn script_dir(&self) -> PathBuf;        // 计划任务脚本（受限目录，防任意命令）
     fn backup_dir(&self) -> PathBuf;
     /// 容器守护进程的本地套接字（Linux: docker/podman 的 unix socket）。
-    /// 返回**空路径**表示该平台无此概念（如 Windows 走命名管道）。
+    /// 返回**空路径**表示本平台无此概念（Linux 上恒为真实 socket 路径）。
     /// 这是"守护进程是否可达"探测的入口——二进制存在不代表可用。
     fn container_socket(&self) -> PathBuf;
-    /// 默认站点运行身份（Linux: www-data；Windows: IIS AppPool 身份；macOS: _www）
+    /// 默认站点运行身份（Linux: www-data）
     fn default_web_user(&self) -> &'static str;
     fn sqlite_path(&self) -> PathBuf { self.data_dir().join("panel.db") }
 }
@@ -118,15 +118,6 @@ pub fn layout_with_overrides(ov: &PathOverrides) -> std::sync::Arc<dyn PathLayou
         let _ = ov;
         std::sync::Arc::new(crate::mock::MockPathLayout)
     }
-    #[cfg(all(target_os = "macos", not(feature = "force-mock")))]
-    {
-        std::sync::Arc::new(crate::macos::MacPathLayout::default().with_overrides(
-            ov.config_dir.clone(),
-            ov.site_root.clone(),
-            ov.data_dir.clone(),
-            ov.log_dir.clone(),
-        ))
-    }
     #[cfg(all(target_os = "linux", not(feature = "force-mock")))]
     {
         std::sync::Arc::new(LinuxPathLayout::default().with_overrides(
@@ -136,9 +127,9 @@ pub fn layout_with_overrides(ov: &PathOverrides) -> std::sync::Arc<dyn PathLayou
             ov.log_dir.clone(),
         ))
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", feature = "force-mock")))]
+    #[cfg(not(any(target_os = "linux", feature = "force-mock")))]
     {
-        // 未接入的真实平台（Windows）：先用 mock 内存视图占位，诚实降级。
+        // 非 Linux 目标（本面板不支持，见 panel-core 的平台枚举注释）：用 mock 内存视图。
         let _ = ov;
         std::sync::Arc::new(crate::mock::MockPathLayout)
     }
@@ -199,37 +190,6 @@ impl PathLayout for LinuxPathLayout {
     /// 不在探测范围内——面板通常以服务身份运行，探测的是系统级 daemon。
     fn container_socket(&self) -> PathBuf { PathBuf::from("/var/run/docker.sock") }
     fn default_web_user(&self) -> &'static str { "www-data" }
-}
-
-// ───────────────────────── Windows 实现（预留骨架） ─────────────────────────
-// 接入顺序见设计方案 §0.4.2 Step 2：先实现只读 trait，此处仅给出 PathLayout 形状。
-// 注意：使用 `PathBuf::join`（而非 '/' 字面量），sep() 不再需要——Rust 的 Path 已处理分隔符。
-
-#[cfg(feature = "os-windows")]
-pub struct WindowsPathLayout { program_data: PathBuf }
-
-#[cfg(feature = "os-windows")]
-impl Default for WindowsPathLayout {
-    fn default() -> Self { Self { program_data: PathBuf::from(r"C:\ProgramData\forkpanel") } }
-}
-
-#[cfg(feature = "os-windows")]
-impl PathLayout for WindowsPathLayout {
-    fn config_dir(&self) -> PathBuf { self.program_data.join("config") }
-    fn data_dir(&self) -> PathBuf { self.program_data.join("data") }
-    fn log_dir(&self) -> PathBuf { self.program_data.join("logs") }
-    fn cache_dir(&self) -> PathBuf { self.program_data.join("cache") }
-    fn tmp_dir(&self) -> PathBuf { self.program_data.join("tmp") }
-    fn site_root(&self) -> PathBuf { self.program_data.join("sites") }
-    fn web_conf_dir(&self) -> PathBuf { self.program_data.join("iis") }   // IIS 走 appcmd，非文件优先
-    fn web_log_dir(&self) -> PathBuf { self.program_data.join("logs").join("web") }
-    fn service_dir(&self) -> PathBuf { PathBuf::new() }                    // SCM 无单元文件概念
-    fn cron_dir(&self) -> PathBuf { self.program_data.join("tasks") }
-    fn script_dir(&self) -> PathBuf { self.program_data.join("scripts") }
-    fn backup_dir(&self) -> PathBuf { self.program_data.join("backups") }
-    /// Windows 上 Docker 走命名管道（npipe:////./pipe/docker_engine），无 unix socket
-    fn container_socket(&self) -> PathBuf { PathBuf::new() }
-    fn default_web_user(&self) -> &'static str { "IIS AppPool\\DefaultAppPool" }
 }
 
 // ───────────────────────── 路径沙箱 ─────────────────────────
