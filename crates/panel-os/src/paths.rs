@@ -43,6 +43,7 @@ pub trait PathLayout: Send + Sync {
 /// - 逐个调用点写 `&*layout0`：可行，但 15 处手改易漏，且新增调用点还会再踩；
 /// - 本 blanket impl：一次修复，`&Arc<dyn PathLayout>` 直接满足约束，
 ///   对 `Arc` 包装的任何持有方式都成立。
+///
 /// 选后者：它让"持有布局"的形式对调用方透明，正是跨平台本来要的效果。
 impl PathLayout for std::sync::Arc<dyn PathLayout> {
     fn config_dir(&self) -> PathBuf { (**self).config_dir() }
@@ -112,6 +113,20 @@ impl PathOverrides {
 /// 返回值是 `Arc<dyn PathLayout>`（而非具体类型）——CLI 若持有 `LinuxPathLayout`
 /// 具体类型，就绑死 Linux，非 Linux 目标编译不过（CI 门禁 [4c] 的同源问题）。
 pub fn layout_with_overrides(ov: &PathOverrides) -> std::sync::Arc<dyn PathLayout> {
+    #[cfg(feature = "force-mock")]
+    {
+        let _ = ov;
+        std::sync::Arc::new(crate::mock::MockPathLayout)
+    }
+    #[cfg(all(target_os = "macos", not(feature = "force-mock")))]
+    {
+        std::sync::Arc::new(crate::macos::MacPathLayout::default().with_overrides(
+            ov.config_dir.clone(),
+            ov.site_root.clone(),
+            ov.data_dir.clone(),
+            ov.log_dir.clone(),
+        ))
+    }
     #[cfg(all(target_os = "linux", not(feature = "force-mock")))]
     {
         std::sync::Arc::new(LinuxPathLayout::default().with_overrides(
@@ -121,10 +136,9 @@ pub fn layout_with_overrides(ov: &PathOverrides) -> std::sync::Arc<dyn PathLayou
             ov.log_dir.clone(),
         ))
     }
-    #[cfg(any(not(target_os = "linux"), feature = "force-mock"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", feature = "force-mock")))]
     {
-        // mock 布局是内存视图，配置覆盖无意义；显式丢弃以避免"看起来生效了"。
-        // 真实非 Linux 平台（macOS）在 Phase 1 接入时在此前置分支。
+        // 未接入的真实平台（Windows）：先用 mock 内存视图占位，诚实降级。
         let _ = ov;
         std::sync::Arc::new(crate::mock::MockPathLayout)
     }

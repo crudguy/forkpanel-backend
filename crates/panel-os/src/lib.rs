@@ -13,6 +13,8 @@ pub mod linux;
 pub mod mock_files;
 pub mod mock;
 pub mod paths;
+/// macOS 平台实现（Phase 1：能编译、能启动、能登录；其余能力诚实 Unsupported）。
+pub mod macos;
 /// 敏感路径黑名单（唯一事实源）。linux 与 mock 两路实现共用。
 pub mod sensitive;
 pub mod tls;
@@ -58,12 +60,21 @@ pub trait OsAdapter: Send + Sync + 'static {
     fn terminal(&self) -> &dyn TerminalProvider;
 }
 
-/// 按编译目标选择实现。Windows/macOS 接入时在此追加分支（设计方案 §0.4.2）。
+/// 按编译目标选择实现。
+///
+/// 分支顺序即语义：`force-mock` **优先**于一切真实平台（它的用途就是
+/// "在任意机器上用假数据跑通逻辑"）；macOS 次之；再 Linux；最后兜底 mock。
 pub fn default_adapter() -> Arc<dyn OsAdapter> {
+    #[cfg(feature = "force-mock")]
+    { Arc::new(mock::MockOsAdapter::new()) }
+
+    #[cfg(all(target_os = "macos", not(feature = "force-mock")))]
+    { Arc::new(macos::MacOsAdapter::new()) }
+
     #[cfg(all(target_os = "linux", not(feature = "force-mock")))]
     { Arc::new(linux::LinuxOsAdapter::new()) }
 
-    #[cfg(any(not(target_os = "linux"), feature = "force-mock"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", feature = "force-mock")))]
     { Arc::new(mock::MockOsAdapter::new()) }
 }
 
@@ -91,15 +102,26 @@ pub fn adapter_with_overrides(
 /// 走的是同一个工厂，从而保证"适配器内部的布局"与"CLI 建目录/打印用的布局"
 /// 是同一份语义，不会因两处各写一遍而静默分叉。
 pub fn adapter_with(ov: PathOverrides) -> Arc<dyn OsAdapter> {
+    #[cfg(feature = "force-mock")]
+    {
+        // mock 布局是内存视图，配置覆盖无意义；显式丢弃以避免"看起来生效了"
+        let _ = ov;
+        Arc::new(mock::MockOsAdapter::new())
+    }
+    #[cfg(all(target_os = "macos", not(feature = "force-mock")))]
+    {
+        let layout = macos::MacPathLayout::default().with_overrides(
+            ov.config_dir, ov.site_root, ov.data_dir, ov.log_dir);
+        Arc::new(macos::MacOsAdapter::with_paths(Arc::new(layout)))
+    }
     #[cfg(all(target_os = "linux", not(feature = "force-mock")))]
     {
         let layout = paths::LinuxPathLayout::default().with_overrides(
             ov.config_dir, ov.site_root, ov.data_dir, ov.log_dir);
         Arc::new(linux::LinuxOsAdapter::with_paths(Arc::new(layout)))
     }
-    #[cfg(any(not(target_os = "linux"), feature = "force-mock"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", feature = "force-mock")))]
     {
-        // mock 布局是内存视图，配置覆盖无意义；显式丢弃以避免"看起来生效了"
         let _ = ov;
         Arc::new(mock::MockOsAdapter::new())
     }
