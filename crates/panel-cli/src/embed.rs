@@ -53,6 +53,21 @@ fn is_hashed(p: &str) -> bool {
         && p.rsplit('/').next().unwrap_or("").split('.').count() >= 3
 }
 
+/// 该路径是否"本来就应该是一个静态文件"（而非前端路由）。
+///
+/// 判据：最后一段含 `.`（有扩展名）即认为是资源请求，例如 `assets/x.js`、
+/// `favicon.ico`、`manifest.json`。SPA 路由（`/sites`、`/processes`）没有扩展名。
+///
+/// 为什么要分开：SPA 回退对**路由**是必要的（刷新 `/sites` 不能 404），但对
+/// **资源**是错的——浏览器请求 `index.js` 拿到 `text/html` 会直接报 MIME 错误，
+/// 而更糟的是**掩盖了真实故障**：部署缺了一个 chunk 时，页面看起来"200 正常"，
+/// 实际报错信息与真因（文件没打进去）毫无关系。这与 `/api` 不回退 HTML 同源。
+fn looks_like_asset(p: &str) -> bool {
+    let last = p.rsplit('/').next().unwrap_or("");
+    // 点号开头是隐藏文件（.well-known 之类），不当资源；纯点号结尾也不当资源
+    !last.is_empty() && last != "." && last != ".." && last.contains('.') && !last.starts_with('.')
+}
+
 /// 静态资源 handler
 pub async fn static_handler(uri: Uri) -> Response {
     let raw = uri.path().trim_start_matches('/');
@@ -90,7 +105,12 @@ pub async fn static_handler(uri: Uri) -> Response {
                     })),
                 ).into_response();
             }
-            // SPA 回退：仅对非 API 路径生效
+            // SPA 回退：仅对非 API **且非静态资源**的路径生效。
+            // 资源请求（带扩展名）未命中必须如实 404：回退成 HTML 会让浏览器
+            // 报 MIME 错误，且把「部署缺文件」这个真因掩盖成"看起来 200 正常"。
+            if looks_like_asset(path) {
+                return (StatusCode::NOT_FOUND, "asset not embedded").into_response();
+            }
             match get("index.html") {
                 Some((data, _)) => {
                     let mut res = (StatusCode::OK, Body::from(data)).into_response();
@@ -141,12 +161,64 @@ mod tests {
     async fn non_api_paths_fall_back_to_spa() {
         let res = static_handler(Uri::from_static("/some/spa/route")).await;
         assert_eq!(res.status(), StatusCode::OK);
-        let ctype = res.headers()
+        let ctype = res
+            .headers()
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        assert!(ctype.starts_with("text/html"),
-                "SPA 回退应返回 HTML，实际为 {ctype:?}");
+        assert!(
+            ctype.starts_with("text/html"),
+            "SPA 回退应返回 HTML，实际为 {ctype:?}"
+        );
+    }
+
+    /// 缺失的**静态资源**绝不能回退成 index.html。
+    ///
+    /// 这是本条修复的核心判据：回退后浏览器拿到 `text/html` 的 `.js` 会报 MIME
+    /// 错误，而真因（chunk 没打进二进制）被一个"200 正常"彻底掩盖。
+    #[tokio::test]
+    async fn missing_assets_are_real_404_not_spa_fallback() {
+        // 用一定不存在的 hash，避免依赖当前构建产物
+        for path in [
+            "/assets/index.__definitely_missing__.js",
+            "/favicon.__missing__.ico",
+        ] {
+            let res = static_handler(Uri::from_static(path)).await;
+            assert_eq!(
+                res.status(),
+                StatusCode::NOT_FOUND,
+                "{path} 未命中必须 404，而不是回退 HTML"
+            );
+            let ctype = res
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            assert!(
+                !ctype.starts_with("text/html"),
+                "{path} 不得返回 HTML（会把 MIME 错误与真因混在一起），实际 {ctype:?}"
+            );
+        }
+    }
+
+    /// `looks_like_asset` 的正反两态：SPA 路由不算资源，带扩展名才算。
+    /// 边界（点号开头 / 仅点号结尾）单独钉住——它们决定了这些路径会不会被误判成资源。
+    #[test]
+    fn asset_detection_distinguishes_routes_from_files() {
+        // 资源：应当 404，不回退
+        assert!(looks_like_asset("assets/index.abc123.js"));
+        assert!(looks_like_asset("favicon.ico"));
+        assert!(looks_like_asset("manifest.json"));
+        assert!(looks_like_asset("deep/nested/file.css"));
+        // 路由：应当回退 SPA
+        assert!(!looks_like_asset("sites"));
+        assert!(!looks_like_asset("processes/detail"));
+        assert!(!looks_like_asset(""));
+        // 边界
+        assert!(!looks_like_asset(".well-known"));      // 点号开头 = 隐藏文件，不当资源
+        assert!(!looks_like_asset("dir/."));            // 纯点号
+        assert!(!looks_like_asset("."));
+        assert!(!looks_like_asset(".."));
     }
 }
