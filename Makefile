@@ -8,7 +8,14 @@
 # （恒绿比没门禁更危险）。故 audit 单独成一个目标，CI 里单独一个 job——
 # advisory-db 托管在 GitHub，网络抖动时不该连带拖红主门禁。
 
-.PHONY: check guards audit test embed-fresh e2e-files e2e-backups e2e-containers e2e-cron e2e-databases e2e-sites e2e-firewall e2e-rbac e2e-security e2e-all e2e-ui e2e-observe
+.PHONY: check guards audit test embed-fresh e2e-files e2e-backups e2e-containers e2e-cron e2e-databases e2e-sites e2e-firewall e2e-rbac e2e-security e2e-all e2e-ui e2e-observe e2e-restore
+
+# E2E 用的后端地址与二进制路径（可按需覆盖：make e2e-files BASE=http://127.0.0.1:2084）
+BASE ?= http://127.0.0.1:2083
+# e2e-restore 直接在进程内跑 CLI，不需要 HTTP，需要的是 panel 二进制。
+# ⚠ 只用 debug 产物：`make check` 只编 test profile，**不更新** target/debug/panel，
+#   故改了源码要先 `cargo build --bin panel`。
+BIN ?= ./target/debug/panel
 
 # 主门禁：静态守卫 + 全量测试（离线可跑，确定性高）
 check: guards lint embed-fresh test
@@ -126,7 +133,7 @@ e2e-rbac:
 e2e-security:
 	bash ci/e2e-security.sh "$(BASE)"
 
-# 九域 E2E 汇总：一次串行跑完并聚合（上线前的整机自检）。
+# 全部 E2E 域汇总：一次串行跑完并聚合（上线前的整机自检）。
 # 只做编排与聚合，断言仍由各域脚本负责；后端不可达时明确 [skip] 不再继续，
 # 某域退出码非 0 即判失败（退出码是权威信号）。
 #   make e2e-all
@@ -148,6 +155,17 @@ e2e-ui:
 #   make e2e-observe
 e2e-observe:
 	bash ci/e2e-observe.sh
+
+# 备份恢复链路 E2E（`panel verify-backup` + `panel restore-db`，CLI 级、离线）。
+# 与上面所有 e2e-* 都不同：它们打 HTTP，本脚本**自己在隔离目录造实例**
+# （init → backup → 恢复），不依赖运行中的后端、不需要 BASE，也不碰真实库。
+# 覆盖四道闸门：好产物通过 / 坏产物被拒 / 服务在线被拒 / 非面板库产物被拒；
+# 以及恢复的四条命门：留 pre-restore 快照 / 无 .restore-tmp 残留 / 清旧 -wal、-shm /
+# 恢复后库真能用（起服务 + owner 登录 + 会话）。
+# ⚠ 端口被占时脚本 [skip] 退出 2（不冒充通过）；需要 root 或 sudo（服务绑定端口）。
+#   make e2e-restore
+e2e-restore:
+	bash ci/e2e-restore.sh "$(BIN)"
 
 test:
 	cargo test --workspace

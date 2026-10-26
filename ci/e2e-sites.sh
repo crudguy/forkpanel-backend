@@ -27,7 +27,7 @@ B="${1:-${PANEL_E2E_BASE:-http://127.0.0.1:2083}}"
 U="${PANEL_E2E_USER:-admin}"
 P="${PANEL_E2E_PASS:-DevPreview2026x}"
 CJ=$(mktemp)
-PASS=0; FAIL=0
+PASS=0; FAIL=0; SKIP=0
 SITE_ID=""          # trap 兜底回收的站点 id
 SITE_DIR=""         # trap 兜底清理的站点根目录（create 自愈式 mkdir，空目录）
 
@@ -110,6 +110,7 @@ r=$(get /sites/99999999); chk "GET /sites/{不存在} → 404" "$(echo "$r" | jc
 # webserver.manage 不可用：建站/SSL 一律诚实 501，读端点仍可用。到此为止，不恒绿。
 if [ "$web_sup" != "True" ]; then
   say "  [warn] webserver.manage 不支持（reason 见上）—— 只验证 501 诚实闸门"
+  say "  [降级] 站点：能力位 webserver.manage 不可用——**站点数据面未覆盖**（只验了诚实 501）"
   r=$(post /sites '{"name":"e2e_site","domains":["a.example.com"]}')
   chk "create 在无 web 底座时诚实 501" "$(echo "$r" | jcode)" "10009"
   r=$(post /sites/99999999/ssl/apply '{"method":"http-01"}')
@@ -177,14 +178,22 @@ r=$(get /sites/$SITE_ID); chk "删除后 GET 详情 → 404" "$(echo "$r" | jcod
 r=$(curl -s -b "$CJ" -X DELETE "$B/api/v1/sites/$SITE_ID" -H "x-csrf-token: $CSRF"); chk "重复删除 → 404" "$(echo "$r" | jcode)" "10004"
 SITE_ID=""                                        # 已删，trap 无需再删
 
-# 站点根目录残留清理（create 自愈式 mkdir 的空目录）
+# 站点根目录残留清理（create 自愈式 mkdir 的空目录）。
+# ⚠ 站点根在 /var/www 下、由 **root 后端**创建 ⇒ 权限 root:root 755，普通用户的
+# rm -rf 必然失败。此前这里用裸 `rm -rf`，于是**每次运行都固定报红**——那不是抓到
+# 产品缺陷，而是脚本自己缺 sudo（恒红和恒绿一样有害，都会让人不再看结果）。
+# 现在：优先 sudo（本机已授权），实在删不掉才 skip 并说清原因，不再计入 FAIL。
 if [ -n "$SITE_DIR" ] && [ -d "$SITE_DIR" ]; then
   rm -rf "$SITE_DIR" 2>/dev/null
-  if [ -d "$SITE_DIR" ]; then FAIL=$((FAIL+1)); say "  ✗ 站点根目录未清掉：$SITE_DIR"
-  else PASS=$((PASS+1)); say "  ✓ 站点根目录已清理（零残留）"; fi
+  if [ -d "$SITE_DIR" ] && echo 'a' | sudo -S -p '' rm -rf "$SITE_DIR" 2>/dev/null; then :; fi
+  if [ -d "$SITE_DIR" ]; then
+    SKIP=$((SKIP+1)); say "  [skip] 站点根目录删不掉（需 root）：$SITE_DIR"
+  else
+    PASS=$((PASS+1)); say "  ✓ 站点根目录已清理（零残留）"
+  fi
   SITE_DIR=""
 fi
 
 say ""
-say "──────── E2E 结果：PASS=$PASS  FAIL=$FAIL ────────"
+say "──────── E2E 结果：PASS=$PASS  FAIL=$FAIL  SKIP=$SKIP ────────"
 [ "$FAIL" -eq 0 ] || exit 1
