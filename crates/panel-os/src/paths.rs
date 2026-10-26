@@ -31,6 +31,38 @@ pub trait PathLayout: Send + Sync {
     fn sqlite_path(&self) -> PathBuf { self.data_dir().join("panel.db") }
 }
 
+/// 让 `Arc<dyn PathLayout>` **本身**也是 `PathLayout`，逐项转发。
+///
+/// 存在理由：跨平台重构后 `build_layout()` 返回 `Arc<dyn PathLayout>`，而
+/// `ensure_dirs(&dyn PathLayout)` / `doctor::run(.., &dyn PathLayout, ..)` 这类
+/// 签名收的是 trait 对象引用。`&Arc<dyn PathLayout>` **不会**自动变成
+/// `&dyn PathLayout`（deref 强制转换在"引用套引用"的场景不自动触发），
+/// 于是 15 个调用点全部 E0277。
+///
+/// 两种修法对比：
+/// - 逐个调用点写 `&*layout0`：可行，但 15 处手改易漏，且新增调用点还会再踩；
+/// - 本 blanket impl：一次修复，`&Arc<dyn PathLayout>` 直接满足约束，
+///   对 `Arc` 包装的任何持有方式都成立。
+/// 选后者：它让"持有布局"的形式对调用方透明，正是跨平台本来要的效果。
+impl PathLayout for std::sync::Arc<dyn PathLayout> {
+    fn config_dir(&self) -> PathBuf { (**self).config_dir() }
+    fn data_dir(&self) -> PathBuf { (**self).data_dir() }
+    fn log_dir(&self) -> PathBuf { (**self).log_dir() }
+    fn cache_dir(&self) -> PathBuf { (**self).cache_dir() }
+    fn tmp_dir(&self) -> PathBuf { (**self).tmp_dir() }
+    fn site_root(&self) -> PathBuf { (**self).site_root() }
+    fn web_conf_dir(&self) -> PathBuf { (**self).web_conf_dir() }
+    fn caddy_sites_dir(&self) -> PathBuf { (**self).caddy_sites_dir() }
+    fn web_log_dir(&self) -> PathBuf { (**self).web_log_dir() }
+    fn service_dir(&self) -> PathBuf { (**self).service_dir() }
+    fn cron_dir(&self) -> PathBuf { (**self).cron_dir() }
+    fn script_dir(&self) -> PathBuf { (**self).script_dir() }
+    fn backup_dir(&self) -> PathBuf { (**self).backup_dir() }
+    fn container_socket(&self) -> PathBuf { (**self).container_socket() }
+    fn default_web_user(&self) -> &'static str { (**self).default_web_user() }
+    fn sqlite_path(&self) -> PathBuf { (**self).sqlite_path() }
+}
+
 /// 站点标识的文件名安全化：仅保留 `[A-Za-z0-9._-]`，其余替换为 `_`，空串回退 `site`。
 ///
 /// 站点配置文件（`panel-<slug>.conf`）与站点日志文件（`<slug>.access.log`）都由此派生，
@@ -42,6 +74,60 @@ pub fn slug(s: &str) -> String {
         .collect();
     if out.is_empty() { out.push_str("site"); }
     out
+}
+
+// ───────────────────────── 覆盖值（跨平台） ─────────────────────────
+
+/// 配置里 `[paths]` 的覆盖值，**平台无关**。
+///
+/// 为什么用结构体而不是 4 个 `Option<PathBuf>` 位置参数：后者在调用点有
+/// `(config, site_root, data, log)` 四连 `None`，顺序写错编译器不会报错，
+/// 只会让"站点根目录"静默落到"日志目录"上。具名字段从根上消掉这个错误面。
+#[derive(Debug, Clone, Default)]
+pub struct PathOverrides {
+    pub config_dir: Option<PathBuf>,
+    pub site_root: Option<PathBuf>,
+    pub data_dir: Option<PathBuf>,
+    pub log_dir: Option<PathBuf>,
+}
+
+impl PathOverrides {
+    /// 全部为 `None` 的覆盖（即"用平台默认"）。语义比 `Default::default()` 更明确。
+    pub fn none() -> Self { Self::default() }
+
+    /// 有任意一项被配置覆盖？用于判断是否需要重建布局。
+    pub fn is_empty(&self) -> bool {
+        self.config_dir.is_none() && self.site_root.is_none()
+            && self.data_dir.is_none() && self.log_dir.is_none()
+    }
+}
+
+/// 构造**当前平台**的路径布局并套用配置覆盖 —— 跨平台唯一入口。
+///
+/// 存在理由：此前 `panel-os::adapter_with_overrides()` 与 `panel-cli::build_layout()`
+/// **各建一份** `LinuxPathLayout`，靠"传入的参数恰好一致"保持同步。那是脆弱的一致性：
+/// 任一处改了覆盖顺序或漏传一项，运行时布局与 CLI 打印/建目录用的布局就分叉，
+/// 而编译与测试全绿。收敛到本函数后，两者必然同源。
+///
+/// 返回值是 `Arc<dyn PathLayout>`（而非具体类型）——CLI 若持有 `LinuxPathLayout`
+/// 具体类型，就绑死 Linux，非 Linux 目标编译不过（CI 门禁 [4c] 的同源问题）。
+pub fn layout_with_overrides(ov: &PathOverrides) -> std::sync::Arc<dyn PathLayout> {
+    #[cfg(all(target_os = "linux", not(feature = "force-mock")))]
+    {
+        std::sync::Arc::new(LinuxPathLayout::default().with_overrides(
+            ov.config_dir.clone(),
+            ov.site_root.clone(),
+            ov.data_dir.clone(),
+            ov.log_dir.clone(),
+        ))
+    }
+    #[cfg(any(not(target_os = "linux"), feature = "force-mock"))]
+    {
+        // mock 布局是内存视图，配置覆盖无意义；显式丢弃以避免"看起来生效了"。
+        // 真实非 Linux 平台（macOS）在 Phase 1 接入时在此前置分支。
+        let _ = ov;
+        std::sync::Arc::new(crate::mock::MockPathLayout)
+    }
 }
 
 // ───────────────────────── Linux 实现 ─────────────────────────

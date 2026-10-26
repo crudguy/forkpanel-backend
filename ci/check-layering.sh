@@ -102,9 +102,13 @@ if [ -z "${SKIP_STRIP_RULES:-}" ]; then
 fi
 
 echo "== [4] 平台条件编译位置 =="
-# cfg(target_os=...) 只允许出现在 OS 抽象层内部
+# cfg(target_os=...) 只允许出现在 OS 抽象层内部。
+#
+# ⚠ 必须 strip_comments：本门禁此前**不**剔注释，于是任何一行解释性注释里
+# 提到 `cfg(unix)`（例如"这里不要写 cfg(unix)，要走 set_mode"）都会把自己
+# 判成违规——门禁被自己的注释绊倒，实测踩过。与 [4c] 保持同一处理。
 CFG_HITS=$(grep -rn --include="*.rs" -E 'cfg\(target_os|cfg\(target_family|cfg\(windows\)|cfg\(unix\)' crates/ 2>/dev/null \
-  | grep -v "crates/panel-os/")
+  | grep -v "crates/panel-os/" | strip_comments)
 if [ -n "$CFG_HITS" ]; then
   note_fail "业务层出现平台条件编译（应通过 trait 抽象）："
   echo "$CFG_HITS" | sed 's/^/      /'

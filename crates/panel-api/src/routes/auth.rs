@@ -809,10 +809,12 @@ mod tests {
             writer.clone(), tier, base.join("tasks"), db_path.clone(), "NORMAL".to_string()));
         let metrics = std::sync::Arc::new(std::sync::Mutex::new(
             panel_db::aggregator::Aggregator::new(tier)));
-        let layout = panel_os::paths::LinuxPathLayout::default()
-            .with_overrides(None, None, Some(data_dir.clone()), None);
-        let os = std::sync::Arc::new(
-            panel_os::linux::LinuxOsAdapter::with_paths(std::sync::Arc::new(layout)));
+        // 走跨平台入口而非直接构造 LinuxOsAdapter：后者会让 panel-api 绑死 Linux
+        // （CI 门禁 [4c]）。同时保证测试用的 layout 与生产同源（同一工厂）。
+        let os = panel_os::adapter_with(panel_os::PathOverrides {
+            data_dir: Some(data_dir.clone()),
+            ..Default::default()
+        });
         let state = std::sync::Arc::new(crate::AppState::new(
             os, writer, pool, tasks, metrics, tier, None, false, 5,
             std::time::Duration::from_secs(1800), std::time::Duration::from_secs(43_200),

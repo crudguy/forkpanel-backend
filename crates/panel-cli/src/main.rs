@@ -54,8 +54,13 @@ fn atomic_replace_db(plain: &std::path::Path, db: &std::path::Path) -> Result<()
 /// 文件属主，同机非 root 进程读不到。文件在 bootstrap 成功后由端点删除。
 fn write_bootstrap_token_file(path: &std::path::Path, tok: &str) -> std::io::Result<()> {
     std::fs::write(path, tok)?;
-    #[cfg(unix)]
-    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    // 权限收紧走 `panel_os::fs::set_mode`，平台条件编译只允许出现在 OS 抽象层内
+    // （CI 门禁 [4]），CLI 层出现即绑死平台。
+    // set_mode 内部已按 unix / 非 unix 分流（后者为 no-op），失败不致命——
+    // 文件内容已写入，权限收紧失败最多是"比预期宽松"，不应让 serve 起不来。
+    if let Err(e) = panel_os::fs::set_mode(path, 0o600) {
+        eprintln!("[panel] ⚠ 引导令牌文件权限收紧失败（内容已写入）：{e}");
+    }
     Ok(())
 }
 
@@ -791,7 +796,7 @@ async fn register_internal_jobs(
     os: &Arc<dyn panel_os::OsAdapter>,
     writer: Arc<panel_db::WriterActor>,
     metrics: Arc<std::sync::Mutex<panel_db::aggregator::Aggregator>>,
-    layout: &panel_os::paths::LinuxPathLayout,
+    layout: &Arc<dyn panel_os::PathLayout>,
     cfg: &Config,
     tier: Tier,
     // 供证书自动续期使用（需要任务队列、读连接池与主密钥）
@@ -1131,19 +1136,30 @@ fn load_cfg(cli: &Cli, layout: &dyn panel_os::PathLayout) -> Result<Config> {
 
 /// 用配置文件中的覆盖值构造路径布局。
 /// 关键：覆盖之后仍然只通过 `PathLayout` 访问，业务层不出现路径字面量。
-/// `os` 参数暂未使用（LinuxPathLayout 尚不依赖运行时探测），保留以维持
-/// 「布局由平台适配器注入」的签名契约，多平台接入时启用。
-fn build_layout(_os: &Arc<dyn panel_os::OsAdapter>, cfg: Option<&Config>) -> panel_os::paths::LinuxPathLayout {
-    let base = panel_os::paths::LinuxPathLayout::default();
-    match cfg {
-        None => base,
-        Some(c) => base.with_overrides(
-            c.paths.config.clone(),
-            c.paths.site_root.clone(),
-            c.paths.data.clone(),
-            c.paths.log.clone(),
-        ),
-    }
+///
+/// 返回 `Arc<dyn PathLayout>` 而**不是** `LinuxPathLayout`：后者是本 crate 绑死
+/// Linux 的最后一处（业务层其余部分早已只认 trait）。持有具体类型时，macOS/Windows
+/// 目标上 CLI 会拿着 `/etc/forkpanel`、`/var/www` 这类不存在的目录继续跑，
+/// 且编译期毫无提示。
+///
+/// 构造必须经 `panel_os::layout_with_overrides()`：`adapter_with()` 内部用的是
+/// **同一个工厂**，从而保证"适配器持有的布局"与"CLI 建目录/打印的布局"永远同源。
+/// 此前两处各建一份 `LinuxPathLayout`、靠参数巧合保持一致，任一处改动都会静默分叉。
+///
+/// `_os` 参数保留但不用：当前各平台布局都不依赖运行时探测（纯配置 + 平台默认值）。
+/// 若将来某平台需要探测（如 Windows 的盘符），在工厂内部实现，**不要**在这里加分支
+/// ——否则平台知识又漏回 CLI 层（CI 门禁 [4] 会拦）。
+fn build_layout(_os: &Arc<dyn panel_os::OsAdapter>, cfg: Option<&Config>) -> Arc<dyn panel_os::PathLayout> {
+    let ov = match cfg {
+        None => panel_os::PathOverrides::none(),
+        Some(c) => panel_os::PathOverrides {
+            config_dir: c.paths.config.clone(),
+            site_root: c.paths.site_root.clone(),
+            data_dir: c.paths.data.clone(),
+            log_dir: c.paths.log.clone(),
+        },
+    };
+    panel_os::layout_with_overrides(&ov)
 }
 
 /// 档位探测：宿主规模**必须**来自 OsAdapter，CLI 不得自行读 procfs

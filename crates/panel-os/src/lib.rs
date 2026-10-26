@@ -24,7 +24,7 @@ pub use fs::{
     prune_keep_newest, read_password, set_mode, write_private, ElfArch, PortInUse,
 };
 pub use linux::scheduler::local_utc_offset_secs_at;
-pub use paths::{resolve_within, PathLayout};
+pub use paths::{layout_with_overrides, resolve_within, PathLayout, PathOverrides};
 pub use traits::*;
 
 use panel_core::{Capability, CapabilityMap, PlatformInfo};
@@ -82,16 +82,25 @@ pub fn adapter_with_overrides(
     data_dir: Option<std::path::PathBuf>,
     log_dir: Option<std::path::PathBuf>,
 ) -> Arc<dyn OsAdapter> {
+    adapter_with(PathOverrides { config_dir, site_root, data_dir, log_dir })
+}
+
+/// 同 [`adapter_with_overrides`]，但收 [`PathOverrides`] 具名结构体。
+///
+/// 布局**必须**经 `paths::layout_with_overrides()` 构造：CLI 的 `build_layout()`
+/// 走的是同一个工厂，从而保证"适配器内部的布局"与"CLI 建目录/打印用的布局"
+/// 是同一份语义，不会因两处各写一遍而静默分叉。
+pub fn adapter_with(ov: PathOverrides) -> Arc<dyn OsAdapter> {
     #[cfg(all(target_os = "linux", not(feature = "force-mock")))]
     {
-        let layout = paths::LinuxPathLayout::default()
-            .with_overrides(config_dir, site_root, data_dir, log_dir);
+        let layout = paths::LinuxPathLayout::default().with_overrides(
+            ov.config_dir, ov.site_root, ov.data_dir, ov.log_dir);
         Arc::new(linux::LinuxOsAdapter::with_paths(Arc::new(layout)))
     }
     #[cfg(any(not(target_os = "linux"), feature = "force-mock"))]
     {
         // mock 布局是内存视图，配置覆盖无意义；显式丢弃以避免"看起来生效了"
-        let _ = (config_dir, site_root, data_dir, log_dir);
+        let _ = ov;
         Arc::new(mock::MockOsAdapter::new())
     }
 }
