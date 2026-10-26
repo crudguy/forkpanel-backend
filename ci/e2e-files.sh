@@ -199,8 +199,34 @@ for p in /etc/fail2ban/jail.local /etc/nftables.conf /etc/sysctl.conf /root/.bas
 done
 # 反向：普通 /etc 文件必须仍可写——防"补齐缺口"变成"过度收宽"把日常运维堵死。
 # （文件带 PID 后缀、测完即删，宿主机不留残留）
-r=$(put /files/write "{\"path\":\"/etc/hosts.e2e-$$\",\"content\":\"x\"}"); chk "写 /etc/hosts.e2e-$$ 放行" "$(echo "$r" | jcode)" "0"
-r=$(post /files/delete "{\"path\":\"/etc/hosts.e2e-$$\"}"); chk "删反向样本" "$(echo "$r" | jcode)" "0"
+#
+# ⚠ 两种运行态都要过，判据不能混为一谈：
+# - **以 root 跑**（开发机 sudo / 生产）：写入必然成功 ⇒ 断言 code=0。
+# - **以普通用户跑**（`ci/run-e2e-ci.sh` 的目标就是零 root）：`/etc` 是 755 root，
+#   写入必然 IO 失败 ⇒ 断言 50002。此时**意图仍要守住**：50002 是「权限不够」，
+#   与「被敏感黑名单拒绝」(10003) 是两回事——所以额外断言它**不是 10003**，
+#   这才证明黑名单是精确匹配、没有把整个 /etc 一刀切。
+# 判据必须取「本进程对这个具体路径有没有写权限」，而不是 `id -u`：前者是被测对象
+# 的真实约束，后者只是间接推断。
+PROBE="/etc/hosts.e2e-$$"
+if ( : > "$PROBE" ) 2>/dev/null; then
+  rm -f "$PROBE"
+  r=$(put /files/write "{\"path\":\"$PROBE\",\"content\":\"x\"}"); chk "写 $PROBE 放行（root 态）" "$(echo "$r" | jcode)" "0"
+  r=$(post /files/delete "{\"path\":\"$PROBE\"}"); chk "删反向样本" "$(echo "$r" | jcode)" "0"
+else
+  say "  · /etc 不可写（非 root 态）：反向样本改判「未被黑名单拒绝」"
+  r=$(put /files/write "{\"path\":\"$PROBE\",\"content\":\"x\"}"); CODE=$(echo "$r" | jcode)
+  # 唯一判据：**不得是 10003**（敏感黑名单）。非 10003 即证明普通 /etc 文件没被误伤。
+  # 不能写成 `chk ... "50002"` 再补一个 10003 判断——那样 10003 时 chk 已记 FAIL，
+  # 补判分支永远走不到，是死代码。
+  if [ "$CODE" = "10003" ]; then
+    FAIL=$((FAIL+1)); say "  ✗ 黑名单误伤普通 /etc 文件（$PROBE 被判 sensitive，应只是一刀切之外的普通路径）"
+  elif [ -z "$CODE" ]; then
+    FAIL=$((FAIL+1)); say "  ✗ 写 $PROBE 无响应体（无法判定是否被黑名单拒绝）"
+  else
+    PASS=$((PASS+1)); say "  ✓ 普通 /etc 文件未被黑名单误伤（code=$CODE ≠ 10003）"
+  fi
+fi
 # list 标记：/etc/ssh 整目录在黑名单内，列出的每个条目都应带 sensitive=true
 lcode=$(get "/files/list?path=/etc/ssh" | jcode)
 if [ "$lcode" = "0" ]; then
