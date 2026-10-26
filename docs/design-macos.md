@@ -84,18 +84,48 @@ fn build_layout(_os: &Arc<dyn panel_os::OsAdapter>, cfg: Option<&Config>) -> pan
 
 每期都以 **conformance 用例逐条点亮** 作为客观验收判据，不靠"我觉得做完了"。
 
-### Phase 0：解耦前置（无 macOS 代码，纯重构）
+### Phase 0：解耦前置（无 macOS 代码，纯重构）✅ 已完成（`d5fb1dc`）
 - 修 `build_layout()` 绑死 `LinuxPathLayout`（第 1 节）。
-- `which()` 的 PATH 列表（`stub/mod.rs`）抽出为平台常量，避免 macOS 上找不到 brew 前缀。
 - **验收**：现有 Linux 全量测试与门禁不变绿→不红即可合并（纯重构，行为不变）。
 
-### Phase 1：能编译、能启动、能登录（最小可运行）
-- 新建 `panel-os/src/macos/`（`mod.rs` + `paths.rs` + 各 provider 先 `Unsupported`）。
-- `MacPathLayout`：`~/Library/Application Support/ForkPanel`（data）、`~/Library/Logs/ForkPanel`、`/opt/homebrew/var/www`（site_root）、`/opt/homebrew/etc/forkpanel`（config）。
-- `detect_platform()` 返回 `Os::Macos` + 真实 `sw_vers` 版本。
-- `capabilities()` 全部诚实置 no（除 `user.manage` 等内建位），前端菜单自然置灰。
-- `lib.rs` 的 `default_adapter()` / `adapter_with_overrides()` 加 `cfg(target_os="macos")` 分支。
-- **验收**：macOS 上 `cargo build` 通过；`cargo test -p panel-os --test conformance` 通过契约 1/2/3/9/10（能力自洽、平台信息、路径非空、Unsupported 显式、沙箱拒穿越）；面板能启动、能完成首启、能登录。
+实际做法与偏差说明：
+- 布局构造收敛到单一工厂 `paths::layout_with_overrides()`，返回 `Arc<dyn PathLayout>`。
+- `&Arc<dyn PathLayout>` **不会**自动 deref 成 `&dyn PathLayout`（引用套引用场景），
+  15 个调用点全部 E0277。解法是加 `impl PathLayout for Arc<dyn PathLayout>` blanket impl，
+  而不是手改 15 处（易漏，且新增调用点还会再踩）。
+- 本设计方案原本写的"`which()` 的 PATH 列表抽出为平台常量"实际落在 `cmd::Bin::resolved()`
+  的 `SEARCH` 常量上（那里才是唯一解析二进制路径的地方）。
+- 顺带修掉门禁 `[4]` 自身缺陷：它此前不剔注释，代码里在**注释中**提到 `cfg(unix)` 也会
+  被判违规（自己绊自己）。
+
+### Phase 1：能编译、能启动、能登录（最小可运行）✅ 已完成（`480dd0c`）
+- 新建 `panel-os/src/macos/`（`mod.rs` + `paths.rs` + `providers.rs`，16 个 provider 先 `Unsupported`）。
+- `detect_platform()` 返回 `Os::Macos` + 真实 `sw_vers` 版本；探测走 `cmd::run_probe_sync`
+  （新增的同步出口），不绕过子进程唯一出口门禁 `[1]`。
+- `capabilities()` 22 项：仅 `BACKUP_MANAGE`/`USER_MANAGE` 为 yes（复用既有实现），
+  其余 `no(具体原因 + 分期)`，前端菜单自然置灰。
+- `default_adapter()` / `adapter_with()` / `layout_with_overrides()` 四分支化
+  （force-mock → macos → linux → 兜底），并补上 `adapter_with()` 此前缺失的 force-mock 分支。
+
+实际做法与偏差说明（**与本节原规划的差异，已按实际落地修正**）：
+- 路径规划原写 `/opt/homebrew/var/www`（site_root）、`/opt/homebrew/etc/forkpanel`（config），
+  但这两个都需要 brew 且 `/opt/homebrew` 由 brew 拥有、非 root 不可写。Phase 1 的目标是
+  "非 root 也能起来"，故实际全部落在用户家目录：
+  `~/Library/Application Support/ForkPanel`（config+data）、`~/Library/Logs/ForkPanel`（log）、
+  `~/Sites`（site_root）、`~/Library/LaunchAgents`（service，用户级 LaunchAgent）。
+  brew 前缀留给 Phase 4 包管理，不作为面板自身的数据目录。
+- **交叉编译暴露出三个既有代码在 Darwin 上根本编译不过**（Linux 上 `cfg` 分支不参与编译，
+  所以从未被发现）：
+  1. `libc::ptsname_r` 在 Darwin 不存在（GNU 扩展）→ Web 终端整块编译失败；
+  2. `libc::ioctl` 的 request 在 BSD 是 `c_ulong`，而 `TIOCSWINSZ`/`TIOCSCTTY` 字面量是 u32；
+  3. `Bin::resolved()` 的搜索目录全是 Linux 布局，macOS 上除系统自带外一律判"不可用"。
+  三者均已在 Phase 1 一并修掉（`pty_slave_name()` 平台分叉、`as libc::c_ulong`、
+  `SEARCH` 按平台给并补 `/opt/homebrew/bin`）。
+
+**验收结论**：`cargo check --target aarch64-apple-darwin` 零错误零警告（含负向对照）；
+`cargo test --workspace` 791 项全过（含 conformance 11 契约）；
+`ci/check-layering.sh` PASS（含 `[1]` 负向对照）。
+**未做**：macOS 真机运行——故"能启动、能登录"仍属待真机确认的推断，不作已验收记录。
 
 ### Phase 2：可观测（看板可用）
 - `MacMetrics`：CPU/内存/磁盘/网络/负载。**契约 4（快照自洽）点亮**。
@@ -132,8 +162,11 @@ fn build_layout(_os: &Arc<dyn panel_os::OsAdapter>, cfg: Option<&Config>) -> pan
 - **业务层零改动**：所有平台知识进 `panel-os/src/macos/`，`ci/check-layering.sh` 的 `[4]`/`[4b]`/`[4c]` 保持全绿。
 - **不做"假装可移植"**：不在 Linux 实现里加 `if is_macos`，而是真正独立实现。
 
-## 6. 待老板确认
+## 6. 老板裁决记录
 
-1. Phase 0 的 `build_layout()` 重构是否现在就做（它与平台无关，属既有债务）。
-2. Phase 1 是否接受「先全部置灰、能登录」作为第一交付（而非一次做完看板）。
-3. macOS 验证环境：是否有真机/CI runner 可用？没有的话 Phase 2+ 无法客观验收。
+1. **Phase 0 的 `build_layout()` 重构是否现在就做** → 做，已完成（`d5fb1dc`）。
+   理由：它与平台选择无关，是既有债务；不做则 Phase 1 无法把布局交给 trait 对象。
+2. **Phase 1 是否接受「先全部置灰、能登录」作为第一交付** → 接受，已完成（`480dd0c`）。
+3. **macOS 验证环境：是否有真机/CI runner 可用？** → **仍未确认**，这是 Phase 2+ 的
+   硬前置：没有真机（或 `macos-latest` runner）就无法客观验收"读到的数据对不对"，
+   而"能编译"只证明类型正确、不证明行为正确（本项目已有多次「构建绿≠渲染对」的教训）。
