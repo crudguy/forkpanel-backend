@@ -223,13 +223,15 @@
 | `e2e-security` | WAF 模板校验与 CRUD（profile/限速/burst/IP 列表）、拦截事件过滤、告警阈值与窗宽越界、安全基线（只读 + 错误确认词 10001）、在线会话（恰一 current、差集识别并吊销自己新建的会话 204） | **绝不用正确确认词调 `baseline/apply`**（会写回 sshd）；告警只原值回写；只吊销本次新建的会话 | 40 |
 | `e2e-observe` | 系统概览与指标（overview 字段齐全、realtime/history、`gran` 非法 10001）、日志源与读取（行形状、histogram、未知源 404、grep 超长 10001）、通知（未读数、只碰不存在的 id）、本机便签完整生命周期、任务中心（详情/输出/不存在 404） | 通知 read-all 与任务 cancel **不碰**（前者改用户可见状态、后者会打断真实任务）；日志 download 不落文件 | 46 |
 | `e2e-restore` | **离线恢复链路（CLI 级，不打 HTTP）**：`init` → `backup` 造真产物 → `verify-backup` 好产物通过（`integrity_check=ok`）/ 坏产物拒绝（`not a database`）→ `restore-db` 四道闸门（服务在线拒绝且**库与 WAL 原封不动**、站点归档拒绝、不存在产物拒绝）→ 真恢复后四条命门（**留 `pre-restore-{ts}.db` 快照**、无 `.restore-tmp` 残留、旧 `-wal`/`-shm` 已清、起服务 + owner 登录 + CSRF + 能力位可读） | **绝不碰真实库**：全程在 `mktemp -d` 隔离目录、独占一个端口、退出时 `trap` 清目录并只按端口精确停自己的进程（**绝不用 `pgrep -x panel`**，会误杀用户的 dev 实例） | 26 |
+| `e2e-install` | **安装/卸载脚本（在 user namespace 里真跑）**：`unshare -rmn` 内把 `/usr/local`、`/etc`、`/var/lib`、`/var/log`、`/var/www` 全盖成 tmpfs 再跑 `deploy/install.sh`，逐条核对 `install-footprint.md` 的声明——六个权限位（0755/0750/0700/0750/0755/0640）、端口随机化真生效（≥10000 且非模板默认）、默认只绑回环、单元带 `ProtectSystem=strict`、`ReadWritePaths` 逐项含四个根目录、探活单元落盘、`systemctl` 调用序列（daemon-reload / enable panel / enable timer）、**装出来的二进制真能起进程 + init + 登录 204**、重跑不覆盖既有配置、`uninstall.sh` 删程序但保留数据与配置 | **不动本机**：所有路径是 tmpfs，进程一退即消失；`systemctl` 用 shim **不真的动 init**（故验的是"调了哪些命令"，不是"服务真开机自启"，后者只能上真机）；userns 只映射单 uid ⇒ 『非 root 被拒』分支诚实 `[skip]` | 39 |
 
-合计 **418 条断言**。运行方式：
+合计 **457 条断言**。运行方式：
 
 ```bash
-make e2e-all                                    # 十一域串行跑完并聚合（上线前整机自检）
+make e2e-all                                    # 全部域串行跑完并聚合（上线前整机自检）
 make e2e-containers BASE=http://127.0.0.1:2084  # 单域
-make e2e-restore                                # 恢复链路（吃 panel 二进制，不吃 BASE）
+make e2e-restore                                # 恢复链路（吃 debug panel 二进制，不吃 BASE）
+make e2e-install                                # 安装脚本（吃 release panel 二进制，需 userns）
 ```
 
 - 凭据走 `PANEL_E2E_USER` / `PANEL_E2E_PASS`（默认 dev 的 `admin/DevPreview2026x`）。
@@ -241,6 +243,9 @@ make e2e-restore                                # 恢复链路（吃 panel 二�
   比没有守卫更危险。人工在真机跑。
 - `e2e-restore` 吃 `PANEL_E2E_BIN`（默认 `./target/debug/panel`）。⚠ `make check`
   只编 test profile，**不更新** `target/debug/panel`，改了源码要先 `cargo build --bin panel`。
+- `e2e-install` 吃 release 产物（debug 的 `rust-embed` 运行期读磁盘，装到别处找不到前端）。
+  它**刻意不进 `e2e-all`**：`e2e-all` 的语义是"对着一个跑着的后端打 API"，而它自己在
+  ns 里造环境，且独占回环端口；混进去会让"后端不可达"的判定语义变模糊。
 
 ### 浏览器级 UI 冒烟（`ci/e2e-ui.sh`，20 条断言）
 

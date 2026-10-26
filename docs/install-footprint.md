@@ -10,6 +10,12 @@
 > 文中路径与 `deploy/install.sh`、`deploy/config.toml` 严格对应；凡带 `forkpanel`
 > 后缀的是**安装脚本实际值**，带 `panel` 后缀的是**代码内默认值**（仅在你不带
 > `--config` 手动跑 `panel` 时生效，不是真实安装路径）。
+>
+> **本文的每条声明都有脚本守着**（此前只是"写了但没人验过"）：`make e2e-install`
+> 在 user namespace 里把 `/usr/local`、`/etc`、`/var/lib`、`/var/log`、`/var/www`
+> 全盖成一次性 tmpfs（**本机一个字节不动**），然后真跑一遍 `deploy/install.sh`，
+> 逐条核对下表的路径、权限、单元加固项，最后真起进程初始化并登录 204。
+> 改了安装脚本却忘了同步本文，这条 E2E 会红。
 
 ---
 

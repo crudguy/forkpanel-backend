@@ -6,6 +6,11 @@
 #
 # 该脚本只做"安装"，不建账号。首个 owner 由 Web 首启向导创建：
 # 启动服务后从日志取一次性引导令牌，在浏览器里完成初始化。
+#
+# ★ 改动本脚本前请看 `ci/e2e-install.sh`：它在 user namespace 里把 /usr/local、
+#   /etc、/var/lib、/var/log、/var/www 换成一次性 tmpfs 后**真跑一遍本脚本**，
+#   逐条核对 `docs/install-footprint.md` 声称的路径与权限（`make e2e-install`）。
+#   加了新落盘位置或改了权限，记得同步文档与那条 E2E，否则门禁会红。
 set -euo pipefail
 
 BIN_SRC="${1:-./target/release/panel}"
@@ -21,14 +26,34 @@ SITE_ROOT=/var/www
 die() { echo "install: $1" >&2; exit 1; }
 
 # 发行版端口随机分配 ≥10000，避免固定 2083 被扫描（参考宝塔面板）
+# ⚠ 探测工具必须显式检查：`ss | awk` 里 awk 若不可用（精简镜像、路径被覆盖、
+#   alternatives 链断裂），管道**照样 exit 0**（退出码来自 awk，而 awk 根本没跑起来
+#   时 bash 报 "awk: command not found" 却仍以 0 结束管道）⇒ 于是"没有任何端口被占"，
+#   随手挑一个。装完服务起不来，原因还离现场很远。宁可不随机，也不要随机到错的。
 pick_random_port() {
+  local p
+  if ! command -v ss >/dev/null 2>&1 || ! command -v awk >/dev/null 2>&1; then
+    echo "install: 缺少 ss/awk，无法检测端口占用，退回默认端口 2083" >&2
+    echo 2083; return 0
+  fi
+  # 一次性取到所有监听端口，避免循环里反复 fork。
+  # ⚠ 判据不能是"used 为空"——一台全新机器可能真的一个监听都没有，那是合法状态。
+  #   要判的是**探测本身有没有跑起来**：ss 头部固定有 "State Recv-Q ..." 这行，
+  #   连头部都没有才说明 ss 输出异常（无权限、命令坏了）。
+  local raw; raw=$(ss -ltn 2>/dev/null)
+  local used; used=$(printf '%s\n' "$raw" | awk 'NR>1{print $4}')
+  if ! printf '%s\n' "$raw" | grep -q '^State'; then
+    echo "install: ss 输出异常（缺少表头），无法检测端口占用，退回默认端口 2083" >&2
+    echo 2083; return 0
+  fi
   for _ in $(seq 1 30); do
     p=$(( 10000 + (RANDOM * 32768 + RANDOM) % 55536 ))
-    if ! ss -ltn 2>/dev/null | awk 'NR>1{print $4}' | grep -qE "[:.]${p}\$"; then
+    if ! printf '%s\n' "$used" | grep -qE "[:.]${p}\$"; then
       echo "$p"; return 0
     fi
   done
-  echo $(( 10000 + (RANDOM * 32768 + RANDOM) % 55536 )); return 0
+  echo "install: 30 次随机都没找到空闲端口，退回默认端口 2083" >&2
+  echo 2083; return 0
 }
 
 [ "$(id -u)" -eq 0 ] || die "需要 root 权限（面板要管理系统服务/防火墙）"

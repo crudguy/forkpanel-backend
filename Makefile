@@ -8,7 +8,7 @@
 # （恒绿比没门禁更危险）。故 audit 单独成一个目标，CI 里单独一个 job——
 # advisory-db 托管在 GitHub，网络抖动时不该连带拖红主门禁。
 
-.PHONY: check guards audit test embed-fresh e2e-files e2e-backups e2e-containers e2e-cron e2e-databases e2e-sites e2e-firewall e2e-rbac e2e-security e2e-all e2e-ui e2e-observe e2e-restore
+.PHONY: check guards audit test embed-fresh e2e-files e2e-backups e2e-containers e2e-cron e2e-databases e2e-sites e2e-firewall e2e-rbac e2e-security e2e-all e2e-ui e2e-observe e2e-restore e2e-install
 
 # E2E 用的后端地址与二进制路径（可按需覆盖：make e2e-files BASE=http://127.0.0.1:2084）
 BASE ?= http://127.0.0.1:2083
@@ -16,6 +16,9 @@ BASE ?= http://127.0.0.1:2083
 # ⚠ 只用 debug 产物：`make check` 只编 test profile，**不更新** target/debug/panel，
 #   故改了源码要先 `cargo build --bin panel`。
 BIN ?= ./target/debug/panel
+# e2e-install 装的是**生产形态**，必须用 release 产物（debug 的 rust-embed 运行期读磁盘，
+# 装到别处会找不到前端；release 才是真内嵌）。
+REL_BIN ?= ./target/release/panel
 
 # 主门禁：静态守卫 + 全量测试（离线可跑，确定性高）
 check: guards lint embed-fresh test
@@ -166,6 +169,17 @@ e2e-observe:
 #   make e2e-restore
 e2e-restore:
 	bash ci/e2e-restore.sh "$(BIN)"
+
+# 安装脚本 E2E（deploy/install.sh + uninstall.sh，**在 user namespace 里真跑**）。
+# 又一次不同于前面所有 e2e-*：它不碰 HTTP、不碰运行中的后端，而是在 `unshare -rmn`
+# 里把 /usr/local、/etc、/var/lib、/var/log、/var/www 用 tmpfs 盖住后真装一遍，
+# 逐条核对 docs/install-footprint.md 的声明（权限 0700/0750、ProtectSystem=strict、
+# ReadWritePaths 跟随 [paths]、升级不覆盖配置、卸载删程序留数据），最后真起进程
+# 初始化并登录，证明"装出来的二进制能用"。
+# ⚠ 需要 unshare + user namespace；不具备时 [skip] 退出 2。吃 release 二进制。
+#   make e2e-install
+e2e-install:
+	bash ci/e2e-install.sh "$(REL_BIN)"
 
 test:
 	cargo test --workspace
