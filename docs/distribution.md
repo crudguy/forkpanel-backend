@@ -121,3 +121,15 @@ gh secret set PANEL_RELEASE_KEY < release.key
 ## 资产命名约定
 
 `build-static.sh` 产出固定名 `panel-linux-{amd64,arm64}.tar.gz(.sig)`，`get-panel.sh` 按此名下载——**两边必须保持一致**，改名需同步改两处。
+
+## 前端如何分发：编进后端二进制，**不分开发布**
+
+- 分发的只有**后端**产物（`panel-linux-*.tar.gz`）。**前端不单独分发**、也没有独立 release。
+- 原因：前端构建产物 `web/dist/` 被 `rust-embed`（`crates/panel-cli/src/embed.rs` 的
+  `#[folder = "../../web/dist"]`）**编译期内嵌**进 `panel` 二进制，`web/dist/` 本身被
+  `.gitignore` 忽略、不入库。用户装一个二进制即可得到完整 UI，无需额外下载前端。
+- 发版时 `release.yml` 自动完成：`检出私有前端仓 → pnpm build → rm -rf web/dist/* &&
+  cp -a 前端dist/. → touch embed.rs → cargo 静态编译`，所以**前后端版本天然绑定**，
+  打一个 tag 同时冻结两端。
+- 推论：只给后端打 tag 就够；但前端仓必须先有对应提交（`release.yml` 拉的是其默认分支
+  最新代码）。想发「前端某特定提交」的版本，需先把该提交合入前端默认分支。
