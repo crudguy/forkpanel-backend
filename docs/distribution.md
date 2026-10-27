@@ -47,12 +47,35 @@ PANEL_RELEASE_BASE=https://releases.forkpanel.dev curl -fsSL <get-panel.sh 入�
 ## 安全模型（务必读完）
 
 - 每个 tarball 都用 **ed25519 私钥**签名（`.sig`），安装器**先验签后执行**，签名不过绝不会运行任何文件。
-- **发布前必须替换正式密钥**：`get-panel.sh` 里现存的 `RELEASE_PUBKEY` 是**演示公钥**。正式发版前请：
-  1. 本地生成密钥对：`openssl genpkey -algorithm ed25519 -out release.key`
-  2. 提取公钥：`openssl pkey -in release.key -pubout`
-  3. 把公钥替换进 `deploy/get-panel.sh` 的 `RELEASE_PUBKEY`
-  4. 私钥 `release.key` 内容存为 GitHub repo secret **`PANEL_RELEASE_KEY`**（多行 PEM 原样粘贴，**绝不入库**）
-- 任何人拿到演示私钥都能伪造签名——正式发版前不换密钥等于没有验签。
+
+### 密钥策略：固定一对，长期复用，**不是**每次发版都换
+
+- **生成一次，长期用**。私钥保密、公钥嵌进 `get-panel.sh` 随安装器分发到用户机器。
+  如果每次发版都换密钥，用户机器上的安装器还是旧公钥，新签的包就验不过——所以密钥必须稳定。
+- **只有两种情况才需要换（密钥轮转）**：
+  1. **私钥泄露**（最严重）：必须立即换，并通知用户「旧公钥作废、请重新拉取安装器」；
+  2. **主动定期轮转**（安全好习惯，如每年一次）。
+- 正常发版**不要**换密钥，沿用同一对即可。
+
+### 首次发布前：生成并配置正式密钥（一次性）
+
+> ⚠ **私钥必须由维护者本地生成并自行保管，绝不能经 AI / 脚本 / 仓库传输或落盘到非私密处。**
+> 下面是维护者本机执行的命令（AI 不代生成）：
+
+1. 生成密钥对（私钥权限锁 600，绝不入库）：
+   `openssl genpkey -algorithm ed25519 -out release.key && chmod 600 release.key`
+2. 提取公钥：`openssl pkey -in release.key -pubout`
+3. 把公钥（上一步输出）替换进 `deploy/get-panel.sh` 的 `RELEASE_PUBKEY`（那段 PEM 块）。
+   公钥是公开的，可交给协助者代替换，不含秘密。
+4. 私钥 `release.key` 的**全部内容**（含 `-----BEGIN/END-----` 与换行）原样粘贴为
+   GitHub repo secret **`PANEL_RELEASE_KEY`**（GitHub secret 支持多行；release.yml 会还原成文件）。
+
+### 演示密钥的用途
+
+- 仓库里现存的 `RELEASE_PUBKEY` + `build-static.sh` 默认读的 `$HOME/.forkpanel-release.key`
+  是**一对演示密钥**，专供你**本地联调**整条「签名→下载→验签→安装」链路
+  （用演示私钥签的包，演示公钥能验过）。**正式发版前必须换成你自己的正式密钥对**，
+  否则任何人拿演示私钥都能伪造签名。
 
 ## 发布流程（维护者）
 
