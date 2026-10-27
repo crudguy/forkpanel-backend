@@ -41,9 +41,12 @@ cd forkpanel-frontend
 corepack enable && corepack pnpm@9 install --frozen-lockfile
 corepack pnpm@9 build                          # 产出 forkpanel-frontend/dist/
 
-# 3. 同步进后端（这一步不可省，且必须先清空再拷）
+# 3. 同步进后端（这一步不可省；前端仓放在哪都行，下面路径换成你实际的）
 cd ../forkpanel-backend
-rm -rf web/dist/* && cp -a ../forkpanel-frontend/dist/. web/dist/
+#    ⚠ web/ 不入库（git ls-files web 为空），全新 clone 连 web/ 都没有，
+#      必须先 mkdir -p web/dist，否则 cp 报 "cannot create directory 'web/dist'"。
+mkdir -p web/dist && rm -rf web/dist/* && cp -a ../forkpanel-frontend/dist/. web/dist/
+#    ↑ ../forkpanel-frontend 是「并列 clone」的例子；若你把前端放别处，改成实际路径
 touch crates/panel-cli/src/embed.rs            # 强制重新嵌入（防增量编译用旧产物）
 
 # 4. 编译后端
@@ -93,7 +96,7 @@ openssl genpkey -algorithm ed25519 -out release.key && chmod 600 release.key
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| 编译报 `web/dist` 不存在 / 嵌入的是旧页面 | 漏了第 3 步同步，或只 `cp -a` 未先 `rm -rf` | 清空后重拷 + `touch embed.rs` |
+| 编译报 `web/dist` 不存在 / `cannot create directory 'web/dist'` | 漏第 3 步同步；或全新 clone 连 `web/` 都没有就直接 `cp`（未先 `mkdir -p`）；或只 `cp` 未先 `rm -rf` | `mkdir -p web/dist` 后清空重拷 + `touch embed.rs` |
 | 前端改了但发出去还是旧 UI | 未重新编译后端（嵌入发生在编译期） | 必须重新 `cargo build` |
 | 门禁输出 `[skip]` 却显示"通过" | 前端路径没找到，跨仓检查被跳过 | 设 `PANEL_FRONTEND_ROOT` 后重跑 |
 | `get-panel.sh` 验签失败 | 公钥与签名私钥不匹配（用了别人公钥） | 换成自己私钥对应的公钥 |
