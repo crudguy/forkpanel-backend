@@ -1,0 +1,46 @@
+# cargo-audit 配置：RustSec advisory 忽略清单
+#
+# 位置说明：cargo-audit 只认 `.cargo/audit.toml`（仓库根的 audit.toml **不生效**，
+# 已实测）。`ci/check-audit.sh` 与 CI 的 audit job 会因本文件自动生效。
+#
+# ⚠ 纪律：每条 ignore 都必须写明「为什么可忽略」与「何时必须复审」。
+#   本文件不是"让门禁变绿"的开关——没有正当理由的 ignore 等于关掉门禁。
+
+[advisories]
+
+# ── zstd 族：上游依赖链暂无可用修复版本 ─────────────────────────────────────
+#
+# 依赖链：rust-embed → include-flate → include-flate-compress → zstd 0.13.3
+# 现状（2026-10-27 核实）：
+#   · include-flate 0.3.4 与 rust-embed 8.13.0 **均已是上游最新版**，仍锁定 zstd 0.13；
+#   · 有修复的 zstd 0.14.3 / zstd-safe 8.2.0 属跨大版本（0.x 破坏性变更），
+#     须上游 include-flate 适配后本仓库才能升 —— 单方面无法消除。
+#
+# 为什么本项目风险可接受：
+#   zstd 在此**只用于解压编译期嵌入的前端静态资源**（rust-embed 把 web/dist 压缩进
+#   二进制、运行时自解压）。全程不接触任何外部/用户提供的 zstd 数据流，而上述
+#   advisory 的触发条件均为「解压攻击者构造或损坏的 zstd 数据」（越界读、未初始化
+#   内存、UAF、堆溢出）—— 本项目没有该输入面。
+#
+# 复审条件（满足任一即必须回来重新评估，不可长期放任）：
+#   1. include-flate 发布支持 zstd 0.14+ 的版本 → 升级并删除本节全部 ignore；
+#   2. 本项目开始解压任何外部来源的 zstd 数据（上传、备份导入、第三方 API）→ 立刻复审；
+#   3. 定期（建议每季度）复查上游进度。
+ignore = [
+  # 漏洞级（vulnerabilities，会使 cargo audit 非零退出）
+  "RUSTSEC-2026-0391",  # zstd 0.13.3 — 重用上下文时，前一流的数据泄漏到下一流
+  "RUSTSEC-2026-0398",  # zstd-safe 7.3.0 — Seekable::decompress 越界时 Vec 长度超出容量
+  "RUSTSEC-2026-0403",  # zstd-safe 7.3.0 — 旧格式帧流式解压失败时暴露未初始化内存
+  "RUSTSEC-2026-0410",  # zstd-sys 2.1.1 — WASM 分配器 shim 在分配失败时破坏内存
+  # 警告级（unsound，不改变退出码；显式记录便于日后查阅）
+  "RUSTSEC-2026-0395",  # zstd-safe — StableInBuffer 导致 UAF
+  "RUSTSEC-2026-0396",  # zstd-safe — Seekable 读取 NULL/越界 seek 表
+  "RUSTSEC-2026-0397",  # zstd-safe — OutBuffer::around_pos 暴露未初始化内存
+  "RUSTSEC-2026-0399",  # zstd-safe — init_using_cdict/ddict 导致 UAF
+  "RUSTSEC-2026-0400",  # zstd-safe — 上下文有未完成流时一次性调用的字典 UAF
+  "RUSTSEC-2026-0401",  # zstd-safe — train_from_buffer 样本长度溢出时越界读
+  "RUSTSEC-2026-0402",  # zstd-safe — 多线程上下文 CCtx::try_clone 堆溢出
+  "RUSTSEC-2026-0404",  # zstd-safe — DCtx::try_clone 双重释放
+  "RUSTSEC-2026-0405",  # zstd-safe — InBuffer::pos 越界导致越界读
+  "RUSTSEC-2026-0406",  # zstd-safe — 切换多线程上下文时 UAF
+]
