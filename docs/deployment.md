@@ -126,20 +126,59 @@ localhost_only = true     # ← 它会强制覆盖 bind
 4. 访问控制：填 **IP 白名单**（只放行你自己的出口网段），建议再叠一层 Basic Auth
 5. 防火墙放行 443
 
-**方式二（手写 nginx，适合自动化 / 不走面板站点模型）**
+**方式二：用 `deploy/expose-public.sh` 生成（脚本化，推荐给自动化 / 批量场景）**
+
+不用面板站点模型时，仓库自带一个"一次跑完"的脚本，它上面三步全包了，而且**失败就退干净**：
+
+```bash
+sudo ./deploy/expose-public.sh -d panel.example.com -a 203.0.113.0/24 [-a 1.2.3.4/32] \
+      [--fullchain <链> --key <私钥> | --self-signed] [--no-firewall]
+sudo ./deploy/expose-public.sh --uninstall          # 撤下反代，面板仍绑回环
+```
+
+它会做这些事（每一条都是过去手写时最容易漏的）：
+
+| 步骤 | 做什么 | 漏了会怎样 |
+| --- | --- | --- |
+| 校验 | 不给 `-a/--allow` **直接拒绝**；域名/CIDR 不合法拒绝 | 没有来源限制的反代＝把 root 面板开放到公网任人触达 |
+| 探测 | 用 `ss -ltn` 看**真实监听**（而非配置文件里的 bind）：非回环即拒绝；`ss` 输出连表头都没有也拒绝 | "没检测到＝没监听"会把裸奔判成安全 |
+| 证书 | 自带 `--fullchain/--key`，或 `--self-signed` 现场生成；CN 没变就**复用**（不会每次重签） | 每次重签会换指纹、也会把用户后放的受信任证书悄悄替回自签 |
+| 配置 | 80 跳 HTTPS + ACME 挑战路径放行、443 终结 TLS、IP 白名单 `deny all`、WebSocket/SSE 转发、放开上传体积 | 少 SSE 那条会表现为"日志流看着卡住" |
+| 生效 | 先 `nginx -t`，**不通过就回滚上一份可用配置**（首次失败则删除）；重载失败会明说 | `conf.d` 一个语法错误会让整台 nginx 起不来，本机其它站点陪葬 |
+| 防火墙 | ufw / firewalld 放行 **80 与 443**（80 是续期挑战要走的） | 只开 443：跳转正常，三个月后证书续不上才炸 |
+| 收尾 | 写 systemd drop-in `PANEL_TLS=1` 并重启面板（当前会话会断开，重登即可） | cookie 不带 `Secure`：HTTPS 装了也白装 |
+
+脚本本身有 E2E（`make e2e-expose`）：在 user namespace 里用 tmpfs + systemctl/nginx/ss/ufw 的 shim 真跑一遍，把上面三条拒绝与配置逐条钉住；不具备 `unshare` 时 `[skip]` 退出 2，不冒充通过。
+
+**方式三：纯手写 nginx（供裁剪参考）**
 
 ```nginx
-# /etc/nginx/conf.d/forkpanel-public.conf
+# ← 注意 WebSocket 的 Connection 必须**动态决定**：写死 "upgrade" 会让所有请求
+#   都带升级头、破坏后端连接复用（本项目 Rust 侧站点渲染器也是同样写法）。
+map $http_upgrade $forkpanel_panel_ws {
+    default upgrade;
+    ''      close;
+}
+
 server {
     listen 80;
     server_name panel.example.com;
-    return 301 https://$host$request_uri;
+    # 续期挑战必须放行，否则白名单会把 ACME 验证挡在门外
+    location /.well-known/acme-challenge/ { root /var/www/html; try_files $uri =404; }
+    location / { return 301 https://$host$request_uri; }
 }
+
 server {
-    listen 443 ssl http2;
+    # 刻意不写 http2：`http2 on;` 需要 nginx ≥ 1.25.1，而旧写法 `listen 443 ssl http2`
+    # 又在 1.25+ 报弃用告警，两边无法通吃。HTTPS 的安全性来自 TLS，不来自 HTTP/2。
+    listen 443 ssl;
     server_name panel.example.com;
     ssl_certificate     /path/to/fullchain.pem;
     ssl_certificate_key /path/to/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Content-Type-Options nosniff always;
 
     # IP 白名单：只放行自己的出口网段，其余一律拒绝（宁可收紧）
     allow 203.0.113.0/24;
@@ -147,20 +186,25 @@ server {
 
     location / {
         proxy_pass http://127.0.0.1:<面板随机端口>;   # ← 换成实际端口
+        proxy_http_version 1.1;
         proxy_set_header Host              $host;
         proxy_set_header X-Real-IP         $remote_addr;
         proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-        # 控制台/日志类功能若用到 WebSocket 或 SSE，保留下面三行
-        proxy_http_version 1.1;
         proxy_set_header Upgrade    $http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Connection $forkpanel_panel_ws;
+        # SSE（日志流）不能被缓冲，默认 60s 读超时也会把长连接掐断
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+        # 文件管理器要传文件，nginx 默认 1m 会让稍大一点的上传直接 413
+        client_max_body_size 0;
     }
 }
 ```
 
 ```bash
 nginx -t && systemctl reload nginx
+ufw allow 80/tcp && ufw allow 443/tcp     # 80 也要开：ACME 续期挑战走 80
 ```
 
 #### 别漏这一步：告诉 panel 它现在跑在 HTTPS 后面
@@ -181,7 +225,10 @@ systemctl restart panel
 - [ ] 证书已签发，且自动续期在跑
 - [ ] IP 白名单已收紧到自己的出口网段
 - [ ] `/etc/forkpanel/config.toml` 里 `localhost_only` **仍为 `true`**（面板本身不对外）
+- [ ] 防火墙 **80 与 443** 都已放行（80 留给 HTTP-01 续期挑战；云厂商安全组是另一层，脚本碰不到）
 - [ ] `PANEL_TLS=1` 已生效（`systemctl show panel -p Environment` 可查）
+- [ ] `ss -ltn | grep <端口>` 确认面板仍**只**监听 `127.0.0.1:<端口>`
+- [ ] 换一台**不在白名单内**的机器访问必须是 403（不做这一步＝白名单可能压根没生效）
 - [ ] 应急后门可用：`ssh -L <端口>:127.0.0.1:<端口> <user>@<server>`
 
 ---
