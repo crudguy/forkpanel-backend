@@ -6,6 +6,41 @@
 
 ---
 
+## 安装（一键，无需编译）
+
+在以 root / sudo 执行的 Linux 机器上：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/crudguy/forkpanel-backend/main/deploy/get-panel.sh | sh
+```
+
+装完后从日志取一次性初始化令牌，浏览器打开对应端口完成引导：
+
+```bash
+journalctl -u panel -n 50 --no-pager      # 找到引导令牌
+```
+
+> 安装器会按架构（amd64 / arm64）下载**静态二进制**、**校验 ed25519 签名**（验不过绝不执行）、
+> 落 systemd 单元与开机自启，并随机分配一个 ≥10000 的端口避开扫描。
+>
+> 详细说明（指定版本 / 切镜像源 / 升级 / 卸载）：[docs/distribution.md](docs/distribution.md)
+
+**支持**：Linux（Debian / Ubuntu / CentOS / Rocky / Alma / Alpine 等，需 systemd）；架构 amd64 / arm64。
+面板默认只监听 `127.0.0.1`，远程请用 SSH 隧道：`ssh -L <端口>:127.0.0.1:<端口> user@server`。
+
+## 从源码构建
+
+```bash
+git clone https://github.com/crudguy/forkpanel-backend.git
+git clone https://github.com/crudguy/forkpanel-frontend.git forkpanel-frontend
+cd forkpanel-backend
+# 前端产物必须同步进本仓 web/dist（rust-embed 编译期内嵌），详见文档
+```
+
+完整步骤与常见坑：[docs/building-from-source.md](docs/building-from-source.md)
+
+---
+
 ## 本仓库职责（与前端彻底分离）
 
 | 关注点 | 归属 |
