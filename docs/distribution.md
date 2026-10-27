@@ -104,7 +104,7 @@ PANEL_RELEASE_BASE=https://releases.forkpanel.dev curl -fsSL <get-panel.sh 入�
 
 | Secret | 用途 |
 |---|---|
-| `FRONTEND_REPO_TOKEN` | 拉取私有前端仓 `crudguy/forkpanel-frontend`（已有，CI 同用） |
+| `FRONTEND_REPO_TOKEN` | 拉取前端仓 `crudguy/forkpanel-frontend`（**已公开，可不配**；若改回私有则必须配 PAT） |
 | `PANEL_RELEASE_KEY` | ed25519 签名私钥 PEM（发版签名用，**绝不入库**） |
 
 **配置入口（图形界面）**：仓库页面 → `Settings`（注意是**仓库**的 Settings，不是你 GitHub 个人账户设置）→ 左侧 `Secrets and variables` → `Actions` → `New repository secret`。`FRONTEND_REPO_TOKEN` 也已在同一页面。
@@ -128,7 +128,7 @@ gh secret set PANEL_RELEASE_KEY < release.key
 - 原因：前端构建产物 `web/dist/` 被 `rust-embed`（`crates/panel-cli/src/embed.rs` 的
   `#[folder = "../../web/dist"]`）**编译期内嵌**进 `panel` 二进制，`web/dist/` 本身被
   `.gitignore` 忽略、不入库。用户装一个二进制即可得到完整 UI，无需额外下载前端。
-- 发版时 `release.yml` 自动完成：`检出私有前端仓 → pnpm build → rm -rf web/dist/* &&
+- 发版时 `release.yml` 自动完成：`检出前端仓 → pnpm build → rm -rf web/dist/* &&
   cp -a 前端dist/. → touch embed.rs → cargo 静态编译`，所以**前后端版本天然绑定**，
   打一个 tag 同时冻结两端。
 - 推论：只给后端打 tag 就够；但前端仓必须先有对应提交（`release.yml` 拉的是其默认分支

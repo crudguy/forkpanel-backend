@@ -32,9 +32,9 @@ forkpanel/
 ## 完整构建步骤
 
 ```bash
-# 1. 取代码（前端仓在维护者侧是私有的；fork 场景请换自己的仓库地址）
-git clone <后端仓地址> forkpanel-backend
-git clone <前端仓地址> forkpanel-frontend      # 位置随意，下面用绝对路径指过去
+# 1. 取代码（两个仓均已公开，可直接 clone）
+git clone https://github.com/crudguy/forkpanel-backend.git
+git clone https://github.com/crudguy/forkpanel-frontend.git forkpanel-frontend   # 位置随意
 
 # 2. 构建前端
 cd forkpanel-frontend
@@ -97,4 +97,4 @@ openssl genpkey -algorithm ed25519 -out release.key && chmod 600 release.key
 | 前端改了但发出去还是旧 UI | 未重新编译后端（嵌入发生在编译期） | 必须重新 `cargo build` |
 | 门禁输出 `[skip]` 却显示"通过" | 前端路径没找到，跨仓检查被跳过 | 设 `PANEL_FRONTEND_ROOT` 后重跑 |
 | `get-panel.sh` 验签失败 | 公钥与签名私钥不匹配（用了别人公钥） | 换成自己私钥对应的公钥 |
-| 拉前端仓 403 | 前端仓私有，无权限 | 用有权限的 token，或用自己 fork 的前端仓 |
+| 拉前端仓 403 | 仓为私有或 token 无权限 | 两仓现均公开；私有镜像场景用有权限的 token |
