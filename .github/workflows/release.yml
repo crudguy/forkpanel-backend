@@ -27,15 +27,15 @@ jobs:
       - name: 检出后端
         uses: actions/checkout@v4
 
-      # 前端是私有独立仓；发布构建必须拷真实 dist（CI 门禁那次只生成占位 index.html）。
-      # 未配 FRONTEND_REPO_TOKEN 时这一步硬失败——这是正确的：没有前端就不能发版。
-      # （与 ci.yml 不同，这里不 continue-on-error：发版不能拿占位前端糊弄。）
-      - name: 检出前端仓（私有仓需 secrets.FRONTEND_REPO_TOKEN）
+      # 前端是独立仓库（现已公开）。发布构建必须拷真实 dist，不能用 CI 那次
+      # 占位的 index.html——没有前端就不能发版，故这一步失败即中止（不 continue-on-error）。
+      # 仓库公开后不再需要 token；仍保留 token 字段以便将来若改回私有可直接配 secret。
+      - name: 检出前端仓
         uses: actions/checkout@v4
         with:
           repository: crudguy/forkpanel-frontend
           path: forkpanel-frontend
-          token: ${{ secrets.FRONTEND_REPO_TOKEN }}
+          token: ${{ secrets.FRONTEND_REPO_TOKEN || github.token }}
 
       - name: Rust 工具链 + musl 目标
         uses: dtolnay/rust-toolchain@stable
