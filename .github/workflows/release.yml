@@ -1,0 +1,91 @@
+name: Release
+
+# 触发：
+#   - 推送 v* tag（如 v0.1.0）自动发版
+#   - 手动 workflow_dispatch（可选填 version 覆盖）
+#
+# 产物：dist/panel-linux-{amd64,arm64}.tar.gz(+.sig) + SHA256SUMS，上传到 GitHub Release。
+# 用户侧安装：curl -fsSL https://raw.githubusercontent.com/crudguy/forkpanel-backend/main/deploy/get-panel.sh | sh
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '覆盖版本号（如 0.1.0）；留空则用触发的 tag'
+        required: false
+
+# 创建 Release 并上传资产需要写权限
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: 跨平台 musl 静态构建 + 签名 + 发布
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出后端
+        uses: actions/checkout@v4
+
+      # 前端是私有独立仓；发布构建必须拷真实 dist（CI 门禁那次只生成占位 index.html）。
+      # 未配 FRONTEND_REPO_TOKEN 时这一步硬失败——这是正确的：没有前端就不能发版。
+      # （与 ci.yml 不同，这里不 continue-on-error：发版不能拿占位前端糊弄。）
+      - name: 检出前端仓（私有仓需 secrets.FRONTEND_REPO_TOKEN）
+        uses: actions/checkout@v4
+        with:
+          repository: crudguy/forkpanel-frontend
+          path: forkpanel-frontend
+          token: ${{ secrets.FRONTEND_REPO_TOKEN }}
+
+      - name: Rust 工具链 + musl 目标
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+
+      # 预编译二进制，比 cargo install 快得多
+      - name: 安装 cargo-zigbuild（跨平台 musl 静态编译）
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Node + pnpm
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: 构建前端
+        working-directory: forkpanel-frontend
+        run: |
+          corepack enable
+          corepack pnpm@9 install --frozen-lockfile
+          corepack pnpm@9 build
+
+      - name: 同步前端 dist 进后端 web/dist（供 RustEmbed 编译）
+        run: |
+          rm -rf web/dist/* && cp -a forkpanel-frontend/dist/. web/dist/
+          touch crates/panel-cli/src/embed.rs
+
+      - name: 写入 ed25519 签名私钥（来自 secret，绝不入库）
+        run: |
+          [ -n "${{ secrets.PANEL_RELEASE_KEY }}" ] || { echo "缺少 secret PANEL_RELEASE_KEY（ed25519 私钥 PEM）" >&2; exit 1; }
+          printf '%s\n' "${{ secrets.PANEL_RELEASE_KEY }}" > "$HOME/.forkpanel-release.key"
+          chmod 600 "$HOME/.forkpanel-release.key"
+
+      # 复用 deploy/build-static.sh（打包 + 签名的单一事实源），避免两处漂移
+      - name: 静态构建 + 签名 tarball
+        run: ./deploy/build-static.sh "${{ github.event.inputs.version || github.ref_name }}"
+
+      - name: 生成 SHA256SUMS
+        run: ( cd dist && sha256sum panel-linux-*.tar.gz > SHA256SUMS )
+
+      - name: 发布到 GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/panel-linux-amd64.tar.gz
+            dist/panel-linux-amd64.tar.gz.sig
+            dist/panel-linux-arm64.tar.gz
+            dist/panel-linux-arm64.tar.gz.sig
+            dist/SHA256SUMS
+          # tag 名含 "-"（如 v0.1.0-rc1）视为预发布
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true

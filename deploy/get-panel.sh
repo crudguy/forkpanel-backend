@@ -15,7 +15,16 @@
 #       并替换此处公钥（否则任何人都能用演示私钥伪造签名）。
 set -euo pipefail
 
-RELEASE_BASE="${PANEL_RELEASE_BASE:-https://releases.forkpanel.dev}"
+# 默认分发源：GitHub Releases（latest = 最新非预发布）。
+#   - 指定版本：releases/download/v<版本>/panel-linux-<arch>.tar.gz
+#   - 最新稳定：releases/latest/download/panel-linux-<arch>.tar.gz（GitHub 自动 302 到最新）
+# 想切到自建源（如 releases.forkpanel.dev）或镜像：PANEL_RELEASE_BASE=https://... ./get-panel.sh
+PANEL_VERSION="${PANEL_VERSION:-latest}"
+if [ "$PANEL_VERSION" = "latest" ]; then
+  RELEASE_BASE="${PANEL_RELEASE_BASE:-https://github.com/crudguy/forkpanel-backend/releases/latest/download}"
+else
+  RELEASE_BASE="${PANEL_RELEASE_BASE:-https://github.com/crudguy/forkpanel-backend/releases/download/v$PANEL_VERSION}"
+fi
 RELEASE_PUBKEY='-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEADXjjuYRAJz1RUunSQkgkgicczOPuZApv5knoj31G0X8=
 -----END PUBLIC KEY-----'
