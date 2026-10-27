@@ -65,6 +65,7 @@ journalctl -u panel -n 50 --no-pager
 
 ```bash
 # 远程部署：先建隧道（不要改 localhost_only）；<端口> 为安装时随机分配的监听端口
+# 不想每次开隧道、要长期公网访问：见 2.5（唯一受支持方式是前置反代终结 TLS，别直接改 bind）
 ssh -L <端口>:127.0.0.1:<端口> <user>@<server>
 # 本机浏览器访问 http://127.0.0.1:<端口>
 ```
@@ -82,6 +83,106 @@ ssh -L <端口>:127.0.0.1:<端口> <user>@<server>
 
 > 副作用顺序纪律：owner 检查 → 输入校验 → 哈希 → **最后**才消费令牌。
 > 否则用户第一次提交弱口令失败却已焚毁令牌，第二次改对也进不去。
+
+---
+
+### 2.5 公网远程访问：前置反代是唯一受支持的方式
+
+**先说结论：别把面板直接绑到 `0.0.0.0`。**
+
+面板以 root 运行（它要管理系统服务、防火墙），而**本构建不提供 HTTPS**——
+`serve` 永远是明文 `axum::serve`。两个事实叠加的后果是：一旦监听非回环地址，
+就是把 root 权限的操作入口**明文**放到网上，登录口令可被嗅探。
+
+> `[server].tls` 是**故意做成拒绝启动**的：历史上宣传过 `--features tls`，但代码从未接线。
+> 现在配置它，启动时会直接报错并提示改走前置反代——宁可拒绝，也不留一个
+> "看起来有 HTTPS、实际是明文"的假开关（见 `crates/panel-cli/src/config.rs` 的
+> `validate_implemented`）。
+
+#### 最容易踩的一处：只改 `bind` 是不生效的
+
+```toml
+[server]
+bind = "0.0.0.0"          # ← 只改这个没用
+localhost_only = true     # ← 它会强制覆盖 bind
+```
+
+`Config::addr()` 里是 `if localhost_only { "127.0.0.1" } else { bind }`：
+`localhost_only` 为真时无论 `bind` 写什么都绑回本机，表现为"改了没生效"。
+两者都改才会真的监听非回环——届时启动会打印醒目安全横幅，但**不会拒绝启动**。
+
+#### 受支持做法：面板继续绑回环，由 nginx 反代终结 TLS
+
+好处是**面板自身零外网暴露面**；即便 nginx 挂了或在改错白名单时把自己锁在外面，
+`ssh -L` 到面板的回环端口这条**应急后门依然存在**。
+
+**方式一（推荐，零手写配置）：在面板里给自己建一个反代站点**
+
+面板已有完整的站点反代 + 证书签发与自动续期 + 访问控制能力，直接用即可：
+
+1. 站点 → 新建 → 域名填 `panel.<你的域名>`，类型选**反向代理**
+2. upstream 填 `http://127.0.0.1:<面板端口>`（端口见安装输出，或 `grep ^port /etc/forkpanel/config.toml`）
+3. 开启 SSL（面板负责签发，**并会跑 `010_cert_auto_renew` 的到期自动续期**）
+4. 访问控制：填 **IP 白名单**（只放行你自己的出口网段），建议再叠一层 Basic Auth
+5. 防火墙放行 443
+
+**方式二（手写 nginx，适合自动化 / 不走面板站点模型）**
+
+```nginx
+# /etc/nginx/conf.d/forkpanel-public.conf
+server {
+    listen 80;
+    server_name panel.example.com;
+    return 301 https://$host$request_uri;
+}
+server {
+    listen 443 ssl http2;
+    server_name panel.example.com;
+    ssl_certificate     /path/to/fullchain.pem;
+    ssl_certificate_key /path/to/privkey.pem;
+
+    # IP 白名单：只放行自己的出口网段，其余一律拒绝（宁可收紧）
+    allow 203.0.113.0/24;
+    deny  all;
+
+    location / {
+        proxy_pass http://127.0.0.1:<面板随机端口>;   # ← 换成实际端口
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # 控制台/日志类功能若用到 WebSocket 或 SSE，保留下面三行
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+}
+```
+
+```bash
+nginx -t && systemctl reload nginx
+```
+
+#### 别漏这一步：告诉 panel 它现在跑在 HTTPS 后面
+
+反代终结 TLS 后必须设 `PANEL_TLS=1`，会话 cookie 才会带 `Secure`
+（`panel-api/src/routes/auth.rs` 读这个环境变量，默认关闭）：
+
+```bash
+systemctl edit panel        # 写入下面三行后保存
+# [Service]
+# Environment=PANEL_TLS=1
+systemctl restart panel
+```
+
+#### 开放前逐条确认
+
+- [ ] 域名 DNS 已解析到本机
+- [ ] 证书已签发，且自动续期在跑
+- [ ] IP 白名单已收紧到自己的出口网段
+- [ ] `/etc/forkpanel/config.toml` 里 `localhost_only` **仍为 `true`**（面板本身不对外）
+- [ ] `PANEL_TLS=1` 已生效（`systemctl show panel -p Environment` 可查）
+- [ ] 应急后门可用：`ssh -L <端口>:127.0.0.1:<端口> <user>@<server>`
 
 ---
 
