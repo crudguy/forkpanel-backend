@@ -8,7 +8,7 @@
 # （恒绿比没门禁更危险）。故 audit 单独成一个目标，CI 里单独一个 job——
 # advisory-db 托管在 GitHub，网络抖动时不该连带拖红主门禁。
 
-.PHONY: check guards audit test embed-fresh e2e-files e2e-backups e2e-containers e2e-cron e2e-databases e2e-sites e2e-firewall e2e-rbac e2e-security e2e-all e2e-ui e2e-observe e2e-restore e2e-install
+.PHONY: check guards audit test embed-fresh e2e-files e2e-backups e2e-containers e2e-cron e2e-databases e2e-sites e2e-firewall e2e-rbac e2e-security e2e-all e2e-ui e2e-observe e2e-restore e2e-install e2e-expose
 
 # E2E 用的后端地址与二进制路径（可按需覆盖：make e2e-files BASE=http://127.0.0.1:2084）
 BASE ?= http://127.0.0.1:2083
@@ -180,6 +180,18 @@ e2e-restore:
 #   make e2e-install
 e2e-install:
 	bash ci/e2e-install.sh "$(REL_BIN)"
+
+# 公网暴露脚本 E2E（deploy/expose-public.sh，在 user namespace 里真跑）。
+# 和 e2e-install 同一路数：不碰 HTTP、不需要运行中的后端，用 tmpfs + systemctl /
+# nginx / ss / ufw 的 shim 在隔离环境里把脚本真跑一遍，逐条核对三条 fail-closed
+# （不给 allow 就拒 / 面板已裸奔就拒 / 端口探测不可信就拒）、生成的 nginx 配置、
+# 坏配置必须回滚上一份、以及卸载必须撤干净。
+# 这是"把 root 面板放到公网边缘"的脚本，守卫必须能自证有效：改动脚本 / 断言后，
+# 请把对应的那一条行为**改坏**再跑本目标，确认它真的变红，并还原后再确认转绿。
+# ⚠ 需要 unshare + user namespace；不具备时 [skip] 退出 2。
+#   make e2e-expose
+e2e-expose:
+	bash ci/e2e-expose-public.sh
 
 test:
 	cargo test --workspace
