@@ -52,6 +52,18 @@ jobs:
         with:
           tool: cargo-zigbuild
 
+      # ⚠ cargo-zigbuild 只是 cargo 子命令包装器，**不含 zig 编译器本体**——
+      #   缺 zig 时它报 `Failed to find zig / cannot find binary path` 直接挂。
+      #   必须单独装 zig（taiki-e/install-action 的工具清单里没有 zig，只能走
+      #   cargo-binstall 兜底，而 zig 不是 Rust crate ⇒ 兜底也失败，故用官方 setup-zig）。
+      - name: 安装 Zig 编译器（cargo-zigbuild 的 linker 后端）
+        uses: mlugg/setup-zig@v2
+        with:
+          # 钉死版本，理由同 rust 1.98.1：留空（""）会 fallback 到 latest，
+          # 某天 zig 发新版改了 musl/CLI 行为就把发版搞红，属于同一类「移动靶」。
+          # 0.16.0 = cargo-zigbuild 维护者 Dockerfile 实际验证过的版本。
+          version: "0.16.0"
+
       - name: Node + pnpm
         uses: actions/setup-node@v4
         with:

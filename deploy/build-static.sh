@@ -2,7 +2,9 @@
 # ForkPanel 静态分发构建：musl 静态二进制 + 签名 tarball
 #
 # 前提（在 CI / 有网环境执行）：
-#   cargo install cargo-zigbuild     # 首次会自动下载 zig
+#   cargo install cargo-zigbuild     # 只是 cargo 子命令，**不会**自动下载 zig 本体
+#   zig（0.13+）                     # ⚠ 必须单独安装，否则报 Failed to find zig 直接挂
+#                                     #   CI 见 release.yml 的 mlugg/setup-zig@v2
 #   openssl                         # ed25519 签名
 #   openssl genpkey -algorithm ed25519 -out "$KEY"   # 生成您的签名私钥（妥善保管，勿入库）
 #
@@ -21,6 +23,13 @@ mkdir -p "$OUT"
 
 [ -f "$SIGN_KEY" ] || { echo "缺少签名私钥：$SIGN_KEY（见文件头注释生成方式）" >&2; exit 1; }
 command -v cargo-zigbuild >/dev/null 2>&1 || { echo "缺少 cargo-zigbuild：cargo install cargo-zigbuild" >&2; exit 1; }
+# zig 是 cargo-zigbuild 的 linker 后端，缺失时它只会报含糊的 "Failed to find zig"。
+# 在这里提前拦住并说清病因，省去下一次「看不出为什么」的 CI 红。
+command -v zig >/dev/null 2>&1 || {
+  echo "缺少 zig 编译器（cargo-zigbuild 依赖它，且不会自动下载）：" >&2
+  echo "  Debian/Ubuntu：下载官方 tarball 解压后加进 PATH；CI 见 release.yml 的 mlugg/setup-zig@v2" >&2
+  exit 1
+}
 command -v openssl >/dev/null 2>&1 || { echo "缺少 openssl" >&2; exit 1; }
 
 # 把安装三件套打进 tarball（install.sh 单源来自 deploy/，避免漂移）
