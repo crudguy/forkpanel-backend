@@ -387,7 +387,9 @@ fn dow_from_days(z: i64) -> u8 {
 /// 供 panel-task 的内部调度器复用：每日类任务同样必须以本地时间为准，
 /// 否则东八区上"03:10 执行"会漂到 11:10。
 pub fn local_utc_offset_secs_at(now_unix: i64) -> i64 {
-    let t = now_unix as libc::time_t;
+    // time_t 在现代 64 位平台（glibc / musl 1.2.0+）恒为 64 位；libc 已弃用
+    // `libc::time_t` 类型别名（musl 1.2.0 起改 64 位），直接用 i64 避免弃用警告。
+    let t = now_unix;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     let ok = unsafe { libc::localtime_r(&t, &mut tm) };
     if ok.is_null() { 0 } else { tm.tm_gmtoff as i64 }

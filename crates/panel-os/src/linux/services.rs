@@ -494,9 +494,11 @@ fn format_journal_line(raw: &str) -> Option<String> {
 /// 用 libc `localtime_r`（libc 已是本 crate 直接依赖），不引入 chrono/time 新依赖
 /// （直接依赖预算上限 38，去重后现约 22）。转换失败给占位符，绝不 panic。
 fn format_local_ts(secs: i64) -> String {
-    let t: libc::time_t = secs as libc::time_t;
+    // time_t 在现代 64 位平台（glibc / musl 1.2.0+）恒为 64 位；libc 已弃用
+    // `libc::time_t` 类型别名（musl 1.2.0 起改 64 位），直接用 i64 避免弃用警告。
+    let t = secs;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    // SAFETY: localtime_r 只写我们提供的 tm；t 为合法 time_t。
+    // SAFETY: localtime_r 只写我们提供的 tm；t 为合法 i64（time_t 在目标平台恒 64 位）。
     let ok = unsafe { !libc::localtime_r(&t, &mut tm).is_null() };
     if !ok {
         return "????-??-?? ??:??:??".to_string();
