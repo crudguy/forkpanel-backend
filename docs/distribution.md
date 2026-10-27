@@ -107,6 +107,17 @@ PANEL_RELEASE_BASE=https://releases.forkpanel.dev curl -fsSL <get-panel.sh 入�
 | `FRONTEND_REPO_TOKEN` | 拉取私有前端仓 `crudguy/forkpanel-frontend`（已有，CI 同用） |
 | `PANEL_RELEASE_KEY` | ed25519 签名私钥 PEM（发版签名用，**绝不入库**） |
 
+**配置入口（图形界面）**：仓库页面 → `Settings`（注意是**仓库**的 Settings，不是你 GitHub 个人账户设置）→ 左侧 `Secrets and variables` → `Actions` → `New repository secret`。`FRONTEND_REPO_TOKEN` 也已在同一页面。
+
+**配置内容注意**：`PANEL_RELEASE_KEY` 的值是私钥文件 `release.key` 的**全部内容**（含 `-----BEGIN/END PRIVATE KEY-----` 与中间 base64 行及换行），必须原样、多行粘贴。保存后 GitHub 不再显示明文，粘贴务必准确。
+
+**更快的方式（避免多行私钥复制出错）**：本机装了 GitHub CLI 且已 `gh auth login` 后，直接在仓库目录或显式 `--repo` 执行：
+```bash
+gh secret set PANEL_RELEASE_KEY < release.key
+```
+
+> ⚠ 私钥由维护者本地生成并自行保管（见上文安全模型），**不要**把私钥内容贴给 AI 或他人代配；上面的 `gh` 命令是你本机对自己仓库执行。
+
 ## 资产命名约定
 
 `build-static.sh` 产出固定名 `panel-linux-{amd64,arm64}.tar.gz(.sig)`，`get-panel.sh` 按此名下载——**两边必须保持一致**，改名需同步改两处。
