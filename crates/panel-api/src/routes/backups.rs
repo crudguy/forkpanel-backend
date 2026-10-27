@@ -2351,7 +2351,7 @@ mod exec_tests {
         // SQLite 头 16 字节是对的，后面全是垃圾：能过"是不是 sqlite"的粗检，
         // 但 integrity_check 会炸——比纯随机字节更接近真实损坏。
         let mut v = b"SQLite format 3\x00".to_vec();
-        v.extend(std::iter::repeat(0xABu8).take(64 * 1024));
+        v.extend(std::iter::repeat_n(0xABu8, 64 * 1024));
         std::fs::write(&bad, &v).unwrap();
 
         let e = verify_artifact(&bad, None, &base).await.expect_err("坏库必须被拒");

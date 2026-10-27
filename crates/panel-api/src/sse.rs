@@ -62,7 +62,7 @@ pub async fn metrics_stream(
         None => return ApiError::unauthorized().into_response(),
     }
     let limit = state.tier.max_sse_clients();
-    if SSE_CONNS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+    if SSE_CONNS.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
         if n >= limit { None } else { Some(n + 1) }
     }).is_err() {
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -138,7 +138,7 @@ pub async fn task_stream(
         return ApiError::unauthorized().into_response();
     }
     let limit = state.tier.max_sse_clients();
-    if SSE_CONNS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+    if SSE_CONNS.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
         if n >= limit { None } else { Some(n + 1) }
     }).is_err() {
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -205,7 +205,7 @@ pub async fn follow_source(
 ) -> axum::response::Response {
     let n = limit.clamp(1, 2000);
     let cap = state.tier.max_sse_clients();
-    if SSE_CONNS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |k| {
+    if SSE_CONNS.try_update(Ordering::SeqCst, Ordering::SeqCst, |k| {
         if k >= cap { None } else { Some(k + 1) }
     }).is_err() {
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -307,7 +307,7 @@ pub async fn service_journal_stream(
     };
 
     let limit = state.tier.max_sse_clients();
-    if SSE_CONNS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+    if SSE_CONNS.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
         if n >= limit { None } else { Some(n + 1) }
     }).is_err() {
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE,

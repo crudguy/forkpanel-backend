@@ -37,9 +37,13 @@ jobs:
           path: forkpanel-frontend
           token: ${{ secrets.FRONTEND_REPO_TOKEN || github.token }}
 
+      # 工具链版本 / musl 目标 / clippy 锁定 1.98.1（与仓库根 rust-toolchain.toml 一致）：
+      # 显式写死，避免 action 默认拉 latest stable 触发「新 deprecation 把 -D warnings 打成错误」
+      # 这类移动靶。本地 rustup 也吃 rust-toolchain.toml，故本地与 CI 工具链完全一致。
       - name: Rust 工具链 + musl 目标
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: "1.98.1"
           targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
 
       # 预编译二进制，比 cargo install 快得多

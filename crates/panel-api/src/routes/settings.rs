@@ -572,8 +572,8 @@ pub async fn test_llm(
 /// 把 Duration 渲染成 config.toml 同款 "30m"/"12h"/"90s"（deployment 段展示用）。
 fn fmt_dur(d: std::time::Duration) -> String {
     let s = d.as_secs();
-    if s % 3600 == 0 { format!("{}h", s / 3600) }
-    else if s % 60 == 0 { format!("{}m", s / 60) }
+    if s.is_multiple_of(3600) { format!("{}h", s / 3600) }
+    else if s.is_multiple_of(60) { format!("{}m", s / 60) }
     else { format!("{}s", s) }
 }
 

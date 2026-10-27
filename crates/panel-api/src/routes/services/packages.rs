@@ -473,7 +473,7 @@ impl panel_task::TaskBody for PackageTask {
                             b.push(line.clone());
                         }
                         // 每 20 行上报一次进度，其余只转发日志行
-                        if n % 20 == 0 {
+                        if n.is_multiple_of(20) {
                             progress.set(percent_from_lines(n), &line).await;
                         } else {
                             progress.log(&line).await;

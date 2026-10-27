@@ -1,0 +1,10 @@
+# 锁定工具链版本，杜绝「latest stable 突然引入新 deprecation/lint 把 -D warnings 打成错误」
+# 这类移动靶破坏 CI。CI（ci.yml / release.yml）与本地 `make check` 都吃这个文件。
+#
+# 选 1.98.1 的理由：本地开发机默认就是它；它已稳定 try_update（1.80 起），
+# 且尚未把 fetch_update 标记 deprecated——但代码侧已改用 try_update，
+# 即便将来升到更新 stable 也不会再触发该 deprecation。
+[toolchain]
+channel = "1.98.1"
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
+components = ["clippy", "rustfmt"]

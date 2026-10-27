@@ -5,8 +5,9 @@ members = ["crates/panel-core", "crates/panel-os", "crates/panel-db", "crates/pa
 [workspace.package]
 version = "0.1.0"
 edition = "2021"          # 如需 edition 2024，请将 MSRV 提升到 1.85
-# 代码用到 std::sync::LazyLock（1.80 才稳定）——原先声明 1.75 是不实的：那个版本根本编不过。
-rust-version = "1.80"
+# MSRV 1.98：原子 `try_update`（1.95 才稳定，取代已 deprecated 的 `fetch_update`）要求 ≥1.95；
+# 取 1.98 与本仓 rust-toolchain.toml 锁定的 1.98.1 一致，杜绝「本地绿 / CI 红」的工具链漂移。
+rust-version = "1.98"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]

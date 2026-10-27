@@ -754,7 +754,7 @@ fn validate_sqlite_path(state: &Shared, db: &str) -> ApiResult<()> {
 /// sqlite 是本地文件、无账号概念，user 可不填。
 fn validate_connection_create(engine: &str, user: &Option<String>) -> ApiResult<()> {
     if (engine == "mysql" || engine == "postgres")
-        && user.as_ref().map_or(true, |u| u.trim().is_empty())
+        && user.as_ref().is_none_or(|u| u.trim().is_empty())
     {
         return Err(ApiError::bad_request("user", "mysql/postgres 连接必须指定账号（user 必填）"));
     }
