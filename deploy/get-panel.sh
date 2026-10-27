@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 # ForkPanel 一键安装（分发版）：下载签名 tarball → 验签 → 解包 → 安装
 #
-# 用法（小白复制这一行即可）：
-#   curl -fsSL https://get.forkpanel.dev | sh
+# 用法（三选一）：
+#   1) 官方一键脚本域名（规划中，尚未部署，请勿使用）：
+#        curl -fsSL https://get.forkpanel.dev | sh
+#   2) 已 clone 仓库 / 已有本脚本：
+#        sudo bash deploy/get-panel.sh
+#   3) 中国大陆网络（GitHub Release 资产 CDN 直连不稳，详见下方"网络问题"）：
+#        https_proxy=http://<代理>:port sudo -E bash deploy/get-panel.sh
+#        PANEL_RELEASE_BASE=https://<国内镜像基址>/... sudo -E bash deploy/get-panel.sh
 #
 # 安全设计：
 #   - 仅支持 Linux（面板 OS 抽象层当前只有 Linux 实现；其他系统适配中）
@@ -10,15 +16,25 @@
 #   - 用「内嵌 ed25519 公钥 + openssl」验证 tarball 签名；签不过立即中止，绝不运行未验文件
 #   - 解包后执行 tarball 内的 install.sh（建目录 / 配置随机端口 / 系统单元 / 探活）
 #
-# 覆盖项：PANEL_RELEASE_BASE=... 切换下载源；--no-install 仅下载验签不解装（调试 / 测试）
-# 注意：下方 RELEASE_PUBKEY 为「演示公钥」。正式发版前请用您自己的 ed25519 私钥重签，
-#       并替换此处公钥（否则任何人都能用演示私钥伪造签名）。
+# 覆盖项：PANEL_RELEASE_BASE=... 切换下载源（国内镜像 / 自建源）；
+#        PANEL_VERSION=... 指定版本（默认 latest）；--no-install 仅下载验签不解装。
+#
+# 网络问题（中国大陆用户最常见）：
+#   脚本默认从 GitHub Releases 下载，资产实际落在 release-assets.githubusercontent.com
+#   （Azure CDN），该域名在国内常直连超时或被重置，表现就是"一直下载不了安装文件"。
+#   解决：① 走代理（https_proxy，注意用 sudo -E 透传环境变量）；
+#        ② 把 PANEL_RELEASE_BASE 指到国内可达镜像；③ 手动下载后本地装（见下方失败提示）。
+#
+# 注意：下方 RELEASE_PUBKEY 即为发布私钥 /home/a/release.key 对应的 ed25519 公钥
+#       （base64 已与 release.key 对齐，并非占位演示密钥）。若将来更换签名密钥，
+#       须用新私钥重签，并用 `openssl pkey -in <新私钥> -pubout` 同步更新此处。
 set -euo pipefail
 
 # 默认分发源：GitHub Releases（latest = 最新非预发布）。
 #   - 指定版本：releases/download/v<版本>/panel-linux-<arch>.tar.gz
 #   - 最新稳定：releases/latest/download/panel-linux-<arch>.tar.gz（GitHub 自动 302 到最新）
-# 想切到自建源（如 releases.forkpanel.dev）或镜像：PANEL_RELEASE_BASE=https://... ./get-panel.sh
+# 想切到自建源（如 releases.forkpanel.dev）或国内镜像：
+#   PANEL_RELEASE_BASE=https://... sudo -E bash get-panel.sh
 PANEL_VERSION="${PANEL_VERSION:-latest}"
 if [ "$PANEL_VERSION" = "latest" ]; then
   RELEASE_BASE="${PANEL_RELEASE_BASE:-https://github.com/crudguy/forkpanel-backend/releases/latest/download}"
@@ -62,15 +78,42 @@ SIGURL="$RELEASE_BASE/$TARBALL.sig"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
+# 稳健下载：重试 + 断点续传 + 长超时，扛住 GitHub CDN 的瞬时抖动。
+#   curl：--retry 只在连接/超时/5xx 时重试（404 等硬错立即失败，交给我们给诊断）；
+#         -C - 支持 Range 续传；--max-time 600 给慢速链路留足时间。
+#   wget：-c 续传，--tries/--timeout 对应重试。
 dl() {  # dl <url> <out>
-  if command -v curl >/dev/null 2>&1; then curl -fsSL "$1" -o "$2";
-  elif command -v wget >/dev/null 2>&1; then wget -q "$1" -O "$2";
-  else echo "缺少 curl / wget" >&2; exit 1; fi
+  local url="$1" out="$2" rc=0
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --retry 5 --retry-delay 2 \
+          --connect-timeout 15 --max-time 600 -C - "$url" -o "$out" || rc=$?
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q --tries=5 --timeout=60 -c "$url" -O "$out" || rc=$?
+  else
+    echo "缺少 curl / wget，无法下载。" >&2; exit 1
+  fi
+  return $rc
+}
+
+# 下载失败的统一诊断：区分"版本/URL 错（404）"与"网络被墙/超时（连接失败）"
+diagnose_fetch_fail() {
+  local what="$1" url="$2"
+  echo "$what 失败：$url" >&2
+  echo "  常见原因与对策：" >&2
+  echo "  1) 网络（中国大陆最常见）：GitHub Release 资产走 release-assets.githubusercontent.com，" >&2
+  echo "     CDN 直连常超时/被重置。请走代理并以 sudo -E 透传环境变量：" >&2
+  echo "       https_proxy=http://<代理>:port sudo -E bash get-panel.sh" >&2
+  echo "  2) 改用国内可达镜像源：PANEL_RELEASE_BASE=https://<镜像基址>/... sudo -E bash get-panel.sh" >&2
+  echo "  3) 手动下载后本地安装（绕过脚本下载）：" >&2
+  echo "       在能访问 GitHub 的机器下载 panel-linux-$ARCH.tar.gz 与 .sig，" >&2
+  echo "       scp 到本机后：tar xzf panel-linux-$ARCH.tar.gz && sudo sh ./install.sh ./panel" >&2
+  echo "  4) 若提示 404：检查 PANEL_VERSION（默认 latest）或 PANEL_RELEASE_BASE 是否拼写错误。" >&2
+  exit 1
 }
 
 echo "==> 下载 $URL"
-dl "$URL" "$WORK/$TARBALL" || { echo "下载失败：$URL" >&2; exit 1; }
-dl "$SIGURL" "$WORK/$TARBALL.sig" || { echo "下载签名失败：$SIGURL" >&2; exit 1; }
+dl "$URL" "$WORK/$TARBALL" || diagnose_fetch_fail "下载" "$URL"
+dl "$SIGURL" "$WORK/$TARBALL.sig" || diagnose_fetch_fail "下载签名" "$SIGURL"
 
 echo "==> 校验签名（内嵌公钥，openssl ed25519）"
 printf '%s\n' "$RELEASE_PUBKEY" > "$WORK/pubkey.pem"
