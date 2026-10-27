@@ -244,18 +244,35 @@ impl FirewallProvider for LinuxFirewall {
 
     async fn apply(&self, plan: RulePlan) -> Result<ApplyReport> {
         self.ensure_ufw()?;
-        // 1) 先删所有面板自有规则（按 ufw 真实编号、逆序删除）
+        // 现状：只取面板自有规则（带 ufw 真实编号），用于幂等判定与过期清理。
+        // ⚠ 只认带 `panel-managed` 标记的规则，绝不碰用户既有规则。
+        let existing = panel_rules_with_nums(self).await?;
+
+        let mut added = 0;
         let mut removed = 0;
-        for n in panel_rule_numbers(self).await? {
+        let mut unchanged = 0;
+        let mut warnings = Vec::new();
+
+        // 1) 过期清理：现有面板规则若已不在期望计划中（或内容变化），逆序删
+        //    （从大到小删，避免删一条后编号整体前移误删别的规则）。
+        let mut stale: Vec<u32> = existing.iter()
+            .filter(|(_, e)| !plan.rules.iter().any(|d| rule_eq(e, d)))
+            .map(|(n, _)| *n)
+            .collect();
+        stale.sort_unstable_by(|a, b| b.cmp(a));
+        for n in stale {
             if delete_number(self, n).await.is_ok() { removed += 1; }
         }
-        // 2) 加新规则（每条带 panel-managed <id> 标记）
-        let mut added = 0;
-        let mut warnings = Vec::new();
+
+        // 2) 新增/更新：已存在且功能一致的跳过（幂等，计数 unchanged），其余写入。
         for rule in &plan.rules {
+            if existing.iter().any(|(_, e)| rule_eq(e, rule)) {
+                unchanged += 1;
+                continue;
+            }
             let id = gen_id();
-            let comment = format!("panel-managed {} {}", id,
-                rule.comment.clone().unwrap_or_default().trim());
+            let comment = format!("panel-managed {} {}",
+                id, rule.comment.clone().unwrap_or_default().trim());
             let mut args: Vec<String> = Vec::new();
             args.push(match rule.action { Action::Deny => "deny", Action::Reject => "reject", _ => "allow" }.into());
             let port = port_to_arg(&rule.ports);
@@ -274,7 +291,8 @@ impl FirewallProvider for LinuxFirewall {
             if out.code == Some(0) { added += 1; }
             else { warnings.push(format!("add {} 失败: {}", rule.id, out.stderr.trim())); }
         }
-        Ok(ApplyReport { added, removed, unchanged: 0, warnings })
+
+        Ok(ApplyReport { added, removed, unchanged, warnings })
     }
 
     async fn delete_rule(&self, id: &str) -> Result<()> {
@@ -362,8 +380,45 @@ impl FirewallProvider for LinuxFirewall {
     }
 }
 
+/// 列出当前**面板自有**规则及其 ufw 真实编号（幂等判定 / 过期清理用）。
+/// 只认带 `panel-managed` 标记的规则，绝不碰用户既有规则。
+/// 作为自由函数（同模块可访问 LinuxFirewall 的私有 `ufw`）以避免塞进 trait impl。
+async fn panel_rules_with_nums(fw: &LinuxFirewall) -> Result<Vec<(u32, FirewallRule)>> {
+    let out = fw.ufw(&["status", "numbered"], Duration::from_secs(10)).await?;
+    let raw = parse_status(&out.stdout);
+    let mut v = Vec::new();
+    for r in raw {
+        if !r.comment.as_deref().map(|c| c.contains("panel-managed")).unwrap_or(false) { continue; }
+        let num = match r.num { Some(n) => n, None => continue };
+        let id = panel_id(&r.comment).unwrap_or_else(|| format!("rule-{}", num));
+        let (ports, proto) = parse_to(&r.to);
+        v.push((num, FirewallRule {
+            id,
+            ports,
+            protocol: proto,
+            action: action_from(&r.action),
+            direction: if r.dir == "OUT" { Direction::Outbound } else { Direction::Inbound },
+            source_cidr: if r.from == "Anywhere" { None } else { Some(r.from) },
+            comment: r.comment,
+            panel_managed: true,
+        }));
+    }
+    Ok(v)
+}
+
 fn proto_str(p: Protocol) -> &'static str {
     match p { Protocol::Udp => "udp", Protocol::Icmp => "icmp", Protocol::Any => "any", _ => "tcp" }
+}
+
+/// 两条规则「功能上是否一致」：比较端口 / 协议 / 动作 / 方向 / 来源，
+/// 忽略内部随机 id 与注释（这些都随每次写入变化，不代表规则语义变化）。
+/// 用于 apply 的幂等判定——同一份期望计划二次 apply 时，已存在的规则应被识别为 unchanged。
+fn rule_eq(e: &FirewallRule, d: &FirewallRule) -> bool {
+    e.ports == d.ports
+        && e.protocol == d.protocol
+        && e.action == d.action
+        && e.direction == d.direction
+        && e.source_cidr == d.source_cidr
 }
 
 #[cfg(test)]
