@@ -26,7 +26,7 @@ else
   RELEASE_BASE="${PANEL_RELEASE_BASE:-https://github.com/crudguy/forkpanel-backend/releases/download/v$PANEL_VERSION}"
 fi
 RELEASE_PUBKEY='-----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEADXjjuYRAJz1RUunSQkgkgicczOPuZApv5knoj31G0X8=
+MCowBQYDK2VwAyEAcw1u+sjeBdzxlMwz88QBli5DCBTi705rQcIdIIPRKGU=
 -----END PUBLIC KEY-----'
 
 NO_INSTALL=0
