@@ -64,6 +64,18 @@ jobs:
           rm -rf web/dist/* && cp -a forkpanel-frontend/dist/. web/dist/
           touch crates/panel-cli/src/embed.rs
 
+      # ★ 发布门槛：门禁 + 全量测试，不过则中止，决不让坏代码被签名发出去。
+      # 用真实前端（上面已 build+同步），比 CI 占位 web/dist 更严格——
+      # 同时验证「嵌入新鲜度」这一发布特有的风险点。
+      # ⚠ 打 tag 的 push 不会触发 ci.yml（它只绑 main 分支），所以这一步是
+      #   release 自己兜底的防线，不能省。
+      - name: 门禁 + 全量测试（发布门槛，不过则中止）
+        run: make check
+        env:
+          PANEL_FRONTEND_ROOT: ${{ github.workspace }}/forkpanel-frontend
+          PANEL_FRONTEND_OPENAPI: ${{ github.workspace }}/forkpanel-frontend/src/api/openapi.yaml
+          FE_DIST: ${{ github.workspace }}/forkpanel-frontend/dist
+
       - name: 写入 ed25519 签名私钥（来自 secret，绝不入库）
         run: |
           [ -n "${{ secrets.PANEL_RELEASE_KEY }}" ] || { echo "缺少 secret PANEL_RELEASE_KEY（ed25519 私钥 PEM）" >&2; exit 1; }

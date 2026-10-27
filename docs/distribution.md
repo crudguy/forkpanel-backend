@@ -59,7 +59,8 @@ PANEL_RELEASE_BASE=https://releases.forkpanel.dev curl -fsSL <get-panel.sh 入�
 1. 本地提交、push `main`；确认 CI（门禁 + 测试）全绿。
 2. 确保 `get-panel.sh` 已是正式公钥（见上）。
 3. 打 tag 触发发版：`git tag v0.1.0 && git push origin v0.1.0`
-4. GitHub Actions `Release` workflow 自动：构建（前端 + 后端 musl 静态）→ 签名 → 上传到 `v0.1.0` Release 资产。
+   ⚠ 打 tag 的 push **不会**触发 `ci.yml`（`ci.yml` 只绑 `main` 分支）。所以发版前的质量兜底完全由 `release.yml` 内置的 `make check` 承担——它必须留在发布链最前面，不能省。
+4. GitHub Actions `Release` workflow 自动：先跑 **`make check`（门禁 + 全量测试）作为发布门槛** → 构建（前端 + 后端 musl 静态）→ 签名 → 上传到 `v0.1.0` Release 资产。门禁不过则中止，不会把坏代码签名发出去。
 5. 在 GitHub Releases 页面复核资产（`*.tar.gz` / `*.tar.gz.sig` / `SHA256SUMS`），必要时编辑发布说明。
 
 ### 需要的 Secrets
