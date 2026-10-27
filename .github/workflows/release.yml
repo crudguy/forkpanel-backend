@@ -59,10 +59,17 @@ jobs:
           corepack pnpm@9 install --frozen-lockfile
           corepack pnpm@9 build
 
+      # ⚠ 必须先 mkdir -p web/dist：干净 checkout 时后端仓**没有 web/ 目录**
+      #   （web/dist 被 .gitignore，空目录不入库），直接 cp 会报
+      #   "cp: 无法创建目录 'web/dist/': 没有那个文件或目录" 而中止发版。
+      #   本地能过是因为那目录一直存在——CI 从零开始才暴露。
       - name: 同步前端 dist 进后端 web/dist（供 RustEmbed 编译）
         run: |
-          rm -rf web/dist/* && cp -a forkpanel-frontend/dist/. web/dist/
+          mkdir -p web/dist
+          rm -rf web/dist/*
+          cp -a forkpanel-frontend/dist/. web/dist/
           touch crates/panel-cli/src/embed.rs
+          echo "内嵌产物：$(find web/dist -type f | wc -l) 个文件"
 
       # ★ 发布门槛：门禁 + 全量测试，不过则中止，决不让坏代码被签名发出去。
       # 用真实前端（上面已 build+同步），比 CI 占位 web/dist 更严格——
