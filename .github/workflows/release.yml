@@ -76,6 +76,17 @@ jobs:
           PANEL_FRONTEND_OPENAPI: ${{ github.workspace }}/forkpanel-frontend/src/api/openapi.yaml
           FE_DIST: ${{ github.workspace }}/forkpanel-frontend/dist
 
+      # 把 tag 版本写进 Cargo.toml，否则二进制自报的版本恒为源码里的旧值
+      # （panel 的 /api/v1/version 取 env!("CARGO_PKG_VERSION")），
+      # 导致 v0.2.0 的面板「关于」显示 0.1.0。改法只动工作区、不提交。
+      - name: 版本号对齐 tag
+        run: |
+          V="${{ github.event.inputs.version || github.ref_name }}"
+          V="${V#v}"                       # v0.1.0 → 0.1.0
+          echo "发布版本：$V"
+          sed -i -E "s/^version = \"[^\"]*\"/version = \"$V\"/" Cargo.toml
+          grep -n '^version' Cargo.toml | head -2
+
       - name: 写入 ed25519 签名私钥（来自 secret，绝不入库）
         run: |
           [ -n "${{ secrets.PANEL_RELEASE_KEY }}" ] || { echo "缺少 secret PANEL_RELEASE_KEY（ed25519 私钥 PEM）" >&2; exit 1; }
