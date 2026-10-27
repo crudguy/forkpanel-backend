@@ -137,4 +137,4 @@ fi
 echo "==> 安装（执行 tarball 内的 install.sh）"
 ( cd "$WORK" && sh ./install.sh ./panel )
 
-echo "完成。面板已安装并启动；按 install.sh 输出里的随机端口与引导令牌完成初始化。"
+echo "完成。面板已安装（并已尝试自动启动，实际状态见上面 install.sh 打出的『服务状态』行）；按其中的随机端口与引导令牌完成初始化。"

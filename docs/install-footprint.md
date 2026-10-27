@@ -36,8 +36,15 @@
 | `/etc/systemd/system/panel-healthcheck.timer` | 文件 | — | 探活定时器（每分钟一次，连续两次失败才重启） |
 | `/var/lib/forkpanel/scripts/healthcheck.sh` | 文件 | — | 探活脚本（写进数据目录内的受限脚本目录） |
 
-> 安装完成后会执行 `systemctl daemon-reload && systemctl enable panel`
-> 以及 `systemctl enable --now panel-healthcheck.timer`，把两个单元设为开机自启。
+> 安装完成后会执行 `systemctl daemon-reload && systemctl enable panel`、随即
+> `systemctl start panel` **把服务直接拉起来**，以及
+> `systemctl enable --now panel-healthcheck.timer`，把两个单元设为开机自启。
+>
+> ⚠️ 自动拉起之后脚本还会**真探一次端口**（最多 15 秒）才报告"已启动"：单元是
+> `Type=simple`，systemd 在进程 fork 之后就判定启动成功，端口冲突导致"起来又立刻
+> 退出"时 `systemctl start` 的退出码仍可能是 0 —— 只凭退出码宣布成功等于撒谎。
+> 启动失败**不会**让 `install.sh` 判失败（此刻二进制/目录/配置/单元都已落盘），
+> 它仍以 0 退出并给出 `journalctl -u panel` 诊断，真实状态是"已安装、这次没起来"。
 
 **`config.toml` 是唯一需要你关心的配置文件**，其 `[paths]` 节可覆盖上面 4 个根
 （config / data / log / site_root），但业务代码禁止直接拼路径——一律走

@@ -198,6 +198,9 @@ calls=$(cat /tmp/e2e-shim/calls.log 2>/dev/null)
 [ -n "$calls" ] && ok "捕获到 systemctl 调用" || bad "安装过程一次 systemctl 都没调用"
 chk_has "调用了 daemon-reload" "$calls" "daemon-reload"
 chk_has "enable 了 panel 服务" "$calls" "enable panel"
+# 钉住「装完即拉起」：以前 install.sh 只 enable 不 start，用户还得手动 systemctl start，
+# 而这条用例从来没验过那件事。抽掉 start 这行必须变红，否则改动会静默退化。
+chk_has "装完自动拉起服务（用户无需手动 start）" "$calls" "start panel"
 chk_has "enable 了探活 timer" "$calls" "enable --now panel-healthcheck.timer"
 
 # ── 8. 真数据面：装的这个二进制能不能跑起来 + 初始化 + 登录 ─────────────

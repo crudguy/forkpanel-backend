@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# ForkPanel 安装脚本：二进制 → 目录 → 默认配置 → systemd 单元
+# ForkPanel 安装脚本：二进制 → 目录 → 默认配置 → systemd 单元 → 自动拉起服务
 #
 # 用法（需 root）：
 #   ./deploy/install.sh [二进制路径]        # 缺省 ./target/release/panel
 #
 # 该脚本只做"安装"，不建账号。首个 owner 由 Web 首启向导创建：
-# 启动服务后从日志取一次性引导令牌，在浏览器里完成初始化。
+# 服务被自动拉起后，从日志取一次性引导令牌，在浏览器里完成初始化。
 #
 # ★ 改动本脚本前请看 `ci/e2e-install.sh`：它在 user namespace 里把 /usr/local、
 #   /etc、/var/lib、/var/log、/var/www 换成一次性 tmpfs 后**真跑一遍本脚本**，
@@ -56,6 +56,24 @@ pick_random_port() {
   echo 2083; return 0
 }
 
+# 等某个端口真的进入 LISTEN（最多 15 秒）。
+# ⚠ 这个函数不能省：单元是 **Type=simple**（crates/panel-cli/src/bootstrap.rs），
+#   systemd 在进程 fork 之后就判定"启动成功"——端口被占 / 配置有误导致"起来又立刻
+#   退出"时，`systemctl start` 常常早就返回 0 了。也就是说，**systemctl 的退出码
+#   不足以证明服务活着**。判据必须是"内核里真的有东西在 listen"。
+wait_port_up() {
+  local port="$1" i
+  command -v ss >/dev/null 2>&1 || return 1
+  command -v awk >/dev/null 2>&1 || return 1
+  for i in $(seq 1 15); do
+    if ss -ltn 2>/dev/null | awk 'NR>1{print $4}' | grep -qE "[:.]${port}\$"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 [ "$(id -u)" -eq 0 ] || die "需要 root 权限（面板要管理系统服务/防火墙）"
 [ -f "$BIN_SRC" ]   || die "找不到二进制：$BIN_SRC（先 cargo build --release，或显式传入路径）"
 command -v systemctl >/dev/null 2>&1 || die "未检测到 systemd（请用 --config 直接运行 serve，或自行接入进程管理器）"
@@ -84,6 +102,34 @@ systemctl daemon-reload
 systemctl enable panel >/dev/null
 echo "· systemd 单元已安装并设为开机自启"
 
+# ── 装完直接把服务拉起来 ────────────────────────────────────────────────
+# 用户不该还得自己敲 `systemctl start panel`。但这里的诚实性要求有两条，别为省事省掉：
+#
+# 1) **不能只看 systemctl 的退出码**就宣布"已启动"：单元是 Type=simple（见
+#    wait_port_up 的注释），端口冲突等情形下进程会 fork 之后立刻退出，
+#    而那时 systemctl 早已返回 0。⇒ 必须真探端口，否则我们输出的"已启动"是句谎话。
+#
+# 2) **启动失败也不许带崩整条 set -e**：走到这里时二进制 / 目录 / 配置 / 单元都已落盘，
+#    把它判成"安装失败"是错的——真实状态是"已安装、这一次没起来"。用户的退出码语义是
+#    "安装是否成功"，所以本脚本仍以 0 退出，同时给一条能直接看到真实报错的诊断。
+RUN_STATE="up"
+if ! systemctl start panel 2>/dev/null; then
+  RUN_STATE="failed"
+  echo "· ⚠ 服务已安装，但本次自动启动失败。看真实原因（常见：端口 $PORT 被占用 / 配置有误）：" >&2
+  echo "      journalctl -u panel -n 50 --no-pager" >&2
+  echo "      systemctl status panel --no-pager" >&2
+elif wait_port_up "$PORT"; then
+  echo "· 服务已自动启动（端口 $PORT 已在监听）"
+else
+  # start 说自己成功了，端口却没 listen —— 正是 Type=simple 的假阴性，必须照实说
+  RUN_STATE="unknown"
+  echo "· 服务已安装、启动命令已下发，但端口 $PORT 尚未进入监听。" >&2
+  echo "  （Type=simple 单元 fork 即算成功，起来又立刻退出的情况未必反映到退出码里。）" >&2
+  echo "  请按下面第 1 步确认实际状态：" >&2
+  echo "      systemctl status panel --no-pager" >&2
+  echo "      journalctl -u panel -n 50 --no-pager" >&2
+fi
+
 # 外部探活：Restart=on-failure 只覆盖「进程死了」，不覆盖「活着但不服务」
 # （事件循环卡死、监听 socket 丢失但主线程没退）。每分钟探一次 /api/v1/version，
 # 连续两次失败才重启——给瞬时抖动留机会，避免误把好服务重启掉。
@@ -93,12 +139,18 @@ systemctl daemon-reload
 systemctl enable --now panel-healthcheck.timer >/dev/null
 echo "· 外部探活已安装（每分钟一次，连续两次失败才重启）"
 
+case "$RUN_STATE" in
+  up)      STEP1="服务已自动启动并在端口 $PORT 监听（systemctl status panel 看详情）" ;;
+  unknown) STEP1="启动命令已下发但端口未确认监听，先跑 systemctl status panel 确认状态" ;;
+  *)       STEP1="本次自动启动失败：先 journalctl -u panel -n 50 看原因，修好后 systemctl start panel" ;;
+esac
+
 cat <<EOF
 
-安装完成。下一步：
+安装完成。面板已安装，并已尝试自动启动。
 
-  1. 启动服务
-       systemctl start panel
+  1. 服务状态
+       $STEP1
 
   2. 取出一次性引导令牌（首次启动且无 owner 时打印，30 分钟内有效）
        journalctl -u panel -n 50 --no-pager

@@ -29,10 +29,12 @@
 ```bash
 cargo build --release
 sudo ./deploy/install.sh                 # 缺省取 ./target/release/panel
-sudo systemctl start panel
 ```
 
-`install.sh` 会：装二进制到 `/usr/local/bin/panel`、建目录（数据 0700 / 配置·日志 0750）、写入 `/etc/forkpanel/config.toml`（已存在则不覆盖）、安装并 enable systemd 单元。**它不建账号。**
+`install.sh` 会：装二进制到 `/usr/local/bin/panel`、建目录（数据 0700 / 配置·日志 0750）、写入 `/etc/forkpanel/config.toml`（已存在则不覆盖）、安装 systemd 单元、**并在装完直接把服务拉起来**（会真探端口确认在监听后才报"已启动"）。**它不建账号。**
+
+> **不用再手动 `systemctl start panel`**：安装脚本已代为启动，收尾输出会写明服务实际状态。
+> 万一没起来，脚本不会把"安装"判失败（此时文件都已落盘），而是给出 `journalctl -u panel` 诊断。
 
 > **端口不再固定 2083**：新安装时 `install.sh` 会在 `[10000, 65535]` 随机分配一个监听端口并写进 `config.toml`，安装输出与首启横幅都会打印实际端口（参考宝塔面板，降低被扫描概率）。升级（配置已存在）沿用既有端口。dev/test 默认值仍保留 2083（见 `config.rs` 的 `default_port`），不影响开发环境。
 
