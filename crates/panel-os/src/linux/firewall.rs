@@ -251,7 +251,8 @@ impl FirewallProvider for LinuxFirewall {
         let mut added = 0;
         let mut removed = 0;
         let mut unchanged = 0;
-        let mut warnings = Vec::new();
+        // 注：apply 不再吞失败为假成功，故不再累积 warnings；保留空 Vec 以保持 ApplyReport 结构稳定。
+        let warnings = Vec::new();
 
         // 1) 过期清理：现有面板规则若已不在期望计划中（或内容变化），逆序删
         //    （从大到小删，避免删一条后编号整体前移误删别的规则）。
@@ -288,8 +289,18 @@ impl FirewallProvider for LinuxFirewall {
             args.push(comment);
             let sargs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
             let out = self.ufw(&sargs, Duration::from_secs(20)).await?;
-            if out.code == Some(0) { added += 1; }
-            else { warnings.push(format!("add {} 失败: {}", rule.id, out.stderr.trim())); }
+            if out.code == Some(0) {
+                added += 1;
+            } else {
+                // ufw 真实失败（最常见：非 root / 无 CAP_NET_ADMIN 报 Operation not permitted）。
+                // 必须返回 Err 而非 "Ok + warning"——否则是假成功：上层以为规则已生效，
+                // 也让一致性测试的"权限不足则 skip"分支永远到不了（此前 CI 恒红的根因）。
+                // API 路由已对 Err 做回滚 + 返回错误（见 panel-api firewall.rs）。
+                return Err(PanelError::Command {
+                    bin: "ufw".into(),
+                    detail: format!("add {} 失败: {}", rule.id, out.stderr.trim()),
+                });
+            }
         }
 
         Ok(ApplyReport { added, removed, unchanged, warnings })

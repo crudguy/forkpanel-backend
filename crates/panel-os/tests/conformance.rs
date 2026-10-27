@@ -138,10 +138,16 @@ async fn firewall_apply_is_idempotent() {
     }
 }
 
-/// 命令失败的 stderr 是否**只**是权限不足（nft / nginx / iptables 等特权操作在非 root 下的统一表现）。
+/// 命令失败的 stderr 是否**只**是权限不足（nft / nginx / iptables / ufw 等特权操作在非 root 下的统一表现）。
+/// 只认"特权缺失"类文案——真·契约回归（逻辑错误）不会产出这些字眼，仍会被 `panic!("unexpected")` 暴露。
 fn is_permission_denied(detail: &str) -> bool {
     let d = detail.to_lowercase();
-    d.contains("operation not permitted") || d.contains("permission denied")
+    d.contains("operation not permitted")
+        || d.contains("permission denied")
+        || d.contains("you need to be root")
+        || d.contains("need to be root")
+        || d.contains("could not process rule")
+        || d.contains("could not add rule")
 }
 
 /// 契约 9：未实现的能力必须返回 Unsupported，而不是空结果假装成功
