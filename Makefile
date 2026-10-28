@@ -8,7 +8,7 @@
 # （恒绿比没门禁更危险）。故 audit 单独成一个目标，CI 里单独一个 job——
 # advisory-db 托管在 GitHub，网络抖动时不该连带拖红主门禁。
 
-.PHONY: check guards audit test embed-fresh e2e-files e2e-backups e2e-containers e2e-cron e2e-databases e2e-sites e2e-firewall e2e-rbac e2e-security e2e-all e2e-ui e2e-observe e2e-restore e2e-install e2e-expose
+.PHONY: check guards audit test embed-fresh e2e-files e2e-backups e2e-containers e2e-cron e2e-databases e2e-sites e2e-firewall e2e-rbac e2e-security e2e-all e2e-ui e2e-observe e2e-restore e2e-install e2e-expose e2e-get-panel e2e-mirror mirror-sync
 
 # E2E 用的后端地址与二进制路径（可按需覆盖：make e2e-files BASE=http://127.0.0.1:2084）
 BASE ?= http://127.0.0.1:2083
@@ -192,6 +192,30 @@ e2e-install:
 #   make e2e-expose
 e2e-expose:
 	bash ci/e2e-expose-public.sh
+
+# 分发脚本 E2E（deploy/get-panel.sh，离线）：用本地 http 源模拟"死源→好源回退"、
+# 镜像源坏签名/篡改被验签拒绝（防投毒）、PANEL_RELEASE_BASE 钉死单源、内嵌公钥与测试
+# 公钥互不通用。全程不碰真实 GitHub，跑完输出 7 条断言。
+# 守卫自证：把 get-panel.sh 的 `openssl dgst -verify` 判否分支改坏（去掉 exit 1）再跑，
+# 场景 3/4/7 必须变红；还原后转绿。
+#   make e2e-get-panel
+e2e-get-panel:
+	bash ci/e2e-get-panel.sh
+
+# 镜像同步 E2E（deploy/mirror-sync.sh，离线）：用本地 http 源冒充官方 Release，验证
+# 好源两架构落盘 + 坏源（攻击者签名）被拒绝且零落盘。输出 6 条断言。
+# 守卫自证：把 mirror-sync.sh 的验签 `exit 1` 去掉再跑，场景 B 必须变红；还原后转绿。
+#   make e2e-mirror
+e2e-mirror:
+	bash ci/e2e-mirror.sh
+
+# 镜像同步工具：从官方 Release 拉取签名 tarball → 先验签 → 落本地 / 推 rclone。
+# 只镜像验签通过的真货，坏货绝不写入。详见 deploy/mirror-sync.sh 头部用法。
+#   make mirror-sync                       # 同步 latest 到 ./mirror
+#   make mirror-sync VERSION=v0.1.0 DEST=/srv/mirror
+#   make mirror-sync RCLONE=myremote:/forkpanel PUBLIC_BASE=https://mirror.example.com/forkpanel
+mirror-sync:
+	bash deploy/mirror-sync.sh $(if $(VERSION),--version $(VERSION),) $(if $(DEST),--dest $(DEST),) $(if $(RCLONE),--rclone $(RCLONE),) $(if $(PUBLIC_BASE),--public-base $(PUBLIC_BASE),)
 
 test:
 	cargo test --workspace

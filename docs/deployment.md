@@ -38,6 +38,64 @@ sudo ./deploy/install.sh                 # 缺省取 ./target/release/panel
 
 > **端口不再固定 2083**：新安装时 `install.sh` 会在 `[10000, 65535]` 随机分配一个监听端口并写进 `config.toml`，安装输出与首启横幅都会打印实际端口（参考宝塔面板，降低被扫描概率）。升级（配置已存在）沿用既有端口。dev/test 默认值仍保留 2083（见 `config.rs` 的 `default_port`），不影响开发环境。
 
+### 2.1.1 一键安装脚本 get-panel.sh（无需 Rust 工具链）
+
+不想自己编译的用户：官方提供一个「下载签名二进制 → 验签 → 安装」的脚本，等价于 §2.1 的
+「编译 + install.sh」，但**不需要在本机装 cargo / zig**：
+
+```bash
+# 默认从 GitHub Releases 下载最新稳定版
+curl -fsSL https://github.com/crudguy/forkpanel-backend/releases/latest/download/get-panel.sh | sudo bash
+
+# 指定版本
+PANEL_VERSION=v0.1.0 sudo -E bash get-panel.sh
+```
+
+脚本按架构（amd64 / arm64）选包、用**内嵌 ed25519 公钥**验签（签不过绝不运行），
+解包后执行 tarball 内的 install.sh（即 §2.1 那条安装 + 自动启动链路）。
+
+> **安全不变**：无论 tarball 来自 GitHub 还是下面任何镜像，都必须通过同一把公钥验签，
+> 镜像被污染也不会被放行。
+
+### 2.1.2 国内镜像源（解决 GitHub CDN 下载不动）
+
+中国大陆实机最常见的问题：GitHub Release 资产落在 `release-assets.githubusercontent.com`
+（Azure CDN），直连常超时 / 被重置，表现就是"一直下载不了安装文件"。脚本支持**多源按序回退**：
+
+```bash
+# 方式一：钉死单源（自建源 / 指定镜像，设置后不再回退）
+PANEL_RELEASE_BASE=https://<你的镜像基址>/releases/latest/download \
+  sudo -E bash get-panel.sh
+
+# 方式二：逗号分隔的备用镜像链，逐个尝试，死源快速跳过，最后兜底官方 GitHub
+PANEL_MIRRORS=https://mirror-a.example.com/latest,https://mirror-b.example.com/latest \
+  sudo -E bash get-panel.sh
+```
+
+- 每个"源"是一个**目录基址**：脚本在其后拼接 `/panel-linux-<arch>.tar.gz` 与 `.sig`。
+- 镜像链用更紧的下载预算（连接 8s / 上限 120s / 重试 2）快速跳过死源；钉死源与
+  官方兜底用原韧性参数（连接 15s / 上限 600s / 重试 5）。
+- 想自建镜像？仓库自带 `deploy/mirror-sync.sh`，**只镜像验签通过的真货**（坏货绝不写入）：
+
+  ```bash
+  # 同步 latest（amd64 + arm64）并直接打印客户端该填的 PANEL_MIRRORS
+  bash deploy/mirror-sync.sh --public-base https://mirror.example.com/forkpanel
+  # 同步指定版本到本地目录
+  bash deploy/mirror-sync.sh --version v0.1.0 --dest /srv/mirror
+  # 同时推到 rclone remote（Cloudflare R2 / 对象存储等）
+  bash deploy/mirror-sync.sh --rclone myremote:/forkpanel
+  ```
+
+  产出布局：`<dest>/latest/` 与 `<dest>/<tag>/`，各含 `panel-linux-{amd64,arm64}.tar.gz(.sig)`。
+  把这份目录通过 Web 服务器 / rclone 对外暴露后，客户端设
+  `PANEL_MIRRORS=<对外基址>/latest`（追最新）或 `<对外基址>/<tag>`（钉版本）。
+
+> **密钥轮换**：换签名私钥后，用新私钥重签 Release，并用 `openssl pkey -in <新私钥> -pubout`
+> 同步 `get-panel.sh` 的 `RELEASE_PUBKEY`；或分发时下发 `PANEL_PUBKEY_FILE` 覆盖内嵌公钥。
+>
+> **守卫自证**：两类分发脚本都有 E2E（`make e2e-get-panel` / `make e2e-mirror`），
+> 把验签判否分支改坏再跑会明确变红，还原后转绿——改动后请照此自证。
+
 ### 2.2 取令牌
 
 首次启动且库中无 owner 时，服务日志会打印醒目横幅：
