@@ -81,6 +81,18 @@ command -v systemctl >/dev/null 2>&1 || die "未检测到 systemd（请用 --con
 install -m 0755 "$BIN_SRC" "$BIN_DST"
 echo "· 二进制 → $BIN_DST"
 
+# 公网暴露脚本（面板仍绑回环，由它做 nginx 反代 + 防火墙白名单，绝不裸奔到公网）
+SHARE_DIR="${PREFIX}/share/forkpanel"
+EXPOSE_SRC="$(dirname "$0")/expose-public.sh"
+EXPOSE_DST="$SHARE_DIR/expose-public.sh"
+if [ -f "$EXPOSE_SRC" ]; then
+  install -d -m 0755 "$SHARE_DIR"
+  install -m 0755 "$EXPOSE_SRC" "$EXPOSE_DST"
+  echo "· 公网暴露脚本 → $EXPOSE_DST"
+else
+  echo "· ⚠ 未找到 $EXPOSE_SRC，跳过安装 expose 脚本（panel expose 将不可用）" >&2
+fi
+
 install -d -m 0750 "$CONF_DIR"
 install -d -m 0700 "$DATA_DIR"
 install -d -m 0750 "$LOG_DIR"
@@ -147,23 +159,37 @@ esac
 
 cat <<EOF
 
-安装完成。面板已安装，并已尝试自动启动。
+══════════════════════════════════════════════════════════════════
+⚠ 重要：面板默认【只监听本机 127.0.0.1】，公网用「服务器IP:端口」连不上！
+══════════════════════════════════════════════════════════════════
 
-  1. 服务状态
-       $STEP1
+  这是刻意的安全默认值（面板以 root 运行、且本构建没有内置 HTTPS）。
+  它和宝塔不一样：宝塔默认直接绑 0.0.0.0 让你 IP:端口 就能进；
+  ForkPanel 默认谁也进不来，需要你显式「开门」——避免把 root 面板裸奔到公网。
 
-  2. 取出一次性引导令牌（首次启动且无 owner 时打印，30 分钟内有效）
-       journalctl -u panel -n 50 --no-pager
+  1) 本机访问（最简单，推荐先这样验收）
+       打开 http://127.0.0.1:$PORT
+      （面板以 root 运行、无 HTTPS，绝不要把它直接绑到公网）
 
-  3. 打开面板并完成初始化
-       本机： http://127.0.0.1:$PORT
-       远程： ssh -L $PORT:127.0.0.1:$PORT <user>@<server>   然后访问 http://127.0.0.1:$PORT
-       页面会自动显示"初始化面板"向导，填入令牌 + 账号 + 口令即可。
+  2) 临时远程访问（SSH 端口转发，最安全）
+        ssh -L $PORT:127.0.0.1:$PORT <user>@<server>
+        然后在本机浏览器打开 http://127.0.0.1:$PORT
+
+  3) 长期对外（别人也要访问）
+        sudo panel expose -d 你的域名 -a 你的出口IP/32
+      （脚本会做：nginx 反代终结 TLS + 防火墙白名单；面板本身仍只绑回环，
+       不会把 root 面板裸奔到公网；用完撤销：sudo panel expose --uninstall）
+      ⚠ 不给来源网段、或给 0.0.0.0/0，脚本会直接拒绝——那等于没有限制。
+
+  你的公网 IP 大概是：$(curl -s --max-time 3 ifconfig.me 2>/dev/null || echo '（探测失败，自行用 curl ifconfig.me 查）')
+
+  取出一次性引导令牌（首次启动且无 owner 时打印，30 分钟内有效）：
+      journalctl -u panel -n 50 --no-pager
 
   备用路径（无浏览器/自动化场景）：
-       panel --config $CONF_FILE init --owner admin      # 交互式；脚本里可用 --owner-pass
+      panel --config $CONF_FILE init --owner admin      # 交互式；脚本里可用 --owner-pass
   忘记口令：
-       panel --config $CONF_FILE passwd <user>
+      panel --config $CONF_FILE passwd <user>
 
   卸载： ./deploy/uninstall.sh（保留数据与配置）
 EOF

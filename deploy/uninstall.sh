@@ -17,6 +17,14 @@ echo "· 服务已停止，systemd 单元已移除"
 rm -f /usr/local/bin/panel
 echo "· 二进制已移除"
 
+# 公网暴露脚本（panel expose 调用，面板仍绑回环）
+EXPOSE=/usr/local/share/forkpanel/expose-public.sh
+if [ -f "$EXPOSE" ]; then
+  rm -f "$EXPOSE"
+  rmdir /usr/local/share/forkpanel 2>/dev/null || true
+  echo "· 公网暴露脚本已移除"
+fi
+
 cat <<'EOF'
 
 已卸载。以下目录被保留（含账号与数据，未自动删除）：
