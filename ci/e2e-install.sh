@@ -95,15 +95,15 @@ fi
 ok "一次性文件系统就绪（/etc /var/lib /var/log /var/www /usr/local /run/systemd/system）"
 
 # systemctl shim：记录调用，不真的动 init
-mkdir -p /tmp/e2e-shim
-cat > /tmp/e2e-shim/systemctl <<'SH'
+mkdir -p /tmp/e2e-install-shim
+cat > /tmp/e2e-install-shim/systemctl <<'SH'
 #!/bin/bash
-echo "systemctl $*" >> /tmp/e2e-shim/calls.log
+echo "systemctl $*" >> /tmp/e2e-install-shim/calls.log
 exit 0
 SH
-chmod +x /tmp/e2e-shim/systemctl
-: > /tmp/e2e-shim/calls.log
-export PATH=/tmp/e2e-shim:$PATH
+chmod +x /tmp/e2e-install-shim/systemctl
+: > /tmp/e2e-install-shim/calls.log
+export PATH=/tmp/e2e-install-shim:$PATH
 
 # ── 2. 非 root 必须被拒 ──────────────────────────────────────────────────
 say "== 2. 安装脚本必须拒绝非 root =="
@@ -128,7 +128,7 @@ chk_has "拒绝原因指向二进制路径" "$out" "找不到二进制"
 
 # ── 4. 正式安装 ──────────────────────────────────────────────────────────
 say "== 4. 正式安装（install.sh）=="
-: > /tmp/e2e-shim/calls.log
+: > /tmp/e2e-install-shim/calls.log
 out=$(bash "$REPO/deploy/install.sh" "$BIN_SRC" 2>&1); rc=$?
 chk_rc "install.sh 退出码 0" "$rc" "0"
 if [ "$rc" -ne 0 ]; then
@@ -194,7 +194,7 @@ done
 
 # ── 7. install.sh 调用了哪些 systemctl（shim 记录） ──────────────────────
 say "== 7. 安装过程调用了哪些 systemctl =="
-calls=$(cat /tmp/e2e-shim/calls.log 2>/dev/null)
+calls=$(cat /tmp/e2e-install-shim/calls.log 2>/dev/null)
 [ -n "$calls" ] && ok "捕获到 systemctl 调用" || bad "安装过程一次 systemctl 都没调用"
 chk_has "调用了 daemon-reload" "$calls" "daemon-reload"
 chk_has "enable 了 panel 服务" "$calls" "enable panel"
