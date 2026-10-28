@@ -167,6 +167,15 @@ else
   bad "config.toml 未生成"
 fi
 
+# 公网暴露脚本（install.sh 应已安装，panel expose 依赖它）
+EXPOSE=/usr/local/share/forkpanel/expose-public.sh
+if [ -f "$EXPOSE" ]; then
+  ok "公网暴露脚本已安装：$EXPOSE"
+  chk "expose 脚本权限 0755" "$(stat -c '%a' "$EXPOSE" 2>/dev/null)" "755"
+else
+  bad "公网暴露脚本未安装（$EXPOSE）——panel expose 将不可用"
+fi
+
 # ── 6. systemd 单元：加固项与 ReadWritePaths 必须与 [paths] 对齐 ─────────
 say "== 6. systemd 单元加固（ProtectSystem / ReadWritePaths）=="
 UNIT=/etc/systemd/system/panel.service
@@ -275,6 +284,8 @@ chk_rc "uninstall.sh 退出码 0" "$rc3" "0"
   || bad "数据目录被删除了——卸载脚本绝不应删数据"
 [ -f "$CONF" ] && ok "配置文件被保留" || bad "配置文件被删除"
 chk_has "卸载提示保留目录" "$out3" "保留"
+[ -f /usr/local/share/forkpanel/expose-public.sh ] \
+  && bad "卸载后 expose 脚本仍在" || ok "公网暴露脚本已随 uninstall.sh 移除"
 
 say ""
 say "──────── E2E 结果：PASS=$PASS  FAIL=$FAIL  SKIP=$SKIP ────────"
