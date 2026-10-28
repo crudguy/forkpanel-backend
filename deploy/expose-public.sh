@@ -152,12 +152,31 @@ validate_cidr() {
 # ── 卸载：撤下反代，面板保持绑回环 ─────────────────────────────────────
 if [ "$UNINSTALL" -eq 1 ]; then
   [ "$(id -u)" -eq 0 ] || die "需要 root 权限"
-  rm -f "$NGINX_CONF"
-  echo "· 已删除 $NGINX_CONF"
+  # ⚠ 不无条件声称"已删除"：`rm -f` 对不存在的文件同样返回 0，于是本就未暴露时
+  #   卸载也会打印"已删除"，上游 remove 遂一律审计成 ok——审计日志里出现无从分辨的
+  #   「撤销成功」，运维无法据此判断到底有没有真的撤销过暴露。
+  if [ -e "$NGINX_CONF" ]; then
+    rm -f "$NGINX_CONF" && echo "· 已删除 $NGINX_CONF"
+  else
+    echo "· $NGINX_CONF 不存在（本就未对外暴露，无需撤销）"
+  fi
   if command -v nginx >/dev/null 2>&1; then nginx -t >/dev/null 2>&1 && nginx -s reload >/dev/null 2>&1 || true; fi
   rm -f "$TLS_DROPIN"
-  command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload >/dev/null 2>&1 || true
-  echo "· 已移除 PANEL_TLS=1 的 systemd 配置"
+  # ⚠ 必须**重启** panel，且不能只 `daemon-reload`：PANEL_TLS 是进程启动时
+  #   读取的环境变量（panel-api routes/auth.rs 据此给会话 cookie 加 Secure），
+  #   daemon-reload 只让 systemd 重读单元文件，改变不了已在跑的进程环境。
+  #   不重启则「磁盘已撤销 / 进程仍在 TLS 模式」的不一致会一直挂着，
+  #   且从外面看不出来，直到有人手动重启。
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if systemctl restart panel >/dev/null 2>&1; then
+      echo "· 已移除 PANEL_TLS=1 并重启面板（当前会话会断开，重登即可）"
+    else
+      echo "· 已移除 PANEL_TLS=1 的 systemd 配置，但重启 panel 失败（请手动 systemctl restart panel，否则进程仍在 TLS 模式）"
+    fi
+  else
+    echo "· 已移除 PANEL_TLS=1 的 systemd 配置（无 systemd，请自行重启面板进程）"
+  fi
   echo
   echo "反代已撤下。面板仍只绑回环 ⇒ 本机访问请用："
   echo "    ssh -L <端口>:127.0.0.1:<端口> <user>@<server>"
