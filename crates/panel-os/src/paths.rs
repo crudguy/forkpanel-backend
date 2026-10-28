@@ -74,6 +74,17 @@ pub fn panel_bin_install_path() -> PathBuf {
     PathBuf::from("/usr/local/bin/panel")
 }
 
+/// 公网暴露脚本安装路径（与 `deploy/install.sh` 的 `EXPOSE_DST` 对齐：
+/// `$SHARE_PREFIX/expose-public.sh`，`SHARE_PREFIX` 默认 `/usr/local/share/forkpanel`）。
+///
+/// 定义在本文件（panel-os 内）即被 `check-layering.sh` 规则 [3] 豁免：平台默认目录
+/// 本就是平台知识，业务层应经此函数获取，而不是自己拼 `/usr/local/share/forkpanel`。
+/// `panel expose` 子命令通过本函数定位脚本，再经 `panel-os::Bin::Bash` argv 直传调用，
+/// 不重写其 fail-closed 逻辑（绝不绑 0.0.0.0、防火墙白名单掩码 0 即 0.0.0.0/0 被拒）。
+pub fn panel_expose_script_path() -> PathBuf {
+    PathBuf::from("/usr/local/share/forkpanel/expose-public.sh")
+}
+
 /// 站点标识的文件名安全化：仅保留 `[A-Za-z0-9._-]`，其余替换为 `_`，空串回退 `site`。
 ///
 /// 站点配置文件（`panel-<slug>.conf`）与站点日志文件（`<slug>.access.log`）都由此派生，

@@ -172,6 +172,35 @@ enum Cmd {
     /// 不必再单独取安装脚本。安全边界与 uninstall.sh 一致：**只删程序与单元，
     /// 绝不删数据/配置**（账号、站点、审计、备份都在里面）。彻底清除数据请手动 `rm -rf`。
     Uninstall,
+    /// 交互式公网暴露（薄壳包 `deploy/expose-public.sh`）：引导用户填域名 +
+    /// 来源网段，校验后透传脚本（面板仍绑回环，由 nginx 反代终结 TLS）。
+    ///
+    /// 这是「引导式安全暴露」的 CLI 入口：默认零暴露不变，用户想对外才显式跑。
+    /// 拒绝 0.0.0.0/0（掩码 0）；域名/CIDR 先过 Rust 同款校验，脚本再 fail-closed 复核。
+    /// 卸载模式 `--uninstall` 撤下反代、面板恢复只绑回环。
+    Expose {
+        /// 对外域名（如 panel.example.com）。省略则在终端交互询问。
+        #[arg(long, short)]
+        domain: Option<String>,
+        /// 允许访问的来源 IPv4 CIDR（可重复，如 -a 1.2.3.4/32）。省略则交互询问。
+        #[arg(long = "allow", short = 'a')]
+        allow: Vec<String>,
+        /// 使用自签名证书（脚本现场生成），不需自带证书。
+        #[arg(long)]
+        self_signed: bool,
+        /// 自带证书：证书链文件（PEM）。与 --self-signed 二选一。
+        #[arg(long)]
+        fullchain: Option<String>,
+        /// 自带证书：私钥文件（PEM）。
+        #[arg(long)]
+        key: Option<String>,
+        /// 不写防火墙规则（仅反代）。仅在已有独立防火墙策略时使用。
+        #[arg(long)]
+        no_firewall: bool,
+        /// 撤销暴露：撤下反代，面板恢复只绑回环。
+        #[arg(long)]
+        uninstall: bool,
+    },
 }
 
 fn main() {
@@ -435,6 +464,14 @@ fn run(cli: Cli) -> Result<()> {
                 // 非回环监听必须当场说清楚：面板 root 运行 + 明文 HTTP，
                 // 暴露面是安全边界而不是配置细节（见 warn_if_exposed 的注释）。
                 warn_if_exposed(&addr);
+                if localhost_only {
+                    eprintln!("════════════════════════════════════════════════════════");
+                    eprintln!("[panel] 仅本机访问：面板只监听 127.0.0.1，外部用 IP:端口连不上");
+                    eprintln!("  这是默认安全策略（面板以 root 运行且无 HTTPS）。");
+                    eprintln!("  · 临时远程：ssh -L {}:127.0.0.1:{} <user>@<server>", addr.port(), addr.port());
+                    eprintln!("  · 长期对外：sudo panel expose -d <域名> -a <你的出口IP/32>");
+                    eprintln!("════════════════════════════════════════════════════════");
+                }
                 println!("监听 {addr}（档位 {tier:?}）");
 
                 let listener = tokio::net::TcpListener::bind(addr).await
@@ -838,6 +875,86 @@ fn run(cli: Cli) -> Result<()> {
             println!();
             println!("确认不再需要后自行删除：");
             println!("  rm -rf /var/lib/forkpanel /etc/forkpanel /var/log/forkpanel");
+            Ok(())
+        }
+
+        Cmd::Expose { domain, allow, self_signed, fullchain, key, no_firewall, uninstall } => {
+            // 写 /etc/nginx 反代、systemd 单元与防火墙规则都需要 root；非 root 提前报错，
+            // 绝不半途留下「服务还指着未生效配置」的残态（与 uninstall 同纪律）。
+            if !panel_os::fs::is_root() {
+                return Err(PanelError::Internal(
+                    "expose: 需要 root 权限（要写 /etc/nginx 反代、systemd 单元与防火墙规则）".into(),
+                ));
+            }
+
+            // 卸载模式：直接透传 --uninstall，无需域名/网段。
+            if uninstall {
+                return invoke_expose(&["--uninstall".to_string()]);
+            }
+
+            // 证书二选一：给了 fullchain 就必须给 key（反之亦然）；都不给则脚本默认自签。
+            if fullchain.is_some() != key.is_some() {
+                return Err(PanelError::Validation {
+                    field: "cert",
+                    reason: "--fullchain 与 --key 必须成对提供（要么都给，要么都不给用自签）".into(),
+                });
+            }
+
+            // 收集域名：命令行优先，省略则交互询问（非 TTY 直接报错，不放过）。
+            let domain = match domain {
+                Some(d) => d,
+                None => {
+                    if !std::io::stdin().is_terminal() {
+                        return Err(PanelError::Validation {
+                            field: "domain",
+                            reason: "非交互环境请提供 --domain".into(),
+                        });
+                    }
+                    prompt_line("对外域名（如 panel.example.com）: ")?
+                }
+            };
+            validate_expose_domain(&domain)
+                .map_err(|e| PanelError::Validation { field: "domain", reason: e })?;
+
+            // 收集来源网段（可重复）：命令行优先，省略则交互询问，至少要有一个。
+            let mut allow = allow;
+            if allow.is_empty() {
+                if !std::io::stdin().is_terminal() {
+                    return Err(PanelError::Validation {
+                        field: "allow",
+                        reason: "非交互环境请提供 -a/--allow <CIDR>（可重复）".into(),
+                    });
+                }
+                let raw = prompt_line("允许访问的来源网段（IPv4 CIDR，可多个，逗号/空格分隔，如 1.2.3.4/32）: ")?;
+                for part in raw.split(|c| c == ',' || c == ' ').filter(|s| !s.is_empty()) {
+                    allow.push(part.to_string());
+                }
+            }
+            if allow.is_empty() {
+                return Err(PanelError::Validation {
+                    field: "allow",
+                    reason: "必须至少指定一个来源网段（-a/--allow）；拒绝开无来源限制的反代".into(),
+                });
+            }
+            for c in &allow {
+                validate_expose_cidr(c)
+                    .map_err(|e| PanelError::Validation { field: "allow", reason: e })?;
+            }
+
+            // 组装透传给脚本的参数（脚本再做一次 fail-closed 校验，纵深防御）。
+            let mut args: Vec<String> = Vec::new();
+            args.push("-d".into());
+            args.push(domain);
+            for c in &allow {
+                args.push("-a".into());
+                args.push(c.clone());
+            }
+            if self_signed { args.push("--self-signed".into()); }
+            if let Some(f) = fullchain { args.push("--fullchain".into()); args.push(f); }
+            if let Some(k) = key { args.push("--key".into()); args.push(k); }
+            if no_firewall { args.push("--no-firewall".into()); }
+            invoke_expose(&args)?;
+            println!("（已通过 `panel expose` 调用 expose-public.sh 完成。若需撤销：sudo panel expose --uninstall）");
             Ok(())
         }
     }
@@ -1254,6 +1371,117 @@ fn warn_if_exposed(addr: &std::net::SocketAddr) {
     eprintln!("════════════════════════════════════════════════════════");
 }
 
+/// 与 `deploy/expose-public.sh` 的 `validate_domain` 同款规则：至少两级、
+/// 每段只允许字母数字连字符、段首段尾不能是连字符、顶级域不得含数字
+/// （这条挡住 `1.2.3.4` 被当域名使）。Rust 侧先校验，脚本侧再校验（纵深防御）。
+fn validate_expose_domain(d: &str) -> std::result::Result<(), String> {
+    if d.is_empty() || d.len() > 253 {
+        return Err("域名不能为空且长度不超过 253".into());
+    }
+    let parts: Vec<&str> = d.split('.').collect();
+    if parts.len() < 2 {
+        return Err("域名至少需要两级（如 example.com）".into());
+    }
+    let tld = parts[parts.len() - 1];
+    for p in &parts {
+        if p.is_empty() {
+            return Err("存在空段".into());
+        }
+        if !p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err(format!("段 {p:?} 只能含字母数字连字符"));
+        }
+        if p.starts_with('-') || p.ends_with('-') {
+            return Err(format!("段 {p:?} 首尾不能是连字符"));
+        }
+    }
+    if tld.chars().any(|c| c.is_ascii_digit()) {
+        return Err("顶级域不能含数字（会把 IP 当域名）".into());
+    }
+    Ok(())
+}
+
+/// 与脚本 `validate_cidr` 同款：本版只认 IPv4；掩码 0（0.0.0.0/0）单独挡下——
+/// 形式上"给了 allow"实质上等于不设限制，正是 fail-closed 要防的那扇门。
+fn validate_expose_cidr(c: &str) -> std::result::Result<(), String> {
+    if c.contains(':') {
+        return Err("IPv6 暂不支持（请在生成的 nginx 配置里自行加 allow）".into());
+    }
+    let (ip, mask_str) = match c.split_once('/') {
+        Some((ip, m)) => (ip, m),
+        None => (c, "32"),
+    };
+    if mask_str.is_empty() || !mask_str.chars().all(|x| x.is_ascii_digit()) {
+        return Err("掩码必须是数字".into());
+    }
+    let mask: u32 = mask_str.parse().map_err(|_| "掩码解析失败".to_string())?;
+    if mask > 32 {
+        return Err("掩码超过 32".into());
+    }
+    if mask == 0 {
+        return Err("掩码 0（0.0.0.0/0）等于不设限制，被拒绝".into());
+    }
+    if ip.len() > 15 {
+        return Err("IP 长度异常".into());
+    }
+    let oct: Vec<&str> = ip.split('.').collect();
+    if oct.len() != 4 {
+        return Err("IPv4 必须四段".into());
+    }
+    for n in &oct {
+        if n.is_empty() || !n.chars().all(|x| x.is_ascii_digit()) {
+            return Err(format!("段 {n:?} 非法"));
+        }
+        let v: u32 = n.parse().map_err(|_| format!("段 {n:?} 解析失败"))?;
+        if v > 255 {
+            return Err(format!("段 {n:?} 超过 255"));
+        }
+    }
+    Ok(())
+}
+
+/// 交互读取一行（去掉行尾换行）。仅在确认 `is_terminal()` 后调用。
+fn prompt_line(prompt: &str) -> Result<String> {
+    eprint!("{prompt}");
+    let _ = std::io::stderr().flush();
+    let mut s = String::new();
+    std::io::stdin()
+        .read_line(&mut s)
+        .map_err(|e| PanelError::Internal(format!("读取输入失败：{e}")))?;
+    Ok(s.trim_end_matches(['\r', '\n']).to_string())
+}
+
+/// 调用 `deploy/expose-public.sh`（路径经 `panel_os::paths` 抽象，业务层不硬编码）。
+///
+/// 薄壳：Rust 只负责收输入 + 同款校验 + 透传，绝不重写脚本的 fail-closed 逻辑
+/// （绝不绑 0.0.0.0、防火墙白名单掩码 0 即 0.0.0.0/0 被拒）。脚本不存在时给明确提示，
+/// 而不是让 `bash` 去 exec 一个不存在的路径（那会落到 127 + 难懂报错）。
+fn invoke_expose(script_args: &[String]) -> Result<()> {
+    let script = panel_os::paths::panel_expose_script_path();
+    let script_s = script.to_str().ok_or_else(|| {
+        PanelError::Internal(format!("expose 脚本路径非 UTF-8：{}", script.display()))
+    })?;
+    if !script.exists() {
+        return Err(PanelError::Internal(format!(
+            "找不到 expose 脚本 {}（是否漏装？重新跑 install.sh 或手动部署 deploy/expose-public.sh）",
+            script.display(),
+        )));
+    }
+    let mut argv: Vec<&str> = Vec::with_capacity(script_args.len() + 1);
+    argv.push(script_s);
+    for a in script_args {
+        argv.push(a.as_str());
+    }
+    let out = panel_os::run_sync(panel_os::Bin::Bash, &argv)?;
+    // 脚本约定：非零退出 = 失败（fail-closed）。把它的输出原样透传给用户。
+    if out.code != Some(0) {
+        return Err(PanelError::Internal(format!(
+            "expose-public.sh 失败（退出码 {:?}）：\n{}{}",
+            out.code, out.stdout, out.stderr,
+        )));
+    }
+    Ok(())
+}
+
 fn init_tracing() {
     let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
     let _ = tracing_subscriber::fmt()
@@ -1420,6 +1648,23 @@ mod cli_flags_tests {
             );
         }
     }
+
+    /// `panel expose` 子命令必须能被 clap 正常解析（域名 + 至少一个来源网段）。
+    #[test]
+    fn expose_subcommand_parses() {
+        let ok = Cli::try_parse_from([
+            "panel", "expose", "-d", "panel.example.com", "-a", "203.0.113.0/24",
+        ]);
+        assert!(ok.is_ok(), "expose 必须接受 -d 与 -a");
+        let un = Cli::try_parse_from(["panel", "expose", "--uninstall"]);
+        assert!(un.is_ok(), "expose 必须接受 --uninstall");
+        // 来源网段可重复给定
+        let multi = Cli::try_parse_from([
+            "panel", "expose", "-d", "panel.example.com",
+            "-a", "203.0.113.0/24", "-a", "198.51.100.0/24",
+        ]);
+        assert!(multi.is_ok(), "expose 必须允许重复 -a");
+    }
 }
 
 #[cfg(test)]
@@ -1459,5 +1704,65 @@ mod restore_cli_tests {
         assert!(!d.join("panel.db-shm").exists(), "旧 SHM 必须删掉");
         assert!(!d.join("panel.db.restore-tmp").exists(), "临时文件不能留下");
         let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod expose_tests {
+    /// 域名校验与脚本 `validate_domain` 同款规则，必须拒绝非法输入。
+    #[test]
+    fn domain_validation_rejects_bad_input() {
+        assert!(super::validate_expose_domain("panel.example.com").is_ok());
+        assert!(super::validate_expose_domain("example.com").is_ok());
+        assert!(super::validate_expose_domain("a.b").is_ok());
+        assert!(super::validate_expose_domain("example").is_err(), "单级域名必须拒");
+        assert!(super::validate_expose_domain("1.2.3.4").is_err(), "纯 IP 当域名必须拒（顶级域含数字）");
+        assert!(super::validate_expose_domain("-x.example.com").is_err(), "段首连字符必须拒");
+        assert!(super::validate_expose_domain("x-.example.com").is_err(), "段尾连字符必须拒");
+        assert!(super::validate_expose_domain("a..b").is_err(), "空段必须拒");
+    }
+
+    /// CIDR 校验：IPv4 正常放行；掩码 0（0.0.0.0/0）与 IPv6 必须拒。
+    #[test]
+    fn cidr_validation_rejects_open_and_ipv6() {
+        assert!(super::validate_expose_cidr("203.0.113.0/24").is_ok());
+        assert!(super::validate_expose_cidr("1.2.3.4/32").is_ok());
+        assert!(super::validate_expose_cidr("192.168.1.5").is_ok(), "缺省掩码当 /32");
+        assert!(super::validate_expose_cidr("0.0.0.0/0").is_err(), "掩码 0 = 不设限制，必须拒");
+        assert!(super::validate_expose_cidr("2001:db8::/32").is_err(), "IPv6 必须拒");
+        assert!(super::validate_expose_cidr("1.2.3.256/32").is_err(), "段超 255 必须拒");
+        assert!(super::validate_expose_cidr("1.2.3/24").is_err(), "IPv4 必须四段");
+        assert!(super::validate_expose_cidr("abc").is_err(), "非数字 IP 必须拒");
+    }
+
+    /// 接线守卫：`panel expose` 必须真的调到 expose 脚本（路径经 paths 抽象）、
+    /// 且经 `Bin::Bash` argv 直传——删掉这条调用，子命令就成了"收下参数却不做事"
+    /// 的命令行版假控制。判据指向生产段（剔测试与注释）。
+    #[test]
+    fn expose_arm_invokes_script_via_bash() {
+        let src = include_str!("main.rs");
+        let prod = panel_testutil::production_source(src);
+        assert!(prod.contains("Cmd::Expose"), "Cmd 枚举必须声明 Expose 变体");
+        assert!(
+            prod.contains("panel_os::paths::panel_expose_script_path()"),
+            "expose 必须经由 paths 抽象定位脚本（业务层不得硬编码安装路径，门禁 [3]）"
+        );
+        assert!(
+            prod.contains("panel_os::run_sync(panel_os::Bin::Bash"),
+            "expose 必须经 Bin::Bash argv 直传调脚本（不得 shell 拼字符串）"
+        );
+    }
+
+    /// 接线守卫：serve 在 `localhost_only` 时必须打印"仅本机访问"横幅并提示
+    /// `sudo panel expose`——这是小白困惑的根因修复（装完以为能 IP:端口 访问）。
+    /// 判据指向生产段，避免重复实现时把横幅删了还全绿。
+    #[test]
+    fn serve_prints_localhost_only_banner() {
+        let src = include_str!("main.rs");
+        let prod = panel_testutil::production_source(src);
+        assert!(
+            prod.contains("sudo panel expose"),
+            "serve 在 localhost_only 时必须提示 `sudo panel expose`，否则小白仍以为能 IP:端口 访问"
+        );
     }
 }
