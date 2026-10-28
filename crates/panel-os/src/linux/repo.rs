@@ -195,6 +195,22 @@ pub fn build_sources_content(repo: &ThirdPartyRepo, codename: &str) -> String {
 
 // ─────────────── I/O 流程（需 root） ───────────────
 
+/// I/O 写入失败的人话归因（仅供提示文案）。
+///
+/// ⚠ 刻意区分 EACCES/EPERM 与 EROFS：两者都表现为"写不进 /etc"，但**修法完全不同**——
+///   前者需要 root；后者即使以 root 运行也写不进，得先把文件系统改成可写
+///   （或把目标目录挂成可写层）。此前一律标注"（需 root）"，在只读文件系统上
+///   会把排查方向带偏，故改为「能确定才给，无法确定就不猜」（后者留底层 errno 说明）。
+fn io_why(e: &std::io::Error) -> String {
+    let why = match e.raw_os_error() {
+        Some(1) | Some(13) => "权限不足，需 root", // EPERM / EACCES
+        Some(28) => "磁盘空间不足",                 // ENOSPC
+        Some(30) => "文件系统只读（EROFS）",          // EROFS
+        _ => return String::new(),
+    };
+    format!("（{why}）")
+}
+
 /// 读取当前发行版代号（读 /etc/os-release）。
 pub async fn current_codename() -> Result<String> {
     let content = tokio::fs::read_to_string("/etc/os-release").await
@@ -292,15 +308,15 @@ async fn ensure_repo_inner(repo: &ThirdPartyRepo, sources_content: &str, on_line
 
     // 3) 写隔离 keyring（/etc/apt/keyrings 需 root）
     tokio::fs::create_dir_all(keyrings_dir).await
-        .map_err(|e| PanelError::Io(format!("创建 {} 失败（需 root）：{e}", keyrings_dir.display())))?;
+        .map_err(|e| PanelError::Io(format!("创建 {} 失败{}：{e}", keyrings_dir.display(), io_why(&e))))?;
     tokio::fs::copy(&tmp_key, &keyring_path).await
-        .map_err(|e| PanelError::Io(format!("写入 keyring {} 失败（需 root）：{e}", keyring_path.display())))?;
+        .map_err(|e| PanelError::Io(format!("写入 keyring {} 失败{}：{e}", keyring_path.display(), io_why(&e))))?;
 
     // 4) 写 sources.list.d
     tokio::fs::create_dir_all(sources_dir).await
-        .map_err(|e| PanelError::Io(format!("创建 {} 失败（需 root）：{e}", sources_dir.display())))?;
+        .map_err(|e| PanelError::Io(format!("创建 {} 失败{}：{e}", sources_dir.display(), io_why(&e))))?;
     tokio::fs::write(&sources_path, sources_content).await
-        .map_err(|e| PanelError::Io(format!("写入 sources {} 失败（需 root）：{e}", sources_path.display())))?;
+        .map_err(|e| PanelError::Io(format!("写入 sources {} 失败{}：{e}", sources_path.display(), io_why(&e))))?;
 
     // 5) apt-get update（刷新该源元数据）
     cb(format!("[panel] apt-get update（刷新 {} 源）", repo.logical));
