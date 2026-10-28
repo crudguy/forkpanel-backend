@@ -35,6 +35,7 @@
 | `/etc/systemd/system/panel-healthcheck.service` | 文件 | — | 外部探活服务单元 |
 | `/etc/systemd/system/panel-healthcheck.timer` | 文件 | — | 探活定时器（每分钟一次，连续两次失败才重启） |
 | `/var/lib/forkpanel/scripts/healthcheck.sh` | 文件 | — | 探活脚本（写进数据目录内的受限脚本目录） |
+| `/usr/local/share/forkpanel/expose-public.sh` | 文件 | 0755 | 公网暴露脚本（`panel expose` 调用它做 nginx 反代 + 防火墙白名单，面板仍只绑回环） |
 
 > 安装完成后会执行 `systemctl daemon-reload && systemctl enable panel`、随即
 > `systemctl start panel` **把服务直接拉起来**，以及
@@ -162,6 +163,7 @@ ForkPanel 做了四层：
 - `systemctl stop/disable panel`
 - `rm -f /etc/systemd/system/panel.service`（及探活单元）
 - `rm -f /usr/local/bin/panel`
+- `rm -f /usr/local/share/forkpanel/expose-public.sh`（及空目录）——`panel expose` 依赖它
 
 **以下目录被保留**（含账号与数据，不自动删）：
 
