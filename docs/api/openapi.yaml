@@ -295,6 +295,8 @@ components:
         net_out_bps:   { type: integer }
         load1:         { type: number }
         uptime_sec:    { type: integer }
+        degraded:      { type: boolean, description: "true=已触发低配降频" }
+        alerts:        { type: array, items: { $ref: '#/components/schemas/Alert' } }
     Directories:
       type: object
       description: 目录与文件位置；groups 为按用途分组的条目列表
@@ -356,8 +358,6 @@ components:
       properties:
         output: { type: string, description: 脚本 stdout }
 
-        degraded:      { type: boolean, description: "true=已触发低配降频" }
-        alerts:        { type: array, items: { $ref: '#/components/schemas/Alert' } }
     Alert:
       type: object
       properties:
