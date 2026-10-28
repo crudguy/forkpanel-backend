@@ -101,6 +101,13 @@ need_cmd() { command -v "$1" >/dev/null 2>&1 || die "缺少命令：$1"; }
 validate_domain() {
   local d="$1" parts tld p
   [ "${#d}" -le 253 ] || return 1
+  # ⚠ 尾点必须显式拒：bash 的 `read -ra` 分词会**丢掉末尾空字段**
+  #   （`"example.com."` → parts=2、tld="com"），于是尾点域名在这里一路通过，
+  #   而 Rust `panel_core::expose` 用 `split('.')` 会得到空段并拒绝——
+  #   同一个域名在 CLI/UI 被拒、直接跑脚本却放行，且写出的
+  #   `server_name example.com.;` 几乎不可能匹配到 Host 头，
+  #   表现为「脚本说完成了但打不开」，而 nginx -t 并不报错。故按 Rust 口径统一。
+  case "$d" in ''|*.) return 1 ;; esac
   IFS='.' read -ra parts <<< "$d"
   [ "${#parts[@]}" -ge 2 ] || return 1
   tld="${parts[${#parts[@]}-1]}"
@@ -122,8 +129,16 @@ validate_cidr() {
     *)   ip="$c";     mask=32 ;;
   esac
   case "$mask" in ''|*[!0-9]*) return 1 ;; esac
+  # 位数上限：bash 算术按 2^64 回绕，`10#` 后跟 20 位数字会绕回 0
+  # （实测 `$((10#18446744073709551616))` = 0），不设限就能骗过下面的 `-le 32`。
+  [ "${#mask}" -le 3 ] || return 1
   # 10# 强制十进制：否则 08 / 09 会被当八进制，bash 抛 "value too great for base"
   [ "$((10#$mask))" -le 32 ] || return 1
+  # ⚠ 掩码 0 必须按**数值**挡：0.0.0.0/0 形式上"按要求给了 allow"，实质等于不设
+  #   限制，正是 fail-closed 要防的那扇门。此前用 glob `*/0|*/00|*/000` 只在调用点挡，
+  #   而 `/0000`、`/00000` 在十进制解析下同样为 0 却能穿过（可直接绕过整条检查）。
+  #   故收进本函数——它是「段/掩码合法性」的唯一事实源，与 Rust `panel_core::expose` 同口径。
+  [ "$((10#$mask))" -ge 1 ] || return 1
   [ "${#ip}" -le 15 ] || return 1
   local IFS='.'; read -ra o <<< "$ip" 2>/dev/null || return 1
   [ "${#o[@]}" -eq 4 ] || return 1
@@ -172,17 +187,11 @@ if [ "${#ALLOW[@]}" -eq 0 ]; then
   echo "  请填你自己的出口网段，例如：-a \$(curl -s ifconfig.me)/32" >&2
   exit 1
 fi
+# ⚠ 掩码 0 的拦截**不放这里**：上一版在此用 glob `*/0|*/00|*/000` 挡，
+#   但 `/0000`、`/00000` 在 `10#` 十进制解析下同样为 0，能整条绕过。
+#   已收进 `validate_cidr`（按解析后的数值判定），此处只做一次调用即可。
 for c in "${ALLOW[@]}"; do
-  validate_cidr "$c" || die "来源网段 [$c] 不合法（本版只支持 IPv4 CIDR；IPv6 请在生成的 nginx 配置里自行加 allow）"
-  # ⚠ 掩码 0 必须单独挡：0.0.0.0/0 形式上"按要求给了 allow"，实质上等于不设限制，
-  #   正好是上面第 1 条 fail-closed 要防的那扇门——放行它等于整条检查白做。
-  case "$c" in
-    */0|*/00|*/000)
-      echo "expose-public: 拒绝执行 —— 来源网段 [$c] 覆盖整个 IPv4 空间，等于不设限制。" >&2
-      echo "  请填具体的出口网段（不确定就先填本机出口 IP 的 /32：curl -s ifconfig.me）。" >&2
-      echo "  确实只是临时放通的话，用完请记得 ./deploy/expose-public.sh --uninstall。" >&2
-      exit 1 ;;
-  esac
+  validate_cidr "$c" || die "来源网段 [$c] 不合法（本版只支持 IPv4 CIDR；掩码 0 覆盖整个 IPv4 空间、等于不设限制，已拒绝；IPv6 请在生成的 nginx 配置里自行加 allow）"
 done
 
 if [ -n "$FULLCHAIN" ] || [ -n "$KEY" ]; then
