@@ -186,7 +186,12 @@ enum Cmd {
         #[arg(long = "allow", short = 'a')]
         allow: Vec<String>,
         /// 使用自签名证书（脚本现场生成），不需自带证书。
-        #[arg(long)]
+        ///
+        /// ⚠ 与 `--fullchain` / `--key` 是**互斥**的，且这里必须显式声明：
+        ///   脚本侧在 `SELF_SIGNED=1` 时会把 FULLCHAIN/KEY 变量重赋为自签路径，
+        ///   于是"同时给了受信任证书 + --self-signed"会被**静默降级成自签**
+        ///   （全程退出码 0、不打任何说明）。不拦就等于埋一个静默 TLS 降级。
+        #[arg(long, conflicts_with_all = ["fullchain", "key"])]
         self_signed: bool,
         /// 自带证书：证书链文件（PEM）。与 --self-signed 二选一。
         #[arg(long)]
@@ -1425,6 +1430,17 @@ fn invoke_expose(script_args: &[String]) -> Result<()> {
             "expose-public.sh 失败（退出码 {:?}）：\n{}{}",
             out.code, out.stdout, out.stderr,
         )));
+    }
+    // ⚠ 成功分支**同样**要回显脚本输出：脚本把「nginx -t 已通过但重载失败」
+    //   「云厂商安全组脚本碰不到」「无 systemd，请自行重启面板」等警告写在 stderr
+    //   上且**仍以 0 退出**。此前成功时一律丢弃，用户只看到"完成"而实际并未生效。
+    //   与 Web 向导同口径：后者把脚本 stdout 原样回给前端展示（见 panel-api
+    //   routes/expose.rs 的 apply/remove）。
+    if !out.stdout.trim().is_empty() {
+        println!("{}", out.stdout.trim_end());
+    }
+    if !out.stderr.trim().is_empty() {
+        eprintln!("{}", out.stderr.trim_end());
     }
     Ok(())
 }
