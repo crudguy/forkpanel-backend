@@ -1371,72 +1371,19 @@ fn warn_if_exposed(addr: &std::net::SocketAddr) {
     eprintln!("════════════════════════════════════════════════════════");
 }
 
-/// 与 `deploy/expose-public.sh` 的 `validate_domain` 同款规则：至少两级、
-/// 每段只允许字母数字连字符、段首段尾不能是连字符、顶级域不得含数字
-/// （这条挡住 `1.2.3.4` 被当域名使）。Rust 侧先校验，脚本侧再校验（纵深防御）。
+/// 域名校验：**规则在 `panel_core::expose`（唯一事实源）**，此处只做转发。
+///
+/// 为什么不就地实现：面板内的 Web 向导（`POST /api/v1/system/expose/apply`）要用
+/// 同一套规则，两处各写一份迟早漂移出一个放行、另一个拒绝。保留本函数名是为了
+/// 不动既有 `expose_tests` 的断言面（它们按名调这里，等于顺带钉住"仍走共享层"）。
 fn validate_expose_domain(d: &str) -> std::result::Result<(), String> {
-    if d.is_empty() || d.len() > 253 {
-        return Err("域名不能为空且长度不超过 253".into());
-    }
-    let parts: Vec<&str> = d.split('.').collect();
-    if parts.len() < 2 {
-        return Err("域名至少需要两级（如 example.com）".into());
-    }
-    let tld = parts[parts.len() - 1];
-    for p in &parts {
-        if p.is_empty() {
-            return Err("存在空段".into());
-        }
-        if !p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-            return Err(format!("段 {p:?} 只能含字母数字连字符"));
-        }
-        if p.starts_with('-') || p.ends_with('-') {
-            return Err(format!("段 {p:?} 首尾不能是连字符"));
-        }
-    }
-    if tld.chars().any(|c| c.is_ascii_digit()) {
-        return Err("顶级域不能含数字（会把 IP 当域名）".into());
-    }
-    Ok(())
+    panel_core::expose::validate_domain(d)
 }
 
-/// 与脚本 `validate_cidr` 同款：本版只认 IPv4；掩码 0（0.0.0.0/0）单独挡下——
-/// 形式上"给了 allow"实质上等于不设限制，正是 fail-closed 要防的那扇门。
+/// CIDR 校验：同理由 `panel_core::expose::validate_cidr` 提供（掩码 0 被拒等 fail-closed
+/// 语义都在那边，脚本侧另有同名校验做纵深防御）。
 fn validate_expose_cidr(c: &str) -> std::result::Result<(), String> {
-    if c.contains(':') {
-        return Err("IPv6 暂不支持（请在生成的 nginx 配置里自行加 allow）".into());
-    }
-    let (ip, mask_str) = match c.split_once('/') {
-        Some((ip, m)) => (ip, m),
-        None => (c, "32"),
-    };
-    if mask_str.is_empty() || !mask_str.chars().all(|x| x.is_ascii_digit()) {
-        return Err("掩码必须是数字".into());
-    }
-    let mask: u32 = mask_str.parse().map_err(|_| "掩码解析失败".to_string())?;
-    if mask > 32 {
-        return Err("掩码超过 32".into());
-    }
-    if mask == 0 {
-        return Err("掩码 0（0.0.0.0/0）等于不设限制，被拒绝".into());
-    }
-    if ip.len() > 15 {
-        return Err("IP 长度异常".into());
-    }
-    let oct: Vec<&str> = ip.split('.').collect();
-    if oct.len() != 4 {
-        return Err("IPv4 必须四段".into());
-    }
-    for n in &oct {
-        if n.is_empty() || !n.chars().all(|x| x.is_ascii_digit()) {
-            return Err(format!("段 {n:?} 非法"));
-        }
-        let v: u32 = n.parse().map_err(|_| format!("段 {n:?} 解析失败"))?;
-        if v > 255 {
-            return Err(format!("段 {n:?} 超过 255"));
-        }
-    }
-    Ok(())
+    panel_core::expose::validate_cidr(c)
 }
 
 /// 交互读取一行（去掉行尾换行）。仅在确认 `is_terminal()` 后调用。

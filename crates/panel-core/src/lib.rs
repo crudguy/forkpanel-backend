@@ -8,6 +8,9 @@ use std::fmt;
 
 pub mod crypto; // 应用层密钥加密（AES-256-GCM，关闭 M0 阻塞项）
 pub mod sync;   // 互斥锁中毒恢复（禁止裸 lock().unwrap()，见 ci/check_lock_unwrap.py）
+// 公网暴露参数校验（域名 / CIDR）：CLI 的 `panel expose` 与 Web 向导共用同一份规则，
+// 避免两处各写一份、漂移出"一个放行另一个拒绝"的扯皮。
+pub mod expose;
 // 校验规则判据的唯一事实源（文件内 `#![cfg(test)]`：生产构建里是空模块）。
 // 判据放单独文件而不放在 `mod tests` 里，是为了让"这份文件真被 include_str! 读了"
 // 能被另一处的守卫扫到——判据和守卫同文件的话，守卫会把自己算成消费者。
@@ -182,6 +185,16 @@ pub mod cap_keys {
     pub const TERMINAL_MANAGE: &str = "terminal.manage";
     /// 用户与角色管理：面板内建功能（非 OS 能力），任何平台恒支持
     pub const USER_MANAGE: &str    = "user.manage";
+    /// 公网暴露向导（域名反代 + 防火墙白名单 + TLS）。
+    ///
+    /// 依赖三件事同时成立：本机有 nginx（反代与 TLS 终结都落在它身上，面板自身
+    /// 永远只监听回环、不提供 HTTPS）、面板以 root 运行（要写 nginx 配置、systemd
+    /// 单元与防火墙规则）、且 `expose-public.sh` 已随安装落盘。任一不满足即诚实置
+    /// no——绝不给出"能点但必失败"的假按钮。
+    ///
+    /// 注意：本能力位**不代表已经对外暴露**，只代表"这台机器具备开启暴露的条件"。
+    /// 是否真的暴露由 status 端点读状态文件回答。
+    pub const EXPOSE_MANAGE: &str  = "expose.manage";
 }
 
 pub type CapabilityMap = std::collections::BTreeMap<String, Capability>;

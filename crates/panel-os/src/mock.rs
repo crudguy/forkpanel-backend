@@ -788,7 +788,9 @@ impl crate::OsAdapter for MockOsAdapter {
                   cap_keys::SERVICE_MANAGE, cap_keys::PACKAGE_INSTALL, cap_keys::FIREWALL_MANAGE,
                   cap_keys::WEBSERVER_MANAGE, cap_keys::SCHEDULER_MANAGE, cap_keys::LOGS_READ,
                   cap_keys::DBMS_MANAGE, cap_keys::SSL_ACME, cap_keys::CONTAINER_VIEW,
-                  cap_keys::CONTAINER_MANAGE, cap_keys::TERMINAL_MANAGE] {
+                  cap_keys::CONTAINER_MANAGE, cap_keys::TERMINAL_MANAGE,
+                  // 公网暴露向导：mock 代表"这台机器什么都能干"，测试才能走通 apply/remove
+                  cap_keys::EXPOSE_MANAGE] {
             m.insert(k.into(), Capability::yes("mock"));
         }
         m

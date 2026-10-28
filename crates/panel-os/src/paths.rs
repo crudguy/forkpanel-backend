@@ -85,6 +85,21 @@ pub fn panel_expose_script_path() -> PathBuf {
     PathBuf::from("/usr/local/share/forkpanel/expose-public.sh")
 }
 
+/// 公网暴露脚本落下的 nginx 反代配置（存在 = 正在对外暴露）。
+///
+/// 与 `deploy/expose-public.sh` 的 `NGINX_CONF` 严格对齐——这是"是否已暴露"的
+/// **唯一判据**，改脚本里的路径必须同步改这里，否则 UI 会显示"未暴露"实则已开。
+pub fn expose_nginx_conf_path() -> PathBuf {
+    PathBuf::from("/etc/nginx/conf.d/forkpanel-public-access.conf")
+}
+
+/// 启用 HTTPS 终结时脚本落的 systemd drop-in（存在 = 有 TLS）。
+///
+/// 与脚本的 `TLS_DROPIN` 对齐。注意它只是"启用了 TLS"的标记，不保证证书有效。
+pub fn expose_tls_dropin_path() -> PathBuf {
+    PathBuf::from("/etc/systemd/system/panel.service.d/panel-tls.conf")
+}
+
 /// 站点标识的文件名安全化：仅保留 `[A-Za-z0-9._-]`，其余替换为 `_`，空串回退 `site`。
 ///
 /// 站点配置文件（`panel-<slug>.conf`）与站点日志文件（`<slug>.access.log`）都由此派生，

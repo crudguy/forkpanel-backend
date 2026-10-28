@@ -130,6 +130,27 @@ pub fn signal_capability(is_root: bool) -> Capability {
     if is_root { Capability::yes("posix") } else { Capability::no("non_root") }
 }
 
+/// 公网暴露向导能力位。与 `signal_capability` 同款理由抽成**纯函数**：
+/// 三件事缺一不可——① 本机有 nginx（反代 + TLS 终结，面板自身永不提供 HTTPS）；
+/// ② 面板以 root 运行（要写 nginx 配置 / systemd 单元 / 防火墙规则）；
+/// ③ `expose-public.sh` 已随安装落盘（缺失则点了也是 exec 一个不存在的路径）。
+///
+/// 判定顺序有讲究：先看 nginx（缺它则整件事无从谈起），再看脚本，最后看 root——
+/// 这样非 root 的 CI 上也能覆盖"nginx 在但脚本缺"这类分支，而不是一律落到 non_root。
+pub fn expose_capability(webserver: &str, script_installed: bool, is_root: bool) -> Capability {
+    if webserver != "nginx" {
+        // caddy 未经 expose 流程验证，如实置 no，不做乐观猜测
+        return Capability::no("need_nginx");
+    }
+    if !script_installed {
+        return Capability::no("script_missing");
+    }
+    if !is_root {
+        return Capability::no("non_root");
+    }
+    Capability::yes("nginx")
+}
+
 impl OsAdapter for linux::LinuxOsAdapter {
     fn platform(&self) -> PlatformInfo { self.platform.clone() }
 
@@ -231,6 +252,16 @@ impl OsAdapter for linux::LinuxOsAdapter {
         });
         // 用户与角色管理是面板内建功能，与操作系统能力无关，任何平台恒支持
         m.insert(k::USER_MANAGE.into(), Capability::yes("builtin"));
+        // 公网暴露向导：nginx + 脚本已安装 + root，三者缺一即 no（见 expose_capability）。
+        // 路径统一走 paths 抽象（与 install.sh 的落点对齐），不在此硬编码。
+        m.insert(
+            k::EXPOSE_MANAGE.into(),
+            expose_capability(
+                self.webserver.name(),
+                crate::paths::panel_expose_script_path().exists(),
+                is_root(),
+            ),
+        );
         m
     }
 
@@ -296,6 +327,32 @@ mod tests {
         assert!(!os.paths().data_dir().as_os_str().is_empty());
         assert!(!os.paths().site_root().as_os_str().is_empty());
         assert!(!os.paths().default_web_user().is_empty());
+    }
+
+    /// 暴露能力位必须**三个前置条件逐一可辨**：任意一个不满足都要置 no 并给出
+    /// 不同 reason。只测"三件都齐 → yes"会漏掉"缺一件却仍报 yes"，那正是
+    /// 用户点了才发现跑不起来的假按钮。
+    #[test]
+    fn expose_capability_requires_nginx_script_and_root() {
+        // 三件齐备才 yes
+        let ok = expose_capability("nginx", true, true);
+        assert!(ok.supported, "nginx + 脚本 + root 应支持");
+        assert_eq!(ok.backend.as_deref(), Some("nginx"));
+
+        // 缺 nginx（caddy / 未知）→ 拒绝，且 reason 指明要 nginx
+        for ws in ["caddy", "none", ""] {
+            let c = expose_capability(ws, true, true);
+            assert!(!c.supported, "web 服务器 {ws:?} 不该支持 expose");
+            assert_eq!(c.reason.as_deref(), Some("need_nginx"));
+        }
+        // 脚本缺失 → 拒绝（否则点了是 exec 不存在的路径）
+        let no_script = expose_capability("nginx", false, true);
+        assert!(!no_script.supported);
+        assert_eq!(no_script.reason.as_deref(), Some("script_missing"));
+        // 非 root → 拒绝（写不了 nginx 配置/防火墙）
+        let no_root = expose_capability("nginx", true, false);
+        assert!(!no_root.supported);
+        assert_eq!(no_root.reason.as_deref(), Some("non_root"));
     }
 
     /// mock 的 hold 读写必须闭环（幂等 + 全集语义）：预览模式下 UI 的
