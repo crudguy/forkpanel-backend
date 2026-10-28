@@ -11,7 +11,11 @@
 在以 root / sudo 执行的 Linux 机器上：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/crudguy/forkpanel-backend/main/deploy/get-panel.sh | sh
+# 两步法（推荐，比 curl | sh 更稳）：先把脚本下到本地，确认完整再执行
+# —— 避免管道中途断流让 sh 只执行到半截脚本（留下脏状态）；wget 自带重试+续传
+wget -O get-panel.sh https://raw.githubusercontent.com/crudguy/forkpanel-backend/main/deploy/get-panel.sh
+# 没有 wget 时：curl -fSL --retry 5 --retry-delay 2 -o get-panel.sh <同一 URL>
+sudo sh get-panel.sh
 ```
 
 装完后从日志取一次性初始化令牌，浏览器打开对应端口完成引导：

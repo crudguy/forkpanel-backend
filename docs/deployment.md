@@ -45,7 +45,9 @@ sudo ./deploy/install.sh                 # 缺省取 ./target/release/panel
 
 ```bash
 # 默认从 GitHub Releases 下载最新稳定版
-curl -fsSL https://github.com/crudguy/forkpanel-backend/releases/latest/download/get-panel.sh | sudo bash
+# 两步法：先下载脚本到本地（wget 重试+续传；curl 备选见 README），再 sudo 执行
+wget -O get-panel.sh https://github.com/crudguy/forkpanel-backend/releases/latest/download/get-panel.sh
+sudo bash get-panel.sh
 
 # 指定版本
 PANEL_VERSION=v0.1.0 sudo -E bash get-panel.sh

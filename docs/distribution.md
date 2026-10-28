@@ -5,8 +5,14 @@ ForkPanel 以**单一静态二进制 + 一键安装器**的形式分发。用户
 ## 安装（最新稳定版）
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/crudguy/forkpanel-backend/main/deploy/get-panel.sh | sh
+# 两步法（推荐）：先把脚本下载到本地，确认完整再执行，避免管道中途断流半执行
+wget -O get-panel.sh https://raw.githubusercontent.com/crudguy/forkpanel-backend/main/deploy/get-panel.sh
+# curl 备选：curl -fSL --retry 5 --retry-delay 2 -o get-panel.sh <同一 URL>
+sudo sh get-panel.sh
 ```
+
+> 若 `raw.githubusercontent.com` 持续掉线（中国大陆常见）：可用代理 `https_proxy=http://<代理>:port wget -O get-panel.sh <同 URL>` 下载，
+> 或把仓库导入 Gitee 等国内镜像后从镜像拉脚本。脚本到手后，其内部二进制下载已支持 `PANEL_MIRRORS` / 代理（见下文"切换到自建 / 镜像源"），全链路即稳。
 
 安装器会：检测架构（amd64/arm64）→ 从 GitHub Releases 下载对应 tarball → **用内嵌 ed25519 公钥验签** → 验过才解包 → 执行 `install.sh`（建目录、随机端口、systemd 单元、外部探活）。
 
@@ -15,13 +21,17 @@ curl -fsSL https://raw.githubusercontent.com/crudguy/forkpanel-backend/main/depl
 ## 安装指定版本
 
 ```bash
-PANEL_VERSION=0.1.0 curl -fsSL https://raw.githubusercontent.com/crudguy/forkpanel-backend/main/deploy/get-panel.sh | sh
+# 两步法：先下载（版本变量只影响执行，不影响下载），再执行时指定版本
+wget -O get-panel.sh https://raw.githubusercontent.com/crudguy/forkpanel-backend/main/deploy/get-panel.sh
+PANEL_VERSION=0.1.0 sudo -E sh get-panel.sh
 ```
 
 ## 仅下载验签、不安装（调试 / 审计）
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/crudguy/forkpanel-backend/main/deploy/get-panel.sh | sh -s -- --no-install
+# 两步法：先下载，再传 --no-install 仅验签不安装
+wget -O get-panel.sh https://raw.githubusercontent.com/crudguy/forkpanel-backend/main/deploy/get-panel.sh
+sudo sh get-panel.sh --no-install
 ```
 产物留在临时目录（脚本会打印路径），不触动系统。
 
@@ -30,7 +40,9 @@ curl -fsSL https://raw.githubusercontent.com/crudguy/forkpanel-backend/main/depl
 默认源是 GitHub Releases。若想走自建源（如 `releases.forkpanel.dev`）或镜像：
 
 ```bash
-PANEL_RELEASE_BASE=https://releases.forkpanel.dev curl -fsSL <get-panel.sh 入口> | sh
+# 两步法：先下载脚本（入口用 main 分支源码版或 releases 版均可），执行时切到自建/镜像源
+wget -O get-panel.sh https://raw.githubusercontent.com/crudguy/forkpanel-backend/main/deploy/get-panel.sh
+PANEL_RELEASE_BASE=https://releases.forkpanel.dev sudo -E sh get-panel.sh
 ```
 
 ## 更新
