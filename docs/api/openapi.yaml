@@ -1279,9 +1279,21 @@ components:
           type: object
           description: 部署级只读展示（改 config.toml 并重启）
           properties:
-            read_only: { type: boolean }
-            tier:      { type: string, enum: [nano, small, standard] }
-            hint:      { type: string }
+            read_only:            { type: boolean }
+            tier:                 { type: string, enum: [nano, small, standard] }
+            # 以下各项后端**均已返回**（见 settings.rs 的 deployment json!），此前契约
+            # 只声明了三键，前端照契约声明而从不展示 ⇒ 「hint 里列了一堆配置，页面上
+            # 一个值都看不到」。补齐声明，让契约与实际响应对齐。
+            max_login_attempts:   { type: integer, description: '[security] max_login_attempts，连续失败达此次数即锁定账号' }
+            session_idle:         { type: string, description: 空闲超时（fmt_dur），形如 30m / 12h / 45s }
+            session_absolute:     { type: string, description: 绝对超时（fmt_dur），格式同上 }
+            audit_retention_days: { type: integer, description: '[audit] retention_days，审计日志保留天数' }
+            audit_max_rows:       { type: integer, description: '[audit] max_rows，审计表单行数上限' }
+            localhost_only:       { type: boolean, description: '[server] localhost_only；为真时 Config::addr() 强制只监听 127.0.0.1（覆盖 bind）——决定面板对外可达性' }
+            db_daily_backup:      { type: boolean, description: '[db] daily_backup，每日自动备份开关' }
+            db_synchronous:       { type: string, description: '[db] synchronous，SQLite 落盘同步档（归一化大写）' }
+            db_backup_keep:       { type: integer, description: '[db] backup_keep，备份保留份数' }
+            hint:                 { type: string }
         reserved:
           type: object
           properties:
