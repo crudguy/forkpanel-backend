@@ -12,6 +12,10 @@
 
 use panel_core::{PanelError, Result};
 use std::{collections::HashMap, ffi::OsString, path::{Path, PathBuf}, process::Stdio, time::Duration};
+// pre_exec（setsid 独立进程组，防孙进程泄漏）仅 unix 提供，需显式引入 trait。
+// 本面板仅支持 Linux（CI 门禁 [9]），非 unix 不在支持范围。
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 /// 该路径是否「一个可执行的普通文件」——能力位判定的**唯一判据**。
 ///
@@ -388,6 +392,56 @@ pub async fn run_checked(bin: Bin, args: &[&str], opt: CmdOpt) -> Result<CmdOutp
             detail: format!("exit={other:?} stderr={}", truncate(&out.stderr, 2000)),
         }),
     }
+}
+
+/// 同步执行命令（出口唯一性纪律内的**同步**分支）。
+///
+/// 存在理由：CLI 的 `run()` 是纯同步函数，卸载这种一次性、确定性的运维动作
+/// 若改走异步 [`run`] 需在同步上下文里再起一个 tokio runtime 包 `block_on`，
+/// 徒增复杂度。本函数用同步 `std::process::Command` 提供**同款约束**
+/// （Bin 白名单 + 安全 PATH + 不解释 shell），出口仍只落在 cmd.rs 内——
+/// 业务层不得直接 spawn 子进程（CI 门禁 [1]）。
+///
+/// 与 [`run`] 的差异：同步、不收集逐行回调、不做超时（运维动作瞬时确定）。
+pub fn run_sync(bin: Bin, args: &[&str]) -> Result<CmdOutput> {
+    let program = bin.resolved()?;
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    // 固定 PATH + 清除可被劫持的动态链接器变量（与 run() 一致）
+    cmd.env_clear();
+    cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    cmd.env("LANG", "C");
+    cmd.env("LC_ALL", "C");
+    // 独立进程组，避免孙进程泄漏成为孤儿
+    unsafe { cmd.pre_exec(|| { libc::setsid(); Ok(()) }); }
+
+    let mut child = cmd.spawn().map_err(|e| PanelError::Command {
+        bin: bin.as_str().into(), detail: format!("spawn failed: {e}")
+    })?;
+
+    // 先取管道读到 EOF（子进程关闭 stdout/stderr 后），再回收，避免管道缓冲死锁。
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut o) = child.stdout.take() {
+        let _ = std::io::Read::read_to_string(&mut o, &mut stdout);
+    }
+    if let Some(mut e) = child.stderr.take() {
+        let _ = std::io::Read::read_to_string(&mut e, &mut stderr);
+    }
+    let status = child.wait().map_err(|e| PanelError::Command {
+        bin: bin.as_str().into(), detail: format!("wait failed: {e}")
+    })?;
+
+    Ok(CmdOutput {
+        code: exit_code(&status),
+        stdout,
+        stderr,
+        truncated: false,
+        elapsed: Duration::ZERO,
+    })
 }
 
 fn truncate(s: &str, n: usize) -> String {

@@ -64,6 +64,16 @@ impl PathLayout for std::sync::Arc<dyn PathLayout> {
     fn sqlite_path(&self) -> PathBuf { (**self).sqlite_path() }
 }
 
+/// 面板二进制安装路径（与 `deploy/install.sh` 的 `BIN_DST` 对齐：`$PREFIX/bin/panel`，
+/// `PREFIX` 默认 `/usr/local`）。卸载时只删这个固定路径，**绝不删 `current_exe()`**——
+/// 否则在 E2E namespace 里会误删宿主构建产物。
+///
+/// 定义在本文件（panel-os 内）即被 `check-layering.sh` 规则 [3] 豁免：平台默认目录
+/// 本就是平台知识，业务层应经此函数获取，而不是自己拼 `/usr/local/bin`。
+pub fn panel_bin_install_path() -> PathBuf {
+    PathBuf::from("/usr/local/bin/panel")
+}
+
 /// 站点标识的文件名安全化：仅保留 `[A-Za-z0-9._-]`，其余替换为 `_`，空串回退 `site`。
 ///
 /// 站点配置文件（`panel-<slug>.conf`）与站点日志文件（`<slug>.access.log`）都由此派生，

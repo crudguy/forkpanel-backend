@@ -793,30 +793,35 @@ fn run(cli: Cli) -> Result<()> {
             // 「服务还指着已删二进制」的残态（与 uninstall.sh 同纪律）。
             if !panel_os::fs::is_root() {
                 return Err(PanelError::Internal(
-                    "uninstall: 需要 root 权限（停止/禁用 systemd 服务、移除单元、删除 /usr/local/bin/panel 都需 root）".into(),
+                    "uninstall: 需要 root 权限（停止/禁用 systemd 服务、移除单元、删除面板二进制都需 root）".into(),
                 ));
             }
 
             // 容错：这些命令在容器 / 非 systemd 环境可能不存在或报错，卸载仍要继续。
-            let _ = std::process::Command::new("systemctl").args(["stop", "panel"]).status();
-            let _ = std::process::Command::new("systemctl").args(["disable", "panel"]).status();
+            // 子进程出口唯一收敛在 panel-os（cmd.rs）——业务层不得直接 spawn。
+            let _ = panel_os::run_sync(panel_os::Bin::Systemctl, &["stop", "panel"]);
+            let _ = panel_os::run_sync(panel_os::Bin::Systemctl, &["disable", "panel"]);
 
-            // 移除面板自建单元（与 install.sh 写入的路径一致）。
-            let unit = std::path::Path::new("/etc/systemd/system/panel.service");
+            // 移除面板自建单元：路径经 PathLayout（service_dir），业务层不硬编码 /etc。
+            let unit = os.paths().service_dir().join("panel.service");
             if unit.exists() {
-                std::fs::remove_file(unit).ok();
-                println!("· 已移除 systemd 单元 /etc/systemd/system/panel.service");
+                if std::fs::remove_file(&unit).is_ok() {
+                    println!("· 已移除 systemd 单元 {}", unit.display());
+                } else {
+                    eprintln!("  警告：无法移除单元 {}（权限？）", unit.display());
+                }
             } else {
                 println!("· systemd 单元不存在（跳过）");
             }
-            let _ = std::process::Command::new("systemctl").args(["daemon-reload"]).status();
+            let _ = panel_os::run_sync(panel_os::Bin::Systemctl, &["daemon-reload"]);
 
-            // 移除二进制：与 install.sh 的 BIN_DST（$PREFIX/bin/panel，默认 /usr/local/bin/panel）一致。
-            // 只删这个固定安装路径——不删 current_exe()，避免跑到其它路径时误删宿主机构建产物。
-            let bin = std::path::Path::new("/usr/local/bin/panel");
+            // 移除二进制：与 install.sh 的 BIN_DST 对齐（默认 /usr/local/bin/panel），
+            // 路径经 panel-os 抽象获取，业务层不拼绝对路径。
+            // 只删这个固定安装路径——不删 current_exe()，避免 E2E namespace 里误删宿主构建产物。
+            let bin = panel_os::paths::panel_bin_install_path();
             if bin.exists() {
-                if std::fs::remove_file(bin).is_ok() {
-                    println!("· 已移除二进制 /usr/local/bin/panel");
+                if std::fs::remove_file(&bin).is_ok() {
+                    println!("· 已移除二进制 {}", bin.display());
                 } else {
                     eprintln!("  警告：无法移除二进制 {}（权限？）", bin.display());
                 }
