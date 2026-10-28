@@ -250,9 +250,23 @@ else
   bad "配置不存在，幂等性无法验证"
 fi
 
-# ── 10. 卸载：必须移除二进制与单元，且保留数据 ──────────────────────────
-say "== 10. uninstall.sh：删程序、留数据 =="
+# ── 10. panel uninstall 子命令：删程序、留数据 ──────────────────────────
+say "== 10. panel uninstall 子命令：删程序、留数据 =="
 mkdir -p /var/lib/forkpanel && echo keep > /var/lib/forkpanel/panel.db
+out_a=$("$BIN_SRC" --config "$CONF" uninstall 2>&1); rc_a=$?
+chk_rc "panel uninstall 退出码 0" "$rc_a" "0"
+[ -e /usr/local/bin/panel ] && bad "卸载后二进制仍在" || ok "二进制已移除"
+[ -e "$UNIT" ] && bad "卸载后 panel.service 仍在" || ok "systemd 单元已移除"
+[ -f /var/lib/forkpanel/panel.db ] && ok "数据目录被保留（不自动删账号与数据）" \
+  || bad "数据目录被删除了——卸载绝不应删数据"
+[ -f "$CONF" ] && ok "配置文件被保留" || bad "配置文件被删除"
+chk_has "卸载提示保留目录" "$out_a" "保留"
+
+# ── 11. 重装恢复后再验 uninstall.sh（两条卸载路径都必须"删程序、留数据"）──
+say "== 11. 重装恢复二进制与单元，再验 uninstall.sh：删程序、留数据 =="
+bash "$REPO/deploy/install.sh" "$BIN_SRC" >/dev/null 2>&1
+[ -e /usr/local/bin/panel ] && ok "重装后二进制恢复" || bad "重装后二进制未恢复"
+[ -e "$UNIT" ] && ok "重装后 systemd 单元恢复" || bad "重装后单元未恢复"
 out3=$(bash "$REPO/deploy/uninstall.sh" 2>&1); rc3=$?
 chk_rc "uninstall.sh 退出码 0" "$rc3" "0"
 [ -e /usr/local/bin/panel ] && bad "卸载后二进制仍在" || ok "二进制已移除"

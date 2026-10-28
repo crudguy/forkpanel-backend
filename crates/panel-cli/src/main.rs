@@ -166,6 +166,12 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// 卸载 ForkPanel：停服务 → 移除 systemd 单元 → 移除二进制（保留数据与配置）
+    ///
+    /// 与 `deploy/uninstall.sh` 等价，给「已经装好的面板自己卸载自己」一个 CLI 入口，
+    /// 不必再单独取安装脚本。安全边界与 uninstall.sh 一致：**只删程序与单元，
+    /// 绝不删数据/配置**（账号、站点、审计、备份都在里面）。彻底清除数据请手动 `rm -rf`。
+    Uninstall,
 }
 
 fn main() {
@@ -779,6 +785,54 @@ fn run(cli: Cli) -> Result<()> {
                     println!("{} {:<20} {}{}", mark, k, backend, reason);
                 }
             }
+            Ok(())
+        }
+
+        Cmd::Uninstall => {
+            // 删单元 / 删二进制都需要 root；非 root 一律提前报错，绝不半途留下
+            // 「服务还指着已删二进制」的残态（与 uninstall.sh 同纪律）。
+            if !panel_os::fs::is_root() {
+                return Err(PanelError::Internal(
+                    "uninstall: 需要 root 权限（停止/禁用 systemd 服务、移除单元、删除 /usr/local/bin/panel 都需 root）".into(),
+                ));
+            }
+
+            // 容错：这些命令在容器 / 非 systemd 环境可能不存在或报错，卸载仍要继续。
+            let _ = std::process::Command::new("systemctl").args(["stop", "panel"]).status();
+            let _ = std::process::Command::new("systemctl").args(["disable", "panel"]).status();
+
+            // 移除面板自建单元（与 install.sh 写入的路径一致）。
+            let unit = std::path::Path::new("/etc/systemd/system/panel.service");
+            if unit.exists() {
+                std::fs::remove_file(unit).ok();
+                println!("· 已移除 systemd 单元 /etc/systemd/system/panel.service");
+            } else {
+                println!("· systemd 单元不存在（跳过）");
+            }
+            let _ = std::process::Command::new("systemctl").args(["daemon-reload"]).status();
+
+            // 移除二进制：与 install.sh 的 BIN_DST（$PREFIX/bin/panel，默认 /usr/local/bin/panel）一致。
+            // 只删这个固定安装路径——不删 current_exe()，避免跑到其它路径时误删宿主机构建产物。
+            let bin = std::path::Path::new("/usr/local/bin/panel");
+            if bin.exists() {
+                if std::fs::remove_file(bin).is_ok() {
+                    println!("· 已移除二进制 /usr/local/bin/panel");
+                } else {
+                    eprintln!("  警告：无法移除二进制 {}（权限？）", bin.display());
+                }
+            } else {
+                println!("· 二进制不存在（跳过）");
+            }
+
+            println!();
+            println!("已卸载 ForkPanel。以下目录被保留（含账号与数据，未自动删除）：");
+            println!("  /var/lib/forkpanel    数据库、主密钥、备份");
+            println!("  /etc/forkpanel        配置");
+            println!("  /var/log/forkpanel    日志");
+            println!("  /var/www              站点根目录");
+            println!();
+            println!("确认不再需要后自行删除：");
+            println!("  rm -rf /var/lib/forkpanel /etc/forkpanel /var/log/forkpanel");
             Ok(())
         }
     }
