@@ -926,7 +926,7 @@ fn run(cli: Cli) -> Result<()> {
                     });
                 }
                 let raw = prompt_line("允许访问的来源网段（IPv4 CIDR，可多个，逗号/空格分隔，如 1.2.3.4/32）: ")?;
-                for part in raw.split(|c| c == ',' || c == ' ').filter(|s| !s.is_empty()) {
+                for part in raw.split(|c| [',', ' '].contains(&c)).filter(|s| !s.is_empty()) {
                     allow.push(part.to_string());
                 }
             }

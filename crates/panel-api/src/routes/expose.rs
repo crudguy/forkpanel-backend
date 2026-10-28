@@ -256,8 +256,6 @@ fn invoke_script(script_args: &[String]) -> std::result::Result<String, String> 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     /// ⭐ **接线守卫**：apply / remove 必须真的经 `Bin::Bash` 调脚本。
     ///
     /// 只测"参数校验会对坏输入报错"是不够的——把 `invoke_script` 的调用删掉、
