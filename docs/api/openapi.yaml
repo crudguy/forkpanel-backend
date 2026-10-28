@@ -317,6 +317,45 @@ components:
                     path:  { type: string, description: 路径或说明文本 }
                     desc:  { type: string, nullable: true, description: 补充说明 }
 
+    ExposeStatus:
+      type: object
+      description: 公网暴露状态。exposed 由 nginx 反代配置是否存在判定，tls 由 systemd drop-in 判定。
+      properties:
+        exposed:            { type: boolean, description: 是否正在对外暴露（nginx 反代配置存在） }
+        tls:                { type: boolean, description: 是否启用 HTTPS 终结 }
+        script_installed:   { type: boolean, description: expose-public.sh 是否已安装（缺失时 apply 必失败） }
+        supported:          { type: boolean, description: 能力位 EXPOSE_MANAGE 是否支持 }
+        unsupported_reason: { type: string, nullable: true, description: 不支持的原因（need_nginx / script_missing / non_root） }
+
+    ExposeApplyReq:
+      type: object
+      required: [domain, allow]
+      description: |
+        开启公网访问的入参。校验规则与 CLI `panel expose` 及 expose-public.sh 同源
+        （panel_core::expose）：域名至少两级且顶级域不含数字；CIDR 只收 IPv4、掩码 0 被拒。
+      properties:
+        domain:     { type: string, description: 对外域名，如 panel.example.com }
+        allow:
+          type: array
+          minItems: 1
+          items: { type: string }
+          description: 允许访问的来源网段（IPv4 CIDR），至少一个；名单外一律拒绝
+        self_signed: { type: boolean, description: "true=现场生成自签证书（浏览器会告警）" }
+        fullchain:   { type: string, nullable: true, description: 已有证书链路径（与 key 成对） }
+        key:         { type: string, nullable: true, description: 证书私钥路径（与 fullchain 成对） }
+        no_firewall: { type: boolean, description: "true=不自动放行防火墙端口" }
+
+    ExposeApplyResp:
+      type: object
+      properties:
+        domain: { type: string, description: 已生效的域名 }
+        output: { type: string, description: 脚本 stdout（逐步结果，原样展示给用户） }
+
+    ExposeRemoveResp:
+      type: object
+      properties:
+        output: { type: string, description: 脚本 stdout }
+
         degraded:      { type: boolean, description: "true=已触发低配降频" }
         alerts:        { type: array, items: { $ref: '#/components/schemas/Alert' } }
     Alert:
@@ -1545,6 +1584,55 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/Directories' } } }
+
+  /api/v1/system/expose/status:
+    get:
+      tags: [system]
+      summary: 公网暴露状态（是否已对外暴露 / 是否启用 TLS / 能力位是否支持）
+      description: 只读。探测 nginx 反代配置与 TLS drop-in 是否存在，不触达脚本。
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/ExposeStatus' } } }
+
+  /api/v1/system/expose/apply:
+    post:
+      tags: [system]
+      summary: 开启公网访问（域名反代 + 防火墙白名单 + TLS）
+      description: |
+        经 `deploy/expose-public.sh` 落地：面板仍绑回环，由 nginx 终结 TLS。
+        fail-closed：至少一个来源网段；掩码 0（0.0.0.0/0）被拒；IPv6 暂不支持。
+        证书链与私钥必须成对提供，都不给则默认自签。
+      security: [cookieAuth, csrfHeader]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExposeApplyReq' }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/ExposeApplyResp' } } }
+        '400': { description: 参数非法（域名/CIDR/证书不成对）或脚本 fail-closed 拒绝 }
+        '501': { description: 能力位 EXPOSE_MANAGE 不支持（缺 nginx / 脚本未安装 / 非 root） }
+
+  /api/v1/system/expose/remove:
+    post:
+      tags: [system]
+      summary: 撤销公网访问（等同脚本 --uninstall；面板仍绑回环，ssh 隧道可用）
+      security: [cookieAuth, csrfHeader]
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/ExposeRemoveResp' } } }
+        '400': { description: 脚本执行失败 }
+        '501': { description: 能力位 EXPOSE_MANAGE 不支持 }
 
   /api/v1/server/notes:
     get:

@@ -14,6 +14,7 @@ pub mod assistant;
 pub mod backups;
 pub mod containers;
 pub mod databases;
+pub mod expose;
 pub mod files;
 pub mod firewall;
 pub mod logs;
@@ -108,7 +109,13 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/metrics/history", get(system::history))
         .route("/api/v1/system/users", get(system::users))
         .route("/api/v1/system/directories", get(system::directories))
-        .route("/api/v1/metrics/snapshot", get(system::snapshot));
+        .route("/api/v1/metrics/snapshot", get(system::snapshot))
+        // ── 公网暴露向导（域名反代 + 白名单 + TLS）──
+        // 只读状态用 SYSTEM_VIEW；apply/remove 用 SYSTEM_MANAGE（等同于系统级运维）。
+        // 三者都不绕过能力门：EXPOSE_MANAGE 不支持时 apply/remove 返回 501。
+        .route("/api/v1/system/expose/status", get(expose::status))
+        .route("/api/v1/system/expose/apply", post(expose::apply))
+        .route("/api/v1/system/expose/remove", post(expose::remove));
 
     // ── 进程（M2） ──
     let proc_r = Router::new()
@@ -592,7 +599,7 @@ mod tests {
     #[test]
     fn capability_gates_census() {
         // (文件, needle, 期望出现次数, 说明)
-        let cases: [(&str, &str, usize, &str); 22] = [
+        let cases: [(&str, &str, usize, &str); 24] = [
             (include_str!("routes/services/mod.rs"), ".get(cap_keys::SERVICE_MANAGE)", 4, "services::*"),
             (include_str!("routes/services/packages.rs"), ".get(cap_keys::PACKAGE_INSTALL)", 5, "packages::*"),
             (include_str!("routes/services/packages.rs"), ".get(cap_keys::PACKAGE_UPGRADE)", 2, "packages::*"),
@@ -615,6 +622,8 @@ mod tests {
             (include_str!("routes/sites/ssl.rs"), ".get(cap_keys::SSL_SELFSIGNED)", 2, "ssl_apply / cert_renew"),
             (include_str!("routes/backups.rs"), ".get(cap_keys::BACKUP_MANAGE)", 3, "backups::*"),
             (include_str!("routes/terminal.rs"), ".get(cap_keys::TERMINAL_MANAGE)", 1, "terminal::ws_handler"),
+            (include_str!("routes/expose.rs"), ".get(cap_keys::EXPOSE_MANAGE)", 3, "expose：ensure_supported 两道（supported 判定 + 取 reason）+ status 一道（只报告能力状态，不是门）"),
+            (include_str!("routes/expose.rs"), "ensure_supported(&state)?", 2, "apply / remove 各接一道能力门"),
         ];
         for (src, needle, want, who) in cases {
             // ⚠ 生产段：注释里逐字写着这些 needle，不剔会恒真；测试块里的
