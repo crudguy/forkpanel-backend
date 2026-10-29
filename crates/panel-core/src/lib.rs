@@ -178,7 +178,7 @@ pub mod cap_keys {
     pub const CONTAINER_MANAGE: &str = "container.manage";
     /// 容器查看/入口：恒 supported（只要平台支持容器概念）。与 `CONTAINER_MANAGE` 解耦——
     /// 菜单是否点亮只看"功能是否可见"，不卡"daemon 是否可达"。daemon 不可达时进页面
-    /// 由 ContainersView 显示诊断/引导，而非把整个菜单置灰（宝塔式常亮体验）。
+    /// 由 ContainersView 显示诊断/引导，而非把整个菜单置灰（集中式面板式的常亮体验）。
     pub const CONTAINER_VIEW: &str = "container.view";
     /// 内置 Web 终端：本机存在可用交互 shell（bash/sh）即可。**高危面**——
     /// 能力位只管"能不能开"，真正的准入还叠加 SYSTEM_MANAGE 权限 + 只读拒绝。

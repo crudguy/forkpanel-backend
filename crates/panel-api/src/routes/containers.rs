@@ -622,7 +622,7 @@ const INSTALL_CONFIRM: &str = "安装 Docker";
 
 /// 一键安装 Docker（仅当二进制缺失时可用）。
 ///
-/// 与宝塔"点进去自己装"一致：菜单常亮，进入后若未装 Docker，提供安装入口。
+/// 与"菜单常亮、进入后再装"的体验一致：菜单常亮，进入后若未装 Docker，提供安装入口。
 /// 要求 `container.manage` 权限 + 手输确认词 + 走任务队列（可审计、可取消、可查进度）。
 ///
 /// 本端点**只装引擎**，不自动把面板用户加 docker 组——那等于授予 root 级权限，
@@ -674,7 +674,7 @@ pub async fn install(
 
 /// 修复 `daemon_unreachable` 的核心一步：把**面板进程用户**加入 docker 组。
 ///
-/// 与宝塔"点一下就好"一致——用户不必手敲 `usermod`。目标用户取 `panel_os::runtime_user()`
+/// 与"点一下就好"的体验一致——用户不必手敲 `usermod`。目标用户取 `panel_os::runtime_user()`
 /// （effective uid 映射），**不是登录用户**：docker socket 权限取决于面板进程身份，
 /// 加错人对管理容器毫无帮助（之前前端提示 `usermod -aG docker <登录用户>` 就是误导）。
 ///

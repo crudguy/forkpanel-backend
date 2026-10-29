@@ -36,7 +36,7 @@ sudo ./deploy/install.sh                 # 缺省取 ./target/release/panel
 > **不用再手动 `systemctl start panel`**：安装脚本已代为启动，收尾输出会写明服务实际状态。
 > 万一没起来，脚本不会把"安装"判失败（此时文件都已落盘），而是给出 `journalctl -u panel` 诊断。
 
-> **端口不再固定 2083**：新安装时 `install.sh` 会在 `[10000, 65535]` 随机分配一个监听端口并写进 `config.toml`，安装输出与首启横幅都会打印实际端口（参考宝塔面板，降低被扫描概率）。升级（配置已存在）沿用既有端口。dev/test 默认值仍保留 2083（见 `config.rs` 的 `default_port`），不影响开发环境。
+> **端口不再固定 2083**：新安装时 `install.sh` 会在 `[10000, 65535]` 随机分配一个监听端口并写进 `config.toml`，安装输出与首启横幅都会打印实际端口（降低被扫描概率）。升级（配置已存在）沿用既有端口。dev/test 默认值仍保留 2083（见 `config.rs` 的 `default_port`），不影响开发环境。
 
 ### 2.1.1 一键安装脚本 get-panel.sh（无需 Rust 工具链）
 
@@ -342,7 +342,7 @@ sudo panel --config /etc/forkpanel/config.toml passwd admin --pass '<新口令>'
 
 1. **守住 `localhost_only = true`**。远程访问走 SSH 隧道，不要改成 `0.0.0.0`。确需公网暴露时先接 TLS（M3 ACME）再改，并自行承担暴露面。
 2. **`--owner-pass` / `--pass` 只用于脚本**。命令行参数会进 shell history 且 `ps` 可见；手工部署一律用交互模式（口令关回显）。
-3. **不做多用户注册**。面板账号即服务器管理员。未来有团队需求应做"owner 邀请子账号"，而非注册页——主流面板（宝塔 / 1Panel / CasaOS）都是这个模型。
+3. **不做多用户注册**。面板账号即服务器管理员。未来有团队需求应做"owner 邀请子账号"，而非注册页——主流面板（如 1Panel / CasaOS）都是这个模型。
 
 ---
 
