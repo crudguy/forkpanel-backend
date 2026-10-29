@@ -25,7 +25,7 @@
 #   逐条钉住上述三条与生成的 nginx 配置（`make e2e-expose`）。
 set -euo pipefail
 
-CONF_FILE=/etc/forkpanel/config.toml
+CONF_FILE="${FORKPANEL_CONFIG:-/etc/forkpanel/config.toml}"
 NGINX_CONF=/etc/nginx/conf.d/forkpanel-public-access.conf
 CERT_DIR=/var/lib/forkpanel/ssl/public-access
 # 本脚本自签时留个记号：下次才知道这份证书是自己签的、可以替换（见 ③）
@@ -129,6 +129,8 @@ validate_cidr() {
     *)   ip="$c";     mask=32 ;;
   esac
   case "$mask" in ''|*[!0-9]*) return 1 ;; esac
+  # 前导零掩码（`/024`）必须拒：无必要、且不同解析器口径不一。
+  case "$mask" in 0[0-9]*) return 1 ;; esac
   # 位数上限：bash 算术按 2^64 回绕，`10#` 后跟 20 位数字会绕回 0
   # （实测 `$((10#18446744073709551616))` = 0），不设限就能骗过下面的 `-le 32`。
   [ "${#mask}" -le 3 ] || return 1
@@ -142,10 +144,21 @@ validate_cidr() {
   [ "${#ip}" -le 15 ] || return 1
   local IFS='.'; read -ra o <<< "$ip" 2>/dev/null || return 1
   [ "${#o[@]}" -eq 4 ] || return 1
+  ip32=0
   for n in "${o[@]}"; do
     case "$n" in ''|*[!0-9]*) return 1 ;; esac
+    # 前导零八位组（`001`）必须拒：Rust 侧同口径，避免"同一条 CIDR 两端口径不同"。
+    case "$n" in 0[0-9]*) return 1 ;; esac
     [ "$((10#$n))" -le 255 ] || return 1
+    ip32=$(( (ip32 << 8) | (10#$n) ))
   done
+  # 主机位必须全 0（`203.0.113.5/24` 这类"网络地址之外还写主机位"既非合法 CIDR，
+  # 也会让 nginx 的 `allow` 只覆盖一台却伪装成整段）——与 Rust `panel_core::expose` 同口径。
+  m="$((10#$mask))"
+  if [ "$m" -lt 32 ]; then
+    host_bits=$(( 0xFFFFFFFF >> m ))          # 低 (32-m) 位为 1
+    [ "$(( ip32 & host_bits ))" -eq 0 ] || return 1
+  fi
   return 0
 }
 
@@ -329,7 +342,11 @@ if [ "$SELF_SIGNED" -eq 1 ]; then
       case "$cert_cn" in */*) cert_cn="${cert_cn%%/*}" ;; esac    # 后面还跟着别的字段
       cert_cn="${cert_cn#"${cert_cn%%[![:space:]]*}"}"            # 去首尾空白
       cert_cn="${cert_cn%"${cert_cn##*[![:space:]]}"}"
-      if [ "$cert_cn" = "$DOMAIN" ]; then
+      # CN 比较大小写不敏感（DNS 名称本就大小写不敏感，否则同域名因大小写差一点
+      # 就被判"不符"去重建证书，浏览器再次告警）。
+      cert_cn_lc="$(printf '%s' "$cert_cn" | tr '[:upper:]' '[:lower:]')"
+      domain_lc="$(printf '%s' "$DOMAIN" | tr '[:upper:]' '[:lower:]')"
+      if [ "$cert_cn_lc" = "$domain_lc" ]; then
         REUSE=1
         note "复用已有证书 $FULLCHAIN（CN=$DOMAIN）"
       elif [ -n "$cert_cn" ]; then
@@ -411,8 +428,8 @@ server {
     listen 443 ssl;
     server_name $DOMAIN;
 
-    ssl_certificate     $FULLCHAIN;
-    ssl_certificate_key $KEY;
+    ssl_certificate     "$FULLCHAIN";
+    ssl_certificate_key "$KEY";
     ssl_protocols       TLSv1.2 TLSv1.3;
 
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
