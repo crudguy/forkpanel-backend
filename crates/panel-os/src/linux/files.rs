@@ -44,8 +44,12 @@ pub(crate) fn cmp_entries(a: &DirEntry, b: &DirEntry, opt: &ListOpt) -> std::cmp
     }
     match opt.sort {
         SortBy::Name => a.name.cmp(&b.name),
-        SortBy::Size => b.size.cmp(&a.size),
-        SortBy::Modified => b.modified_unix.cmp(&a.modified_unix),
+        // ⚠ 相等键必须回落到名称升序：否则 `sort_by`（非稳定排序）在尺寸/修改时间打平时
+        // 顺序不确定——同一份目录在不同文件系统上 read_dir 顺序不同 ⇒ 偶发排序测试失败
+        // （CI 在一种 read_dir 顺序下红、本地另一种顺序下绿）。名称升序是确定性次级键，
+        // 也正好对应 dirs_first 下目录群的预期次序（adir 先于 zdir）。
+        SortBy::Size => b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)),
+        SortBy::Modified => b.modified_unix.cmp(&a.modified_unix).then_with(|| a.name.cmp(&b.name)),
     }
 }
 
