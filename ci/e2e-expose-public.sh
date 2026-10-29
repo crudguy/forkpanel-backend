@@ -165,6 +165,25 @@ chk "超长数字掩码（回绕成 0）必须拒绝" "$rc" "1"
 out=$(bash "$SCRIPT" -d panel.example.com -a 203.0.113.0/24 2>&1)
 chk_not "合法 /24 不得被掩码守卫误伤" "$out" "掩码 0"
 
+# ⚠ 与 Rust `panel_core::expose::validate_cidr` 同口径的进一步收紧（2026-10-29）：
+#   - 前导零八位组（192.168.001.1 / 1.02.3.4）：不同解析器口径不一，必须拒绝；
+#   - 单前导零掩码（/024、/00）：早期 glob 守卫只拦 "0000/00000/..." 等长串，
+#     单零变体从未被覆盖，这里补全钉死；
+#   - 主机位非 0（203.0.113.5/24、10.0.0.1/8、172.16.5.0/12）：非法的"网络地址
+#     之外还写主机位"，会让 nginx 的 allow 只覆盖一台却伪装成整段。
+for c in "192.168.001.1/24" "1.02.3.4/24" "192.168.1.1/024" "192.168.1.1/00" \
+         "203.0.113.5/24" "10.0.0.1/8" "172.16.5.0/12"; do
+  out=$(bash "$SCRIPT" -d panel.example.com -a "$c" 2>&1); rc=$?
+  chk "非法 CIDR [$c] 必须拒绝（前导零/主机位非0 收紧）" "$rc" "1"
+done
+# 反向确认：收紧不得误伤合法网络地址（主机位全 0、无前导零）。
+# 判据=脚本输出不出现「不合法」拒绝文案——若 CIDR 守卫误杀合法地址，必走这里唯一
+#   的那条 CIDR 拒绝分支（域名恒为 panel.example.com，不会触发域名拒绝）。
+for c in "203.0.113.0/24" "10.0.0.0/8" "172.16.0.0/12" "192.168.1.0/24"; do
+  out=$(bash "$SCRIPT" -d panel.example.com -a "$c" 2>&1)
+  chk_not "合法网络地址 [$c] 不得被 CIDR 收紧误伤" "$out" "不合法"
+done
+
 # IPv6 本版明确不支持：必须**明确拒绝**而不是假装通过
 out=$(bash "$SCRIPT" -d panel.example.com -a 2001:db8::/32 2>&1); rc=$?
 chk "IPv6 来源被拒（不支持却装懂最危险）" "$rc" "1"
@@ -375,6 +394,20 @@ out=$(bash "$SCRIPT" -d panel.example.com -a 203.0.113.0/24 2>&1); rc=$?
 chk "连 [server] 表都没有必须拒绝" "$rc" "1"
 
 cp -a /tmp/e2e-shim/config.toml.bak "$CFG"
+
+# ── 8b. FORKPANEL_CONFIG 覆盖：必须读指向的那份，而非默认 /etc/forkpanel/config.toml ──
+# ⚠ 该环境变量是 2026-10-29 加的：允许把面板配置放到非默认路径。必须钉死脚本真的去
+#   读它，而不是悄悄回落到默认路径——回落会让用户的自定义路径形同虚设。
+say "== 8b. FORKPANEL_CONFIG 覆盖：必须读指向的那份配置 =="
+CFG_ALT=/var/lib/forkpanel/alt-config.toml
+printf '[server]\nbind = "127.0.0.1"\nport = %s\nlocalhost_only = true\n' "$PORT" > "$CFG_ALT"
+# 故意把默认份的端口写成错值 9：若脚本没读 alt 而回落默认，就会拿到 9 而非 $PORT
+printf '[server]\nbind = "127.0.0.1"\nport = 9\nlocalhost_only = true\n' > /etc/forkpanel/config.toml
+out=$(FORKPANEL_CONFIG="$CFG_ALT" bash "$SCRIPT" -d panel.example.com -a 203.0.113.0/24 2>&1); rc=$?
+chk "FORKPANEL_CONFIG 指向的份被使用（退出码 0）" "$rc" "0"
+chk_has "反代指向 alt 配置的端口 $PORT（而非默认份的错端口 9）" "$out" "127.0.0.1:$PORT"
+# 还原默认份，避免影响上方 section 8 的其它断言与汇总
+cp -a /tmp/e2e-shim/config.toml.bak /etc/forkpanel/config.toml
 
 say ""
 say "──────── E2E 结果：PASS=$PASS  FAIL=$FAIL  SKIP=$SKIP ────────"
