@@ -1301,14 +1301,14 @@ components:
                 build:            { type: string, description: 构建标识（PANEL_BUILD，缺省 dev） }
                 platform:         { type: string, description: 平台标识（本面板只支持 linux） }
                 bin_path:         { type: string, description: 安装后的二进制路径 }
-                config_dir:       { type: string, description: 配置目录（PathLayout，受 [paths] 覆盖） }
-                data_dir:         { type: string, description: 数据目录（PathLayout，受 [paths] 覆盖） }
-                log_dir:          { type: string, description: 日志目录（PathLayout，受 [paths] 覆盖） }
+                config_dir:       { type: string, description: '配置目录（PathLayout，受 [paths] 覆盖）' }
+                data_dir:         { type: string, description: '数据目录（PathLayout，受 [paths] 覆盖）' }
+                log_dir:          { type: string, description: '日志目录（PathLayout，受 [paths] 覆盖）' }
                 service_manager:  { type: string, enum: [systemd] }
                 service_active:   { type: [boolean, "null"], description: systemctl is-active；null = 无法判定（非 systemd / 命令缺失），不得渲染成「已停止」 }
                 service_enabled:  { type: [boolean, "null"], description: systemctl is-enabled；null 同上 }
                 can_restart:      { type: boolean, description: 当前会话是否可重启（仅 owner）；admin 可改设置但不能重启服务 }
-                can_upgrade:      { type: boolean, description: 是否允许 Web 触发升级（owner + [danger] allow_web_upgrade + systemd-run 可用） }
+                can_upgrade:      { type: boolean, description: '是否允许 Web 触发升级（owner + [danger] allow_web_upgrade + systemd-run 可用）' }
                 upgrade_blocked_reason: { type: [string, "null"], description: 不可升级的具体原因；null = 可升级 }
             hint:                 { type: string }
         reserved:
@@ -1321,7 +1321,7 @@ components:
     UpgradeReq:
       type: object
       properties:
-        version: { type: [string, "null"], description: 目标版本（带不带 v 均可）；省略=最新。字符白名单 [A-Za-z0-9._-]，长度 ≤32 }
+        version: { type: [string, "null"], description: '目标版本（带不带 v 均可）；省略=最新。字符白名单 [A-Za-z0-9._-]，长度 ≤32' }
 
     UpgradeCheck:
       type: object
