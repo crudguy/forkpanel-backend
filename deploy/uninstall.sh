@@ -2,7 +2,7 @@
 # ForkPanel 卸载（源码树 / 兼容入口）
 #
 # 真正的实现在已安装二进制的 `panel uninstall` 里（单一事实源）：它清 panel.service、
-# 探活 service/timer、探活脚本、panel/forkpanel/fp 三个命令入口与公网暴露脚本，
+# 探活 service/timer、探活脚本、panel 命令入口与公网暴露脚本，
 # **保留数据与配置**。本脚本只是源码树里的入口，避免两处清单漂移。
 #
 # 推荐用法：sudo panel uninstall
@@ -31,7 +31,7 @@ rm -f /etc/systemd/system/panel.service \
       /etc/systemd/system/panel-healthcheck.timer
 rm -f /var/lib/forkpanel/scripts/healthcheck.sh
 systemctl daemon-reload 2>/dev/null || true
-rm -f /usr/local/bin/panel /usr/local/bin/forkpanel /usr/local/bin/fp
+rm -f /usr/local/bin/panel
 rm -f /usr/local/share/forkpanel/expose-public.sh
 rmdir /usr/local/share/forkpanel 2>/dev/null || true
 

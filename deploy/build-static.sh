@@ -13,8 +13,7 @@
 #   ./deploy/build-static.sh [版本号] [签名私钥路径]
 #
 # 产出 dist/panel-linux-{amd64,arm64}.tar.gz(+.sig)
-#   tarball 内含：panel（静态二进制）、install.sh（安装逻辑）、config.toml（默认配置）、
-#                forkpanel-config.sh（交互式配置入口，装为 forkpanel / fp）、
+#   tarball 内含：panel（静态二进制，交互式配置菜单与 panel config 已内置）、install.sh（安装逻辑）、config.toml（默认配置）、
 #                expose-public.sh（公网暴露脚本，install.sh 同目录查找，漏打包会导致 panel expose 不可用）
 set -euo pipefail
 
@@ -45,12 +44,11 @@ pack() {
   local tmp; tmp="$(mktemp -d)"
   cp "$bin" "$tmp/panel"
   cp deploy/install.sh "$tmp/install.sh"
-  cp deploy/forkpanel-config.sh "$tmp/forkpanel-config.sh"
   cp deploy/config.toml "$tmp/config.toml"
   cp deploy/expose-public.sh "$tmp/expose-public.sh"
   chmod 0755 "$tmp/panel"
   local tarball="$OUT/panel-linux-$arch.tar.gz"
-  tar -C "$tmp" -czf "$tarball" panel install.sh forkpanel-config.sh config.toml expose-public.sh
+  tar -C "$tmp" -czf "$tarball" panel install.sh config.toml expose-public.sh
   # ⚠ 必须用 pkeyutl -rawin，**不能**用 `dgst -sign`：openssl 官方文档写明
   #   `dgst -sign` 不支持 Ed25519/Ed448（"Use the pkeyutl command instead"）。
   #   旧版 openssl（如 ubuntu-24.04 自带的 3.0.x）会直接拒绝：
@@ -65,7 +63,7 @@ pack() {
   # 打包完整性守卫：解包校验 tarball 必含这些文件，漏打任何一个立即失败，
   # 避免发布残缺 tarball（曾漏 expose-public.sh → 安装报「未找到 ./expose-public.sh」）。
   # 清单须与上方 cp + tar 列表保持一致；新增安装依赖文件时三处同步改。
-  local expected=( panel install.sh forkpanel-config.sh config.toml expose-public.sh )
+  local expected=( panel install.sh config.toml expose-public.sh )
   local listing; listing="$(tar -tzf "$tarball")"
   local miss=0
   for f in "${expected[@]}"; do

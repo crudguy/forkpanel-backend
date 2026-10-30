@@ -145,8 +145,12 @@ else bad "安装输出里没有『监听端口随机分配为 N』"; fi
 say "== 5. 核对文件与权限（对照 docs/install-footprint.md）=="
 
 chk "二进制权限 0755"        "$(stat -c '%a' /usr/local/bin/panel 2>/dev/null)" "755"
-[ -x /usr/local/bin/forkpanel ] && ok "配置入口 forkpanel 已安装" || bad "配置入口 forkpanel 未安装"
-[ -L /usr/local/bin/fp ] && ok "短别名 fp 已创建" || bad "短别名 fp 未创建"
+# 交互式配置已并入 panel（panel menu / panel config），不再单独安装 forkpanel / fp
+out=$(/usr/local/bin/panel config --help 2>&1)
+case "$out" in
+  *"status"*"set"*) ok "交互式配置已并入 panel（panel config：status / set，替代原 forkpanel/fp）" ;;
+  *) bad "panel config 子命令缺失（应含 status / set）" ;;
+esac
 chk "/etc/forkpanel 权限 0750"  "$(stat -c '%a' /etc/forkpanel 2>/dev/null)" "750"
 chk "/var/lib/forkpanel 权限 0700" "$(stat -c '%a' /var/lib/forkpanel 2>/dev/null)" "700"
 chk "/var/log/forkpanel 权限 0750" "$(stat -c '%a' /var/log/forkpanel 2>/dev/null)" "750"
@@ -281,16 +285,19 @@ done
   && bad "panel uninstall 后探活脚本仍在" || ok "探活脚本已移除"
 [ -e /usr/local/share/forkpanel/expose-public.sh ] \
   && bad "panel uninstall 后 expose 脚本仍在" || ok "expose 脚本已随 panel uninstall 移除"
-if [ -e /usr/local/bin/forkpanel ] || [ -e /usr/local/bin/fp ]; then
-  bad "panel uninstall 后配置入口仍在"
-else ok "配置入口已移除"; fi
+# 交互式配置已并入 panel，安装不再产生 forkpanel / fp；二者若存在即是回归
+{ [ -e /usr/local/bin/forkpanel ] || [ -e /usr/local/bin/fp ]; } \
+  && bad "出现已废弃的 forkpanel/fp 命令入口（应只保留 panel）" \
+  || ok "无 forkpanel/fp 残留（交互式配置已并入 panel）"
 
 # ── 11. 重装恢复后再验 uninstall.sh（两条卸载路径都必须"删程序、留数据"）──
 say "== 11. 重装恢复二进制与单元，再验 uninstall.sh：删程序、留数据 =="
 bash "$REPO/deploy/install.sh" "$BIN_SRC" >/dev/null 2>&1
 [ -e /usr/local/bin/panel ] && ok "重装后二进制恢复" || bad "重装后二进制未恢复"
 [ -e "$UNIT" ] && ok "重装后 systemd 单元恢复" || bad "重装后单元未恢复"
-[ -x /usr/local/bin/forkpanel ] && ok "重装后配置入口恢复" || bad "重装后配置入口未恢复"
+# 重装只恢复 panel；forkpanel / fp 不应再出现（回归守卫）
+{ [ -e /usr/local/bin/forkpanel ] || [ -e /usr/local/bin/fp ]; } \
+  && bad "重装后不该出现 forkpanel/fp" || ok "重装后无 forkpanel/fp 残留"
 out3=$(bash "$REPO/deploy/uninstall.sh" 2>&1); rc3=$?
 chk_rc "uninstall.sh 退出码 0" "$rc3" "0"
 [ -e /usr/local/bin/panel ] && bad "卸载后二进制仍在" || ok "二进制已移除"
@@ -304,9 +311,10 @@ chk_has "卸载提示保留目录" "$out3" "保留"
 for f in panel-healthcheck.service panel-healthcheck.timer; do
   [ -e "/etc/systemd/system/$f" ] && bad "uninstall.sh 后 $f 仍在" || ok "uninstall.sh 后 $f 已移除"
 done
-if [ -e /usr/local/bin/forkpanel ] || [ -e /usr/local/bin/fp ]; then
-  bad "uninstall.sh 后配置入口仍在"
-else ok "配置入口已随 uninstall.sh 移除"; fi
+# 交互式配置已并入 panel，uninstall.sh 也不应残留 forkpanel / fp（回归守卫）
+{ [ -e /usr/local/bin/forkpanel ] || [ -e /usr/local/bin/fp ]; } \
+  && bad "uninstall.sh 后出现已废弃的 forkpanel/fp" \
+  || ok "uninstall.sh 后无 forkpanel/fp 残留"
 
 say ""
 say "──────── E2E 结果：PASS=$PASS  FAIL=$FAIL  SKIP=$SKIP ────────"

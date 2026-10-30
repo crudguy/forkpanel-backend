@@ -81,17 +81,8 @@ command -v systemctl >/dev/null 2>&1 || die "未检测到 systemd（请用 --con
 install -m 0755 "$BIN_SRC" "$BIN_DST"
 echo "· 二进制 → $BIN_DST"
 
-# 交互式配置入口（forkpanel / fp）：端口、口令、暴露、升级、卸载收进一个菜单。
-# 与二进制同目录安装，uninstall 时按同一组命令名清理（见 panel uninstall）。
-CONFIG_SRC="$(dirname "$0")/forkpanel-config.sh"
-CONFIG_DST="$PREFIX/bin/forkpanel"
-if [ -f "$CONFIG_SRC" ]; then
-  install -m 0755 "$CONFIG_SRC" "$CONFIG_DST"
-  ln -sf forkpanel "$PREFIX/bin/fp"
-  echo "· 配置入口 → $CONFIG_DST（命令：forkpanel 或 fp）"
-else
-  echo "· ⚠ 未找到 $CONFIG_SRC，跳过配置入口（forkpanel/fp 将不可用）" >&2
-fi
+# 交互式配置入口已并入 panel 二进制本身（panel config / panel menu），
+# 不再单独安装 forkpanel / fp 壳脚本；uninstall 也只清理 panel 一个入口（见 panel uninstall）。
 
 # 公网暴露脚本（面板仍绑回环，由它做 nginx 反代 + 防火墙白名单，绝不裸奔到公网）
 SHARE_DIR="${PREFIX}/share/forkpanel"
@@ -183,7 +174,8 @@ cat <<EOF
 ForkPanel 已安装（端口 $PORT，默认仅本机可访问）
   面板地址   http://127.0.0.1:$PORT
   引导令牌   journalctl -u panel -n 50 --no-pager
-  配置面板   sudo forkpanel        # 或 sudo fp：改端口/口令/暴露/升级/卸载
+  配置面板   sudo panel            # TTY 下直接进交互菜单；看状态用 panel config status
+  改端口/地址 sudo panel config set port <N>   # 改监听地址用 set bind，非回环需 --yes
   公网访问   sudo panel expose -d <域名> -a <出口IP>/32
   忘记口令   sudo panel passwd <user>
   卸载       sudo panel uninstall   # 保留数据与配置

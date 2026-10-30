@@ -116,8 +116,7 @@ make_pkg() { # $1=stage $2=install.sh 路径 $3=输出 tar
   cp "$BIN_SRC" "$stage/panel" && chmod 0755 "$stage/panel"
   cp "$ins" "$stage/install.sh" && chmod 0755 "$stage/install.sh"
   cp "$REPO/deploy/config.toml" "$stage/config.toml"
-  cp "$REPO/deploy/forkpanel-config.sh" "$stage/forkpanel-config.sh"
-  tar -C "$stage" -czf "$tar" panel install.sh config.toml forkpanel-config.sh || return 1
+  tar -C "$stage" -czf "$tar" panel install.sh config.toml || return 1
   openssl pkeyutl -sign -inkey /tmp/up.key -rawin -in "$tar" -out "$tar.sig" || return 1
   [ -s "$tar" ] && [ -s "$tar.sig" ]
 }

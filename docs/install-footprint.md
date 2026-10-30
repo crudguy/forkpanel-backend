@@ -25,9 +25,7 @@
 
 | 路径 | 类型 | 权限 | 内容 |
 |---|---|---|---|
-| `/usr/local/bin/panel` | 文件 | 0755 | **单文件静态二进制**，前端产物已内嵌其中，无代码目录 |
-| `/usr/local/bin/forkpanel` | 文件 | 0755 | 交互式配置入口（改端口/地址、重置口令、暴露/升级/卸载引导） |
-| `/usr/local/bin/fp` | 软链 | — | `forkpanel` 的短别名（相对软链，同目录） |
+| `/usr/local/bin/panel` | 文件 | 0755 | **单文件静态二进制**，前端产物已内嵌其中，无代码目录；交互式配置菜单（`panel` 直接运行）与 `panel config` 子命令也内置其中，不再单独安装 `forkpanel` / `fp` 壳 |
 | `/etc/forkpanel/` | 目录 | 0750 | 配置目录 |
 | `/etc/forkpanel/config.toml` | 文件 | 0640 | 唯一配置文件（已存在则**保留**，升级不覆盖） |
 | `/var/lib/forkpanel/` | 目录 | **0700** | 面板私有数据根（数据库 / 密钥 / 备份） |
@@ -166,7 +164,7 @@ ForkPanel 做了四层：
 - `systemctl disable --now panel-healthcheck.timer`、`stop/disable panel`
 - `rm -f /etc/systemd/system/panel.service` + `panel-healthcheck.{service,timer}`
 - `rm -f /var/lib/forkpanel/scripts/healthcheck.sh`（探活脚本属安装产物）
-- `rm -f /usr/local/bin/{panel,forkpanel,fp}` 三个命令入口
+- `rm -f /usr/local/bin/panel` 命令入口（交互式配置已并入 panel，不再单独安装 forkpanel / fp）
 - `rm -f /usr/local/share/forkpanel/expose-public.sh`（及空目录）——`panel expose` 依赖它
 
 **以下目录被保留**（含账号与数据，不自动删）：
