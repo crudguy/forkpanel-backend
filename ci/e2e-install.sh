@@ -145,6 +145,8 @@ else bad "安装输出里没有『监听端口随机分配为 N』"; fi
 say "== 5. 核对文件与权限（对照 docs/install-footprint.md）=="
 
 chk "二进制权限 0755"        "$(stat -c '%a' /usr/local/bin/panel 2>/dev/null)" "755"
+[ -x /usr/local/bin/forkpanel ] && ok "配置入口 forkpanel 已安装" || bad "配置入口 forkpanel 未安装"
+[ -L /usr/local/bin/fp ] && ok "短别名 fp 已创建" || bad "短别名 fp 未创建"
 chk "/etc/forkpanel 权限 0750"  "$(stat -c '%a' /etc/forkpanel 2>/dev/null)" "750"
 chk "/var/lib/forkpanel 权限 0700" "$(stat -c '%a' /var/lib/forkpanel 2>/dev/null)" "700"
 chk "/var/log/forkpanel 权限 0750" "$(stat -c '%a' /var/log/forkpanel 2>/dev/null)" "750"
@@ -270,12 +272,25 @@ chk_rc "panel uninstall 退出码 0" "$rc_a" "0"
   || bad "数据目录被删除了——卸载绝不应删数据"
 [ -f "$CONF" ] && ok "配置文件被保留" || bad "配置文件被删除"
 chk_has "卸载提示保留目录" "$out_a" "保留"
+# 探活单元/脚本与命令入口必须一并清掉：只删 panel.service 会让 timer 继续每分钟
+# 触发一个已不存在的脚本，journal 持续刷 Failed to start。
+for f in panel-healthcheck.service panel-healthcheck.timer; do
+  [ -e "/etc/systemd/system/$f" ] && bad "panel uninstall 后 $f 仍在" || ok "panel uninstall 后 $f 已移除"
+done
+[ -e /var/lib/forkpanel/scripts/healthcheck.sh ] \
+  && bad "panel uninstall 后探活脚本仍在" || ok "探活脚本已移除"
+[ -e /usr/local/share/forkpanel/expose-public.sh ] \
+  && bad "panel uninstall 后 expose 脚本仍在" || ok "expose 脚本已随 panel uninstall 移除"
+if [ -e /usr/local/bin/forkpanel ] || [ -e /usr/local/bin/fp ]; then
+  bad "panel uninstall 后配置入口仍在"
+else ok "配置入口已移除"; fi
 
 # ── 11. 重装恢复后再验 uninstall.sh（两条卸载路径都必须"删程序、留数据"）──
 say "== 11. 重装恢复二进制与单元，再验 uninstall.sh：删程序、留数据 =="
 bash "$REPO/deploy/install.sh" "$BIN_SRC" >/dev/null 2>&1
 [ -e /usr/local/bin/panel ] && ok "重装后二进制恢复" || bad "重装后二进制未恢复"
 [ -e "$UNIT" ] && ok "重装后 systemd 单元恢复" || bad "重装后单元未恢复"
+[ -x /usr/local/bin/forkpanel ] && ok "重装后配置入口恢复" || bad "重装后配置入口未恢复"
 out3=$(bash "$REPO/deploy/uninstall.sh" 2>&1); rc3=$?
 chk_rc "uninstall.sh 退出码 0" "$rc3" "0"
 [ -e /usr/local/bin/panel ] && bad "卸载后二进制仍在" || ok "二进制已移除"
@@ -286,6 +301,12 @@ chk_rc "uninstall.sh 退出码 0" "$rc3" "0"
 chk_has "卸载提示保留目录" "$out3" "保留"
 [ -f /usr/local/share/forkpanel/expose-public.sh ] \
   && bad "卸载后 expose 脚本仍在" || ok "公网暴露脚本已随 uninstall.sh 移除"
+for f in panel-healthcheck.service panel-healthcheck.timer; do
+  [ -e "/etc/systemd/system/$f" ] && bad "uninstall.sh 后 $f 仍在" || ok "uninstall.sh 后 $f 已移除"
+done
+if [ -e /usr/local/bin/forkpanel ] || [ -e /usr/local/bin/fp ]; then
+  bad "uninstall.sh 后配置入口仍在"
+else ok "配置入口已随 uninstall.sh 移除"; fi
 
 say ""
 say "──────── E2E 结果：PASS=$PASS  FAIL=$FAIL  SKIP=$SKIP ────────"

@@ -843,32 +843,61 @@ fn run(cli: Cli) -> Result<()> {
             // 子进程出口唯一收敛在 panel-os（cmd.rs）——业务层不得直接 spawn。
             let _ = panel_os::run_sync(panel_os::Bin::Systemctl, &["stop", "panel"]);
             let _ = panel_os::run_sync(panel_os::Bin::Systemctl, &["disable", "panel"]);
+            // 探活 timer 必须先 `disable --now`：只删单元不停 timer，会留下
+            // 「每分钟触发一次、ExecStart 指向不存在的脚本」的残态，journal 持续刷错误。
+            let _ = panel_os::run_sync(
+                panel_os::Bin::Systemctl,
+                &["disable", "--now", "panel-healthcheck.timer"],
+            );
 
             // 移除面板自建单元：路径经 PathLayout（service_dir），业务层不硬编码 /etc。
-            let unit = os.paths().service_dir().join("panel.service");
-            if unit.exists() {
-                if std::fs::remove_file(&unit).is_ok() {
-                    println!("· 已移除 systemd 单元 {}", unit.display());
-                } else {
-                    eprintln!("  警告：无法移除单元 {}（权限？）", unit.display());
+            // 三件套必须一起删——历史上只删了 panel.service，探活 service/timer 留在
+            // 机器上继续跑，卸载后 journal 每分钟报一次 Failed to start。
+            let service_dir = os.paths().service_dir();
+            let units = [
+                service_dir.join("panel.service"),
+                service_dir.join("panel-healthcheck.service"),
+                service_dir.join("panel-healthcheck.timer"),
+            ];
+            let mut removed_units = 0;
+            for unit in &units {
+                if unit.exists() && std::fs::remove_file(unit).is_ok() {
+                    removed_units += 1;
                 }
-            } else {
-                println!("· systemd 单元不存在（跳过）");
             }
+            // 探活脚本与单元同源（`panel healthcheck --install` 落盘）；数据目录保留，
+            // 但这条脚本属于「安装产物」而非用户数据，一并清掉。
+            let _ = std::fs::remove_file(os.paths().script_dir().join("healthcheck.sh"));
             let _ = panel_os::run_sync(panel_os::Bin::Systemctl, &["daemon-reload"]);
+            println!("· 已移除 systemd 单元 {removed_units} 个（含探活 service/timer）");
 
-            // 移除二进制：与 install.sh 的 BIN_DST 对齐（默认 /usr/local/bin/panel），
-            // 路径经 panel-os 抽象获取，业务层不拼绝对路径。
-            // 只删这个固定安装路径——不删 current_exe()，避免 E2E namespace 里误删宿主构建产物。
+            // 移除命令入口：panel + 交互式配置 forkpanel + 短别名 fp。
+            // 与 install.sh 的落点对齐（同一目录），避免「删了 panel 却留下 forkpanel
+            // 指向不存在的文件」。只删固定安装路径——不删 current_exe()，
+            // 避免 E2E namespace 里误删宿主构建产物。
             let bin = panel_os::paths::panel_bin_install_path();
-            if bin.exists() {
-                if std::fs::remove_file(&bin).is_ok() {
-                    println!("· 已移除二进制 {}", bin.display());
-                } else {
-                    eprintln!("  警告：无法移除二进制 {}（权限？）", bin.display());
+            let bin_dir = bin.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| bin.clone());
+            for name in ["panel", "forkpanel", "fp"] {
+                let p = bin_dir.join(name);
+                if !p.exists() {
+                    continue;
                 }
-            } else {
-                println!("· 二进制不存在（跳过）");
+                if std::fs::remove_file(&p).is_ok() {
+                    println!("· 已移除 {}", p.display());
+                } else {
+                    eprintln!("  警告：无法移除 {}（权限？）", p.display());
+                }
+            }
+
+            // 公网暴露脚本（`panel expose` 的依赖）与它的空目录。与 install.sh 的
+            // EXPOSE_DST 同源（panel-os 提供路径），避免「删了单元却留下脚本」。
+            let expose = panel_os::paths::panel_expose_script_path();
+            if expose.exists() {
+                let _ = std::fs::remove_file(&expose);
+                if let Some(dir) = expose.parent() {
+                    let _ = std::fs::remove_dir(dir); // 仅当空目录，非空则失败无副作用
+                }
+                println!("· 已移除公网暴露脚本 {}", expose.display());
             }
 
             println!();
