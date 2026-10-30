@@ -7,6 +7,10 @@
 #   - 断点续传：预置半成品 + Range 服务器，断言确实续传（206）且产物完整验签通过
 #
 # 用本地 python http.server 冒充多个"下载源"目录；用自签 ed25519 测试密钥验签。
+#
+# ★ 本文件的 Range 服务器模板已抽成可复用 agent skill `bash-installer-progress-resume`
+#   （SKILL.md / references/range-server.md 可粘贴 heredoc / assets/range-server.py）。
+#   改这段 Range 逻辑时，请把改动反向同步进该 skill，避免两处漂移。
 set -uo pipefail
 
 GP="$(cd "$(dirname "$0")/.." && pwd)/deploy/get-panel.sh"
