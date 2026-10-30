@@ -294,29 +294,6 @@ pub async fn restart(
 const RELEASE_URL: &str =
     "https://api.github.com/repos/crudguy/forkpanel-backend/releases/latest";
 
-/// 只取数字核心：`v0.2.1-rc1` → `[0,2,1]`；解析失败返回 None。
-///
-/// 预发布（rc/beta）不参与「大小」比较——同一核心版本的 rc 不应被当作可升级，
-/// 是否预发布由响应里的 `prerelease` 单独告知前端。
-fn parse_core(v: &str) -> Option<[u64; 3]> {
-    let s = v.trim().trim_start_matches('v').trim_start_matches('V');
-    let core = s.split(['-', '+']).next()?;
-    let mut out = [0u64; 3];
-    let mut it = core.split('.');
-    for slot in out.iter_mut() {
-        *slot = it.next()?.parse().ok()?;
-    }
-    Some(out)
-}
-
-fn is_newer(latest: &str, current: &str) -> bool {
-    match (parse_core(latest), parse_core(current)) {
-        (Some(l), Some(c)) => l > c,
-        // 版本号形态不认识时**不**宣称有更新：宁可不提示，也不要让用户去跑一次
-        // 无意义的升级（升级本身是有风险的操作）。
-        _ => false,
-    }
-}
 
 #[derive(Debug, Serialize)]
 pub struct UpgradeCheckResp {
@@ -407,7 +384,7 @@ pub async fn upgrade_check(
                     resp.latest_tag = Some(tag.to_string());
                     resp.prerelease = v.get("prerelease").and_then(|x| x.as_bool()).unwrap_or(false);
                     resp.published_at = v.get("published_at").and_then(|x| x.as_str()).map(str::to_string);
-                    resp.available = is_newer(tag, resp.current);
+                    resp.available = panel_os::release::is_newer(tag, resp.current);
                 }
             }
             Err(e) => resp.error = Some(format!("发行信息不是合法 JSON：{e}")),
@@ -419,36 +396,4 @@ pub async fn upgrade_check(
         }
     }
     Ok(ok(resp))
-}
-
-#[cfg(test)]
-mod upgrade_tests {
-    use super::*;
-
-    #[test]
-    fn parse_core_accepts_v_prefix_and_prerelease() {
-        assert_eq!(parse_core("v0.1.0"), Some([0, 1, 0]));
-        assert_eq!(parse_core("0.2.1"), Some([0, 2, 1]));
-        assert_eq!(parse_core("v1.0.0-rc1"), Some([1, 0, 0]));
-        assert_eq!(parse_core("v1.0.0+build7"), Some([1, 0, 0]));
-    }
-
-    #[test]
-    fn parse_core_rejects_malformed() {
-        assert_eq!(parse_core(""), None);
-        assert_eq!(parse_core("v0.1"), None, "缺段不能被当成 0");
-        assert_eq!(parse_core("v0.x.0"), None);
-        assert_eq!(parse_core("latest"), None);
-    }
-
-    #[test]
-    fn newer_only_when_numeric_core_is_greater() {
-        assert!(is_newer("v0.2.0", "0.1.0"));
-        assert!(is_newer("v0.1.1", "0.1.0"));
-        assert!(is_newer("v1.0.0", "0.99.99"));
-        assert!(!is_newer("v0.1.0", "0.1.0"));
-        assert!(!is_newer("v0.1.0-rc1", "0.1.0"), "同核心的预发布不算可升级");
-        assert!(!is_newer("v0.0.9", "0.1.0"));
-        assert!(!is_newer("garbage", "0.1.0"), "无法解析时不得宣称有更新");
-    }
 }

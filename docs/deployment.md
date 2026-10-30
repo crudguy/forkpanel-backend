@@ -569,9 +569,10 @@ MySQL 侧无需这两个参数：`mysqldump` 默认就带 `DROP TABLE IF EXISTS`
 ## 6. 升级与卸载
 
 ```bash
-# 升级（保留配置与数据）
-sudo sh get-panel.sh          # 下载新版本 → 验签 → 覆盖二进制 → 重启
-# 源码部署：sudo ./deploy/install.sh ./target/release/panel
+# 升级（面板自带：下载 → 验签 → 失败自动回滚；保留配置与数据）
+sudo panel upgrade
+# 只检查是否有新版本：sudo panel upgrade --check
+# 源码 / 离线：sudo sh get-panel.sh
 
 # 卸载（二进制自带，任何目录都能跑）
 sudo panel uninstall

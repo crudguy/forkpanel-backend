@@ -225,7 +225,9 @@
 | `e2e-restore` | **离线恢复链路（CLI 级，不打 HTTP）**：`init` → `backup` 造真产物 → `verify-backup` 好产物通过（`integrity_check=ok`）/ 坏产物拒绝（`not a database`）→ `restore-db` 四道闸门（服务在线拒绝且**库与 WAL 原封不动**、站点归档拒绝、不存在产物拒绝）→ 真恢复后四条命门（**留 `pre-restore-{ts}.db` 快照**、无 `.restore-tmp` 残留、旧 `-wal`/`-shm` 已清、起服务 + owner 登录 + CSRF + 能力位可读） | **绝不碰真实库**：全程在 `mktemp -d` 隔离目录、独占一个端口、退出时 `trap` 清目录并只按端口精确停自己的进程（**绝不用 `pgrep -x panel`**，会误杀用户的 dev 实例） | 26 |
 | `e2e-install` | **安装/卸载脚本（在 user namespace 里真跑）**：`unshare -rmn` 内把 `/usr/local`、`/etc`、`/var/lib`、`/var/log`、`/var/www` 全盖成 tmpfs 再跑 `deploy/install.sh`，逐条核对 `install-footprint.md` 的声明——六个权限位（0755/0750/0700/0750/0755/0640）、端口随机化真生效（≥10000 且非模板默认）、默认只绑回环、单元带 `ProtectSystem=strict`、`ReadWritePaths` 逐项含四个根目录、探活单元落盘、`systemctl` 调用序列（daemon-reload / enable panel / enable timer）、**装出来的二进制真能起进程 + init + 登录 204**、重跑不覆盖既有配置、`uninstall.sh` 删程序但保留数据与配置 | **不动本机**：所有路径是 tmpfs，进程一退即消失；`systemctl` 用 shim **不真的动 init**（故验的是"调了哪些命令"，不是"服务真开机自启"，后者只能上真机）；userns 只映射单 uid ⇒ 『非 root 被拒』分支诚实 `[skip]` | 39 |
 
-合计 **457 条断言**。运行方式：
+| `e2e-upgrade` | **升级链路（离线；user namespace 内真跑）**：本地 http 源 + 测试 ed25519 密钥签名的 tarball → `panel upgrade --dry-run`（下载/验签/解包）→ 篡改 tarball 必须验签失败且**不执行包内 install.sh** → 正常升级（备份 `panel.bak`、install.sh 拉起服务）→ install.sh 失败必须回滚到失败前二进制 | **不动本机**：`/usr/local`、`/etc`、`/var` 全 tmpfs；systemctl/ss 用 shim（`Bin::resolved` 不读 PATH，故 shim 需 bind-mount 到真实路径） | 19 |
+
+合计 **476 条断言**。运行方式：
 
 ```bash
 make e2e-all                                    # 全部域串行跑完并聚合（上线前整机自检）

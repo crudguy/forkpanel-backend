@@ -47,7 +47,14 @@ PANEL_RELEASE_BASE=https://releases.forkpanel.dev sudo -E sh get-panel.sh
 
 ## 更新
 
-重新跑一次安装器即可，会下载新版本、覆盖 `/usr/local/bin/panel`；**已有配置 `/etc/forkpanel/config.toml` 不会被覆盖**（端口等保留）。
+二选一：
+
+- **面板自带**（装好之后，推荐）：`sudo panel upgrade` —— 下载签名 tarball、用内嵌公钥
+  验签、调用包内 install.sh；失败自动回滚旧二进制。`sudo panel upgrade --check` 只检查
+  有没有新版本，不下载。
+- **重跑安装器**：`sudo sh get-panel.sh` —— 下载 + 验签 + 覆盖二进制。
+
+两种方式都**不会覆盖** `/etc/forkpanel/config.toml`（端口等保留）。
 
 ## 卸载
 

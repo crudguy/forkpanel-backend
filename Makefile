@@ -8,7 +8,7 @@
 # （恒绿比没门禁更危险）。故 audit 单独成一个目标，CI 里单独一个 job——
 # advisory-db 托管在 GitHub，网络抖动时不该连带拖红主门禁。
 
-.PHONY: check guards audit test embed-fresh e2e-files e2e-backups e2e-containers e2e-cron e2e-databases e2e-sites e2e-firewall e2e-rbac e2e-security e2e-all e2e-ui e2e-observe e2e-restore e2e-install e2e-expose e2e-get-panel e2e-mirror mirror-sync
+.PHONY: check guards audit test embed-fresh e2e-files e2e-backups e2e-containers e2e-cron e2e-databases e2e-sites e2e-firewall e2e-rbac e2e-security e2e-all e2e-ui e2e-observe e2e-restore e2e-install e2e-upgrade e2e-expose e2e-get-panel e2e-mirror mirror-sync
 
 # E2E 用的后端地址与二进制路径（可按需覆盖：make e2e-files BASE=http://127.0.0.1:2084）
 BASE ?= http://127.0.0.1:2083
@@ -180,6 +180,12 @@ e2e-restore:
 #   make e2e-install
 e2e-install:
 	bash ci/e2e-install.sh "$(REL_BIN)"
+
+# 升级链路 E2E（离线；user namespace 内真跑）：本地 http 源 + 测试密钥签名，
+# 覆盖 下载/验签/解包 → 篡改必须拒绝 → 正常安装 → install.sh 失败必须回滚。
+#   make e2e-upgrade
+e2e-upgrade:
+	bash ci/e2e-upgrade.sh "$(REL_BIN)"
 
 # 公网暴露脚本 E2E（deploy/expose-public.sh，在 user namespace 里真跑）。
 # 和 e2e-install 同一路数：不碰 HTTP、不需要运行中的后端，用 tmpfs + systemctl /

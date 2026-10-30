@@ -84,5 +84,26 @@ if grep -q '属审计 P2-5 待办' "$HERE/docs/env.md" 2>/dev/null; then
   bad "env.md 仍写 P2-5 是待办——它已完成（23050e9/16b67d9）"
 else ok "env.md：P2-5 不再是待办"; fi
 
+# 6) 发布公钥单一事实源：get-panel.sh 内嵌 PEM 必须与 deploy/release-pubkey.pub 一致
+#    两处不一致 = 「安装器信的钥匙」与「panel upgrade 信的钥匙」不同；最坏情况是
+#    升级验签永远失败，或其中一处被换成攻击者公钥而没人发现。
+KEYFILE="$HERE/deploy/release-pubkey.pub"
+GPGUARD="$HERE/deploy/get-panel.sh"
+if [ ! -f "$KEYFILE" ]; then
+  bad "缺少 deploy/release-pubkey.pub（panel upgrade 的验签公钥）"
+elif [ ! -f "$GPGUARD" ]; then
+  bad "缺少 deploy/get-panel.sh（安装器的内嵌公钥来源）"
+else
+  EMB_B64="$(grep -A1 'BEGIN PUBLIC KEY' "$GPGUARD" | tail -1 | tr -d " \t'")"
+  FILE_B64="$(grep -v -e 'BEGIN PUBLIC KEY' -e 'END PUBLIC KEY' "$KEYFILE" | tr -d ' \n\r')"
+  if [ -z "$EMB_B64" ] || [ -z "$FILE_B64" ]; then
+    bad "公钥提取为空（正则失效，守卫不可信）"
+  elif [ "$EMB_B64" = "$FILE_B64" ]; then
+    ok "发布公钥一致（get-panel.sh == release-pubkey.pub）"
+  else
+    bad "发布公钥不一致：get-panel.sh 与 deploy/release-pubkey.pub 必须逐字节相同"
+  fi
+fi
+
 [ $fail -eq 0 ] || exit 1
 echo "PASS：文档 ↔ 代码一致性通过"

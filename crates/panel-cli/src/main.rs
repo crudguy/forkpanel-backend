@@ -4,6 +4,7 @@ mod bootstrap;
 mod config;
 mod doctor;
 mod embed;
+mod upgrade;
 
 use clap::{Parser, Subcommand};
 use config::Config;
@@ -205,6 +206,29 @@ enum Cmd {
         /// 撤销暴露：撤下反代，面板恢复只绑回环。
         #[arg(long)]
         uninstall: bool,
+    },
+    /// 升级面板：下载签名发行包 → 验签 → 解包 → 调用包内 install.sh → 失败回滚
+    ///
+    /// 验签公钥与 `deploy/get-panel.sh` 内嵌的是同一把（`deploy/release-pubkey.pub`，
+    /// 由 `ci/check-docs-consistency.sh` 钉住两处一致）。验不过立即中止，绝不执行
+    /// 包内文件。安装前备份旧二进制为 `panel.bak`，install.sh 失败或装完服务不是
+    /// active 都会回滚。配置与数据不删。
+    Upgrade {
+        /// 只检查是否有新版本（不下载）
+        #[arg(long)]
+        check: bool,
+        /// 下载并验签后停止，不安装
+        #[arg(long)]
+        dry_run: bool,
+        /// 指定版本（带不带 v 均可）；省略则取 GitHub 最新
+        #[arg(long)]
+        version: Option<String>,
+        /// 覆盖下载基址（自建镜像；签名仍用内嵌公钥校验）
+        #[arg(long)]
+        base_url: Option<String>,
+        /// 覆盖验签公钥（仅自建分发 / E2E；官方安装不要用）
+        #[arg(long)]
+        pubkey_file: Option<PathBuf>,
     },
 }
 
@@ -910,6 +934,21 @@ fn run(cli: Cli) -> Result<()> {
             println!("确认不再需要后自行删除：");
             println!("  rm -rf /var/lib/forkpanel /etc/forkpanel /var/log/forkpanel");
             Ok(())
+        }
+
+        Cmd::Upgrade { check, dry_run, ref version, ref base_url, ref pubkey_file } => {
+            // 与其它需要 [paths] 的命令同款：先按默认布局读配置，再用配置重建布局。
+            let layout0 = build_layout(&os, None);
+            let cfg = load_cfg(&cli, &layout0)?;
+            let layout = build_layout(&os, Some(&cfg));
+            upgrade::run(upgrade::Opts {
+                check,
+                dry_run,
+                version: version.clone(),
+                base_url: base_url.clone(),
+                pubkey: pubkey_file.clone(),
+                data_dir: layout.data_dir(),
+            })
         }
 
         Cmd::Expose { domain, allow, self_signed, fullchain, key, no_firewall, uninstall } => {

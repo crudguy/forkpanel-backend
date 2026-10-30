@@ -13,6 +13,7 @@ pub mod linux;
 pub mod mock_files;
 pub mod mock;
 pub mod paths;
+pub mod release;
 /// 敏感路径黑名单（唯一事实源）。linux 与 mock 两路实现共用。
 pub mod sensitive;
 pub mod tls;
