@@ -52,6 +52,11 @@ use tokio::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bin {
     Systemctl, Service, RcService,      // 服务
+    /// 瞬时 systemd 单元（`systemd-run`）：**升级/重启必须脱离当前进程的 cgroup**。
+    /// 安全评估：① 只用于执行面板自己的固定命令（`/usr/local/bin/panel upgrade`），
+    /// 不存在用户可控的命令字符串；② 版本号作为单个 argv 传入且已做字符白名单校验；
+    /// ③ `--unit` 固定为 `panel-upgrade`，不允许调用方指定（避免覆盖别的单元）。
+    SystemdRun,
     Nft, Iptables, Ufw, FirewallCmd,    // 防火墙
     Apt, Dnf, Yum, Apk, Zypper, Dpkg,   // 包管理
     /// 只读列举可升级包（`apt list --upgradable`）。**只能用 `apt` 包装器**，因为
@@ -122,6 +127,7 @@ impl Bin {
         match self {
             Bash => "bash",
             Systemctl => "systemctl", Service => "service", RcService => "rc-service",
+            SystemdRun => "systemd-run",
             Nft => "nft", Iptables => "iptables", Ufw => "ufw", FirewallCmd => "firewall-cmd",
             Apt => "apt-get", Dnf => "dnf", Yum => "yum", Apk => "apk", Zypper => "zypper", Dpkg => "dpkg-query",
             AptList => "apt",

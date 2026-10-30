@@ -203,6 +203,20 @@ pub async fn get(
             "service_active": svc("is-active"),
             "service_enabled": svc("is-enabled"),
             "can_restart": s.role == "owner",
+            // Web 升级三道门：owner + [danger] allow_web_upgrade + systemd-run 可用。
+            // 默认关闭；不满足时给出**具体**原因，UI 显示说明而不是一个点了 501 的按钮。
+            "can_upgrade": s.role == "owner"
+                && state.allow_web_upgrade
+                && panel_os::Bin::SystemdRun.available(),
+            "upgrade_blocked_reason": if s.role != "owner" {
+                Some("仅 owner 可执行升级")
+            } else if !state.allow_web_upgrade {
+                Some("Web 升级未开启（config.toml [danger] allow_web_upgrade）")
+            } else if !panel_os::Bin::SystemdRun.available() {
+                Some("缺少 systemd-run，无法脱离当前进程执行")
+            } else {
+                None
+            },
         },
         "hint": "部署级配置：config.toml [security] 的 read_only / max_login_attempts / session_idle / session_absolute、[audit] 的 retention_days / max_rows、[server] 的 localhost_only、[db] 的 daily_backup / synchronous / backup_keep 改后重启生效（此处 PATCH 会造成『改了却不生效』的谎言，故拒绝）",
     });
@@ -728,7 +742,7 @@ mod tests {
         let state = std::sync::Arc::new(crate::AppState::new(
             os, writer, pool, tasks, metrics, tier, Some(master), false, 5,
             std::time::Duration::from_secs(1800), std::time::Duration::from_secs(43_200),
-            90, 50_000, true, true, "NORMAL".to_string(), 7));
+            90, 50_000, true, true, "NORMAL".to_string(), 7, false));
 
         // 三键齐配（api_key 走后门：主密钥加密 + enc: 前缀，与 PATCH 落库格式一致）
         let blob = master.encrypt(b"sk-test").unwrap();

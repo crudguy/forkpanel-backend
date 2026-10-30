@@ -818,7 +818,7 @@ mod tests {
         let state = std::sync::Arc::new(crate::AppState::new(
             os, writer, pool, tasks, metrics, tier, None, false, 5,
             std::time::Duration::from_secs(1800), std::time::Duration::from_secs(43_200),
-            90, 50_000, true, true, "NORMAL".to_string(), 7));
+            90, 50_000, true, true, "NORMAL".to_string(), 7, false));
 
         // 写入与内存一致的令牌，并落盘到 data_dir（与 handler 读取路径同源）
         let tok = "deadbeefdeadbeefdeadbeefdeadbeef";

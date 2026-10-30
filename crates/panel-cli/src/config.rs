@@ -28,6 +28,10 @@ pub struct Config {
     #[serde(default)]
     pub audit: Audit,
 
+    /// 高危操作开关（默认全关）。改后重启生效。
+    #[serde(default)]
+    pub danger: Danger,
+
     /// "auto" 依据内存/CPU 探测；也可强制指定档位
     #[serde(default = "default_tier")]
     pub tier: String,
@@ -105,6 +109,19 @@ pub struct Audit {
     pub max_rows: u64,
 }
 
+/// 高危操作开关。**默认全部关闭**：这些操作会动到面板自身或 root 产物，
+/// 必须由部署者在 config.toml 里显式打开，而不是靠 UI 上一个按钮。
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct Danger {
+    /// 允许 Web 端触发 `panel upgrade`（默认 false）。
+    ///
+    /// 打开后设置页才出现「执行升级」按钮，`POST /system/upgrade` 才受理。
+    /// 升级会替换 `/usr/local/bin/panel` 并重启服务；失败由 CLI 回滚旧二进制。
+    #[serde(default)]
+    pub allow_web_upgrade: bool,
+}
+
 fn default_bind() -> String { "127.0.0.1".into() }
 fn default_port() -> u16 { 2083 }
 fn default_tier() -> String { "auto".into() }
@@ -141,7 +158,8 @@ impl Default for Config {
     fn default() -> Self {
         Self { server: Server::default(), paths: PathsOverride::default(),
                db: Db::default(), security: Security::default(),
-               audit: Audit::default(), tier: default_tier() }
+               audit: Audit::default(), danger: Danger::default(),
+               tier: default_tier() }
     }
 }
 
@@ -277,6 +295,12 @@ read_only = false
 # 默认 90 天：实测 180 天 × 200 条/天 ≈ 4.12MB，是分层后指标体积的 6 倍
 retention_days = 90
 max_rows = 50000
+
+[danger]
+# Web 端「执行升级」开关（默认 false）。打开前请确认你能通过 SSH / 控制台恢复：
+# 升级会替换 /usr/local/bin/panel 并重启；失败时 CLI 会自动回滚，但网络中断仍可能
+# 让你暂时失联。命令行升级（sudo panel upgrade）不受此开关影响。
+allow_web_upgrade = false
 "#, cfg = cfg, data = data, site = site)
 }
 
@@ -434,5 +458,16 @@ session_absolute = "2h"
         assert_eq!(c.tier(256, 1), Tier::Nano);
         let c2 = Config { tier: "standard".into(), ..Config::default() };
         assert_eq!(c2.tier(256, 1), Tier::Standard, "显式档位必须覆盖探测结果");
+    }
+
+    #[test]
+    fn web_upgrade_is_disabled_by_default_and_documented() {
+        assert!(!Config::default().danger.allow_web_upgrade, "Web 升级必须默认关闭");
+        let t = template(
+            std::path::Path::new("/etc/forkpanel"),
+            std::path::Path::new("/var/lib/forkpanel"),
+            std::path::Path::new("/var/www"),
+        );
+        assert!(t.contains("allow_web_upgrade = false"), "模板必须显式写 false 并带说明");
     }
 }

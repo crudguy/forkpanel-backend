@@ -578,6 +578,11 @@ sudo panel upgrade
 sudo panel uninstall
 ```
 
+> **Web 端「执行升级」默认关闭**：升级会替换 root 二进制并重启，只有 owner 才看得到按钮。
+> 启用方式：`config.toml` 加 `[danger] allow_web_upgrade = true` 并重启面板；之后仍需
+> owner + 输入确认词 `UPGRADE`。命令行 `panel upgrade` 不受此开关影响，也是网络中断时
+> 唯一可靠的恢复路径——所以**不要**因为开了 Web 升级就关掉 SSH。
+
 卸载保留 `/var/lib/forkpanel`、`/etc/forkpanel`、`/var/log/forkpanel`（含账号与数据），确认后自行删除。
 源码树里的 `deploy/uninstall.sh` 是同一实现的薄包装（有二进制时直接 `exec panel uninstall`），仅供习惯相对路径的人使用。
 

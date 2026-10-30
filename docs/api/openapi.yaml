@@ -1308,6 +1308,8 @@ components:
                 service_active:   { type: [boolean, "null"], description: systemctl is-active；null = 无法判定（非 systemd / 命令缺失），不得渲染成「已停止」 }
                 service_enabled:  { type: [boolean, "null"], description: systemctl is-enabled；null 同上 }
                 can_restart:      { type: boolean, description: 当前会话是否可重启（仅 owner）；admin 可改设置但不能重启服务 }
+                can_upgrade:      { type: boolean, description: 是否允许 Web 触发升级（owner + [danger] allow_web_upgrade + systemd-run 可用） }
+                upgrade_blocked_reason: { type: [string, "null"], description: 不可升级的具体原因；null = 可升级 }
             hint:                 { type: string }
         reserved:
           type: object
@@ -1315,6 +1317,11 @@ components:
             wired:  { type: boolean, enum: [false] }
             note:   { type: string }
             values: { type: object, additionalProperties: { type: string } }
+
+    UpgradeReq:
+      type: object
+      properties:
+        version: { type: [string, "null"], description: 目标版本（带不带 v 均可）；省略=最新。字符白名单 [A-Za-z0-9._-]，长度 ≤32 }
 
     UpgradeCheck:
       type: object
@@ -1654,6 +1661,30 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/UpgradeCheck' } } }
+
+  /api/v1/system/upgrade:
+    post:
+      tags: [system]
+      summary: 触发 Web 升级（默认关闭；owner + [danger] allow_web_upgrade + systemd-run）
+      description: |
+        交给 `systemd-run --unit=panel-upgrade` 在独立 cgroup 执行 `panel upgrade`，
+        避免面板重启把升级进程一起杀掉。202 只代表「已受理」，是否成功要看
+        `/api/v1/version` 是否恢复，以及 CLI 的回滚日志。默认关闭。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpgradeReq' }
+      responses:
+        '202':
+          description: 已受理（瞬时单元 panel-upgrade）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { accepted: { type: boolean }, unit: { type: string }, version: { type: [string, 'null'] } } } } }
+        '403':
+          description: 需要 system.manage 且角色为 owner
+        '501':
+          description: Web 升级未开启（[danger] allow_web_upgrade=false）或缺少 systemd-run
 
   /api/v1/system/expose/status:
     get:

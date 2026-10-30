@@ -6,7 +6,7 @@ use crate::{
     routes::{Auth, Shared},
 };
 use axum::{extract::{Query, State}, http::StatusCode, Json};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 #[derive(Debug, Serialize)]
@@ -396,4 +396,104 @@ pub async fn upgrade_check(
         }
     }
     Ok(ok(resp))
+}
+
+
+#[derive(Debug, Deserialize)]
+pub struct UpgradeReq {
+    /// 目标版本（带不带 v 均可）；省略 = 最新
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+/// 触发 Web 升级（**默认关闭**）。
+///
+/// 三道门：`[danger] allow_web_upgrade` + owner + `systemd-run` 可用。
+///
+/// 为什么必须 `systemd-run`：升级会重启面板。直接 spawn 的子进程留在当前 service
+/// 的 cgroup 里，systemd 重启时会把它一起杀掉，升级半途而废（二进制已替换、
+/// install.sh 没跑完）。瞬时单元在独立 cgroup 执行，面板重启不影响它；页面靠
+/// 轮询 `/version` 判断恢复，失败由 CLI 自动回滚。
+///
+/// 版本号只做**字符白名单**校验并作为单个 argv 传入（不经 shell）；`--unit` 固定，
+/// 不允许调用方指定，避免覆盖别的 systemd 单元。
+pub async fn upgrade(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    Json(req): Json<UpgradeReq>,
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    crate::auth::require(&s, perm::SYSTEM_MANAGE)?;
+    if s.role != "owner" {
+        return Err(ApiError::new(10003, StatusCode::FORBIDDEN, "仅 owner 可执行升级"));
+    }
+    if !state.allow_web_upgrade {
+        return Err(ApiError::unsupported(
+            "Web 升级未开启：在 config.toml 设 [danger] allow_web_upgrade = true 并重启（命令行 sudo panel upgrade 不受限）",
+        ));
+    }
+    if !panel_os::Bin::SystemdRun.available() {
+        return Err(ApiError::unsupported("缺少 systemd-run，无法脱离当前进程执行升级"));
+    }
+    let version = match req.version.as_deref() {
+        None => None,
+        Some(v) => {
+            let v = v.trim();
+            if v.is_empty()
+                || v.len() > 32
+                || v.starts_with('-')
+                || !v.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            {
+                return Err(ApiError::bad_request(
+                    "version",
+                    "版本号只允许字母/数字/./_/-，长度 1-32 且不能以 - 开头",
+                ));
+            }
+            Some(v.to_string())
+        }
+    };
+    crate::ratelimit::check_heavy(&state, &s.username, "system.upgrade")?;
+
+    let bin = panel_os::paths::panel_bin_install_path();
+    if !bin.is_file() {
+        return Err(ApiError::unsupported(format!(
+            "找不到已安装的二进制 {}（Web 升级只支持标准安装；开发实例请用 CLI）",
+            bin.display()
+        )));
+    }
+    let mut args: Vec<String> = vec![
+        "--unit=panel-upgrade".into(),
+        "--collect".into(),
+        "--description=ForkPanel upgrade".into(),
+        bin.display().to_string(),
+        "upgrade".into(),
+    ];
+    if let Some(v) = &version {
+        args.push("--version".into());
+        args.push(v.clone());
+    }
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = panel_os::cmd::run(
+        panel_os::Bin::SystemdRun,
+        &refs,
+        panel_os::cmd::CmdOpt {
+            timeout: std::time::Duration::from_secs(15),
+            ..Default::default()
+        },
+    )
+    .await?;
+    if out.code != Some(0) {
+        let detail: String = out.stderr.trim().chars().take(300).collect();
+        return Err(ApiError::new(
+            30000,
+            StatusCode::BAD_GATEWAY,
+            format!("systemd-run 启动失败：{detail}"),
+        ));
+    }
+
+    let target = version.as_deref().unwrap_or("latest").to_string();
+    crate::routes::audit(&state, &s, "system.upgrade", &target, "ok").await;
+    Ok((
+        StatusCode::ACCEPTED,
+        ok(json!({ "accepted": true, "unit": "panel-upgrade", "version": version })),
+    ))
 }

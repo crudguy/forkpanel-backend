@@ -79,6 +79,10 @@ pub struct AppState {
     /// （此前只增不减，一年堆 365 份）。备份页系统卡片只读展示——页面写死
     /// 「保留 7 份」会在用户改成 3 份时变成谎言。
     pub backup_keep: i64,
+    /// 允许 Web 端触发 `panel upgrade`（config.toml `[danger] allow_web_upgrade`）。
+    /// **默认 false**：升级会替换 root 二进制并重启，属最高危操作；只有显式打开
+    /// 才出现按钮、端点才受理。命令行升级（`sudo panel upgrade`）不受此开关影响。
+    pub allow_web_upgrade: bool,
     /// SQLite 落盘同步档（来自 config.toml `[db] synchronous`，归一化后的大写值）。
     /// **真实生效**：`panel_db::open` 据此设置 `PRAGMA synchronous`（非法值启动即报错）。
     pub db_synchronous: String,
@@ -118,7 +122,7 @@ impl AppState {
                session_idle: std::time::Duration, session_absolute: std::time::Duration,
                audit_retention_days: u32, audit_max_rows: u64,
                localhost_only: bool, daily_backup: bool, db_synchronous: String,
-               backup_keep: i64) -> Self {
+               backup_keep: i64, allow_web_upgrade: bool) -> Self {
         let capabilities = os.capabilities();
         // 会话持久化：把写者交给 SessionCache（`sessions` 表 001 已定义、此前无人使用）。
         // 先 clone——下方 struct 字面量会把 db move 进字段。
@@ -126,7 +130,7 @@ impl AppState {
         Self {
             os, db, pool, tasks, metrics, tier, capabilities, session_idle, session_absolute,
             audit_retention_days, audit_max_rows, localhost_only, daily_backup, db_synchronous,
-            backup_keep,
+            backup_keep, allow_web_upgrade,
             sessions: Arc::new(crate::auth::SessionCache::new_with_db(
                 session_idle,
                 session_absolute,
@@ -265,7 +269,7 @@ pub(crate) mod test_support {
         crate::AppState::new(
             os, writer, pool, tasks, metrics, tier, None, false, 5,
             std::time::Duration::from_secs(1800), std::time::Duration::from_secs(43_200),
-            90, 50_000, true, true, "NORMAL".to_string(), 7)
+            90, 50_000, true, true, "NORMAL".to_string(), 7, false)
     }
 
     /// 源码守卫取「**生产段**」：剔注释行 + 剔 `#[cfg(test)]` 包裹的块。

@@ -110,6 +110,7 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/system/directories", get(system::directories))
         .route("/api/v1/system/restart", post(system::restart))
         .route("/api/v1/system/upgrade/check", get(system::upgrade_check))
+        .route("/api/v1/system/upgrade", post(system::upgrade))
         .route("/api/v1/metrics/snapshot", get(system::snapshot))
         // ── 公网暴露向导（域名反代 + 白名单 + TLS）──
         // 只读状态用 SYSTEM_VIEW；apply/remove 用 SYSTEM_MANAGE（等同于系统级运维）。
@@ -561,7 +562,7 @@ mod tests {
         let state = std::sync::Arc::new(crate::AppState::new(
             os, writer, pool, tasks, metrics, tier, None, false, 5,
             std::time::Duration::from_secs(1800), std::time::Duration::from_secs(43_200),
-            90, 50_000, true, true, "NORMAL".to_string(), 7));
+            90, 50_000, true, true, "NORMAL".to_string(), 7, false));
 
         let app = crate::routes::build_router(state);
         let res = app
