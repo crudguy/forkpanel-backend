@@ -4,6 +4,7 @@
 #   - 镜像源坏签名 / 篡改 tarball 被验签拒绝（防投毒）
 #   - PANEL_RELEASE_BASE 钉死单源（成功 / 死源无兜底→诊断退出）
 #   - 内嵌公钥与测试公钥互不通用（密钥隔离）
+#   - 断点续传：预置半成品 + Range 服务器，断言确实续传（206）且产物完整验签通过
 #
 # 用本地 python http.server 冒充多个"下载源"目录；用自签 ed25519 测试密钥验签。
 set -uo pipefail
@@ -12,7 +13,7 @@ GP="$(cd "$(dirname "$0")/.." && pwd)/deploy/get-panel.sh"
 [ -f "$GP" ] || { echo "找不到 $GP" >&2; exit 1; }
 
 ROOT="$(mktemp -d)"
-trap 'kill "$HTTP_PID" 2>/dev/null; rm -rf "$ROOT"' EXIT
+trap 'kill "$HTTP_PID" "$RANGE_PID" 2>/dev/null; rm -rf "$ROOT"' EXIT
 
 # ---- 测试密钥 ----
 openssl genpkey -algorithm ed25519 -out "$ROOT/test.key" 2>/dev/null
@@ -52,8 +53,9 @@ for _ in $(seq 1 50); do
 done
 
 # ---- 运行器：在伪 root 下跑 get-panel.sh（--no-install），捕获输出与退出码 ----
+# 统一把 PANEL_CACHE_DIR 关进 $ROOT/cache，避免 E2E 触碰真实 /var/cache 或 $HOME。
 run_gp() {  # run_gp <env 赋值...>
-  OUT="$(unshare -r env "$@" bash "$GP" --no-install 2>&1)"; RC=$?
+  OUT="$(unshare -r env "$@" PANEL_CACHE_DIR="$ROOT/cache" bash "$GP" --no-install 2>&1)"; RC=$?
 }
 
 pass=0; fail=0
@@ -93,6 +95,69 @@ echo "==> 场景 7：内嵌公钥拒绝测试签名（密钥隔离，证明内�
 run_gp "PANEL_RELEASE_BASE=http://127.0.0.1:$PORT/good"   # 不设 PUBKEY_FILE → 用内嵌公钥
 check "内嵌公钥与测试私钥不匹配→退出非0" \
   '[ "$RC" -ne 0 ]'
+
+echo "==> 场景 8：断点续传（预置半成品 + Range 服务器，断言确实续传且产物完整验签）"
+# Range 服务器：对 tarball 支持 bytes Range（返回 206），并在日志里记录是否收到 Range 请求。
+RANGE_PORT=8732
+RANGE_LOG="$ROOT/range.log"
+rm -f "$RANGE_LOG"
+cat > "$ROOT/range_server.py" <<'PY'
+import http.server, socketserver, os
+class H(http.server.SimpleHTTPRequestHandler):
+    def __init__(self, *a, **kw):
+        # SimpleHTTPRequestHandler.__init__ 会用 os.getcwd() 覆盖类属性 directory，
+        # 故必须从构造参数显式传入，否则服务的是脚本所在目录而非 $ROOT/good。
+        super().__init__(*a, directory=os.environ['RANGE_DIR'], **kw)
+    def do_GET(self):
+        p = self.translate_path(self.path)
+        rng = self.headers.get('Range')
+        with open(os.environ['RANGE_LOG'], 'a') as f:
+            f.write(('1' if rng else '0') + '\n')
+        if not os.path.isfile(p):
+            self.send_error(404); return
+        data = open(p, 'rb').read()
+        total = len(data)
+        if rng and rng.startswith('bytes='):
+            start_s = rng[len('bytes='):].split('-')[0]
+            start = int(start_s) if start_s.strip() else 0
+            end = total - 1
+            chunk = data[start:end + 1]
+            self.send_response(206)
+            self.send_header('Content-Range', 'bytes %d-%d/%d' % (start, end, total))
+            self.send_header('Content-Length', str(len(chunk)))
+            self.send_header('Accept-Ranges', 'bytes')
+            self.end_headers(); self.wfile.write(chunk)
+        else:
+            self.send_response(200)
+            self.send_header('Content-Length', str(total))
+            self.send_header('Accept-Ranges', 'bytes')
+            self.end_headers(); self.wfile.write(data)
+    def log_message(self, *a): pass
+socketserver.TCPServer.allow_reuse_address = True
+socketserver.TCPServer(('127.0.0.1', int(os.environ['RANGE_PORT'])), H).serve_forever()
+PY
+RANGE_PORT="$RANGE_PORT" RANGE_LOG="$RANGE_LOG" RANGE_DIR="$ROOT/good" python3 "$ROOT/range_server.py" &
+RANGE_PID=$!
+for _ in $(seq 1 50); do
+  curl -fsS "http://127.0.0.1:$RANGE_PORT/panel-linux-amd64.tar.gz.sig" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+
+# 预置半成品：截取好 tarball 前 64 字节，落进 get-panel.sh 会用的「同 URL 缓存键」路径。
+# 非 latest（=0.0.0）才允许续传；latest 会强制全新下载、清掉半成品。
+TARBALL="panel-linux-amd64.tar.gz"
+RANGE_URL="http://127.0.0.1:$RANGE_PORT/$TARBALL"
+SAFE="$(printf '%s' "$RANGE_URL" | sha256sum | cut -c1-16)"
+mkdir -p "$ROOT/cache"
+head -c 64 "$ROOT/good/$TARBALL" > "$ROOT/cache/$SAFE.tar.gz"
+
+run_gp "PANEL_VERSION=0.0.0" "PANEL_RELEASE_BASE=http://127.0.0.1:$RANGE_PORT" "PANEL_PUBKEY_FILE=$ROOT/test.pub.pem"
+check "续传后成功（exit0 + 签名OK）" \
+  '[ "$RC" -eq 0 ] && printf "%s" "$OUT" | grep -q "签名 OK"'
+check "确实触发了续传（Range 服务器收到带 Range 的请求）" \
+  'grep -q "1" "$RANGE_LOG"'
+# 产物完整由上面的「签名 OK」保证（openssl 对整份 tarball 验签，残缺/错位必失败）；
+# 缓存文件在 --no-install 退出时已被清理，故不再比对磁盘大小。
 
 echo
 echo "=========================================="

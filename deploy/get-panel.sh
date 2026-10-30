@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # ForkPanel 一键安装（分发版）：下载签名 tarball → 验签 → 解包 → 安装
+# （终端内显示下载进度条；支持断点续传，中断后重跑即可从断点继续）
 #
 # 用法（推荐先下载到本地、确认完整，再本地执行；避免 `curl | sh` 中途断流导致脚本半执行）：
 #   0) 先把本脚本下载到本地，再执行（wget 重试+续传，curl 备选）：
@@ -23,6 +24,7 @@
 #   PANEL_RELEASE_BASE=... 钉死单一下载源（国内镜像 / 自建源），不再回退
 #   PANEL_MIRRORS=...      逗号分隔的备用源基址，按顺序回退
 #   PANEL_PUBKEY_FILE=...  用外部公钥文件覆盖内嵌公钥（密钥轮换 / E2E 自签测试）
+#   PANEL_CACHE_DIR=...    断点续传的半成品缓存目录（默认 /var/cache/forkpanel-install，或 $HOME/.cache）；E2E 用它隔离
 #   --no-install           仅下载验签不解装
 #
 # 安全设计：
@@ -38,6 +40,14 @@
 #   镜像链（PANEL_MIRRORS 各项）用更紧的下载预算（连接 8s / 上限 120s / 重试 2）快速跳过死源；
 #   钉死源与 GitHub 兜底用原韧性参数（连接 15s / 上限 600s / 重试 5）。
 #   mirror-sync.sh 会把可用的源基址直接打印出来，粘进 PANEL_MIRRORS 即可。
+#
+# 进度条与断点续传：
+#   - 终端里（交互）显示下载进度条：curl 用 -#（# 号条），wget 去掉 -q（自带百分比 + ETA）；
+#     CI / 管道 / sudo 捕获输出时自动静默，不刷屏。
+#   - 断点续传：半成品落在 PANEL_CACHE_DIR，按「来源 URL 分别缓存」（URL 哈希为键），
+#     curl -C - / wget -c 按磁盘已有字节续传；换源自动避让，不会跨源字节错位；
+#     version=latest 因"最新版"内容可能漂移，强制每次全新下载，pinned 版本才允许续传。
+#     中途被打断（Ctrl-C / 断网 / 断电）只需重跑本脚本即可从断点继续，无需从头来过。
 #
 # 网络问题（中国大陆用户最常见）：
 #   脚本默认从 GitHub Releases 下载，资产实际落在 release-assets.githubusercontent.com
@@ -107,29 +117,62 @@ fi
 
 TARBALL="panel-linux-$ARCH.tar.gz"
 
+# 交互检测：进度条只在"终端"里显示；CI / 管道 / sudo 捕获输出时保持静默，
+# 避免把一堆 # 号或 wget 进度刷进日志。两处都判一下，任一为 tty 即视为交互。
+have_tty=0
+if [ -t 1 ] || [ -t 2 ]; then have_tty=1; fi
+
 # 稳健下载：重试 + 断点续传 + 长超时，扛住 GitHub CDN 的瞬时抖动。
 #   budget=tight：连接 8s / 上限 120s / 重试 2（镜像链快速跳过死源）
 #   budget=normal：连接 15s / 上限 600s / 重试 5（钉死源 / GitHub 兜底的原韧性参数）
-#   curl：--retry 只在连接/超时/5xx 时重试（404 等硬错立即失败，交给上层诊断）；
-#         -C - 支持 Range 续传。
-#   wget：-c 续传，--timeout 对应连接+读取超时。
+#   断点续传：curl -C - / wget -c 都按「磁盘上已存在的半成品」继续 Range 下载；
+#            半成品按来源 URL 分别缓存（见下方下载循环），换源不会字节错位。
+#   进度条：交互终端里 curl 用 -#（# 号进度条）、wget 去掉 -q（自带带 ETA 的进度条）；
+#            非交互一律静默（仅报错），绝不刷屏。
 dl() {  # dl <url> <out> <budget: tight|normal>
   local url="$1" out="$2" budget="${3:-normal}" rc=0
   local cto=15 max=600 retries=5
   if [ "$budget" = "tight" ]; then cto=8; max=120; retries=2; fi
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --retry "$retries" --retry-delay 2 \
-          --connect-timeout "$cto" --max-time "$max" -C - "$url" -o "$out" || rc=$?
+    # 交互： -# 显示 # 号进度条；非交互： -fsSL 静默仅报错。-fL 失败即报错 + 跟随重定向。
+    local cflags=( --retry "$retries" --retry-delay 2 \
+          --connect-timeout "$cto" --max-time "$max" -C - )
+    if [ "$have_tty" -eq 1 ]; then
+      cflags=( -fSL# "${cflags[@]}" )
+    else
+      cflags=( -fsSL "${cflags[@]}" )
+    fi
+    curl "${cflags[@]}" "$url" -o "$out" || rc=$?
   elif command -v wget >/dev/null 2>&1; then
-    wget -q --tries="$retries" --timeout="$cto" -c "$url" -O "$out" || rc=$?
+    # wget 默认进度条带百分比与 ETA；非交互加 -q 静默。-c 续传。
+    local wflags=( --tries="$retries" --timeout="$cto" -c )
+    [ "$have_tty" -eq 0 ] && wflags=( -q "${wflags[@]}" )
+    wget "${wflags[@]}" "$url" -O "$out" || rc=$?
   else
     echo "缺少 curl / wget，无法下载。" >&2; exit 1
   fi
   return $rc
 }
 
+# 临时解包区（每次新建，存公钥 / 解包产物，用完即删）
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+# 持久缓存区（跨运行保留半成品 tarball，断点续传靠它）：
+#   root 且 /var/cache 可写 → /var/cache/forkpanel-install；否则回退 $HOME/.cache。
+#   可用 PANEL_CACHE_DIR 强制指定（E2E 用它把缓存关进自己的临时目录，互不污染）。
+CACHE_DIR="${PANEL_CACHE_DIR:-}"
+if [ -z "$CACHE_DIR" ]; then
+  if [ "$(id -u)" -eq 0 ] && mkdir -p /var/cache/forkpanel-install 2>/dev/null; then
+    CACHE_DIR=/var/cache/forkpanel-install
+  else
+    CACHE_DIR="${HOME:-/tmp}/.cache/forkpanel-install"
+  fi
+fi
+mkdir -p "$CACHE_DIR"
+# 退出时：临时解包区永远清；缓存 tarball 仅在「成功装完 / --no-install 正常结束」后清
+# （CLEAN_CACHE=1），中途被打断 / 失败则保留半成品，下次运行才能续传。
+CHOSEN_TAR=""; CHOSEN_SIG=""
+CLEAN_CACHE=0
+trap 'rm -rf "$WORK"; if [ "$CLEAN_CACHE" -eq 1 ] && [ -n "${CHOSEN_TAR:-}" ]; then rm -f "$CHOSEN_TAR" "$CHOSEN_SIG"; fi' EXIT
 
 # 验签公钥：优先 PANEL_PUBKEY_FILE（密钥轮换 / E2E 自签测试），否则内嵌。
 if [ -n "${PANEL_PUBKEY_FILE:-}" ]; then
@@ -161,6 +204,9 @@ diagnose_fetch_fail() {
 }
 
 # 按序尝试每个源；tarball 与签名都下载成功才算该源可用。
+# 断点续传：半成品按「来源 URL 哈希」分别缓存（同一 URL 才续传，换源自动避让，不会跨源字节错位）；
+#   version=latest 时"最新版"内容可能漂移，故 latest 强制清掉旧半成品、每次全新下载；
+#   pinned 版本 URL 稳定，才允许续传。源失败不删半成品（留在缓存里，重跑本脚本即可续传）。
 TARBALL_OK=0
 for i in "${!sources[@]}"; do
   base="${sources[$i]}"
@@ -173,38 +219,53 @@ for i in "${!sources[@]}"; do
   else
     budget=tight
   fi
+  # 同一来源 URL 的稳定缓存键
+  safe="$(printf '%s' "$url" | sha256sum | cut -c1-16)"
+  ct="$CACHE_DIR/$safe.tar.gz"
+  cs="$CACHE_DIR/$safe.sig"
+  # latest 内容可能漂移：不续传，强制全新下载
+  if [ "$PANEL_VERSION" = latest ]; then
+    rm -f "$ct" "$cs"
+  fi
   echo "==> [源 $((i+1))/${#sources[@]}] $base （预算：$budget）"
-  if dl "$url" "$WORK/$TARBALL" "$budget" && dl "$sigurl" "$WORK/$TARBALL.sig" "$budget"; then
+  if dl "$url" "$ct" "$budget" && dl "$sigurl" "$cs" "$budget"; then
     TARBALL_OK=1
+    CHOSEN_TAR="$ct"
+    CHOSEN_SIG="$cs"
     echo "    已选用该源"
     break
   fi
   echo "    该源不可用，尝试下一个…" >&2
-  # 清理可能残存的半成品，避免拿到部分文件误判
-  rm -f "$WORK/$TARBALL" "$WORK/$TARBALL.sig"
+  # 不在此处删除半成品：保留在缓存，重跑脚本可续传；换源由上面的 safe 键自动避让。
 done
 
 [ "$TARBALL_OK" -eq 1 ] || diagnose_fetch_fail
 
 echo "==> 校验签名（openssl ed25519，公钥：$PUBKEY_FILE）"
-if ! openssl dgst -verify "$PUBKEY_FILE" -signature "$WORK/$TARBALL.sig" "$WORK/$TARBALL" >/dev/null 2>&1; then
+if ! openssl dgst -verify "$PUBKEY_FILE" -signature "$CHOSEN_SIG" "$CHOSEN_TAR" >/dev/null 2>&1; then
   echo "签名校验失败！tarball 可能被篡改或来源不可信，已中止（未执行任何文件）。" >&2
+  # 验签失败的半成品不能续传（内容已不可信 / 可能残缺），清掉以便下次全新下载
+  rm -f "$CHOSEN_TAR" "$CHOSEN_SIG"
   exit 1
 fi
 echo "    签名 OK"
 
 echo "==> 解包"
-tar -C "$WORK" -xzf "$WORK/$TARBALL"
+tar -C "$WORK" -xzf "$CHOSEN_TAR"
 
 if [ "${NO_INSTALL:-0}" -eq 1 ]; then
   echo "（--no-install）已下载并验签；产物："
   echo "    $WORK/panel"
   echo "    $WORK/install.sh"
   echo "    $WORK/config.toml"
+  # --no-install 也算正常结束：清掉缓存（已是完整可信文件，无需续传）
+  CLEAN_CACHE=1
   exit 0
 fi
 
 echo "==> 安装（执行 tarball 内的 install.sh）"
 ( cd "$WORK" && sh ./install.sh ./panel )
 
+# 安装成功：清除缓存的 tarball / 签名（续传只针对"未完成的下载"）
+CLEAN_CACHE=1
 echo "完成。面板已安装（并已尝试自动启动，实际状态见上面 install.sh 打出的『服务状态』行）；按其中的随机端口与引导令牌完成初始化。"
