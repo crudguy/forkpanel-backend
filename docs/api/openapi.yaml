@@ -1316,6 +1316,21 @@ components:
             note:   { type: string }
             values: { type: object, additionalProperties: { type: string } }
 
+    UpgradeCheck:
+      type: object
+      description: 检查更新结果（只读；不下载/不写盘）。网络失败时 HTTP 仍为 200，由 error 说明原因。
+      properties:
+        current:      { type: string, description: 当前版本（CARGO_PKG_VERSION） }
+        latest:       { type: [string, "null"], description: 最新版本号（去掉 v 前缀）；未知为 null }
+        latest_tag:   { type: [string, "null"], description: 原始 tag（保留 v 前缀） }
+        available:    { type: boolean, description: 数字核心版本是否更大；同核心的预发布不算可升级 }
+        prerelease:   { type: boolean, description: 最新发行是否为预发布 }
+        published_at: { type: [string, "null"], description: 发行时间（ISO 8601） }
+        source:       { type: string, enum: [github] }
+        supported:    { type: boolean, description: false = 宿主无 curl，无法检查 }
+        checked_at:   { type: integer, description: 检查时间（unix 秒） }
+        error:        { type: [string, "null"], description: 失败原因；null = 本次检查成功 }
+
     SettingsPatch:
       type: object
       required: [settings]
@@ -1628,6 +1643,17 @@ paths:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { accepted: { type: boolean } } } } }
         '403':
           description: 需要 system.manage 且角色为 owner
+
+  /api/v1/system/upgrade/check:
+    get:
+      tags: [system]
+      summary: 检查是否有新版本（只读；system.manage + 只读限流）
+      responses:
+        '200':
+          description: 检查结果（网络失败时 error 说明原因，HTTP 仍为 200，不渲染成 5xx）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/UpgradeCheck' } } }
 
   /api/v1/system/expose/status:
     get:
