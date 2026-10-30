@@ -457,6 +457,8 @@ fn _assert_calendar() {
 }
 
 impl LinuxScheduler {
+    /// 预留：当前无调用方（实例由 `scheduler_for` 按平台构造）。
+    /// 保留以便后续「运行环境探测」复用；若确认永不使用应整体删除，而不是长期挂着属性。
     #[allow(dead_code)]
     pub fn detect() -> Self { Self }
 }

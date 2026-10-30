@@ -168,7 +168,6 @@ pub struct SslApplyReq {
     pub domains: Vec<String>,
     /// `self-signed`（缺省）| `http-01` | `dns-01`
     pub method: Option<String>,
-    #[allow(dead_code)]
     pub email: Option<String>,
 }
 

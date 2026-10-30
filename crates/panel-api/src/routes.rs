@@ -49,7 +49,6 @@ use axum::{
     routing::{delete, get, patch, post, put},
     Router,
 };
-use serde_json::Value;
 use std::sync::Arc;
 
 pub type Shared = Arc<AppState>;
@@ -458,11 +457,11 @@ pub fn build_router(state: Shared) -> Router {
         .with_state(state)
 }
 
-async fn handler_404(req: Request) -> (StatusCode, axum::Json<Value>) {
+async fn handler_404(req: Request) -> (StatusCode, axum::Json<Envelope<()>>) {
     let rid = req.headers().get("x-request-id")
         .and_then(|v| v.to_str().ok()).unwrap_or("-").to_string();
     let e: Envelope<()> = Envelope { code: 10004, message: "not found", data: None, request_id: rid };
-    (StatusCode::NOT_FOUND, axum::Json(serde_json::to_value(e).unwrap()))
+    (StatusCode::NOT_FOUND, axum::Json(e))
 }
 
 /// 写操作审计入口。**每个写 handler 结束时调用。**

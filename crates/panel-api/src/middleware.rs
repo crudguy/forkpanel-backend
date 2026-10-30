@@ -9,7 +9,7 @@ use crate::{
 };
 use axum::{
     extract::{Request, State},
-    http::{header, HeaderMap, Method},
+    http::{header, HeaderMap, HeaderValue, Method},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -72,20 +72,20 @@ pub async fn guard_write(req: Request, next: Next) -> Response {
 pub async fn security_headers(req: Request, next: Next) -> Response {
     let mut res = next.run(req).await;
     let h = res.headers_mut();
-    h.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
-    h.insert(header::X_FRAME_OPTIONS, "DENY".parse().unwrap());
-    h.insert(header::REFERRER_POLICY, "no-referrer".parse().unwrap());
-    h.insert("Permissions-Policy", "geolocation=(), microphone=(), camera=()".parse().unwrap());
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    h.insert("Permissions-Policy", HeaderValue::from_static("geolocation=(), microphone=(), camera=()"));
     // nonce 在渲染 index.html 时注入；API 响应不需要脚本执行
     h.insert(
         header::CONTENT_SECURITY_POLICY,
-        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; \
-         connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
-            .parse()
-            .unwrap(),
+        HeaderValue::from_static(
+            "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; \
+             connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+        ),
     );
     if req_uses_https() {
-        h.insert(header::STRICT_TRANSPORT_SECURITY, "max-age=31536000; includeSubDomains".parse().unwrap());
+        h.insert(header::STRICT_TRANSPORT_SECURITY, HeaderValue::from_static("max-age=31536000; includeSubDomains"));
     }
     res
 }
