@@ -81,6 +81,18 @@ command -v systemctl >/dev/null 2>&1 || die "未检测到 systemd（请用 --con
 install -m 0755 "$BIN_SRC" "$BIN_DST"
 echo "· 二进制 → $BIN_DST"
 
+# 交互式配置入口（forkpanel / fp）：端口、口令、暴露、升级、卸载收进一个菜单。
+# 与二进制同目录安装，uninstall 时按同一组命令名清理（见 panel uninstall）。
+CONFIG_SRC="$(dirname "$0")/forkpanel-config.sh"
+CONFIG_DST="$PREFIX/bin/forkpanel"
+if [ -f "$CONFIG_SRC" ]; then
+  install -m 0755 "$CONFIG_SRC" "$CONFIG_DST"
+  ln -sf forkpanel "$PREFIX/bin/fp"
+  echo "· 配置入口 → $CONFIG_DST（命令：forkpanel 或 fp）"
+else
+  echo "· ⚠ 未找到 $CONFIG_SRC，跳过配置入口（forkpanel/fp 将不可用）" >&2
+fi
+
 # 公网暴露脚本（面板仍绑回环，由它做 nginx 反代 + 防火墙白名单，绝不裸奔到公网）
 SHARE_DIR="${PREFIX}/share/forkpanel"
 EXPOSE_SRC="$(dirname "$0")/expose-public.sh"
@@ -152,44 +164,21 @@ systemctl enable --now panel-healthcheck.timer >/dev/null
 echo "· 外部探活已安装（每分钟一次，连续两次失败才重启）"
 
 case "$RUN_STATE" in
-  up)      STEP1="服务已自动启动并在端口 $PORT 监听（systemctl status panel 看详情）" ;;
-  unknown) STEP1="启动命令已下发但端口未确认监听，先跑 systemctl status panel 确认状态" ;;
-  *)       STEP1="本次自动启动失败：先 journalctl -u panel -n 50 看原因，修好后 systemctl start panel" ;;
+  up)      echo "· 服务已启动并在端口 $PORT 监听" ;;
+  unknown) echo "· ⚠ 启动命令已下发，但端口 $PORT 尚未监听：systemctl status panel --no-pager" >&2 ;;
+  *)       echo "· ⚠ 已安装但本次未启动：journalctl -u panel -n 50 --no-pager" >&2 ;;
 esac
 
 cat <<EOF
 
-══════════════════════════════════════════════════════════════════
-⚠ 重要：面板默认【只监听本机 127.0.0.1】，公网用「服务器IP:端口」连不上！
-══════════════════════════════════════════════════════════════════
+ForkPanel 已安装（端口 $PORT，默认仅本机可访问）
+  面板地址   http://127.0.0.1:$PORT
+  引导令牌   journalctl -u panel -n 50 --no-pager
+  配置面板   sudo forkpanel        # 或 sudo fp：改端口/口令/暴露/升级/卸载
+  公网访问   sudo panel expose -d <域名> -a <出口IP>/32
+  忘记口令   sudo panel passwd <user>
+  卸载       sudo panel uninstall   # 保留数据与配置
 
-  这是刻意的安全默认值（面板以 root 运行、且本构建没有内置 HTTPS）。
-  它和集中式面板不一样：这类面板默认直接绑 0.0.0.0 让你 IP:端口 就能进；
-  ForkPanel 默认谁也进不来，需要你显式「开门」——避免把 root 面板裸奔到公网。
-
-  1) 本机访问（最简单，推荐先这样验收）
-       打开 http://127.0.0.1:$PORT
-      （面板以 root 运行、无 HTTPS，绝不要把它直接绑到公网）
-
-  2) 临时远程访问（SSH 端口转发，最安全）
-        ssh -L $PORT:127.0.0.1:$PORT <user>@<server>
-        然后在本机浏览器打开 http://127.0.0.1:$PORT
-
-  3) 长期对外（别人也要访问）
-        sudo panel expose -d 你的域名 -a 你的出口IP/32
-      （脚本会做：nginx 反代终结 TLS + 防火墙白名单；面板本身仍只绑回环，
-       不会把 root 面板裸奔到公网；用完撤销：sudo panel expose --uninstall）
-      ⚠ 不给来源网段、或给 0.0.0.0/0，脚本会直接拒绝——那等于没有限制。
-
-  你的公网 IP 大概是：$(curl -s --max-time 3 ifconfig.me 2>/dev/null || echo '（探测失败，自行用 curl ifconfig.me 查）')
-
-  取出一次性引导令牌（首次启动且无 owner 时打印，30 分钟内有效）：
-      journalctl -u panel -n 50 --no-pager
-
-  备用路径（无浏览器/自动化场景）：
-      panel --config $CONF_FILE init --owner admin      # 交互式；脚本里可用 --owner-pass
-  忘记口令：
-      panel --config $CONF_FILE passwd <user>
-
-  卸载： ./deploy/uninstall.sh（保留数据与配置）
+默认只监听 127.0.0.1 是刻意的安全默认（root 面板 + 无内置 HTTPS）。
+临时远程：ssh -L $PORT:127.0.0.1:$PORT <user>@<server>
 EOF
