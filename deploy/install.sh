@@ -136,8 +136,17 @@ echo "· systemd 单元已安装并设为开机自启"
 # 2) **启动失败也不许带崩整条 set -e**：走到这里时二进制 / 目录 / 配置 / 单元都已落盘，
 #    把它判成"安装失败"是错的——真实状态是"已安装、这一次没起来"。用户的退出码语义是
 #    "安装是否成功"，所以本脚本仍以 0 退出，同时给一条能直接看到真实报错的诊断。
+# 重装/升级的关键：服务若已 active（绝大多数「重新安装」都在此状态），`systemctl start`
+# 是 no-op——只替换了磁盘上的二进制，正在跑的仍是旧进程，于是「装完还是旧面板」。
+# 故先判 is-active：已激活则 restart（真正重新加载新二进制），未激活才 start。
 RUN_STATE="up"
-if ! systemctl start panel 2>/dev/null; then
+START_OK=false
+if systemctl is-active --quiet panel; then
+  systemctl restart panel 2>/dev/null && START_OK=true
+else
+  systemctl start panel 2>/dev/null && START_OK=true
+fi
+if [ "$START_OK" != "true" ]; then
   RUN_STATE="failed"
   echo "· ⚠ 服务已安装，但本次自动启动失败。看真实原因（常见：端口 $PORT 被占用 / 配置有误）：" >&2
   echo "      journalctl -u panel -n 50 --no-pager" >&2
@@ -145,7 +154,7 @@ if ! systemctl start panel 2>/dev/null; then
 elif wait_port_up "$PORT"; then
   echo "· 服务已自动启动（端口 $PORT 已在监听）"
 else
-  # start 说自己成功了，端口却没 listen —— 正是 Type=simple 的假阴性，必须照实说
+  # start/restart 说自己成功了，端口却没 listen —— 正是 Type=simple 的假阴性，必须照实说
   RUN_STATE="unknown"
   echo "· 服务已安装、启动命令已下发，但端口 $PORT 尚未进入监听。" >&2
   echo "  （Type=simple 单元 fork 即算成功，起来又立刻退出的情况未必反映到退出码里。）" >&2

@@ -157,8 +157,8 @@ printf 'X' >> /tmp/up-srv/v0.1.0/panel-linux-amd64.tar.gz
 out=$(up --version 0.1.0 $BASE --dry-run); rc=$?
 [ "$rc" -ne 0 ] && ok "篡改包被拒（rc=$rc）" || bad "篡改包竟然通过"
 chk_has "拒绝原因是验签失败" "$out" "验签失败"
-grep -q "start panel" /tmp/up-shim/calls.log \
-  && bad "篡改包竟触发了 install.sh（start panel 已被调用）" || ok "包内 install.sh 未被执行"
+grep -Eq "start panel|restart panel" /tmp/up-shim/calls.log \
+  && bad "篡改包竟触发了 install.sh（start/restart panel 已被调用）" || ok "包内 install.sh 未被执行"
 cp /tmp/good.tar /tmp/up-srv/v0.1.0/panel-linux-amd64.tar.gz
 
 say "== 3. 正常升级：install.sh 成功 =="
@@ -168,7 +168,7 @@ chk_has "升级完成" "$out" "升级完成"
 [ -f /usr/local/bin/panel.bak ] && ok "旧二进制已备份为 panel.bak" || bad "缺少 panel.bak"
 chk "备份内容 == 升级前二进制" \
   "$(sha256sum /usr/local/bin/panel.bak | cut -d' ' -f1)" "$SHA_OLD"
-grep -q "start panel" /tmp/up-shim/calls.log && ok "install.sh 已拉起服务" || bad "install.sh 未拉起服务"
+grep -Eq "start panel|restart panel" /tmp/up-shim/calls.log && ok "install.sh 已拉起服务" || bad "install.sh 未拉起服务"
 
 say "== 4. install.sh 失败：必须回滚 =="
 # 先把当前二进制换成一个**不同内容**的标记文件：否则新旧都是同一个 release 二进制，
