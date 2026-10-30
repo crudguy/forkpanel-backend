@@ -54,6 +54,22 @@ cargo build --release                          # 动态链接版，本机跑
 # 或静态分发版（见下）
 ```
 
+### 开发期：改前端免重编后端（`dev-assets`）
+
+只调前端时不必每次重跑完整嵌入流程。用 `dev-assets` 特性构建一次后端，之后前端
+`build` 出的产物直接从磁盘读取（`PANEL_WEB_DIST`，默认 **当前工作目录** 下 `web/dist`）：
+
+```bash
+# 后端只编译这一次；此后改前端无需再编译 Rust
+cargo build -p panel-cli --features dev-assets
+
+# 启动时把前端产物指到磁盘目录（或在 forkpanel-backend/ 下启动，用默认 web/dist）
+PANEL_WEB_DIST=/path/to/forkpanel-frontend/dist ./target/debug/panel serve
+```
+
+> ⚠️ `dev-assets` 只是**开发便利**：发布/分发必须用默认特性构建（前端在编译期嵌入），
+> 否则二进制离开那台机器的 `web/dist` 就会全部 404。
+
 ## 门禁（可选但强烈建议）
 
 `make check` 会跑门禁 + 全量测试。它默认去 `../forkpanel-frontend` 找前端，位置不同时用
@@ -97,7 +113,7 @@ openssl genpkey -algorithm ed25519 -out release.key && chmod 600 release.key
 | 现象 | 原因 | 处理 |
 |---|---|---|
 | 编译报 `web/dist` 不存在 / `cannot create directory 'web/dist'` | 漏第 3 步同步；或全新 clone 连 `web/` 都没有就直接 `cp`（未先 `mkdir -p`）；或只 `cp` 未先 `rm -rf` | `mkdir -p web/dist` 后清空重拷 + `touch embed.rs` |
-| 前端改了但发出去还是旧 UI | 未重新编译后端（嵌入发生在编译期） | 必须重新 `cargo build` |
+| 前端改了但发出去还是旧 UI | 默认构建下前端在编译期嵌入，未重新编译后端 | 重新 `cargo build`；开发期改用 `--features dev-assets` + `PANEL_WEB_DIST` 免重编（见上） |
 | 门禁输出 `[skip]` 却显示"通过" | 前端路径没找到，跨仓检查被跳过 | 设 `PANEL_FRONTEND_ROOT` 后重跑 |
 | `get-panel.sh` 验签失败 | 公钥与签名私钥不匹配（用了别人公钥） | 换成自己私钥对应的公钥 |
 | 拉前端仓 403 | 仓为私有或 token 无权限 | 两仓现均公开；私有镜像场景用有权限的 token |

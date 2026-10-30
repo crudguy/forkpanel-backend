@@ -105,10 +105,10 @@ cargo build --release
 cargo test  --workspace
 
 # 无 Linux / 无 root 环境：用内存 mock 适配器跑全部逻辑（能力位返回 Unsupported）
-cargo build --release --features force-mock
+cargo build -p panel-cli --release --features panel-os/force-mock
 
 # 启动（需 root 才能管理服务/写 /etc；非特权下降级而非崩溃）
-panel serve --bind 127.0.0.1:2083
+panel serve                       # 监听地址取自 config.toml 的 [server].bind / port（dev 默认 2083）
 ```
 
 ## 接口契约

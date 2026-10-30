@@ -44,13 +44,14 @@ sudo ./deploy/install.sh                 # 缺省取 ./target/release/panel
 「编译 + install.sh」，但**不需要在本机装 cargo / zig**：
 
 ```bash
-# 默认从 GitHub Releases 下载最新稳定版
+# 脚本自身从 main 分支取；二进制默认从 GitHub Releases 下载最新稳定版
 # 两步法：先下载脚本到本地（wget 重试+续传；curl 备选见 README），再 sudo 执行
-wget -O get-panel.sh https://github.com/crudguy/forkpanel-backend/releases/latest/download/get-panel.sh
+wget -O get-panel.sh https://raw.githubusercontent.com/crudguy/forkpanel-backend/main/deploy/get-panel.sh
 sudo bash get-panel.sh
 
 # 指定版本
-PANEL_VERSION=v0.1.0 sudo -E bash get-panel.sh
+# ⚠ 版本号不带 v 前缀（脚本自己拼 /releases/download/v<版本>）
+PANEL_VERSION=0.1.0 sudo -E bash get-panel.sh
 ```
 
 脚本按架构（amd64 / arm64）选包、用**内嵌 ed25519 公钥**验签（签不过绝不运行），
