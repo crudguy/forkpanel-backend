@@ -84,13 +84,18 @@ def scan_flow_scalars(path):
                 elif ch in "'\"":
                     quote = ch
                 elif ch in '{[':
-                    # 结构位置的 '{'（值开头 / 逗号后 / 嵌套）→ 合法
-                    if ch == '{' and depth > 0 and prev_sig not in (':', ',', '{', '['):
+                    # 只有结构位置的 '{'/'['（行首 / 冒号后 / 逗号后 / 嵌套 / 块序列 '-' 后）
+                    # 才是真正的 flow 上下文入口；其它位置是 plain scalar 内容——在 block
+                    # 上下文（如 description: | 的说明文字）合法，在 flow 上下文非法。
+                    structural = (prev_sig == '') or (prev_sig in (':', ',', '{', '[', '-'))
+                    if not structural and depth > 0:
                         problems.append((lineno, ch, line.rstrip()))
                         break
-                    depth += 1
+                    if structural:
+                        depth += 1
                 elif ch in '}]':
-                    depth -= 1
+                    if depth > 0:
+                        depth -= 1
                 if not ch.isspace():
                     prev_sig = ch
                 i += 1
