@@ -24,7 +24,8 @@
 #   PANEL_RELEASE_BASE=... 钉死单一下载源（国内镜像 / 自建源），不再回退
 #   PANEL_MIRRORS=...      逗号分隔的备用源基址，按顺序回退
 #   PANEL_PUBKEY_FILE=...  用外部公钥文件覆盖内嵌公钥（密钥轮换 / E2E 自签测试）
-#   PANEL_CACHE_DIR=...    断点续传的半成品缓存目录（默认 /var/cache/forkpanel-install，或 $HOME/.cache）；E2E 用它隔离
+#   PANEL_CACHE_DIR=...           断点续传的半成品缓存目录（默认 $HOME/.cache/forkpanel-install）；E2E 用它隔离
+#   PANEL_CACHE_MAX_AGE_DAYS=...  陈旧半成品保留天数，超过则清理（默认 3）
 #   --no-install           仅下载验签不解装
 #
 # 安全设计：
@@ -158,20 +159,15 @@ dl() {  # dl <url> <out> <budget: tight|normal>
 # 临时解包区（每次新建，存公钥 / 解包产物，用完即删）
 WORK="$(mktemp -d)"
 # 持久缓存区（跨运行保留半成品 tarball，断点续传靠它）：
-#   root 且 /var/cache 可写 → /var/cache/forkpanel-install；否则回退 $HOME/.cache。
+#   默认缓存放用户家目录下的 .cache（root 即 /root/.cache），绝不写 /var/cache 系统目录；
 #   可用 PANEL_CACHE_DIR 强制指定（E2E 用它把缓存关进自己的临时目录，互不污染）。
-CACHE_DIR="${PANEL_CACHE_DIR:-}"
-if [ -z "$CACHE_DIR" ]; then
-  if [ "$(id -u)" -eq 0 ] && mkdir -p /var/cache/forkpanel-install 2>/dev/null; then
-    CACHE_DIR=/var/cache/forkpanel-install
-  else
-    CACHE_DIR="${HOME:-/tmp}/.cache/forkpanel-install"
-  fi
-fi
+#   跨重启仍落盘，断点续传不受影响。
+CACHE_DIR="${PANEL_CACHE_DIR:-${HOME:-/tmp}/.cache/forkpanel-install}"
 mkdir -p "$CACHE_DIR"
-# 清理 7 天前的陈旧半成品（死源 / 废弃 URL 的残留），避免缓存无限堆积；
-# 在途续传的半成品 mtime 是最近的，不会被误删。
-find "$CACHE_DIR" -type f -mtime +7 -delete 2>/dev/null || true
+# 清理陈旧的半成品（死源 / 废弃 URL 的残留），避免缓存无限堆积；
+# 在途续传的半成品 mtime 是最近的，不会被误删。保留天数由 PANEL_CACHE_MAX_AGE_DAYS 控制（默认 3）。
+CACHE_MAX_AGE="${PANEL_CACHE_MAX_AGE_DAYS:-3}"
+find "$CACHE_DIR" -type f -mtime "+$CACHE_MAX_AGE" -delete 2>/dev/null || true
 [ "$have_tty" -eq 1 ] && echo "==> 断点续传缓存目录：$CACHE_DIR"
 # 退出时：临时解包区永远清；缓存 tarball 仅在「成功装完 / --no-install 正常结束」后清
 # （CLEAN_CACHE=1），中途被打断 / 失败则保留半成品，下次运行才能续传。
