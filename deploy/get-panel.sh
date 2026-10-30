@@ -42,7 +42,7 @@
 #   mirror-sync.sh 会把可用的源基址直接打印出来，粘进 PANEL_MIRRORS 即可。
 #
 # 进度条与断点续传：
-#   - 终端里（交互）显示下载进度条：curl 用 -#（# 号条），wget 去掉 -q（自带百分比 + ETA）；
+#   - 终端里（交互）显示下载进度（curl 自带进度仪表：百分比 + 剩余时间 ETA；wget 去 -q 同样带 ETA）；
 #     CI / 管道 / sudo 捕获输出时自动静默，不刷屏。
 #   - 断点续传：半成品落在 PANEL_CACHE_DIR，按「来源 URL 分别缓存」（URL 哈希为键），
 #     curl -C - / wget -c 按磁盘已有字节续传；换源自动避让，不会跨源字节错位；
@@ -138,7 +138,8 @@ dl() {  # dl <url> <out> <budget: tight|normal>
     local cflags=( --retry "$retries" --retry-delay 2 \
           --connect-timeout "$cto" --max-time "$max" -C - )
     if [ "$have_tty" -eq 1 ]; then
-      cflags=( -fSL# "${cflags[@]}" )
+      # 交互：不用 -s，让 curl 显示自带进度仪表（百分比 + 剩余时间 ETA）
+      cflags=( -fSL "${cflags[@]}" )
     else
       cflags=( -fsSL "${cflags[@]}" )
     fi
@@ -168,6 +169,10 @@ if [ -z "$CACHE_DIR" ]; then
   fi
 fi
 mkdir -p "$CACHE_DIR"
+# 清理 7 天前的陈旧半成品（死源 / 废弃 URL 的残留），避免缓存无限堆积；
+# 在途续传的半成品 mtime 是最近的，不会被误删。
+find "$CACHE_DIR" -type f -mtime +7 -delete 2>/dev/null || true
+[ "$have_tty" -eq 1 ] && echo "==> 断点续传缓存目录：$CACHE_DIR"
 # 退出时：临时解包区永远清；缓存 tarball 仅在「成功装完 / --no-install 正常结束」后清
 # （CLEAN_CACHE=1），中途被打断 / 失败则保留半成品，下次运行才能续传。
 CHOSEN_TAR=""; CHOSEN_SIG=""
