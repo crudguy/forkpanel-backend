@@ -35,6 +35,24 @@ sudo sh get-panel.sh --no-install
 ```
 产物留在临时目录（脚本会打印路径），不触动系统。
 
+## 下载进度与断点续传
+
+安装器在**交互终端**（tty）里会显示下载进度，非交互（CI / 管道 / `sudo` 捕获输出）时保持静默：
+
+- **进度条（带 ETA）**：`curl` 走自带进度仪表（百分比 + 剩余时间），`wget` 去掉 `-q` 同样带 ETA。
+- **断点续传**：下载被打断（断网 / 断电 / Ctrl-C）后，重跑 `sudo sh get-panel.sh` 会**从断点继续**，
+  无需从头下载。半成品按"来源 URL"分别缓存，只有同一 URL 才续传、换源自动避让；装完 / 验签失败
+  / 全部源失败即清理，**不按时间堆积**。
+- **缓存目录**：默认 `~/.cache/forkpanel-install`（root 为 `/root/.cache/forkpanel-install`），可用
+  `PANEL_CACHE_DIR` 覆盖。该目录跨重启仍落盘，断点续传不受影响。
+- **`latest` 与指定版本**：默认 `latest` 的"最新版"内容可能漂移，故每次全新下载；指定
+  `PANEL_VERSION` 时 URL 稳定，才允许续传。
+
+```bash
+# 覆盖续传缓存目录（可选）
+PANEL_CACHE_DIR=/data/forkpanel-cache sudo -E sh get-panel.sh
+```
+
 ## 切换到自建 / 镜像源
 
 默认源是 GitHub Releases。若想走自建源（如 `releases.forkpanel.dev`）或镜像：

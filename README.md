@@ -24,6 +24,12 @@ sudo sh get-panel.sh
 journalctl -u panel -n 50 --no-pager      # 找到引导令牌
 ```
 
+> **下载进度与断点续传**：交互终端下安装器会显示**下载进度（百分比 + 剩余时间 ETA）**；
+> 若中途断网 / 断电 / 按 Ctrl-C，重跑 `sudo sh get-panel.sh` 即**从断点继续**，无需从头下载。
+> 续传半成品默认缓存在 `~/.cache/forkpanel-install`（root 为 `/root/.cache/forkpanel-install`），可用
+> `PANEL_CACHE_DIR` 覆盖；下载完成 / 验签失败 / 全部源失败即自动清理，不按时间堆积。
+> 仅 `PANEL_VERSION` 指定版本才续传，`latest`（默认）每次全新下载，避免"最新版"内容漂移错位。
+
 > 安装器会按架构（amd64 / arm64）下载**静态二进制**、**校验 ed25519 签名**（验不过绝不执行）、
 > 落 systemd 单元与开机自启，并随机分配一个 ≥10000 的端口避开扫描。
 >
