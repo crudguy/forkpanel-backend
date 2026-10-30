@@ -9,7 +9,8 @@
 //!   `assistant::redact_for_llm`）POST 到管理员配置的端点。
 //! - `deployment`：部署级配置（read_only / tier / max_login_attempts / session_idle /
 //!   session_absolute / audit_retention_days / audit_max_rows / localhost_only /
-//!   db_daily_backup / db_synchronous / db_backup_keep），**只读展示**实际生效值，
+//!   db_daily_backup / db_synchronous / db_backup_keep / installation），
+//!   **只读展示**实际生效值，
 //!   修改必须走 config.toml / 环境变量并重启——PATCH 这类键返回 400
 //! - `reserved`：种子预留、尚未接线的键（audit/metrics retention 等），
 //!   展示表内值并标注 `wired:false`。⚠ 注意：审计保留**实际已通过 config.toml
@@ -47,7 +48,7 @@ const RUNTIME_KEYS: [&str; 4] = [K_LLM_ENDPOINT, K_LLM_MODEL, K_LLM_API_KEY, K_L
 pub const NARRATIVE_NOTE: &str = "开启后，每次诊断会把以下内容发送到上方配置的 Endpoint：CPU/内存/磁盘等指标摘要、规则诊断结论，以及最近 20 条 error 级系统日志原文（发送前脱敏 IP 地址、邮箱与密钥样式文本；路径与主机名不脱敏——它们是诊断的核心证据）。数据离开本机后不再受面板控制。关闭时仅使用内置规则诊断，不外发任何数据。";
 
 /// 部署级键：在 settings 表里只有死种子，实际生效值来自 config.toml/env。
-const DEPLOYMENT_KEYS: [&str; 11] = [
+const DEPLOYMENT_KEYS: [&str; 12] = [
     "read_only",
     "tier",
     "max_login_attempts",
@@ -59,6 +60,7 @@ const DEPLOYMENT_KEYS: [&str; 11] = [
     "db_daily_backup",
     "db_synchronous",
     "db_backup_keep",
+    "installation",
 ];
 
 #[derive(Debug, Deserialize)]
@@ -167,6 +169,15 @@ pub async fn get(
     };
 
     // deployment：只读展示实际生效值（不取自 settings 表）
+    let layout = state.os.paths();
+    // systemctl 可能不存在/不可用（非 systemd、精简镜像）⇒ 用 Option 如实表达
+    // 「无法判定」，绝不能把「查不到」渲染成「已停止」。
+    let svc = |verb: &str| -> Option<bool> {
+        panel_os::run_sync(panel_os::Bin::Systemctl, &[verb, "panel"])
+            .ok()
+            .and_then(|o| o.code)
+            .map(|c| c == 0)
+    };
     let deployment = json!({
         "read_only": state.read_only,
         "tier": tier_str(state.tier),
@@ -179,6 +190,20 @@ pub async fn get(
         "db_daily_backup": state.daily_backup,
         "db_synchronous": state.db_synchronous,
         "db_backup_keep": state.backup_keep,
+        // 安装与运行位置：给「面板参数配置」页第一屏用。只读，不是可 PATCH 的设置项。
+        "installation": {
+            "app_version": env!("CARGO_PKG_VERSION"),
+            "build": option_env!("PANEL_BUILD").unwrap_or("dev"),
+            "platform": state.os.platform(),
+            "bin_path": panel_os::paths::panel_bin_install_path().display().to_string(),
+            "config_dir": layout.config_dir().display().to_string(),
+            "data_dir": layout.data_dir().display().to_string(),
+            "log_dir": layout.log_dir().display().to_string(),
+            "service_manager": "systemd",
+            "service_active": svc("is-active"),
+            "service_enabled": svc("is-enabled"),
+            "can_restart": s.role == "owner",
+        },
         "hint": "部署级配置：config.toml [security] 的 read_only / max_login_attempts / session_idle / session_absolute、[audit] 的 retention_days / max_rows、[server] 的 localhost_only、[db] 的 daily_backup / synchronous / backup_keep 改后重启生效（此处 PATCH 会造成『改了却不生效』的谎言，故拒绝）",
     });
 
@@ -600,7 +625,7 @@ mod tests {
             "read_only", "tier", "max_login_attempts", "session_idle",
             "session_absolute", "audit_retention_days", "audit_max_rows",
             "localhost_only", "db_daily_backup", "db_synchronous",
-            "db_backup_keep",
+            "db_backup_keep", "installation",
         ] {
             assert!(DEPLOYMENT_KEYS.contains(&k), "deployment 白名单缺 `{k}`");
         }

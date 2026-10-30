@@ -5,7 +5,7 @@ use crate::{
     error::{ok, ApiError, ApiResult},
     routes::{Auth, Shared},
 };
-use axum::{extract::{Query, State}, Json};
+use axum::{extract::{Query, State}, http::StatusCode, Json};
 use serde::Serialize;
 use serde_json::json;
 
@@ -259,4 +259,30 @@ pub async fn directories(State(state): State<Shared>, Auth(s): Auth) -> ApiResul
         "frontend_embedded": true,
         "groups": groups,
     })))
+}
+
+
+/// 重启面板（owner-only）。
+///
+/// 为什么用 `--no-block`：本 handler 就跑在**即将被 systemd 停掉的那个进程**里。
+/// `systemctl restart` 默认等待 job 完成 ⇒ handler 会在等待中被一起杀掉，浏览器
+/// 连响应都收不到；`--no-block` 把 job 交给 PID 1 后立即返回，响应才发得出去。
+/// 前端仍把「请求失败」视作已发起（重启瞬间断连是预期），靠轮询 `/version` 判定恢复。
+///
+/// 权限：`system.manage` + owner。admin 可以改设置，但重启服务是可用性操作，
+/// 影响所有在线用户，故比普通设置更严一档。
+pub async fn restart(
+    State(_state): State<Shared>,
+    Auth(s): Auth,
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    crate::auth::require(&s, perm::SYSTEM_MANAGE)?;
+    if s.role != "owner" {
+        return Err(ApiError::new(
+            10003,
+            StatusCode::FORBIDDEN,
+            "仅 owner 可重启面板（admin 可改设置，但不能重启服务）",
+        ));
+    }
+    panel_os::run_sync(panel_os::Bin::Systemctl, &["--no-block", "restart", "panel"])?;
+    Ok((StatusCode::ACCEPTED, ok(json!({ "accepted": true }))))
 }

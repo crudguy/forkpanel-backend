@@ -108,6 +108,7 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/metrics/history", get(system::history))
         .route("/api/v1/system/users", get(system::users))
         .route("/api/v1/system/directories", get(system::directories))
+        .route("/api/v1/system/restart", post(system::restart))
         .route("/api/v1/metrics/snapshot", get(system::snapshot))
         // ── 公网暴露向导（域名反代 + 白名单 + TLS）──
         // 只读状态用 SYSTEM_VIEW；apply/remove 用 SYSTEM_MANAGE（等同于系统级运维）。

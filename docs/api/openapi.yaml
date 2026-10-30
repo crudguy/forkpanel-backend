@@ -1293,6 +1293,21 @@ components:
             db_daily_backup:      { type: boolean, description: '[db] daily_backup，每日自动备份开关' }
             db_synchronous:       { type: string, description: '[db] synchronous，SQLite 落盘同步档（归一化大写）' }
             db_backup_keep:       { type: integer, description: '[db] backup_keep，备份保留份数' }
+            installation:
+              type: object
+              description: 安装与运行位置（只读；不是可 PATCH 的设置项）
+              properties:
+                app_version:      { type: string, description: 面板版本（CARGO_PKG_VERSION） }
+                build:            { type: string, description: 构建标识（PANEL_BUILD，缺省 dev） }
+                platform:         { type: string, description: 平台标识（本面板只支持 linux） }
+                bin_path:         { type: string, description: 安装后的二进制路径 }
+                config_dir:       { type: string, description: 配置目录（PathLayout，受 [paths] 覆盖） }
+                data_dir:         { type: string, description: 数据目录（PathLayout，受 [paths] 覆盖） }
+                log_dir:          { type: string, description: 日志目录（PathLayout，受 [paths] 覆盖） }
+                service_manager:  { type: string, enum: [systemd] }
+                service_active:   { type: [boolean, "null"], description: systemctl is-active；null = 无法判定（非 systemd / 命令缺失），不得渲染成「已停止」 }
+                service_enabled:  { type: [boolean, "null"], description: systemctl is-enabled；null 同上 }
+                can_restart:      { type: boolean, description: 当前会话是否可重启（仅 owner）；admin 可改设置但不能重启服务 }
             hint:                 { type: string }
         reserved:
           type: object
@@ -1596,6 +1611,23 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/Directories' } } }
+
+  /api/v1/system/restart:
+    post:
+      tags: [system]
+      summary: 重启面板（owner + system.manage；202 = job 已交给 PID 1）
+      description: |
+        执行 `systemctl --no-block restart panel`：job 入队后立即返回，避免 handler
+        在等待中被自己触发的重启杀掉。前端必须把「请求失败/连接重置」也视作已发起，
+        并轮询 `/api/v1/version` 判定服务是否恢复——重启瞬间断连是预期行为。
+      responses:
+        '202':
+          description: 已受理（服务即将重启）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { accepted: { type: boolean } } } } }
+        '403':
+          description: 需要 system.manage 且角色为 owner
 
   /api/v1/system/expose/status:
     get:
