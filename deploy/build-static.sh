@@ -14,7 +14,8 @@
 #
 # 产出 dist/panel-linux-{amd64,arm64}.tar.gz(+.sig)
 #   tarball 内含：panel（静态二进制）、install.sh（安装逻辑）、config.toml（默认配置）、
-#                forkpanel-config.sh（交互式配置入口，装为 forkpanel / fp）
+#                forkpanel-config.sh（交互式配置入口，装为 forkpanel / fp）、
+#                expose-public.sh（公网暴露脚本，install.sh 同目录查找，漏打包会导致 panel expose 不可用）
 set -euo pipefail
 
 cd "$(dirname "$0")/.."   # 切到仓库根
@@ -44,11 +45,12 @@ pack() {
   local tmp; tmp="$(mktemp -d)"
   cp "$bin" "$tmp/panel"
   cp deploy/install.sh "$tmp/install.sh"
-cp deploy/forkpanel-config.sh "$tmp/forkpanel-config.sh"
+  cp deploy/forkpanel-config.sh "$tmp/forkpanel-config.sh"
   cp deploy/config.toml "$tmp/config.toml"
+  cp deploy/expose-public.sh "$tmp/expose-public.sh"
   chmod 0755 "$tmp/panel"
   local tarball="$OUT/panel-linux-$arch.tar.gz"
-  tar -C "$tmp" -czf "$tarball" panel install.sh forkpanel-config.sh config.toml
+  tar -C "$tmp" -czf "$tarball" panel install.sh forkpanel-config.sh config.toml expose-public.sh
   # ⚠ 必须用 pkeyutl -rawin，**不能**用 `dgst -sign`：openssl 官方文档写明
   #   `dgst -sign` 不支持 Ed25519/Ed448（"Use the pkeyutl command instead"）。
   #   旧版 openssl（如 ubuntu-24.04 自带的 3.0.x）会直接拒绝：
