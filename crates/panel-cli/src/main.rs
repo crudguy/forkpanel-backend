@@ -494,12 +494,13 @@ fn run(cli: Cli) -> Result<()> {
                 // 暴露面是安全边界而不是配置细节（见 warn_if_exposed 的注释）。
                 warn_if_exposed(&addr);
                 if localhost_only {
-                    eprintln!("════════════════════════════════════════════════════════");
-                    eprintln!("[panel] 仅本机访问：面板只监听 127.0.0.1，外部用 IP:端口连不上");
-                    eprintln!("  这是默认安全策略（面板以 root 运行且无 HTTPS）。");
-                    eprintln!("  · 临时远程：ssh -L {}:127.0.0.1:{} <user>@<server>", addr.port(), addr.port());
-                    eprintln!("  · 长期对外：sudo panel expose -d <域名> -a <你的出口IP/32>");
-                    eprintln!("════════════════════════════════════════════════════════");
+                    // 一行足够：安装提示与文档已把三条访问方式说过一遍，这里每次重启
+                    // 再抄一遍只会把真正要看的东西（令牌 / 启动错误）挤出 journal。
+                    // 安全默认仍然明确说出来，不靠用户自己猜。
+                    eprintln!(
+                        "[panel] 仅本机访问（安全默认）：远程用 ssh -L {}:127.0.0.1:{}，长期对外用 sudo panel expose",
+                        addr.port(), addr.port()
+                    );
                 }
                 println!("监听 {addr}（档位 {tier:?}）");
 
