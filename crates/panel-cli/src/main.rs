@@ -6,7 +6,7 @@ mod doctor;
 mod embed;
 mod upgrade;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use config::Config;
 use panel_core::{crypto::MasterKey, PanelError, Result, Tier};
 // PathLayout 是 trait：只有引入作用域后，LinuxPathLayout 才能调用 data_dir()/log_dir()/
@@ -100,10 +100,10 @@ struct Cli {
     // 人类可读文本（用户以为拿到了机器可读结果）。宁可让 clap 直接报错，
     // 也不要"收下参数却不生效"（配置项假控制那类 bug 的命令行版本）。
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
-#[derive(Subcommand)]
+#[derive(Clone, Subcommand)]
 enum Cmd {
     /// 首次初始化：目录、主密钥、owner、配置模板
     Init {
@@ -207,30 +207,73 @@ enum Cmd {
         #[arg(long)]
         uninstall: bool,
     },
-    /// 升级面板：下载签名发行包 → 验签 → 解包 → 调用包内 install.sh → 失败回滚
-    ///
-    /// 验签公钥与 `deploy/get-panel.sh` 内嵌的是同一把（`deploy/release-pubkey.pub`，
-    /// 由 `ci/check-docs-consistency.sh` 钉住两处一致）。验不过立即中止，绝不执行
-    /// 包内文件。安装前备份旧二进制为 `panel.bak`，install.sh 失败或装完服务不是
-    /// active 都会回滚。配置与数据不删。
-    Upgrade {
-        /// 只检查是否有新版本（不下载）
-        #[arg(long)]
-        check: bool,
-        /// 下载并验签后停止，不安装
-        #[arg(long)]
-        dry_run: bool,
-        /// 指定版本（带不带 v 均可）；省略则取 GitHub 最新
-        #[arg(long)]
-        version: Option<String>,
-        /// 覆盖下载基址（自建镜像；签名仍用内嵌公钥校验）
-        #[arg(long)]
-        base_url: Option<String>,
-        /// 覆盖验签公钥（仅自建分发 / E2E；官方安装不要用）
-        #[arg(long)]
-        pubkey_file: Option<PathBuf>,
-    },
-}
+        /// 升级面板：下载签名发行包 → 验签 → 解包 → 调用包内 install.sh → 失败回滚
+        ///
+        /// 验签公钥与 `deploy/get-panel.sh` 内嵌的是同一把（`deploy/release-pubkey.pub`，
+        /// 由 `ci/check-docs-consistency.sh` 钉住两处一致）。验不过立即中止，绝不执行
+        /// 包内文件。安装前备份旧二进制为 `panel.bak`，install.sh 失败或装完服务不是
+        /// active 都会回滚。配置与数据不删。
+        Upgrade {
+            /// 只检查是否有新版本（不下载）
+            #[arg(long)]
+            check: bool,
+            /// 下载并验签后停止，不安装
+            #[arg(long)]
+            dry_run: bool,
+            /// 指定版本（带不带 v 均可）；省略则取 GitHub 最新
+            #[arg(long)]
+            version: Option<String>,
+            /// 覆盖下载基址（自建镜像；签名仍用内嵌公钥校验）
+            #[arg(long)]
+            base_url: Option<String>,
+            /// 覆盖验签公钥（仅自建分发 / E2E；官方安装不要用）
+            #[arg(long)]
+            pubkey_file: Option<PathBuf>,
+        },
+
+        /// 查看 / 修改面板网络配置（端口、监听地址）
+        ///
+        /// 替代原 `forkpanel` / `fp` 壳的 `status` / `set-port` / `set-bind`：由 Rust 端
+        /// 原子、带校验地改 `config.toml` 的 `[server]` 段（保留注释、沿用权限），杜绝
+        /// 原 awk 文本编辑写坏后 serve 因 `deny_unknown_fields` 起不来的情况。
+        Config {
+            /// 查看 / 修改面板网络配置（status / set port / set bind）
+            #[command(subcommand)]
+            action: Option<ConfigAction>,
+        },
+        /// 进入交互式面板配置菜单（TTY 下直接运行 `panel` 即进入，替代原 `forkpanel` / `fp`）
+        Menu,
+    }
+
+    /// `panel config` 的子命令。
+    #[derive(Clone, Subcommand)]
+    enum ConfigAction {
+        /// 打印当前配置与服务状态（不需要 root）
+        Status,
+        /// 修改 `[server]` 段字段（set port / set bind）
+        Set {
+            #[command(subcommand)]
+            target: ConfigSet,
+        },
+    }
+
+    /// `panel config set` 的子命令：修改 `[server]` 段的具体字段。
+    #[derive(Clone, Subcommand)]
+    enum ConfigSet {
+        /// 修改监听端口（1-65535）
+        Port {
+            /// 监听端口
+            port: u16,
+        },
+        /// 修改监听地址；非回环地址默认拒绝，需显式 --yes
+        Bind {
+            /// 监听地址（IPv4 / IPv6 / 主机名）
+            addr: String,
+            /// 非回环地址会暴露 root 面板到网络，默认拒绝，需显式确认
+            #[arg(long)]
+            yes: bool,
+        },
+    }
 
 fn main() {
     let cli = Cli::parse();
@@ -244,7 +287,22 @@ fn run(cli: Cli) -> Result<()> {
     init_tracing();
     let os: Arc<dyn panel_os::OsAdapter> = panel_os::default_adapter();
 
-    match cli.cmd {
+    // 裸跑（无子命令）：
+    //  - TTY：进入交互式面板配置菜单（替代原 forkpanel / fp 壳）
+    //  - 非 TTY（脚本 / 管道）：打印帮助并以非零退出，等价于 clap 缺子命令
+    if cli.cmd.is_none() {
+        if std::io::stdin().is_terminal() {
+            return run_menu(&cli, &os);
+        }
+        let _ = Cli::command().print_help();
+        println!();
+        return Err(PanelError::Validation {
+            field: "command",
+            reason: "缺少子命令：脚本环境请显式指定子命令（如 `panel config --status`），交互终端直接运行 `panel` 即进入配置菜单".into(),
+        });
+    }
+    let cmd = cli.cmd.clone().unwrap();
+    match cmd {
         Cmd::Init { force, ref owner, ref owner_pass } => {
             let layout0 = build_layout(&os, None);
             let cfg_path = cli.config.clone().unwrap_or_else(|| layout0.config_dir().join("config.toml"));
@@ -896,13 +954,12 @@ fn run(cli: Cli) -> Result<()> {
             let _ = panel_os::run_sync(panel_os::Bin::Systemctl, &["daemon-reload"]);
             println!("· 已移除 systemd 单元 {removed_units} 个（含探活 service/timer）");
 
-            // 移除命令入口：panel + 交互式配置 forkpanel + 短别名 fp。
-            // 与 install.sh 的落点对齐（同一目录），避免「删了 panel 却留下 forkpanel
-            // 指向不存在的文件」。只删固定安装路径——不删 current_exe()，
+            // 移除命令入口：只有 panel 一个（交互式配置已并入 panel 二进制，
+            // 不再单独安装 forkpanel / fp 壳）。只删固定安装路径——不删 current_exe()，
             // 避免 E2E namespace 里误删宿主构建产物。
             let bin = panel_os::paths::panel_bin_install_path();
             let bin_dir = bin.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| bin.clone());
-            for name in ["panel", "forkpanel", "fp"] {
+            for name in ["panel"] {
                 let p = bin_dir.join(name);
                 if !p.exists() {
                     continue;
@@ -1031,6 +1088,9 @@ fn run(cli: Cli) -> Result<()> {
             println!("（已通过 `panel expose` 调用 expose-public.sh 完成。若需撤销：sudo panel expose --uninstall）");
             Ok(())
         }
+
+        Cmd::Config { action } => run_config(&cli, &os, action),
+        Cmd::Menu => run_menu(&cli, &os),
     }
 }
 
@@ -1512,6 +1572,263 @@ fn invoke_expose(script_args: &[String]) -> Result<()> {
         eprintln!("{}", out.stderr.trim_end());
     }
     Ok(())
+}
+
+/// 配置子命令：`panel config [status | set port N | set bind ADDR [--yes]]`。
+fn run_config(
+    cli: &Cli,
+    os: &Arc<dyn panel_os::OsAdapter>,
+    action: Option<ConfigAction>,
+) -> Result<()> {
+    match action {
+        Some(ConfigAction::Set { target: ConfigSet::Port { port } }) => do_set_port(cli, os, port),
+        Some(ConfigAction::Set { target: ConfigSet::Bind { addr, yes } }) => do_set_bind(cli, os, &addr, yes),
+        None | Some(ConfigAction::Status) => show_panel_status(cli, os),
+    }
+}
+
+/// 打印面板配置与运行状态（不需要 root）。
+fn show_panel_status(cli: &Cli, os: &Arc<dyn panel_os::OsAdapter>) -> Result<()> {
+    let layout0 = build_layout(os, None);
+    let cfgp = cli.config.clone().unwrap_or_else(|| layout0.config_dir().join("config.toml"));
+    println!("ForkPanel 状态");
+    println!("  配置文件   {}", cfgp.display());
+    if !cfgp.exists() {
+        println!("  （配置文件不存在：面板可能尚未安装）");
+    } else {
+        let cfg = Config::load(&cfgp).map_err(|e| {
+            PanelError::Validation { field: "config", reason: format!("读取配置失败：{e}") }
+        })?;
+        println!("  监听       {}:{}", cfg.server.bind, cfg.server.port);
+        println!("  仅本机     {}  （true 时覆盖 bind）", cfg.server.localhost_only);
+        println!(
+            "  数据目录   {}",
+            cfg.paths.data.clone().unwrap_or_else(|| layout0.data_dir()).display()
+        );
+    }
+    // 服务状态（不依赖 root）
+    let svc = std::process::Command::new("systemctl")
+        .args(["is-active", "--quiet", "panel"])
+        .status()
+        .map(|s| if s.success() { "active" } else { "inactive / 未安装" })
+        .unwrap_or("inactive / 未安装");
+    println!("  服务       {svc}");
+    // 版本（无需 root；二进制不存在则跳过）
+    if let Ok(exe) = std::env::current_exe() {
+        if exe.exists() {
+            if let Ok(out) = std::process::Command::new(&exe).arg("--version").output() {
+                let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !v.is_empty() {
+                    println!("  版本       {v}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 修改监听端口（root 权限；写 config.toml 的 `[server].port` 并重启服务）。
+fn do_set_port(cli: &Cli, os: &Arc<dyn panel_os::OsAdapter>, port: u16) -> Result<()> {
+    if !panel_os::fs::is_root() {
+        return Err(PanelError::Internal(
+            "set-port: 需要 root 权限（写 /etc/forkpanel/config.toml 并重启服务）".into(),
+        ));
+    }
+    if port == 0 {
+        return Err(PanelError::Validation { field: "port", reason: "端口必须是 1-65535".into() });
+    }
+    let layout0 = build_layout(os, None);
+    let cfgp = cli.config.clone().unwrap_or_else(|| layout0.config_dir().join("config.toml"));
+    if !cfgp.exists() {
+        return Err(PanelError::Validation {
+            field: "config",
+            reason: format!("找不到配置文件 {}", cfgp.display()),
+        });
+    }
+    config::write_server_key(&cfgp, "port", &port.to_string())?;
+    println!("· 端口已改为 {port}");
+    restart_panel_service()
+}
+
+/// 修改监听地址（root 权限）。回环地址设 `localhost_only=true`；非回环默认拒绝，需 `--yes`
+/// 并显式设 `localhost_only=false`（否则 bind 不生效，且会暴露 root 面板到网络）。
+fn do_set_bind(cli: &Cli, os: &Arc<dyn panel_os::OsAdapter>, addr: &str, yes: bool) -> Result<()> {
+    if !panel_os::fs::is_root() {
+        return Err(PanelError::Internal(
+            "set-bind: 需要 root 权限（写 /etc/forkpanel/config.toml 并重启服务）".into(),
+        ));
+    }
+    let layout0 = build_layout(os, None);
+    let cfgp = cli.config.clone().unwrap_or_else(|| layout0.config_dir().join("config.toml"));
+    if !cfgp.exists() {
+        return Err(PanelError::Validation {
+            field: "config",
+            reason: format!("找不到配置文件 {}", cfgp.display()),
+        });
+    }
+    let loopback = matches!(addr, "127.0.0.1" | "::1");
+    if !loopback && !yes {
+        return Err(PanelError::Validation {
+            field: "bind",
+            reason: format!(
+                "拒绝直接改到非回环地址：{addr}\n  面板以 root 运行且无内置 HTTPS，直接绑出去等于把 root 面板暴露到网络。\n  确需公网访问，优先用：sudo panel expose -d <域名> -a <出口IP>/32\n  仍要直接改，请显式加 --yes（会同时设置 localhost_only=false，否则 bind 不生效）。",
+            ),
+        });
+    }
+    config::write_server_key(&cfgp, "bind", &format!("\"{addr}\""))?;
+    config::write_server_key(&cfgp, "localhost_only", &loopback.to_string())?;
+    if loopback {
+        println!("· 监听地址已改为 {addr}（localhost_only=true）");
+    } else {
+        println!("· 监听地址已改为 {addr}，并设置 localhost_only=false");
+        println!("  ⚠ 已把 root 面板暴露到网络；强烈建议改用 panel expose 接 TLS。");
+    }
+    restart_panel_service()
+}
+
+/// 写配置后按需重启 panel 服务（systemd 已 enable 才 restart；否则提示下次启动生效）。
+fn restart_panel_service() -> Result<()> {
+    let has_systemctl = std::process::Command::new("systemctl")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !has_systemctl {
+        println!("· 未检测到 systemd，改动将在下次手动启动生效");
+        return Ok(());
+    }
+    let enabled = std::process::Command::new("systemctl")
+        .args(["is-enabled", "--quiet", "panel"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !enabled {
+        println!("· 未检测到 panel 的 systemd 单元，改动将在下次启动生效");
+        return Ok(());
+    }
+    match std::process::Command::new("systemctl").args(["restart", "panel"]).status() {
+        Ok(s) if s.success() => println!("· 已重启 panel"),
+        Ok(s) => eprintln!("· ⚠ 重启失败（退出码 {s}）：journalctl -u panel -n 50 --no-pager"),
+        Err(e) => eprintln!("· ⚠ 重启命令执行失败：{e}"),
+    }
+    Ok(())
+}
+
+/// 交互式面板配置菜单（替代原 forkpanel / fp 壳）。仅在 TTY 下可用。
+fn run_menu(cli: &Cli, os: &Arc<dyn panel_os::OsAdapter>) -> Result<()> {
+    if !std::io::stdin().is_terminal() {
+        return Err(PanelError::Validation {
+            field: "menu",
+            reason: "非交互环境请用 `panel config --status` / `panel config set port N` / `panel config set bind ADDR`".into(),
+        });
+    }
+    loop {
+        println!();
+        println!("==== ForkPanel 配置 ====");
+        println!("  1) 查看状态");
+        println!("  2) 修改监听端口");
+        println!("  3) 修改监听地址（含公网风险确认）");
+        println!("  4) 重置用户口令");
+        println!("  5) 公网暴露（引导命令）");
+        println!("  6) 升级面板");
+        println!("  7) 卸载面板");
+        println!("  8) 查看全部命令");
+        println!("  0) 退出");
+        let choice = prompt_line("选择 [0-8]：")?;
+        match choice.as_str() {
+            "1" => {
+                let _ = show_panel_status(cli, os);
+            }
+            "2" => {
+                let p = prompt_line("新端口 [1-65535]：")?;
+                match p.parse::<u16>() {
+                    Ok(port) => {
+                        if let Err(e) = do_set_port(cli, os, port) {
+                            eprintln!("panel: {e}");
+                        }
+                    }
+                    Err(_) => eprintln!("端口必须是数字：{p}"),
+                }
+            }
+            "3" => {
+                let cfgp = cli.config.clone().unwrap_or_else(|| {
+                    build_layout(os, None).config_dir().join("config.toml")
+                });
+                println!("当前配置：{}", cfgp.display());
+                println!("  1) 127.0.0.1（推荐：仅本机）");
+                println!("  2) 自定义地址");
+                let c = prompt_line("选择 [1-2]：")?;
+                match c.as_str() {
+                    "1" => {
+                        if let Err(e) = do_set_bind(cli, os, "127.0.0.1", false) {
+                            eprintln!("panel: {e}");
+                        }
+                    }
+                    "2" => {
+                        let b = prompt_line("地址：")?;
+                        if let Err(e) = do_set_bind(cli, os, &b, false) {
+                            eprintln!("panel: {e}");
+                        }
+                    }
+                    _ => eprintln!("无效选择"),
+                }
+            }
+            "4" => {
+                let u = prompt_line("用户名：")?;
+                if let Err(e) = reexec_panel(cli, &["passwd", &u]) {
+                    eprintln!("panel: {e}");
+                }
+            }
+            "5" => print_expose_help(),
+            "6" => print_upgrade_help(),
+            "7" => {
+                if let Err(e) = reexec_panel(cli, &["uninstall"]) {
+                    eprintln!("panel: {e}");
+                }
+            }
+            "8" => {
+                if let Err(e) = reexec_panel(cli, &["--help"]) {
+                    eprintln!("panel: {e}");
+                }
+            }
+            "0" | "q" | "Q" => break,
+            _ => eprintln!("无效选择：{choice}"),
+        }
+    }
+    Ok(())
+}
+
+/// 复用同一份 `panel` 二进制执行子命令（口令 / 卸载 / 帮助）。
+/// 用于菜单里那些本就由其它子命令实现的项，避免把长逻辑再抄一份。
+fn reexec_panel(cli: &Cli, args: &[&str]) -> Result<()> {
+    let exe = std::env::current_exe()
+        .map_err(|e| PanelError::Internal(format!("无法确定自身路径：{e}")))?;
+    let mut cmd = std::process::Command::new(&exe);
+    if let Some(c) = &cli.config {
+        cmd.arg("--config").arg(c);
+    }
+    cmd.args(args);
+    let status = cmd
+        .status()
+        .map_err(|e| PanelError::Internal(format!("执行 {args:?} 失败：{e}")))?;
+    if !status.success() {
+        return Err(PanelError::Internal(format!("子命令 {args:?} 退出码 {status}")));
+    }
+    Ok(())
+}
+
+fn print_expose_help() {
+    println!("公网暴露（脚本做 nginx 反代 + 防火墙白名单，面板本身仍只绑回环）：");
+    println!("  sudo panel expose -d <域名> -a <出口IP>/32");
+    println!("撤销：");
+    println!("  sudo panel expose --uninstall");
+}
+
+fn print_upgrade_help() {
+    println!("升级（下载签名二进制 → 验签 → 替换并重启；配置与数据保留）：");
+    println!("  wget -O get-panel.sh https://raw.githubusercontent.com/crudguy/forkpanel-backend/main/deploy/get-panel.sh");
+    println!("  sudo sh get-panel.sh");
+    println!("注：PANEL_VERSION 不带 v 前缀（脚本自己拼 /v<版本>）。");
 }
 
 fn init_tracing() {

@@ -7,7 +7,7 @@
 
 use panel_core::{PanelError, Result, Tier};
 use serde::{Deserialize, Serialize};
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::{Path, PathBuf}};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -246,6 +246,88 @@ pub fn parse_duration(s: &str) -> Result<std::time::Duration> {
     Ok(std::time::Duration::from_secs(secs))
 }
 
+/// 在 config.toml 的 `[server]` 段**原子**替换或追加一个键，保留注释与其它段。
+///
+/// `value` 为最终写入文本（已含引号 / 类型后缀），调用方负责先校验取值合法。
+/// 写盘前先用 `Config::load` 重新解析整份文件——本构建 `deny_unknown_fields`，
+/// 任何写坏（键名拼错、TOML 错位）都会立即报错，绝不落一份 serve 起不来的配置。
+/// 相较原 `forkpanel-config.sh` 的 awk 文本编辑，此处改动后一定可解析，且权限沿用
+/// 原文件（不会把 0640 的 root 配置放宽成 0644）。
+pub fn write_server_key(path: &Path, key: &str, value: &str) -> Result<()> {
+    if !path.exists() {
+        return Err(PanelError::NotFound(format!("config not found: {}", path.display())));
+    }
+    let original = std::fs::read_to_string(path)
+        .map_err(|e| PanelError::Internal(format!("read config: {e}")))?;
+    let updated = replace_in_section(&original, "server", key, value)
+        .map_err(|e| PanelError::Internal(format!("patch config: {e}")))?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, &updated)
+        .map_err(|e| PanelError::Internal(format!("write config tmp: {e}")))?;
+    // 校验整份可解析后再替换（失败 = 不替换，原配置完好）
+    Config::load(&tmp)?;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    }
+    std::fs::rename(&tmp, path)
+        .map_err(|e| PanelError::Internal(format!("replace config: {e}")))?;
+    Ok(())
+}
+
+/// 在 TOML 文本的某个 `[table]` 段内替换 `key = ...`；段内不存在则追加到段尾；
+/// 段本身不存在则在文件末尾补整段。仅做行级替换，**不重排、不丢注释**。
+fn replace_in_section(
+    src: &str,
+    section: &str,
+    key: &str,
+    value: &str,
+) -> std::result::Result<String, String> {
+    let mut out = String::with_capacity(src.len());
+    let mut in_sec = false;
+    let mut replaced = false;
+    let key_line = format!("{key} = {value}");
+    let section_header = format!("[{section}]");
+    for line in src.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if in_sec && !replaced {
+                out.push_str(&key_line);
+                out.push('\n');
+                replaced = true;
+            }
+            in_sec = trimmed == section_header;
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if in_sec && !replaced && trimmed.starts_with(key) {
+            let after = trimmed[key.len()..].trim_start();
+            if after.starts_with('=') {
+                out.push_str(&key_line);
+                out.push('\n');
+                replaced = true;
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if in_sec && !replaced {
+        out.push_str(&key_line);
+        out.push('\n');
+        replaced = true;
+    }
+    if !replaced {
+        if !src.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&format!("[{section}]\n"));
+        out.push_str(&key_line);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 /// 生成默认配置文本。
 ///
 /// 路径默认值**由 PathLayout 注入**而非写死在模板里 —— 这样改默认目录只需动
@@ -315,6 +397,72 @@ mod tests {
         assert_eq!(c.audit.retention_days, 90);
         assert_eq!(c.db.synchronous, "NORMAL");
         assert!(c.addr().unwrap().ip().is_loopback());
+    }
+
+    #[test]
+    fn replace_in_section_preserves_comments_and_other_sections() {
+        let src = "# 顶部注释\n\
+                  tier = \"auto\"\n\
+                  \n\
+                  [server]\n\
+                  # 监听配置\n\
+                  bind = \"127.0.0.1\"\n\
+                  port = 2083\n\
+                  localhost_only = true\n\
+                  \n\
+                  [db]\n\
+                  synchronous = \"NORMAL\"\n\
+                  daily_backup = true\n";
+        let out = replace_in_section(src, "server", "port", "12083").unwrap();
+        // 原 port 行被替换
+        assert!(out.contains("port = 12083"), "port 必须被替换：\n{out}");
+        // 其它段与注释保留
+        assert!(out.contains("[db]"), "[db] 段必须保留");
+        assert!(out.contains("synchronous = \"NORMAL\""), "其它段内容必须保留");
+        assert!(out.contains("# 监听配置"), "注释必须保留");
+        assert!(out.contains("bind = \"127.0.0.1\""), "未改的键必须保留");
+        // 不能出现重复的 port 行
+        assert_eq!(out.matches("port =").count(), 1, "port 行必须唯一");
+    }
+
+    #[test]
+    fn replace_in_section_appends_when_key_missing() {
+        let src = "[server]\nbind = \"127.0.0.1\"\n\n[db]\nsynchronous = \"NORMAL\"\n";
+        let out = replace_in_section(src, "server", "port", "2083").unwrap();
+        assert!(out.contains("port = 2083"), "缺失键必须追加到段尾：\n{out}");
+        assert!(out.contains("bind = \"127.0.0.1\""));
+        assert!(out.contains("[db]"));
+    }
+
+    #[test]
+    fn write_server_key_roundtrips_and_is_reloadable() {
+        let dir = std::env::temp_dir().join(format!("panel-cfgtest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.toml");
+        std::fs::write(&p, "# 注释\n[server]\nbind = \"127.0.0.1\"\nport = 2083\nlocalhost_only = true\n\n[db]\ndaily_backup = true\n").unwrap();
+
+        // 改端口
+        write_server_key(&p, "port", "12083").unwrap();
+        let c = Config::load(&p).unwrap();
+        assert_eq!(c.server.port, 12083, "端口应被改");
+        assert_eq!(c.server.bind, "127.0.0.1", "bind 不应被改");
+        assert!(c.db.daily_backup, "其它段不应被改");
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(raw.contains("# 注释"), "注释必须被保留");
+
+        // 改 bind 并同时改 localhost_only（与 do_set_bind 同款）
+        write_server_key(&p, "bind", "\"0.0.0.0\"").unwrap();
+        write_server_key(&p, "localhost_only", "false").unwrap();
+        let c2 = Config::load(&p).unwrap();
+        assert_eq!(c2.server.bind, "0.0.0.0");
+        assert!(!c2.server.localhost_only);
+
+        // 写坏会被校验拦下：故意塞一个 deny_unknown_fields 不认识的键
+        let bad = "# 注释\n[server]\nbind = \"127.0.0.1\"\nport = 2083\nbogus_key = 1\n[db]\ndaily_backup = true\n";
+        std::fs::write(&p, bad).unwrap();
+        assert!(Config::load(&p).is_err(), "含未知字段的配置必须被拒（deny_unknown_fields）");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
