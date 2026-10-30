@@ -119,6 +119,11 @@ jobs:
       # 复用 deploy/build-static.sh（打包 + 签名的单一事实源），避免两处漂移
       - name: 静态构建 + 签名 tarball
         run: ./deploy/build-static.sh "${{ github.event.inputs.version || github.ref_name }}"
+        # 注入构建标识：/api/v1/version 的 build 字段取 option_env!("PANEL_BUILD")，
+        # 不注入则恒为 "dev"（此前发行版一直显示 dev，与 docs/env.md「CI 可注入」不符）。
+        # 用 commit SHA 作构建号，便于从「关于/版本徽标」反查来源。
+        env:
+          PANEL_BUILD: ${{ github.sha }}
 
       - name: 生成 SHA256SUMS
         run: ( cd dist && sha256sum panel-linux-*.tar.gz > SHA256SUMS )
