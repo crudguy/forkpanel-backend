@@ -62,6 +62,23 @@ pack() {
   openssl pkeyutl -sign -inkey "$SIGN_KEY" -rawin -in "$tarball" -out "$tarball.sig"
   echo "    产出 $tarball ($(du -h "$tarball" | cut -f1)) + .sig"
   rm -rf "$tmp"
+  # 打包完整性守卫：解包校验 tarball 必含这些文件，漏打任何一个立即失败，
+  # 避免发布残缺 tarball（曾漏 expose-public.sh → 安装报「未找到 ./expose-public.sh」）。
+  # 清单须与上方 cp + tar 列表保持一致；新增安装依赖文件时三处同步改。
+  local expected=( panel install.sh forkpanel-config.sh config.toml expose-public.sh )
+  local listing; listing="$(tar -tzf "$tarball")"
+  local miss=0
+  for f in "${expected[@]}"; do
+    if ! printf '%s\n' "$listing" | grep -qx "$f"; then
+      echo "    打包残缺：tarball 缺少 $f（检查上方 cp 与 tar 列表）" >&2
+      miss=1
+    fi
+  done
+  if [ "$miss" -ne 0 ]; then
+    rm -f "$tarball" "$tarball.sig"
+    echo "    已删除残缺产物：$tarball" >&2
+    exit 1
+  fi
 }
 
 pack x86_64-unknown-linux-musl amd64
