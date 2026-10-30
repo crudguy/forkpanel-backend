@@ -52,7 +52,8 @@ PANEL_RELEASE_BASE=https://releases.forkpanel.dev sudo -E sh get-panel.sh
 ## 卸载
 
 ```bash
-/usr/local/bin/panel --config /etc/forkpanel/config.toml uninstall   # 或 ./deploy/uninstall.sh
+sudo panel uninstall        # 等价于 /usr/local/bin/panel --config /etc/forkpanel/config.toml uninstall
+# 源码树里另有 deploy/uninstall.sh：有二进制时直接 exec 上面的命令，不是第二套实现
 ```
 卸载保留数据与配置；如需彻底清除 `/var/lib/forkpanel`、`/var/log/forkpanel`、`/etc/forkpanel` 请手动删除。
 

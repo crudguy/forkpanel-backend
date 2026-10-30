@@ -569,15 +569,16 @@ MySQL 侧无需这两个参数：`mysqldump` 默认就带 `DROP TABLE IF EXISTS`
 ## 6. 升级与卸载
 
 ```bash
-# 升级：覆盖二进制后重启（配置不会被覆盖）
-sudo ./deploy/install.sh ./target/release/panel
-sudo systemctl restart panel
+# 升级（保留配置与数据）
+sudo sh get-panel.sh          # 下载新版本 → 验签 → 覆盖二进制 → 重启
+# 源码部署：sudo ./deploy/install.sh ./target/release/panel
 
-# 卸载
-sudo ./deploy/uninstall.sh
+# 卸载（二进制自带，任何目录都能跑）
+sudo panel uninstall
 ```
 
 卸载保留 `/var/lib/forkpanel`、`/etc/forkpanel`、`/var/log/forkpanel`（含账号与数据），确认后自行删除。
+源码树里的 `deploy/uninstall.sh` 是同一实现的薄包装（有二进制时直接 `exec panel uninstall`），仅供习惯相对路径的人使用。
 
 ---
 
