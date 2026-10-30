@@ -25,7 +25,7 @@
 #   PANEL_MIRRORS=...      逗号分隔的备用源基址，按顺序回退
 #   PANEL_PUBKEY_FILE=...  用外部公钥文件覆盖内嵌公钥（密钥轮换 / E2E 自签测试）
 #   PANEL_CACHE_DIR=...           断点续传的半成品缓存目录（默认 $HOME/.cache/forkpanel-install）；E2E 用它隔离
-#   PANEL_CACHE_MAX_AGE_DAYS=...  陈旧半成品保留天数，超过则清理（默认 3）
+#                               缓存清理为事件驱动：下载完成 / 验签失败 / 全部源失败才清，不按时间保留。
 #   --no-install           仅下载验签不解装
 #
 # 安全设计：
@@ -164,16 +164,16 @@ WORK="$(mktemp -d)"
 #   跨重启仍落盘，断点续传不受影响。
 CACHE_DIR="${PANEL_CACHE_DIR:-${HOME:-/tmp}/.cache/forkpanel-install}"
 mkdir -p "$CACHE_DIR"
-# 清理陈旧的半成品（死源 / 废弃 URL 的残留），避免缓存无限堆积；
-# 在途续传的半成品 mtime 是最近的，不会被误删。保留天数由 PANEL_CACHE_MAX_AGE_DAYS 控制（默认 3）。
-CACHE_MAX_AGE="${PANEL_CACHE_MAX_AGE_DAYS:-3}"
-find "$CACHE_DIR" -type f -mtime "+$CACHE_MAX_AGE" -delete 2>/dev/null || true
+# 缓存清理走"事件驱动"而非按时间：下载完成（装完 / --no-install 正常结束）、验签失败、
+# 或所有源均失败时才清；在途续传的半成品一直保留以支持断点续传。
 [ "$have_tty" -eq 1 ] && echo "==> 断点续传缓存目录：$CACHE_DIR"
 # 退出时：临时解包区永远清；缓存 tarball 仅在「成功装完 / --no-install 正常结束」后清
 # （CLEAN_CACHE=1），中途被打断 / 失败则保留半成品，下次运行才能续传。
 CHOSEN_TAR=""; CHOSEN_SIG=""
 CLEAN_CACHE=0
-trap 'rm -rf "$WORK"; if [ "$CLEAN_CACHE" -eq 1 ] && [ -n "${CHOSEN_TAR:-}" ]; then rm -f "$CHOSEN_TAR" "$CHOSEN_SIG"; fi' EXIT
+# 退出时：临时解包区永远清；缓存 tarball 仅在「事件」触发清理——下载完成（CLEAN_CACHE=1）
+# 时清掉整个缓存目录（装完即清，无需再续传）；中断 / 验签失败 / 全源失败由各自分支清理或保留。
+trap 'rm -rf "$WORK"; [ "$CLEAN_CACHE" -eq 1 ] && rm -f "$CACHE_DIR"/* 2>/dev/null' EXIT
 
 # 验签公钥：优先 PANEL_PUBKEY_FILE（密钥轮换 / E2E 自签测试），否则内嵌。
 if [ -n "${PANEL_PUBKEY_FILE:-}" ]; then
@@ -201,6 +201,8 @@ diagnose_fetch_fail() {
   echo "       在能访问 GitHub 的机器下载 panel-linux-$ARCH.tar.gz 与 .sig，" >&2
   echo "       scp 到本机后：tar xzf panel-linux-$ARCH.tar.gz && sudo sh ./install.sh ./panel" >&2
   echo "  4) 若脚本打印具体源的 404：检查 PANEL_VERSION（默认 latest）或源基址是否拼写错误。" >&2
+  # 全部失败：所有源的半成品都已无用（无源可续传），清掉缓存避免堆积
+  rm -f "$CACHE_DIR"/* 2>/dev/null
   exit 1
 }
 
