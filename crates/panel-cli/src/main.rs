@@ -1606,23 +1606,17 @@ fn show_panel_status(cli: &Cli, os: &Arc<dyn panel_os::OsAdapter>) -> Result<()>
             cfg.paths.data.clone().unwrap_or_else(|| layout0.data_dir()).display()
         );
     }
-    // 服务状态（不依赖 root）
-    let svc = std::process::Command::new("systemctl")
-        .args(["is-active", "--quiet", "panel"])
-        .status()
-        .map(|s| if s.success() { "active" } else { "inactive / 未安装" })
-        .unwrap_or("inactive / 未安装");
-    println!("  服务       {svc}");
-    // 版本（无需 root；二进制不存在则跳过）
-    if let Ok(exe) = std::env::current_exe() {
-        if exe.exists() {
-            if let Ok(out) = std::process::Command::new(&exe).arg("--version").output() {
-                let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !v.is_empty() {
-                    println!("  版本       {v}");
-                }
-            }
-        }
+    // 服务状态（不依赖 root）。进程调用一律走 panel-os 的唯一出口
+    // （ci/check-layering.sh 规则[1]：cmd.rs 之外不得直接 spawn）。
+    let active = panel_os::run_sync(panel_os::Bin::Systemctl, &["is-active", "--quiet", "panel"])
+        .map(|o| o.code == Some(0))
+        .unwrap_or(false);
+    println!("  服务       {}", if active { "active" } else { "inactive / 未安装" });
+    // 版本：直接让 clap 渲染，不必再 spawn 自身二进制去问一次 `--version`
+    let v = Cli::command().render_version();
+    let v = v.trim();
+    if !v.is_empty() {
+        println!("  版本       {v}");
     }
     Ok(())
 }
@@ -1688,27 +1682,27 @@ fn do_set_bind(cli: &Cli, os: &Arc<dyn panel_os::OsAdapter>, addr: &str, yes: bo
 
 /// 写配置后按需重启 panel 服务（systemd 已 enable 才 restart；否则提示下次启动生效）。
 fn restart_panel_service() -> Result<()> {
-    let has_systemctl = std::process::Command::new("systemctl")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
+    // 三处进程调用都走 panel-os 唯一出口（ci/check-layering.sh 规则[1]）。
+    let has_systemctl = panel_os::run_sync(panel_os::Bin::Systemctl, &["--version"])
+        .map(|o| o.code == Some(0))
         .unwrap_or(false);
     if !has_systemctl {
         println!("· 未检测到 systemd，改动将在下次手动启动生效");
         return Ok(());
     }
-    let enabled = std::process::Command::new("systemctl")
-        .args(["is-enabled", "--quiet", "panel"])
-        .status()
-        .map(|s| s.success())
+    let enabled = panel_os::run_sync(panel_os::Bin::Systemctl, &["is-enabled", "--quiet", "panel"])
+        .map(|o| o.code == Some(0))
         .unwrap_or(false);
     if !enabled {
         println!("· 未检测到 panel 的 systemd 单元，改动将在下次启动生效");
         return Ok(());
     }
-    match std::process::Command::new("systemctl").args(["restart", "panel"]).status() {
-        Ok(s) if s.success() => println!("· 已重启 panel"),
-        Ok(s) => eprintln!("· ⚠ 重启失败（退出码 {s}）：journalctl -u panel -n 50 --no-pager"),
+    match panel_os::run_sync(panel_os::Bin::Systemctl, &["restart", "panel"]) {
+        Ok(o) if o.code == Some(0) => println!("· 已重启 panel"),
+        Ok(o) => eprintln!(
+            "· ⚠ 重启失败（退出码 {:?}）：journalctl -u panel -n 50 --no-pager",
+            o.code
+        ),
         Err(e) => eprintln!("· ⚠ 重启命令执行失败：{e}"),
     }
     Ok(())
@@ -1775,21 +1769,20 @@ fn run_menu(cli: &Cli, os: &Arc<dyn panel_os::OsAdapter>) -> Result<()> {
             }
             "4" => {
                 let u = prompt_line("用户名：")?;
-                if let Err(e) = reexec_panel(cli, &["passwd", &u]) {
+                if let Err(e) = run_subcommand(cli, Cmd::Passwd { user: u, pass: None }) {
                     eprintln!("panel: {e}");
                 }
             }
             "5" => print_expose_help(),
             "6" => print_upgrade_help(),
             "7" => {
-                if let Err(e) = reexec_panel(cli, &["uninstall"]) {
+                if let Err(e) = run_subcommand(cli, Cmd::Uninstall) {
                     eprintln!("panel: {e}");
                 }
             }
             "8" => {
-                if let Err(e) = reexec_panel(cli, &["--help"]) {
-                    eprintln!("panel: {e}");
-                }
+                let _ = Cli::command().print_help();
+                println!();
             }
             "0" | "q" | "Q" => break,
             _ => eprintln!("无效选择：{choice}"),
@@ -1798,23 +1791,19 @@ fn run_menu(cli: &Cli, os: &Arc<dyn panel_os::OsAdapter>) -> Result<()> {
     Ok(())
 }
 
-/// 复用同一份 `panel` 二进制执行子命令（口令 / 卸载 / 帮助）。
-/// 用于菜单里那些本就由其它子命令实现的项，避免把长逻辑再抄一份。
-fn reexec_panel(cli: &Cli, args: &[&str]) -> Result<()> {
-    let exe = std::env::current_exe()
-        .map_err(|e| PanelError::Internal(format!("无法确定自身路径：{e}")))?;
-    let mut cmd = std::process::Command::new(&exe);
-    if let Some(c) = &cli.config {
-        cmd.arg("--config").arg(c);
-    }
-    cmd.args(args);
-    let status = cmd
-        .status()
-        .map_err(|e| PanelError::Internal(format!("执行 {args:?} 失败：{e}")))?;
-    if !status.success() {
-        return Err(PanelError::Internal(format!("子命令 {args:?} 退出码 {status}")));
-    }
-    Ok(())
+/// 菜单里那些本就由其它子命令实现的项（口令 / 卸载）：**进程内**委派给 `run()`。
+///
+/// 为什么不再 spawn 自身二进制（原 `reexec_panel` 的做法）：
+/// ① 架构上子进程只允许从 `panel-os/src/cmd.rs` 这一个出口出去，
+///    `ci/check-layering.sh` 规则[1] 会拦住 cmd.rs 之外的进程调用
+/// ② 进程内委派还省掉一次「重新解析配置 / 重建 adapter」，且天然继承菜单
+///    已拿到的 `--config` / `--tier`，不存在漏传参数的可能。
+fn run_subcommand(cli: &Cli, cmd: Cmd) -> Result<()> {
+    run(Cli {
+        config: cli.config.clone(),
+        tier: cli.tier.clone(),
+        cmd: Some(cmd),
+    })
 }
 
 fn print_expose_help() {
