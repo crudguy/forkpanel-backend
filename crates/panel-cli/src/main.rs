@@ -1778,6 +1778,11 @@ fn run_menu(cli: &Cli, os: &Arc<dyn panel_os::OsAdapter>) -> Result<()> {
             "7" => {
                 if let Err(e) = run_subcommand(cli, Cmd::Uninstall) {
                     eprintln!("panel: {e}");
+                } else {
+                    // 卸载已删磁盘二进制，但本菜单进程仍驻内存（删文件不影响在跑的进程）。
+                    // 若不清退，loop 会回显菜单让人误以为「没卸干净」。卸载成功即退出菜单。
+                    println!("面板已卸载，正在退出菜单。");
+                    break;
                 }
             }
             "8" => {
