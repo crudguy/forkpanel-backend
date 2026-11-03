@@ -10,6 +10,11 @@
 //! 且 `auto=true`（由真实状态判定）的步骤在前端禁用勾选框：勾了也不会改变
 //! 结果，做成可点就是假动作。
 //!
+//! ⭐**必做 vs 推荐**：`required` 控制该步是否计入「完成判据」（清单收起 / 进度条）。
+//! WAF 属安全加固而非上手必做，标为推荐（`required=false`）——否则「完成清单」会
+//! 强制新手一上来就开 WAF（可能误伤业务）。推荐项仍由真实状态自动判定，只是不
+//! 阻塞清单收起。
+//!
 //! 权限：GET 只需登录（清单是给所有人看的「这台机器还差什么」）；
 //! PUT（勾选 / 不再显示）需 `settings.manage`——清单是面板级共享进度，
 //! 不能让任意只读账号把它关掉。
@@ -28,6 +33,7 @@ const K_ONBOARDING: &str = "onboarding.state";
 
 /// 步骤定义。`auto_sql` = 用真实数据判定该步是否已完成（None = 后端无法判定，
 /// 只能靠用户自己勾，如「信任根证书」发生在**用户本机浏览器**上）。
+/// `required` = 是否计入完成判据（false = 推荐项，不阻塞清单收起）。
 struct StepDef {
     id: &'static str,
     title: &'static str,
@@ -35,10 +41,14 @@ struct StepDef {
     /// 前端路由（清单每步「前往」直达的路径）
     route: &'static str,
     auto_sql: Option<&'static str>,
+    /// 是否计入「完成判据」（allDone / 进度条）。false = 推荐项，不阻塞清单收起。
+    /// WAF 属安全加固而非上手必做，标为推荐避免诱导新手一上来就开 WAF 误伤业务。
+    required: bool,
 }
 
 /// 顺序即清单顺序：信任根证书 → 创建站点 → 申请证书 → 开启 WAF → 备份计划。
 /// 与评估报告 C2 的建议一致，也与证书页自身的提示（"尚未建站时也应先信任根证书"）呼应。
+/// WAF 为推荐项（required=false），其余四步（含唯一人工项 trust_ca）为必做。
 const STEPS: [StepDef; 5] = [
     StepDef {
         id: "trust_ca",
@@ -46,6 +56,7 @@ const STEPS: [StepDef; 5] = [
         desc: "在证书页下载根证书并导入本机/浏览器信任链。之后访问面板自签证书的站点才不会报警。",
         route: "/certs",
         auto_sql: None,
+        required: true,
     },
     StepDef {
         id: "create_site",
@@ -53,6 +64,7 @@ const STEPS: [StepDef; 5] = [
         desc: "在网站页新建站点：填域名与根目录，创建后需「应用」才会真正下发配置。",
         route: "/sites",
         auto_sql: Some("SELECT COUNT(*) FROM sites"),
+        required: true,
     },
     StepDef {
         id: "issue_cert",
@@ -60,13 +72,15 @@ const STEPS: [StepDef; 5] = [
         desc: "在证书页申请（或导入）证书并绑到站点。自签证书仅供内网/测试，公网请用 ACME。",
         route: "/certs",
         auto_sql: Some("SELECT COUNT(*) FROM ssl_certs"),
+        required: true,
     },
     StepDef {
         id: "enable_waf",
-        title: "开启 WAF 防护",
-        desc: "在 WAF 页为站点开启规则集（basic / strict）与 CC 限速。开启前先确认业务不受影响。",
+        title: "开启 WAF 防护（推荐）",
+        desc: "在 WAF 页为站点开启规则集（basic / strict）与 CC 限速。开启前先确认业务不受影响——属安全加固，非必做。",
         route: "/waf",
         auto_sql: Some("SELECT COUNT(*) FROM sites WHERE waf_enabled = 1"),
+        required: false,
     },
     StepDef {
         id: "backup_plan",
@@ -74,6 +88,7 @@ const STEPS: [StepDef; 5] = [
         desc: "在备份页建一个定时计划。注意：加密备份的主密钥丢了就再也解不开，务必另行保管。",
         route: "/backups",
         auto_sql: Some("SELECT COUNT(*) FROM backup_jobs"),
+        required: true,
     },
 ];
 
@@ -89,10 +104,12 @@ pub struct StepOut {
     pub route: String,
     /// 用户手动勾选
     pub checked: bool,
-    /// 由后端真实状态判定已完成（此时勾选框禁用：勾不勾结果都一样）
+    /// 由后端真实状态判定已完成（此时勾选框禁用：勾了也不会改变结果）
     pub auto: bool,
     /// checked || auto —— 前端只看这个
     pub done: bool,
+    /// 是否计入完成判据（false = 推荐项，如 WAF，不阻塞清单收起）
+    pub required: bool,
 }
 
 /// 落库形态。字段全带默认值：存量脏数据（少字段 / 类型不符）一律回落空进度，
@@ -128,6 +145,7 @@ fn render(checked: &[String], auto: &[bool]) -> Vec<StepOut> {
                 checked,
                 auto: auto_done,
                 done: checked || auto_done,
+                required: s.required,
             }
         })
         .collect()
@@ -285,6 +303,17 @@ mod tests {
     }
 
     #[test]
+    fn waf_is_recommended_not_required() {
+        // WAF 是安全加固项，不是上手必做：计入推荐但不阻塞 allDone，
+        // 避免「完成清单」被迫要求新手一上来就开 WAF（可能误伤业务）。
+        let w = STEPS.iter().find(|s| s.id == "enable_waf").expect("enable_waf");
+        assert!(!w.required, "WAF 不应计入完成判据");
+        assert!(w.auto_sql.is_some(), "WAF 仍由真实状态自动判定");
+        // 其余四步（含唯一人工项 trust_ca）都是必做
+        assert!(STEPS.iter().filter(|s| s.id != "enable_waf").all(|s| s.required));
+    }
+
+    #[test]
     fn auto_done_overrides_unchecked() {
         // 真实状态已完成 ⇒ 即使没勾也必须是 done，且 auto=true（前端据此禁用勾选框）
         let out = render(&[], &flags(&["create_site"]));
@@ -292,6 +321,8 @@ mod tests {
         assert!(s.done, "自动判定的步骤必须算完成");
         assert!(s.auto);
         assert!(!s.checked);
+        // 必做项的 required 必须透传到前端
+        assert!(s.required);
     }
 
     #[test]
@@ -299,6 +330,17 @@ mod tests {
         let out = render(&["trust_ca".to_string()], &flags(&[]));
         let s = out.iter().find(|x| x.id == "trust_ca").expect("trust_ca");
         assert!(s.done && s.checked && !s.auto);
+        assert!(s.required);
+    }
+
+    #[test]
+    fn recommended_step_excluded_from_required_flag() {
+        // 推荐项（WAF）的 required=false 必须透传到前端，供前端排除出完成判据
+        let out = render(&[], &flags(&["enable_waf"]));
+        let w = out.iter().find(|x| x.id == "enable_waf").expect("enable_waf");
+        assert!(!w.required);
+        // 即便真实状态已完成，仍是推荐、不计入必做
+        assert!(w.done && w.auto && !w.required);
     }
 
     #[test]

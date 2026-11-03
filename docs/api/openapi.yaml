@@ -1373,6 +1373,7 @@ components:
         checked: { type: boolean, description: 用户手动勾选 }
         auto:    { type: boolean, description: 由后端真实状态判定已完成（此时勾选框禁用：勾了结果也不变） }
         done:    { type: boolean, description: checked || auto —— 前端只看这一个字段 }
+        required:{ type: boolean, description: 是否计入完成判据；false = 推荐项（如 WAF），不阻塞清单收起 }
     OnboardingState:
       type: object
       description: 首启上手清单整体状态（读：仅需登录；写：需 settings.manage）
