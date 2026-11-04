@@ -478,30 +478,32 @@ pub fn parse_compose_import(yaml: &str, env_text: Option<&str>) -> Result<Compos
         });
     }
 
-    let root: Value = serde_yaml::from_str(yaml).map_err(|e| PanelError::Validation {
-        field: "yaml",
-        reason: format!("YAML 解析失败：{e}"),
-    })?;
-
-    let root_map = match root {
-        Value::Mapping(m) => m,
-        _ => {
-            return Err(PanelError::Validation {
-                field: "yaml",
-                reason: "compose 顶层必须是映射（services: ...）".into(),
-            })
-        }
-    };
+    // 多文档合并 + `<<` 合并键展开，见 parse_yaml_root 的注释。
+    let (root_map, mut warnings) = parse_yaml_root(yaml)?;
 
     // 项目名：优先用 compose 顶层 `name`；可能不合法，交给后续校验报错。
     let project = val_str(&root_map, "name").unwrap_or_default();
 
-    let mut warnings = Vec::new();
     for k in root_keys(&root_map) {
+        // `x-` 是 compose 官方约定的自定义扩展段（`x-common: &common` 就靠它做锚点），
+        // 真 compose 会静默忽略，这里也不该报"不在支持范围"的假警报。
+        if k.starts_with("x-") {
+            continue;
+        }
         if !matches!(k.as_str(), "name" | "version" | "services" | "service") {
-            warnings.push(format!(
-                "顶层字段 `{k}` 不在面板支持范围，已忽略（如 networks / volumes / secrets）"
-            ));
+            // 顶层 `volumes` 几乎每份真 compose 都有。服务引用的具名卷会被自动声明，
+            // 只有 `name:` / `driver:` 这类自定义选项被忽略——别让用户以为卷丢了。
+            if k == "volumes" {
+                warnings.push(
+                    "顶层 volumes 的 name/driver 等自定义选项已忽略；服务引用的具名卷会按 \
+                     `<项目>_<卷名>` 自动声明"
+                        .to_string(),
+                );
+            } else {
+                warnings.push(format!(
+                    "顶层字段 `{k}` 不在面板支持范围，已忽略（如 networks / secrets / configs）"
+                ));
+            }
         }
     }
 
@@ -520,6 +522,8 @@ pub fn parse_compose_import(yaml: &str, env_text: Option<&str>) -> Result<Compos
     let mut dropped: Vec<ComposeImportDropped> = Vec::new();
     // 敏感宿主挂载在抽取阶段就剔除（绝不进 spec），同时记下来变成阻断错误。
     let mut blocked_volumes: Vec<String> = Vec::new();
+    // 抽取阶段就能判定"导不进来"的硬错误（如只有 build: 没有 image）。
+    let mut hard_errors: Vec<String> = Vec::new();
 
     for (name_val, svc_val) in services_map.iter() {
         let Value::String(name) = name_val else { continue };
@@ -589,6 +593,20 @@ pub fn parse_compose_import(yaml: &str, env_text: Option<&str>) -> Result<Compos
             }
         }
 
+        // 真 compose 里最常见的两个"导不进来"原因，直接给可操作的提示，
+        // 而不是只在 dropped 里留个字段名（用户看到 `build` 三个字母不知道下一步做什么）。
+        if val_at(svc_map, "build").is_some() && svc.image.is_empty() {
+            hard_errors.push(format!(
+                "服务 {name} 只有 build: 定义，面板不执行本地构建——请先构建出镜像，再在 compose 里补 image"
+            ));
+        }
+        if let Some(v) = val_at(svc_map, "env_file") {
+            let files = yaml_string_list_loose(v).join("、");
+            warnings.push(format!(
+                "服务 {name} 的 env_file（{files}）不会被读取：请把该文件内容粘贴到下方 .env 输入框"
+            ));
+        }
+
         services.push(svc);
     }
 
@@ -619,6 +637,7 @@ pub fn parse_compose_import(yaml: &str, env_text: Option<&str>) -> Result<Compos
         .into_iter()
         .map(|v| format!("已拒绝：{v}"))
         .collect();
+    errors.extend(hard_errors);
     // 只校验服务；项目名要等用户在导入弹窗里填写（见 validate_stack_services 注释）。
     if let Err(e) = validate_stack_services(&spec.services) {
         errors.push(e.to_string());
@@ -639,6 +658,142 @@ pub fn parse_compose_import(yaml: &str, env_text: Option<&str>) -> Result<Compos
         warnings,
         errors,
     })
+}
+
+/// YAML 1.1 合并键（`<<: *common`）。
+const MERGE_KEY: &str = "<<";
+
+/// 把整份 YAML 解析成**一个**顶层映射，并返回解析期间产生的提示。
+///
+/// 这里踩过两个真机坑，都是"外部 compose 明明合法却导不进来"：
+///
+/// 1. **多文档**：`serde_yaml::from_str` 只吃单文档，碰到第二个 `---` 就报
+///    “deserializing from YAML containing more than one document is not supported”。
+///    而 docker compose 自己是**支持**的——实测 Compose v5.7.0 会把同一文件里的
+///    多个文档深合并（映射按键递归合并、序列拼接、标量后者覆盖，见 [`merge_yaml`]）。
+///    所以这里照 compose 的语义合并，**不能只取第一个文档**：那会静默丢掉后续文档
+///    里的服务，用户看到"导入成功但少了一半服务"。空文档（多余的 `---`，从文档里
+///    复制粘贴时极常见）docker 会直接报错，这里跳过并提示，不阻断导入。
+/// 2. **合并键 `<<`**：`x-common: &common` + `<<: *common` 是 compose 最常用的复用写法，
+///    但 `serde_yaml` 0.9 未实现 YAML 1.1 的合并键语义——`<<` 会原样留成一个键，值就是
+///    锚点内容。不展开的话继承来的 `image` / `ports` 会**静默丢失**（服务只剩自己显式
+///    写的那几个字段），所以解析后必须走一遍 [`expand_merge_keys`]。
+fn parse_yaml_root(yaml: &str) -> Result<(serde_yaml::Mapping, Vec<String>)> {
+    let mut warnings: Vec<String> = Vec::new();
+    let mut docs = 0usize;
+    let mut blanks = 0usize;
+    let mut merged: Option<Value> = None;
+
+    for doc in serde_yaml::Deserializer::from_str(yaml) {
+        let v = Value::deserialize(doc).map_err(|e| PanelError::Validation {
+            field: "yaml",
+            reason: format!("YAML 解析失败：{e}"),
+        })?;
+        if v.is_null() {
+            blanks += 1;
+            continue;
+        }
+        if !v.is_mapping() {
+            return Err(PanelError::Validation {
+                field: "yaml",
+                reason: "compose 顶层必须是映射（services: ...）".into(),
+            });
+        }
+        docs += 1;
+        match merged.as_mut() {
+            Some(base) => merge_yaml(base, v),
+            None => merged = Some(v),
+        }
+    }
+
+    if docs > 1 {
+        warnings.push(format!(
+            "文件含 {docs} 个 YAML 文档，已按 docker compose 的规则合并为一份（映射深合并、列表拼接）"
+        ));
+    }
+    if blanks > 0 && docs > 0 {
+        warnings.push(format!(
+            "已忽略 {blanks} 个空的 YAML 文档（多余的 `---` 分隔符）"
+        ));
+    }
+
+    let Some(mut root) = merged else {
+        return Err(PanelError::Validation {
+            field: "yaml",
+            reason: "compose 内容为空".into(),
+        });
+    };
+    expand_merge_keys(&mut root);
+
+    let Value::Mapping(m) = root else {
+        // 顶层类型在上面已逐个文档校验过，这里只是把类型收窄。
+        return Err(PanelError::Validation {
+            field: "yaml",
+            reason: "compose 顶层必须是映射（services: ...）".into(),
+        });
+    };
+    Ok((m, warnings))
+}
+
+/// 按 docker compose 的规则合并两个文档（实测 Compose v5.7.0）：
+/// 映射按键递归合并；序列**拼接**（`ports` 在两份文档里都写会得到两条映射）；
+/// 其余标量后者覆盖前者。
+fn merge_yaml(base: &mut Value, over: Value) {
+    match (base, over) {
+        (Value::Mapping(b), Value::Mapping(o)) => {
+            for (k, v) in o {
+                if let Some(slot) = b.get_mut(k.clone()) {
+                    merge_yaml(slot, v);
+                } else {
+                    b.insert(k, v);
+                }
+            }
+        }
+        (Value::Sequence(b), Value::Sequence(mut o)) => b.append(&mut o),
+        (slot, v) => *slot = v,
+    }
+}
+
+/// 递归展开 YAML 1.1 合并键 `<<`（值可以是单个映射，也可以是映射序列）。
+/// 映射里显式写出的键优先；多个来源之间**靠前的优先**（YAML 1.1 规定）。
+fn expand_merge_keys(v: &mut Value) {
+    match v {
+        Value::Mapping(m) => {
+            for (_, val) in m.iter_mut() {
+                expand_merge_keys(val);
+            }
+            let Some(src) = m.remove(Value::String(MERGE_KEY.to_string())) else {
+                return;
+            };
+            let mut sources = match src {
+                Value::Sequence(seq) => seq,
+                other => vec![other],
+            };
+            // 先把要补的键全部算出来再插入：中途插入会让后来来源的同名键被
+            // `contains_key` 挡掉，语义就反转成"后者覆盖"了。
+            let mut inherited: Vec<(Value, Value)> = Vec::new();
+            for s in sources.iter_mut() {
+                expand_merge_keys(s);
+                let Value::Mapping(sm) = s else { continue };
+                for (k, val) in sm.iter() {
+                    let already = m.contains_key(k.clone())
+                        || inherited.iter().any(|(ik, _)| ik == k);
+                    if !already {
+                        inherited.push((k.clone(), val.clone()));
+                    }
+                }
+            }
+            for (k, val) in inherited {
+                m.insert(k, val);
+            }
+        }
+        Value::Sequence(seq) => {
+            for e in seq.iter_mut() {
+                expand_merge_keys(e);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// 取映射里的字符串值（`name` / `restart` 这类）。
@@ -1362,6 +1517,183 @@ services:
             p.warnings.iter().any(|w| w.contains("name")),
             "应提示顶层 name 不可用：{:?}",
             p.warnings
+        );
+    }
+
+    /// ⭐⭐ 回归（真机报错原文）：从文档/聊天里复制来的 compose 常带多个 `---` 文档，
+    /// `serde_yaml::from_str` 只吃单文档，直接报
+    /// “deserializing from YAML containing more than one document is not supported”。
+    /// docker compose 自己是支持的：多文档深合并、列表拼接、标量后者覆盖（Compose v5.7.0 实测）。
+    #[test]
+    fn import_merges_multiple_documents() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:80"
+    environment:
+      A: "1"
+---
+services:
+  web:
+    ports:
+      - "9090:90"
+    environment:
+      B: "2"
+  db:
+    image: postgres:16-alpine
+"#;
+        let p = parse_compose_import(yaml, None).expect("多文档 YAML 必须能解析");
+        assert!(p.errors.is_empty(), "不应有阻断错误：{:?}", p.errors);
+        assert_eq!(p.spec.services.len(), 2, "两份文档里的服务都要在");
+        let web = p.spec.services.iter().find(|s| s.name == "web").unwrap();
+        assert_eq!(
+            web.image, "nginx:1.27-alpine",
+            "前一份文档的 image 不能被后一份覆盖掉"
+        );
+        assert_eq!(
+            web.ports,
+            vec!["8080:80".to_string(), "9090:90".to_string()],
+            "列表按 docker compose 语义拼接"
+        );
+        assert_eq!(web.env, vec!["A=1".to_string(), "B=2".to_string()]);
+        assert!(
+            p.spec.services.iter().any(|s| s.name == "db"),
+            "第二份文档里的服务不能被静默丢掉"
+        );
+        assert!(
+            p.warnings.iter().any(|w| w.contains("2 个 YAML 文档")),
+            "应提示已合并：{:?}",
+            p.warnings
+        );
+    }
+
+    /// 尾部多余的 `---`（粘贴时最常见）会产出一个空文档。docker compose 直接报
+    /// “top-level object must be a mapping”，这里跳过并提示——否则用户得手工删掉一个
+    /// 看不见的分隔符才能导入。
+    #[test]
+    fn import_skips_empty_trailing_document() {
+        let yaml = "services:\n  web:\n    image: nginx\n---\n";
+        let p = parse_compose_import(yaml, None).expect("尾部 --- 不应导致失败");
+        assert!(p.errors.is_empty(), "{:?}", p.errors);
+        assert_eq!(p.spec.services.len(), 1);
+        assert!(
+            p.warnings.iter().any(|w| w.contains("空的 YAML 文档")),
+            "应提示跳过了空文档：{:?}",
+            p.warnings
+        );
+    }
+
+    /// ⭐⭐ 回归：`x-common: &common` + `<<: *common` 是 compose 最常见的复用写法，但
+    /// `serde_yaml` 0.9 不实现 YAML 1.1 合并键语义——`<<` 会原样留成一个键。不展开就会
+    /// **静默丢掉**继承来的 image/restart，服务镜像为空，最后报一个看不懂的"镜像不能为空"。
+    #[test]
+    fn import_expands_merge_key_anchor() {
+        let yaml = r#"
+x-common: &common
+  image: nginx:1.27-alpine
+  restart: unless-stopped
+  environment:
+    TZ: Asia/Shanghai
+services:
+  web:
+    <<: *common
+    ports:
+      - "8080:80"
+"#;
+        let p = parse_compose_import(yaml, None).expect("解析应成功");
+        assert!(p.errors.is_empty(), "合并键必须展开：{:?}", p.errors);
+        let s = &p.spec.services[0];
+        assert_eq!(s.image, "nginx:1.27-alpine", "image 应继承自锚点");
+        assert_eq!(s.restart.as_deref(), Some("unless-stopped"));
+        assert_eq!(s.env, vec!["TZ=Asia/Shanghai".to_string()]);
+        assert_eq!(s.ports, vec!["8080:80".to_string()]);
+        assert!(
+            !p.dropped.iter().any(|d| d.field == MERGE_KEY),
+            "`<<` 已展开，不该出现在 dropped：{:?}",
+            p.dropped
+        );
+        assert!(
+            !p.warnings.iter().any(|w| w.contains("x-common")),
+            "`x-` 扩展段是 compose 官方约定，不该报「不在支持范围」：{:?}",
+            p.warnings
+        );
+    }
+
+    /// 合并键优先级：显式键 > 靠前的来源 > 靠后的来源（YAML 1.1）。
+    #[test]
+    fn import_merge_key_priority() {
+        let yaml = r#"
+x-a: &a
+  image: from-a
+  restart: always
+x-b: &b
+  image: from-b
+  mem_limit: 256m
+services:
+  web:
+    <<: [*a, *b]
+    image: explicit
+"#;
+        let p = parse_compose_import(yaml, None).expect("解析应成功");
+        let s = &p.spec.services[0];
+        assert_eq!(s.image, "explicit", "显式键优先于合并键");
+        assert_eq!(s.restart.as_deref(), Some("always"), "来源 a 优先于来源 b");
+        assert_eq!(s.mem_limit.as_deref(), Some("256m"), "来源 b 独有的键仍要继承");
+    }
+
+    /// 只有 `build:` 没有 `image:` 的服务必须给可操作错误，而不是笼统的"镜像不能为空"。
+    #[test]
+    fn import_build_only_service_reports_actionable_error() {
+        let yaml = "services:\n  web:\n    build: .\n";
+        let p = parse_compose_import(yaml, None).expect("解析应成功");
+        assert!(
+            p.errors.iter().any(|e| e.contains("build")),
+            "应给出 build 相关的可操作错误：{:?}",
+            p.errors
+        );
+    }
+
+    /// `env_file` 不会被读取（面板不读外部文件），必须提示用户把内容粘到 .env 输入框。
+    #[test]
+    fn import_env_file_is_reported_with_hint() {
+        let yaml = "services:\n  web:\n    image: nginx\n    env_file: .env\n";
+        let p = parse_compose_import(yaml, None).expect("解析应成功");
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("env_file") && w.contains(".env")),
+            "应提示 env_file 未读取并指向 .env 输入框：{:?}",
+            p.warnings
+        );
+        assert!(
+            p.dropped.iter().any(|d| d.field == "env_file"),
+            "env_file 仍应出现在 dropped"
+        );
+    }
+
+    /// 顶层 `volumes` 是每份真 compose 都有的一段：不能报成"不在面板支持范围"
+    /// （那会让用户以为具名卷丢了），但 `name:`/`driver:` 确实不生效，要说明。
+    #[test]
+    fn import_top_level_volumes_gets_accurate_warning() {
+        let yaml = r#"
+services:
+  db:
+    image: postgres:16-alpine
+    volumes:
+      - data:/var/lib/postgresql/data
+volumes:
+  data:
+    name: my-pgdata
+"#;
+        let p = parse_compose_import(yaml, None).expect("解析应成功");
+        assert!(p.errors.is_empty(), "{:?}", p.errors);
+        let w = p.warnings.join(" | ");
+        assert!(w.contains("具名卷"), "应说明具名卷会自动声明：{w}");
+        assert!(
+            !w.contains("顶层字段 `volumes`"),
+            "顶层 volumes 不该报成「不支持」：{w}"
         );
     }
 }

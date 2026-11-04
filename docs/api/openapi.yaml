@@ -3511,6 +3511,11 @@ paths:
 
         可选 `env` 为 `.env` 文件文本，其中的 `KEY=VALUE` 会合并到**所有**服务的环境变量。
         返回的 `errors` 非空时前端应禁止确认（阻断性校验失败）。
+
+        解析遵循 docker compose 的语义：同一份文本里的**多个 `---` 文档**按映射深合并、
+        列表拼接、标量后者覆盖（与 `docker compose` 一致，后续文档的服务不会被丢掉）；
+        空的 `---` 文档跳过并在 `warnings` 里说明；YAML 1.1 **合并键** `<<: *anchor`
+        （`x-common: &common` 复用写法）会被展开，因此 `x-` 扩展段不产生"字段不支持"提示。
       requestBody:
         required: true
         content:
