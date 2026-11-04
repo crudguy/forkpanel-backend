@@ -898,12 +898,23 @@ pub(crate) fn image_is_safe(img: &str) -> bool {
     !img.chars().any(|c| c.is_whitespace() || ";&|$`\\'\"<>(){}".contains(c))
 }
 
+/// 只读挂载也放行的宿主文件：内容与密钥无关，且容器几乎总要跟宿主对时。
+/// 白名单必须**显式逐个**列，不能写成「`/etc/*.ro` 一律放行」——`/etc/passwd`、
+/// `/etc/shadow` 这类即便只读也不该进容器（可离线爆破、可摸清账号）。
+const RO_MOUNT_OK: &[&str] = &["/etc/localtime", "/etc/timezone"];
+
 /// 若卷挂载的宿主源路径命中敏感目录，返回该路径（供错误信息）；否则 None。
 /// 具名卷（不含 `/`）放行；宿主路径（`/...`）才进入敏感判定。
 pub(crate) fn sensitive_host_mount(spec: &str) -> Option<&'static str> {
-    let src = spec.split(':').next().unwrap_or("").trim();
+    // `src:dst[:mode]`：必须连 mode 一起看，否则没法区分只读挂载。
+    let mut parts = spec.split(':');
+    let src = parts.next().unwrap_or("").trim();
     if src.is_empty() || !src.starts_with('/') {
         return None; // 空或具名卷
+    }
+    // 跳过 dst 取 mode（`/etc/localtime:/etc/localtime:ro`）。
+    if parts.nth(1).map(str::trim) == Some("ro") && RO_MOUNT_OK.contains(&src) {
+        return None;
     }
     const SENSITIVE: &[&str] = &["/", "/etc", "/var/run/docker.sock", "/proc", "/sys", "/var/run"];
     for s in SENSITIVE {
@@ -914,9 +925,15 @@ pub(crate) fn sensitive_host_mount(spec: &str) -> Option<&'static str> {
     None
 }
 
-/// 端口映射 `host:container[/proto]`：端口须为数字，proto 仅 tcp/udp。
+/// 端口映射 `[ip:]host:container[/proto]`：端口须为数字（允许 `8000-8010` 范围），
+/// proto 仅 tcp/udp。
+///
+/// IP 前缀是 compose 的标准写法，且是**收紧**监听面（`127.0.0.1:8000:80` 只绑回环），
+/// 必须放行——否则 vaultwarden / 各类"只绑本机再走反代"的官方 compose 会被判非法而
+/// 整个导入失败（真机报错：「端口映射格式非法…127.0.0.1:8000:80」）。
+/// IPv6 按 compose 规定写成方括号：`[::1]:8000:80`。
 pub(crate) fn port_mapping_is_safe(p: &str) -> bool {
-    let (hp, proto) = match p.split_once('/') {
+    let (body, proto) = match p.split_once('/') {
         Some((a, b)) => (a, Some(b)),
         None => (p, None),
     };
@@ -925,12 +942,41 @@ pub(crate) fn port_mapping_is_safe(p: &str) -> bool {
             return false;
         }
     }
-    match hp.split_once(':') {
-        Some((h, c)) => !h.is_empty() && !c.is_empty()
-            && h.chars().all(|x| x.is_ascii_digit() || x == '-')
-            && c.chars().all(|x| x.is_ascii_digit() || x == '-'),
-        None => false, // 必须有 host:container
+    let Some((host, container)) = split_port_body(body) else {
+        return false;
+    };
+    let is_port = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit() || c == '-');
+    is_port(host) && is_port(container)
+}
+
+/// 从端口串里拆出 `(host, container)`，允许前面带 IP 前缀；不合法返回 None。
+fn split_port_body(body: &str) -> Option<(&str, &str)> {
+    if let Some(rest) = body.strip_prefix('[') {
+        // IPv6 字面量：`[::1]:8000:80`。方括号内只允许十六进制、冒号、点（v4 映射）。
+        let end = rest.find(']')?;
+        let ip = &rest[..end];
+        if ip.is_empty() || !ip.chars().all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.') {
+            return None;
+        }
+        return rest[end + 1..].strip_prefix(':')?.split_once(':');
     }
+    match body.split(':').collect::<Vec<_>>().as_slice() {
+        [h, c] => Some((h, c)),
+        [ip, h, c] if ipv4_is_safe(ip) => Some((h, c)),
+        _ => None,
+    }
+}
+
+/// 只做"长度合理、纯数字点分、每段 0-255"的形状校验：真实可达性交给 docker 报错。
+fn ipv4_is_safe(ip: &str) -> bool {
+    let octets: Vec<&str> = ip.split('.').collect();
+    octets.len() == 4
+        && octets.iter().all(|o| {
+            !o.is_empty()
+                && o.len() <= 3
+                && o.chars().all(|c| c.is_ascii_digit())
+                && o.parse::<u16>().is_ok_and(|n| n <= 255)
+        })
 }
 
 /// 内存上限 `^\d+[kmg]?$`（大小写不敏感，单位可选）。
@@ -1623,6 +1669,30 @@ mod tests {
         assert!(sensitive_host_mount("").is_none());
     }
 
+    /// ⭐⭐ 回归（真机）：`/etc/localtime:ro` 是"容器跟宿主对时"的标准写法，只读单文件、
+    /// 不含任何密钥。旧实现按 `/etc/` 前缀一刀切，把 vaultwarden 的官方 compose 整份拒掉。
+    /// 白名单必须是**穷举 + 必须 :ro**：同目录下其它文件（passwd/shadow）依旧拦。
+    #[test]
+    fn sensitive_host_mount_allows_readonly_localtime() {
+        assert!(sensitive_host_mount("/etc/localtime:/etc/localtime:ro").is_none());
+        assert!(sensitive_host_mount("/etc/timezone:/etc/timezone:ro").is_none());
+        // 可写挂载不放行：容器能改宿主时区，属于越界
+        assert_eq!(
+            sensitive_host_mount("/etc/localtime:/etc/localtime"),
+            Some("/etc")
+        );
+        // 同目录的其它文件即使只读也拦
+        assert_eq!(sensitive_host_mount("/etc/passwd:/x:ro"), Some("/etc"));
+        assert_eq!(sensitive_host_mount("/etc/shadow:/x:ro"), Some("/etc"));
+        // 路径穿越不能绕过
+        assert_eq!(
+            sensitive_host_mount("/etc/localtime/../passwd:/x:ro"),
+            Some("/etc")
+        );
+        // 整个 /etc 目录依旧拒
+        assert_eq!(sensitive_host_mount("/etc:/etc:ro"), Some("/etc"));
+    }
+
     #[test]
     fn port_mapping_is_safe_valid() {
         assert!(port_mapping_is_safe("8080:80"));
@@ -1633,6 +1703,27 @@ mod tests {
         assert!(!port_mapping_is_safe("host:80"));                       // host 非数字
         assert!(!port_mapping_is_safe("80:container"));                  // container 非数字
         assert!(!port_mapping_is_safe("80:80/icmp"));                    // 非法 proto
+    }
+
+    /// ⭐⭐ 回归（真机）：compose 允许带 IP 前缀，且这是**收紧**监听面的写法
+    /// （`127.0.0.1:8000:80` 只绑回环）。旧实现要求恰好两段，把 vaultwarden 这类
+    /// 官方 compose 判成"端口格式非法"，整个导入失败。
+    #[test]
+    fn port_mapping_accepts_ip_prefix() {
+        assert!(port_mapping_is_safe("127.0.0.1:8000:80"));
+        assert!(port_mapping_is_safe("127.0.0.1:8000:80/tcp"));
+        assert!(port_mapping_is_safe("0.0.0.0:8080:80"));
+        assert!(port_mapping_is_safe("[::1]:8000:80"));                  // IPv6 方括号
+        assert!(port_mapping_is_safe("[::]:53:53/udp"));
+        assert!(port_mapping_is_safe("[::ffff:127.0.0.1]:8000:80"));
+        // 形状不对的一律拒，别让脏串进 docker argv
+        assert!(!port_mapping_is_safe("999.1.1.1:8000:80"));             // 段超 255
+        assert!(!port_mapping_is_safe("1.2.3:8000:80"));                 // 段数不足
+        assert!(!port_mapping_is_safe("1.2.3.4.5:8000:80"));
+        assert!(!port_mapping_is_safe("[zz]:8000:80"));                  // 非十六进制
+        assert!(!port_mapping_is_safe("[::1]8000:80"));                  // 缺冒号
+        assert!(!port_mapping_is_safe("127.0.0.1::80"));                 // 端口为空
+        assert!(!port_mapping_is_safe("1.2.3.4:80:80:80"));              // 段数过多
     }
 
     #[test]

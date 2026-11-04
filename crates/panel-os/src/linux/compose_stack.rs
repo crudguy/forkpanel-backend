@@ -559,12 +559,25 @@ pub fn parse_compose_import(yaml: &str, env_text: Option<&str>) -> Result<Compos
             // ⚠ 敏感宿主路径必须在**抽取阶段**剔除，不能只靠后面的
             // validate_stack_services：预览返回的 spec 也不允许带上 `/`、`/etc`、
             // docker.sock 这类挂载（前端会把它当"将创建的内容"展示出来）。
+            let mut rel_mounts: Vec<String> = Vec::new();
             for vol in yaml_volumes(v) {
                 if let Some(bad) = sensitive_host_mount(&vol) {
                     blocked_volumes.push(format!("服务 {name} 的卷 `{vol}` 命中宿主敏感路径 {bad}"));
                 } else {
+                    if is_relative_host_mount(&vol) {
+                        rel_mounts.push(vol.clone());
+                    }
                     svc.volumes.push(vol);
                 }
+            }
+            // 相对路径是导入迁移时最容易踩的一脚：`./vw-data` 在原项目里挨着它自己的
+            // compose 文件，导入后却相对**面板的栈目录**解析，用户会以为"数据丢了"。
+            if !rel_mounts.is_empty() {
+                warnings.push(format!(
+                    "服务 {name} 的挂载 {} 是相对路径：导入后会相对面板的栈目录解析，\
+                     迁移原有数据请改成绝对路径",
+                    rel_mounts.join("、")
+                ));
             }
         }
         if let Some(v) = val_at(svc_map, "restart") {
@@ -854,10 +867,17 @@ fn yaml_ports(v: &Value) -> Vec<String> {
                     if target.is_empty() {
                         None
                     } else if let Some(p) = published {
+                        // 长格式可能带 `host_ip`（只绑某个地址）。**绝不能丢**：丢了就变成
+                        // 绑 0.0.0.0，用户本意「只听回环」被静默放宽成全网可达。
+                        let addr = match val_str(m, "host_ip").filter(|s| !s.is_empty()) {
+                            Some(ip) if ip.contains(':') => format!("[{ip}]:{p}"),
+                            Some(ip) => format!("{ip}:{p}"),
+                            None => p,
+                        };
                         let proto = val_str(m, "protocol");
                         Some(match proto {
-                            Some(pr) => format!("{p}:{target}/{pr}"),
-                            None => format!("{p}:{target}"),
+                            Some(pr) => format!("{addr}:{target}/{pr}"),
+                            None => format!("{addr}:{target}"),
                         })
                     } else {
                         // 只有 target、没有 published：视作容器端口暴露
@@ -918,7 +938,13 @@ fn yaml_volumes(v: &Value) -> Vec<String> {
                     if source.is_empty() || target.is_empty() {
                         None
                     } else {
-                        Some(format!("{source}:{target}"))
+                        // 长格式的 `read_only: true` 必须落成 `:ro`：丢了等于把只读挂载
+                        // 静默变成可写（fail-open），这种"放宽"比报错危险得多。
+                        if matches!(val_at(m, "read_only"), Some(Value::Bool(true))) {
+                            Some(format!("{source}:{target}:ro"))
+                        } else {
+                            Some(format!("{source}:{target}"))
+                        }
                     }
                 }
                 _ => None,
@@ -927,6 +953,13 @@ fn yaml_volumes(v: &Value) -> Vec<String> {
         Value::String(s) => vec![s.clone()],
         _ => Vec::new(),
     }
+}
+
+/// 相对路径的宿主挂载（`./data:/data`、`data/sub:/x`）。
+/// 具名卷 `data:/data` 不算——它由 docker 命名管理，没有"相对谁"的问题。
+fn is_relative_host_mount(spec: &str) -> bool {
+    let src = spec.split(':').next().unwrap_or("").trim();
+    !src.is_empty() && !src.starts_with('/') && (src.starts_with('.') || src.contains('/'))
 }
 
 /// 解析 `.env` 文件内容：`KEY=VALUE` 行，跳过空白与 `#` 注释，剥离 `export ` 前缀。
@@ -1676,8 +1709,7 @@ services:
     /// 顶层 `volumes` 是每份真 compose 都有的一段：不能报成"不在面板支持范围"
     /// （那会让用户以为具名卷丢了），但 `name:`/`driver:` 确实不生效，要说明。
     #[test]
-    fn import_top_level_volumes_gets_accurate_warning() {
-        let yaml = r#"
+    fn import_top_level_volumes_gets_accurate_warning() {        let yaml = r#"
 services:
   db:
     image: postgres:16-alpine
@@ -1694,6 +1726,55 @@ volumes:
         assert!(
             !w.contains("顶层字段 `volumes`"),
             "顶层 volumes 不该报成「不支持」：{w}"
+        );
+    }
+
+    /// ⭐ 相对路径挂载导入后相对**面板栈目录**解析，用户会以为"数据丢了"。必须提示。
+    #[test]
+    fn import_warns_relative_host_mount() {
+        let yaml = r#"
+services:
+  vw:
+    image: vaultwarden/server:latest
+    volumes:
+      - ./vw-data:/data
+      - vaultdata:/other
+volumes:
+  vaultdata: {}
+"#;
+        let p = parse_compose_import(yaml, None).expect("解析应成功");
+        let w = p.warnings.join(" | ");
+        assert!(w.contains("./vw-data"), "应点名相对路径：{w}");
+        assert!(w.contains("绝对路径"), "应指出去改绝对路径：{w}");
+        // 具名卷不该被误报成相对路径
+        assert!(!w.contains("vaultdata:"), "具名卷不是相对路径：{w}");
+    }
+
+    /// ⭐⭐ 长格式 `read_only: true` 丢了就是 fail-open（只读挂载变可写）。必须落成 `:ro`。
+    #[test]
+    fn import_keeps_read_only_flag_from_long_form() {
+        let yaml = r#"
+services:
+  vw:
+    image: vaultwarden/server:latest
+    volumes:
+      - type: bind
+        source: /srv/data
+        target: /data
+        read_only: true
+      - type: bind
+        source: /srv/other
+        target: /other
+"#;
+        let p = parse_compose_import(yaml, None).expect("解析应成功");
+        let vols = &p.spec.services[0].volumes;
+        assert!(
+            vols.contains(&"/srv/data:/data:ro".to_string()),
+            "只读挂载必须保留 :ro：{vols:?}"
+        );
+        assert!(
+            vols.contains(&"/srv/other:/other".to_string()),
+            "非只读挂载不该被加上 :ro：{vols:?}"
         );
     }
 }

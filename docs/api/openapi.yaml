@@ -1102,7 +1102,7 @@ components:
         name:      { type: string, description: "服务名（字母数字与 . _ -，不得以 - 开头）；项目内唯一" }
         image:     { type: string, example: "nginx:1.27-alpine", description: 含 shell 元字符会被拒 }
         command:   { type: array, items: { type: string }, description: 覆盖镜像 ENTRYPOINT；逐元素作为独立参数，不拼 shell 串 }
-        ports:     { type: array, items: { type: string }, description: "host:container[/proto]，如 8080:80" }
+        ports:     { type: array, items: { type: string }, description: "[ip:]host:container[/proto]，如 8080:80、127.0.0.1:8000:80（IPv6 写 [::1]:8000:80）" }
         env:       { type: array, items: { type: string }, description: "KEY=VALUE；KEY 须符合 shell 标识符规则" }
         volumes:   { type: array, items: { type: string }, description: "具名卷或非敏感宿主路径；`/`、`/etc`、`docker.sock`、`/proc`、`/sys`、`/var/run` 会被拒" }
         restart:   { type: string, enum: [no, on-failure, always, unless-stopped] }
@@ -3270,7 +3270,7 @@ paths:
                 name: { type: string }
                 image: { type: string }
                 cmd: { type: array, items: { type: string } }
-                ports: { type: array, items: { type: string }, description: 'host:container[/proto]' }
+                ports: { type: array, items: { type: string }, description: '[ip:]host:container[/proto]' }
                 env: { type: array, items: { type: string }, description: 'KEY=VALUE' }
                 volumes: { type: array, items: { type: string }, description: 'src:dst[:ro]' }
                 restart: { type: string, enum: [no, on-failure, always, unless-stopped] }
