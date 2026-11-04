@@ -674,6 +674,15 @@ impl ContainerProvider for LinuxContainers {
             .await
             .map_err(|e| PanelError::Internal(format!("编排保存任务失败: {e}")))?
     }
+
+    async fn compose_stack_import_preview(
+        &self,
+        yaml: &str,
+        env: Option<&str>,
+    ) -> Result<ComposeImportPreview> {
+        // 纯解析 + 校验，无 IO、无 docker、体积受限（256KB），直接在异步上下文跑。
+        compose_stack::parse_compose_import(yaml, env)
+    }
 }
 
 /// Compose 项目名安全校验（进 argv 白名单）。返回 `Err` 时附可读原因。

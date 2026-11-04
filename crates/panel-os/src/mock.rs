@@ -734,6 +734,14 @@ impl ContainerProvider for MockContainers {
         }
         Ok(mock_stack_view(&spec))
     }
+
+    async fn compose_stack_import_preview(
+        &self,
+        yaml: &str,
+        env: Option<&str>,
+    ) -> Result<ComposeImportPreview> {
+        crate::linux::compose_stack::parse_compose_import(yaml, env)
+    }
 }
 
 #[async_trait]

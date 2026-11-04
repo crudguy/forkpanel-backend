@@ -1781,6 +1781,29 @@ pub struct ComposeStack {
     pub externally_modified: bool,
 }
 
+/// 一次「安全导入」预览——把外部 compose YAML 解析后、抽取白名单子集的结果。
+///
+/// ⚠ 这是**只读**的中间产物，绝不反序列化回原始 YAML：面板只取白名单字段构造
+/// `ComposeStackSpec`，未知字段全部落入 `dropped`（只报告、不写入）。
+#[derive(Debug, Clone, Serialize)]
+pub struct ComposeImportPreview {
+    /// 抽取后的结构化编排（字段受 `ComposeStackService` 类型约束，不可能含特权字段）
+    pub spec: ComposeStackSpec,
+    /// 被忽略的服务级字段（`build` / `depends_on` / `networks` / `healthcheck` …）
+    pub dropped: Vec<ComposeImportDropped>,
+    /// 提示性信息（如 env 文件已合并到所有服务、顶层 networks 被忽略）
+    pub warnings: Vec<String>,
+    /// 阻断性校验错误（如缺镜像、端口格式非法）；非空时前端禁止确认
+    pub errors: Vec<String>,
+}
+
+/// 被导入流程忽略掉的单个字段（服务名 + 字段名）。
+#[derive(Debug, Clone, Serialize)]
+pub struct ComposeImportDropped {
+    pub service: String,
+    pub field: String,
+}
+
 #[async_trait]
 pub trait ContainerProvider: Send + Sync {
     fn engine(&self) -> ContainerEngine;
@@ -1870,6 +1893,13 @@ pub trait ContainerProvider: Send + Sync {
     /// 创建或更新 stack：写 `.forkpanel-compose.json`（单一事实源）并渲染
     /// `compose.yaml`。已存在且 `compose.yaml` 被外部改过时**拒绝覆盖**。
     async fn compose_stack_save(&self, spec: ComposeStackSpec) -> Result<ComposeStack>;
+    /// 安全导入预览：解析外部 compose YAML，只抽取白名单子集并报告被丢弃的字段。
+    /// 只读、不写盘、不调 docker。返回的结果经 `validate_stack_spec` 校验，错误进 `errors`。
+    async fn compose_stack_import_preview(
+        &self,
+        yaml: &str,
+        env: Option<&str>,
+    ) -> Result<ComposeImportPreview>;
 }
 
 /// Compose 项目的生命周期动作。与 [`ContainerAction`] 同纪律：**声明式**，

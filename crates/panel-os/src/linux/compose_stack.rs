@@ -18,14 +18,27 @@
 //! 检测方式是**重新渲染一遍再逐字节比对**（不需要哈希依赖）：
 //! 一致 ⇒ 面板管的；不一致 ⇒ `externally_modified = true`，且**拒绝覆盖保存**，
 //! 由用户决定是放弃面板管理还是删掉这边的元数据。
+//!
+//! ## 「安全导入助手」：解析外部 YAML，但只抽取白名单子集
+//!
+//! 为了让用户能从别的来源粘贴 `docker-compose.yml` + `.env` 一键部署，我们**破例**
+//! 引入 `serde_yaml` 解析器（仅此一处）。但这是"导入"而非"放开原始 YAML"：
+//! 解析出的 `serde_yaml::Value` 树只被用来**读取白名单键**构造 `ComposeStackSpec`，
+//! 未知字段一律落入 `dropped` 列表（只报告、绝不写回）。因此危险字段
+//! （`privileged` / 挂 `/` / 挂 `docker.sock` / `network_mode`）在"抽取"这一步就
+//! 已被类型白名单挡掉——这与"生成阶段不可能出现特权字段"的安全模型完全兼容，
+//! 不依赖运行时黑名单。见 [`parse_compose_import`]。
 
 use crate::linux::containers::{
     image_is_safe, mem_limit_is_safe, port_mapping_is_safe, sensitive_host_mount,
     validate_compose_project,
 };
-use crate::traits::{ComposeStack, ComposeStackSpec};
+use crate::traits::{
+    ComposeImportDropped, ComposeImportPreview, ComposeStack, ComposeStackService, ComposeStackSpec,
+};
 use panel_core::{PanelError, Result};
 use serde::{Deserialize, Serialize};
+use serde_yaml::Value;
 use std::path::{Path, PathBuf};
 
 /// 元数据文件名（单一事实源）。点开头避免与用户的 compose 文件混淆。
@@ -51,8 +64,14 @@ pub fn stack_dir(root: &Path, project: &str) -> PathBuf {
 /// 两份实现会随时间分叉，而这类分叉就是"面板拦得住 create、拦不住 stack"的来源。
 pub fn validate_stack_spec(spec: &ComposeStackSpec) -> Result<()> {
     validate_compose_project(&spec.project)?;
+    validate_stack_services(&spec.services)
+}
 
-    if spec.services.is_empty() {
+/// 只校验服务列表（不含项目名）。导入预览用：外部 compose 常常没有顶层 `name`，
+/// 项目名由用户在导入弹窗里另填；这里若连带校验项目名，预览会永久报"项目名不能为空"，
+/// 而前端把 `errors` 当阻断条件 ⇒「确认导入」永远点不动（真机 bug）。
+fn validate_stack_services(services: &[ComposeStackService]) -> Result<()> {
+    if services.is_empty() {
         return Err(PanelError::Validation {
             field: "services",
             reason: "至少需要一个服务".into(),
@@ -60,7 +79,7 @@ pub fn validate_stack_spec(spec: &ComposeStackSpec) -> Result<()> {
     }
 
     let mut seen: Vec<&str> = Vec::new();
-    for s in spec.services.iter() {
+    for s in services.iter() {
         if s.name.trim().is_empty() {
             return Err(PanelError::Validation {
                 field: "services",
@@ -432,6 +451,346 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
 /// 便于调用方构造目录：`<data_dir>/compose-stacks/<project>`
 pub fn stack_working_dir(root: &Path, project: &str) -> String {
     stack_dir(root, project).to_string_lossy().to_string()
+}
+
+// ─────────────── 安全导入助手（解析外部 compose YAML） ───────────────
+
+/// 导入时允许的最大 YAML 体积，防 DoS（`serde_yaml` 解析大文档有成本）。
+const IMPORT_MAX_BYTES: usize = 256 * 1024;
+
+/// 服务级白名单键：只有这些会被抽取进 `ComposeStackSpec`。
+/// `deploy` 单列是因为我们只从它里面取 `resources.limits.memory`（内存上限）。
+/// 其余一切（build / depends_on / networks / healthcheck / env_file / privileged …）都进 `dropped`。
+const SERVICE_WHITELIST: &[&str] = &[
+    "image", "command", "ports", "environment", "volumes", "restart", "mem_limit", "deploy",
+];
+
+/// 解析**外部提供的** compose YAML，只抽取白名单子集，未知字段全部进 `dropped`。
+///
+/// 这是"导入"而非"放开原始 YAML"：我们从不把解析出的 `Value` 树回写成文件，
+/// 只读取白名单键构造受类型约束的 `ComposeStackSpec`，因此特权字段在抽取阶段就被挡掉。
+/// `env_text`（可选 `.env` 文件内容）里的 `KEY=VALUE` 会合并到所有服务的环境变量。
+pub fn parse_compose_import(yaml: &str, env_text: Option<&str>) -> Result<ComposeImportPreview> {
+    if yaml.len() > IMPORT_MAX_BYTES {
+        return Err(PanelError::Validation {
+            field: "yaml",
+            reason: format!("compose 内容过大（上限 {}KB）", IMPORT_MAX_BYTES / 1024),
+        });
+    }
+
+    let root: Value = serde_yaml::from_str(yaml).map_err(|e| PanelError::Validation {
+        field: "yaml",
+        reason: format!("YAML 解析失败：{e}"),
+    })?;
+
+    let root_map = match root {
+        Value::Mapping(m) => m,
+        _ => {
+            return Err(PanelError::Validation {
+                field: "yaml",
+                reason: "compose 顶层必须是映射（services: ...）".into(),
+            })
+        }
+    };
+
+    // 项目名：优先用 compose 顶层 `name`；可能不合法，交给后续校验报错。
+    let project = val_str(&root_map, "name").unwrap_or_default();
+
+    let mut warnings = Vec::new();
+    for k in root_keys(&root_map) {
+        if !matches!(k.as_str(), "name" | "version" | "services" | "service") {
+            warnings.push(format!(
+                "顶层字段 `{k}` 不在面板支持范围，已忽略（如 networks / volumes / secrets）"
+            ));
+        }
+    }
+
+    let services_val = val_at(&root_map, "services").or_else(|| val_at(&root_map, "service"));
+    let Some(services_map) = services_val.and_then(|v| match v {
+        Value::Mapping(m) => Some(m),
+        _ => None,
+    }) else {
+        return Err(PanelError::Validation {
+            field: "yaml",
+            reason: "未找到 services 定义".into(),
+        });
+    };
+
+    let mut services = Vec::new();
+    let mut dropped: Vec<ComposeImportDropped> = Vec::new();
+    // 敏感宿主挂载在抽取阶段就剔除（绝不进 spec），同时记下来变成阻断错误。
+    let mut blocked_volumes: Vec<String> = Vec::new();
+
+    for (name_val, svc_val) in services_map.iter() {
+        let Value::String(name) = name_val else { continue };
+        let svc_map = match svc_val {
+            Value::Mapping(m) => m,
+            _ => {
+                dropped.push(ComposeImportDropped {
+                    service: name.clone(),
+                    field: "(服务定义不是映射)".into(),
+                });
+                continue;
+            }
+        };
+
+        let mut svc = ComposeStackService {
+            name: name.clone(),
+            ..Default::default()
+        };
+
+        if let Some(v) = val_at(svc_map, "image") {
+            svc.image = yaml_scalar(v).unwrap_or_default();
+        }
+        if let Some(v) = val_at(svc_map, "command") {
+            svc.command = yaml_string_list_loose(v);
+        }
+        if let Some(v) = val_at(svc_map, "ports") {
+            svc.ports = yaml_ports(v);
+        }
+        if let Some(v) = val_at(svc_map, "environment") {
+            svc.env = yaml_environment(v);
+        }
+        if let Some(v) = val_at(svc_map, "volumes") {
+            // ⚠ 敏感宿主路径必须在**抽取阶段**剔除，不能只靠后面的
+            // validate_stack_services：预览返回的 spec 也不允许带上 `/`、`/etc`、
+            // docker.sock 这类挂载（前端会把它当"将创建的内容"展示出来）。
+            for vol in yaml_volumes(v) {
+                if let Some(bad) = sensitive_host_mount(&vol) {
+                    blocked_volumes.push(format!("服务 {name} 的卷 `{vol}` 命中宿主敏感路径 {bad}"));
+                } else {
+                    svc.volumes.push(vol);
+                }
+            }
+        }
+        if let Some(v) = val_at(svc_map, "restart") {
+            svc.restart = yaml_scalar(v);
+        }
+        // 内存上限：顶层 `mem_limit` 优先；否则 `deploy.resources.limits.memory`。
+        let mut mem = val_at(svc_map, "mem_limit").and_then(yaml_scalar);
+        if mem.is_none() {
+            if let Some(Value::Mapping(deploy)) = val_at(svc_map, "deploy") {
+                if let Some(Value::Mapping(res)) = val_at(deploy, "resources") {
+                    if let Some(Value::Mapping(lim)) = val_at(res, "limits") {
+                        mem = val_at(lim, "memory").and_then(yaml_scalar);
+                    }
+                }
+            }
+        }
+        svc.mem_limit = mem;
+
+        // 报告白名单之外的服务级字段
+        for k in root_keys(svc_map) {
+            if !SERVICE_WHITELIST.contains(&k.as_str()) {
+                dropped.push(ComposeImportDropped {
+                    service: name.clone(),
+                    field: k.clone(),
+                });
+            }
+        }
+
+        services.push(svc);
+    }
+
+    // `.env` 文件合并到所有服务
+    if let Some(text) = env_text {
+        let (entries, parse_warn) = parse_dotenv(text);
+        if !entries.is_empty() {
+            for s in services.iter_mut() {
+                for e in &entries {
+                    let key = e.split_once('=').map(|(k, _)| k.to_string()).unwrap_or_default();
+                    let dup = s
+                        .env
+                        .iter()
+                        .any(|x| x.split_once('=').map(|(k, _)| k == key).unwrap_or(false));
+                    if !dup {
+                        s.env.push(e.clone());
+                    }
+                }
+            }
+            warnings.push(format!("env 文件中的 {} 个变量已合并到所有服务", entries.len()));
+        }
+        warnings.extend(parse_warn);
+    }
+
+    let spec = ComposeStackSpec { project, services };
+
+    let mut errors: Vec<String> = blocked_volumes
+        .into_iter()
+        .map(|v| format!("已拒绝：{v}"))
+        .collect();
+    // 只校验服务；项目名要等用户在导入弹窗里填写（见 validate_stack_services 注释）。
+    if let Err(e) = validate_stack_services(&spec.services) {
+        errors.push(e.to_string());
+    }
+    // 顶层 `name` 只是预填提示：不合法不阻断，改成警告，用户改名即可。
+    if !spec.project.is_empty() {
+        if let Err(e) = validate_compose_project(&spec.project) {
+            warnings.push(format!(
+                "compose 顶层 name `{}` 不可用（{e}），请在导入时另填项目名",
+                spec.project
+            ));
+        }
+    }
+
+    Ok(ComposeImportPreview {
+        spec,
+        dropped,
+        warnings,
+        errors,
+    })
+}
+
+/// 取映射里的字符串值（`name` / `restart` 这类）。
+fn val_str(m: &serde_yaml::Mapping, key: &str) -> Option<String> {
+    val_at(m, key).and_then(yaml_scalar)
+}
+
+/// 取映射里的值（按字符串键）。
+fn val_at<'a>(m: &'a serde_yaml::Mapping, key: &str) -> Option<&'a Value> {
+    m.get(Value::String(key.to_string()))
+}
+
+/// 映射的所有字符串键。
+fn root_keys(m: &serde_yaml::Mapping) -> Vec<String> {
+    m.keys()
+        .filter_map(|k| match k {
+            Value::String(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// 标量转字符串（字符串/布尔/数字；Null 返回 None）。
+fn yaml_scalar(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Number(n) => n
+            .as_i64()
+            .map(|v| v.to_string())
+            .or_else(|| n.as_u64().map(|v| v.to_string()))
+            .or_else(|| n.as_f64().map(|v| v.to_string())),
+        Value::Null => None,
+        _ => None,
+    }
+}
+
+/// 列表类字段：序列逐元素转字符串；单个字符串按空白切分（compose 的 command 常见写法）。
+fn yaml_string_list_loose(v: &Value) -> Vec<String> {
+    match v {
+        Value::Sequence(seq) => seq.iter().filter_map(yaml_scalar).collect(),
+        Value::String(s) => s.split_whitespace().map(str::to_string).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// 端口：兼容 `['8080:80']` 与 `{target, published, protocol}` 两种写法，
+/// 统一成面板用的 `host:container[/proto]`。
+fn yaml_ports(v: &Value) -> Vec<String> {
+    match v {
+        Value::Sequence(seq) => seq
+            .iter()
+            .filter_map(|e| match e {
+                Value::String(s) => Some(s.clone()),
+                Value::Mapping(m) => {
+                    let target = val_str(m, "target").unwrap_or_default();
+                    let published = val_str(m, "published");
+                    if target.is_empty() {
+                        None
+                    } else if let Some(p) = published {
+                        let proto = val_str(m, "protocol");
+                        Some(match proto {
+                            Some(pr) => format!("{p}:{target}/{pr}"),
+                            None => format!("{p}:{target}"),
+                        })
+                    } else {
+                        // 只有 target、没有 published：视作容器端口暴露
+                        Some(target)
+                    }
+                }
+                _ => None,
+            })
+            .collect(),
+        Value::String(s) => vec![s.clone()],
+        _ => Vec::new(),
+    }
+}
+
+/// 环境变量：兼容映射 `{KEY: value}` 与序列 `['KEY=value']`（序列里也允许 `{KEY: value}`）。
+fn yaml_environment(v: &Value) -> Vec<String> {
+    match v {
+        Value::Mapping(m) => m
+            .iter()
+            .filter_map(|(k, val)| match k {
+                Value::String(key) => {
+                    let vstr = yaml_scalar(val).unwrap_or_default();
+                    Some(format!("{key}={vstr}"))
+                }
+                _ => None,
+            })
+            .collect(),
+        Value::Sequence(seq) => seq
+            .iter()
+            .filter_map(|e| match e {
+                Value::String(s) => Some(s.clone()),
+                Value::Mapping(m) => {
+                    let (k, v) = m.iter().next()?;
+                    if let Value::String(key) = k {
+                        let vstr = yaml_scalar(v).unwrap_or_default();
+                        Some(format!("{key}={vstr}"))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// 卷：兼容字符串 `data:/data` 与映射 `{source, target, ...}`。
+fn yaml_volumes(v: &Value) -> Vec<String> {
+    match v {
+        Value::Sequence(seq) => seq
+            .iter()
+            .filter_map(|e| match e {
+                Value::String(s) => Some(s.clone()),
+                Value::Mapping(m) => {
+                    let source = val_str(m, "source").unwrap_or_default();
+                    let target = val_str(m, "target").unwrap_or_default();
+                    if source.is_empty() || target.is_empty() {
+                        None
+                    } else {
+                        Some(format!("{source}:{target}"))
+                    }
+                }
+                _ => None,
+            })
+            .collect(),
+        Value::String(s) => vec![s.clone()],
+        _ => Vec::new(),
+    }
+}
+
+/// 解析 `.env` 文件内容：`KEY=VALUE` 行，跳过空白与 `#` 注释，剥离 `export ` 前缀。
+/// 返回条目与解析提示（如某行缺少 `=`）。
+fn parse_dotenv(text: &str) -> (Vec<String>, Vec<String>) {
+    let mut entries = Vec::new();
+    let mut warnings = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        match line.split_once('=') {
+            Some((k, v)) => entries.push(format!("{}={}", k.trim(), v.trim())),
+            None => warnings.push(format!("env 文件忽略无法解析的行：{line}")),
+        }
+    }
+    (entries, warnings)
 }
 
 #[cfg(test)]
@@ -810,5 +1169,199 @@ mod tests {
     fn missing_root_lists_empty_not_error() {
         let root = tmp_root("noroot");
         assert!(list_stacks(&root).unwrap().is_empty());
+    }
+
+    // ── 安全导入（parse_compose_import）──
+
+    /// ⭐ 核心：白名单字段正确抽取，env 映射（含数字值）正确拼成 KEY=VALUE。
+    #[test]
+    fn import_extracts_whitelist_subset() {
+        let yaml = r#"
+name: myapp
+services:
+  web:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:80"
+    environment:
+      TZ: Asia/Shanghai
+      NGINX_PORT: "80"
+    volumes:
+      - data:/data
+    restart: unless-stopped
+    mem_limit: 512m
+"#;
+        let p = parse_compose_import(yaml, None).expect("解析应成功");
+        assert!(p.errors.is_empty(), "合法导入不应有错误：{:?}", p.errors);
+        assert_eq!(p.spec.project, "myapp");
+        assert_eq!(p.spec.services.len(), 1);
+        let s = &p.spec.services[0];
+        assert_eq!(s.image, "nginx:1.27-alpine");
+        assert_eq!(s.ports, vec!["8080:80".to_string()]);
+        assert_eq!(
+            s.env,
+            vec!["TZ=Asia/Shanghai".to_string(), "NGINX_PORT=80".to_string()]
+        );
+        assert_eq!(s.volumes, vec!["data:/data".to_string()]);
+        assert_eq!(s.restart.as_deref(), Some("unless-stopped"));
+        assert_eq!(s.mem_limit.as_deref(), Some("512m"));
+    }
+
+    /// ⭐⭐ **负向对照的判据必须真红**：如果白名单抽取"漏掉"了报告逻辑，
+    /// 外部 compose 里的 build/depends_on 等会被静默吞掉——这条钉住"被忽略字段必被报告"。
+    #[test]
+    fn import_reports_dropped_fields() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx
+    build:
+      context: .
+    depends_on:
+      - db
+    networks:
+      - frontend
+    healthcheck:
+      test: curl
+"#;
+        let p = parse_compose_import(yaml, None).expect("解析应成功");
+        let dropped_fields: Vec<&str> = p
+            .dropped
+            .iter()
+            .filter(|d| d.service == "web")
+            .map(|d| d.field.as_str())
+            .collect();
+        for f in ["build", "depends_on", "networks", "healthcheck"] {
+            assert!(
+                dropped_fields.contains(&f),
+                "应报告被忽略字段 {f}：{dropped_fields:?}"
+            );
+        }
+    }
+
+    /// ⭐⭐ 安全底线：危险字段只能进 dropped，绝不通传到 spec。
+    #[test]
+    fn import_never_passthrough_privileged() {
+        let yaml = r#"
+services:
+  evil:
+    image: nginx
+    privileged: true
+    volumes:
+      - /:/host
+"#;
+        let p = parse_compose_import(yaml, None).expect("解析应成功");
+        // 特权字段必须被报告为"忽略"
+        assert!(
+            p.dropped.iter().any(|d| d.field == "privileged"),
+            "privileged 应被报告为忽略"
+        );
+        let s = &p.spec.services[0];
+        // 敏感挂载既不能进 spec，也必须触发校验错误（绝不静默放行）
+        assert!(
+            !s.volumes.iter().any(|v| v == "/:/host"),
+            "敏感挂载绝不能进 spec"
+        );
+        assert!(!p.errors.is_empty(), "敏感挂载应触发校验错误");
+    }
+
+    #[test]
+    fn import_merges_dotenv_into_all_services() {
+        let yaml = r#"
+services:
+  a:
+    image: nginx
+  b:
+    image: redis
+"#;
+        let env = "TZ=Asia/Shanghai\n# comment\nBADLINE\nFOO=bar";
+        let p = parse_compose_import(yaml, Some(env)).expect("解析应成功");
+        assert_eq!(p.spec.services.len(), 2);
+        for s in &p.spec.services {
+            assert!(
+                s.env.contains(&"TZ=Asia/Shanghai".to_string()),
+                "env 应合并到每个服务"
+            );
+            assert!(s.env.contains(&"FOO=bar".to_string()));
+        }
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("忽略") || w.contains("BADLINE")),
+            "无法解析的 env 行应被提示"
+        );
+    }
+
+    #[test]
+    fn import_rejects_invalid_yaml() {
+        assert!(
+            parse_compose_import("services: [unclosed", None).is_err(),
+            "非法 YAML 必须报错"
+        );
+    }
+
+    /// compose 常见写法：内存上限在 `deploy.resources.limits.memory`。
+    #[test]
+    fn import_handles_deploy_memory_limit() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+"#;
+        let p = parse_compose_import(yaml, None).expect("解析应成功");
+        assert_eq!(p.spec.services[0].mem_limit.as_deref(), Some("1g"));
+        // deploy 自身不应被当成"被忽略字段"报告（我们只取 memory）
+        assert!(
+            !p.dropped.iter().any(|d| d.field == "deploy"),
+            "deploy 不应出现在 dropped"
+        );
+    }
+
+    #[test]
+    fn import_rejects_oversized_yaml() {
+        let big = format!("services:\n  web:\n    image: {}\n", "x".repeat(300 * 1024));
+        assert!(
+            parse_compose_import(&big, None).is_err(),
+            "超过 256KB 的 YAML 必须被拒"
+        );
+    }
+
+    /// ⭐⭐ 回归：外部 compose 常常没有顶层 `name`。项目名由导入弹窗另填，
+    /// 预览绝不能因此产生阻断性 errors——否则前端「确认导入」永久禁用（真机 bug）。
+    #[test]
+    fn import_without_name_has_no_blocking_errors() {
+        let yaml = r#"
+services:
+  web:
+    image: nginx:1.27-alpine
+"#;
+        let p = parse_compose_import(yaml, None).expect("解析应成功");
+        assert!(
+            p.errors.is_empty(),
+            "缺顶层 name 不应阻断导入（项目名另填）：{:?}",
+            p.errors
+        );
+        assert_eq!(p.spec.project, "");
+    }
+
+    /// 顶层 name 非法时只给警告、不阻断——用户可在导入弹窗里改名。
+    #[test]
+    fn import_invalid_name_is_warning_not_error() {
+        let yaml = "name: \"my stack\"\nservices:\n  web:\n    image: nginx\n";
+        let p = parse_compose_import(yaml, None).expect("解析应成功");
+        assert!(
+            p.errors.is_empty(),
+            "非法 name 不应阻断导入：{:?}",
+            p.errors
+        );
+        assert!(
+            p.warnings.iter().any(|w| w.contains("name")),
+            "应提示顶层 name 不可用：{:?}",
+            p.warnings
+        );
     }
 }

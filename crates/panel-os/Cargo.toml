@@ -17,6 +17,10 @@ tracing    = "0.1"
 rusqlite   = { workspace = true }
 # 解析 journalctl -o json 每行（ts/message/priority）
 serde_json = { workspace = true }
+# 仅用于「安全导入助手」：解析**外部提供的** compose YAML，只抽取白名单子集、
+# 绝不通传未知字段（见 compose_stack.rs 的 parse_compose_import）。这不是放开
+# "允许用户提交原始 YAML"——抽取结果仍受 ComposeStackService 类型白名单约束。
+serde_yaml = "0.9"
 
 [features]
 default = []

@@ -336,6 +336,7 @@ pub fn build_router(state: Shared) -> Router {
         // 面板编排（stack 定义）：读写 `<data_dir>/compose-stacks/` 里的文件。
         // ⚠ 不检查 docker 可用性：改编排定义与 daemon 无关（见 routes/containers.rs 注释）。
         .route("/api/v1/containers/stacks", get(containers::stack_list))
+        .route("/api/v1/containers/stacks/import-preview", post(containers::stack_import_preview))
         .route("/api/v1/containers/stacks/{project}", get(containers::stack_get).put(containers::stack_save));
 
     // ── 本机便签（025：多条，由 022 单例说明升级） ──

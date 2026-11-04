@@ -734,6 +734,34 @@ pub async fn stack_save(
     Ok(ok(st))
 }
 
+/// 安全导入预览：解析外部 compose YAML，抽取白名单子集并报告被丢弃字段。
+///
+/// 只读、不写盘、不依赖 docker（与该组其它端点一致）。需 container.manage
+/// （它是创建编排的前置步骤）。输入体积上限在解析函数内校验。
+pub async fn stack_import_preview(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    PanelJson(req): PanelJson<StackImportPreviewReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::CONTAINER_MANAGE)?;
+    let preview = state
+        .os
+        .containers()
+        .compose_stack_import_preview(&req.yaml, req.env.as_deref())
+        .await?;
+    Ok(ok(preview))
+}
+
+/// 导入预览请求体。
+#[derive(Debug, Deserialize)]
+pub struct StackImportPreviewReq {
+    /// 外部 compose YAML 文本
+    pub yaml: String,
+    /// 可选 `.env` 文件内容，合并到所有服务的环境变量
+    #[serde(default)]
+    pub env: Option<String>,
+}
+
 // ─────────────── 一键安装 Docker ───────────────
 
 /// 安装请求。**二次确认词** `confirm_token` 必须为「安装 Docker」——

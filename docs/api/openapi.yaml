@@ -1107,6 +1107,13 @@ components:
         volumes:   { type: array, items: { type: string }, description: "具名卷或非敏感宿主路径；`/`、`/etc`、`docker.sock`、`/proc`、`/sys`、`/var/run` 会被拒" }
         restart:   { type: string, enum: [no, on-failure, always, unless-stopped] }
         mem_limit: { type: string, example: 512m, description: "内存上限（512m / 2g / 纯字节数）" }
+    ComposeStackSpec:
+      type: object
+      description: 一次编排提交（项目名 + 服务列表）；导入预览的 `spec` 即此结构
+      required: [project, services]
+      properties:
+        project:  { type: string, description: "项目名（仅字母数字与 . _ -，不得以 - 开头）" }
+        services: { type: array, items: { $ref: '#/components/schemas/ComposeStackService' } }
     ComposeStack:
       type: object
       description: 面板管理的编排项目（磁盘读出）
@@ -1116,6 +1123,29 @@ components:
         config_file:         { type: string, description: 渲染产物 compose.yaml 绝对路径 }
         services:            { type: array, items: { $ref: '#/components/schemas/ComposeStackService' } }
         externally_modified: { type: boolean, description: "compose.yaml 与「由 .forkpanel-compose.json 重新渲染的结果」不一致 ⇒ 被外部改过；为 true 时面板拒绝覆盖保存" }
+    StackImportPreviewReq:
+      type: object
+      description: 安全导入预览请求体
+      required: [yaml]
+      properties:
+        yaml: { type: string, description: "外部 compose YAML 文本（上限 256KB）" }
+        env: { type: string, description: "可选 .env 文件文本，合并到所有服务的环境变量" }
+    ComposeImportDropped:
+      type: object
+      description: 被导入流程忽略掉的单个字段
+      required: [service, field]
+      properties:
+        service: { type: string, description: 服务名 }
+        field: { type: string, description: "被忽略的字段名（如 build / depends_on / networks / healthcheck）" }
+    ComposeImportPreview:
+      type: object
+      description: 外部 compose 导入预览（只读中间产物，绝不反序列化回原始 YAML）
+      required: [spec, dropped, warnings, errors]
+      properties:
+        spec: { $ref: '#/components/schemas/ComposeStackSpec' }
+        dropped: { type: array, items: { $ref: '#/components/schemas/ComposeImportDropped' } }
+        warnings: { type: array, items: { type: string }, description: "提示性信息（如 env 已合并、顶层 networks 被忽略）" }
+        errors: { type: array, items: { type: string }, description: "阻断性校验错误；非空时前端禁止确认" }
     ContainerImage:
       type: object
       description: 等价 `docker images` 的一行（含悬空镜像 `<none>`）
@@ -3445,6 +3475,29 @@ paths:
           content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/ComposeStack' } } } } }
         '400': { description: 校验失败（项目名/服务名/镜像/端口/挂载/环境变量/重启策略/资源限制） }
         '409': { description: compose.yaml 已被外部修改，拒绝覆盖 }
+  /api/v1/containers/stacks/import-preview:
+    post:
+      tags: [containers]
+      summary: 安全导入预览（解析外部 compose YAML，抽取白名单子集）
+      description: |
+        只读、不写盘、不依赖 docker（与 stacks 组其它端点一致）。需 container.manage。
+
+        ⚠ **这不是放开"允许用户提交原始 YAML"**：入参 YAML 只被解析为值树，再**只读取
+        白名单键**构造 `ComposeStackSpec`；未知字段全部进 `dropped`（只报告、绝不写回）。
+        因此 `privileged` / 挂 `/` / 挂 `docker.sock` / `network_mode` 在抽取阶段就被类型白名单挡掉。
+
+        可选 `env` 为 `.env` 文件文本，其中的 `KEY=VALUE` 会合并到**所有**服务的环境变量。
+        返回的 `errors` 非空时前端应禁止确认（阻断性校验失败）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StackImportPreviewReq' }
+      responses:
+        '200':
+          description: ok，data 为导入预览（spec + 被丢弃字段 + 提示 + 错误）
+          content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/ComposeImportPreview' } } } } }
+        '400': { description: YAML 解析失败或体积超限 }
   /api/v1/containers/join-docker-group:
     post:
       tags: [containers]
