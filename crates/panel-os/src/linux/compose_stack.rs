@@ -644,6 +644,30 @@ pub fn parse_compose_import(yaml: &str, env_text: Option<&str>) -> Result<Compos
         warnings.extend(parse_warn);
     }
 
+    // ⚠ `KEY=` 是「显式设为空」，不是「没配置」——Docker 会把空串真的传进容器。
+    // 有些应用据此判定「配了一半」直接拒绝启动（实测 vaultwarden：`SMTP_HOST=` 与
+    // `SMTP_FROM=` 都留空 ⇒ 报 "Both SMTP_HOST and SMTP_FROM need to be set" 退出，
+    // 容器无限重启）。用户在 .env 里留一行空值往往以为是「没启用」，值得提前点出来。
+    let mut empty_vars: Vec<String> = Vec::new();
+    for s in &services {
+        for e in &s.env {
+            if let Some((k, v)) = e.split_once('=') {
+                if v.trim().is_empty() && !empty_vars.iter().any(|x| x == k) {
+                    empty_vars.push(k.to_string());
+                }
+            }
+        }
+    }
+    if !empty_vars.is_empty() {
+        warnings.push(format!(
+            "有 {} 个环境变量的值为空（{}）：`KEY=` 表示「显式设为空」而不是「没配置」，\
+             部分应用会因此拒绝启动（如 vaultwarden 的 SMTP_HOST/SMTP_FROM 必须成对）——\
+             不需要就删掉这几行",
+            empty_vars.len(),
+            summarize_keys(&empty_vars, 6)
+        ));
+    }
+
     let spec = ComposeStackSpec { project, services };
 
     let mut errors: Vec<String> = blocked_volumes
@@ -960,6 +984,15 @@ fn yaml_volumes(v: &Value) -> Vec<String> {
 fn is_relative_host_mount(spec: &str) -> bool {
     let src = spec.split(':').next().unwrap_or("").trim();
     !src.is_empty() && !src.starts_with('/') && (src.starts_with('.') || src.contains('/'))
+}
+
+/// 列出最多 `max` 个键，其余折成省略号：警告太长会把真正的错误挤到看不见的地方。
+fn summarize_keys(keys: &[String], max: usize) -> String {
+    if keys.len() <= max {
+        keys.join("、")
+    } else {
+        format!("{}…", keys[..max].join("、"))
+    }
 }
 
 /// 解析 `.env` 文件内容：`KEY=VALUE` 行，跳过空白与 `#` 注释，剥离 `export ` 前缀。
@@ -1776,5 +1809,66 @@ services:
             vols.contains(&"/srv/other:/other".to_string()),
             "非只读挂载不该被加上 :ro：{vols:?}"
         );
+    }
+
+    /// ⭐⭐ 回归（真机踩过两次）：`KEY=` 是「显式设为空」，不是「没配置」。
+    /// vaultwarden 的 `SMTP_HOST=` / `SMTP_FROM=` 都留空 ⇒ 判定「配了一半」直接退出，
+    /// 容器无限重启，而日志里那句 "Both SMTP_HOST and SMTP_FROM need to be set"
+    /// 完全看不出是"留空"引起的。
+    #[test]
+    fn import_warns_empty_env_values() {
+        let yaml = r#"
+services:
+  vw:
+    image: vaultwarden/server:latest
+    environment:
+      SMTP_HOST: ""
+      SMTP_FROM: ""
+      DOMAIN: https://vw.example.com
+"#;
+        let p = parse_compose_import(yaml, Some("SMTP_PORT=\nLOG_LEVEL=warn\n")).expect("解析应成功");
+        assert!(p.errors.is_empty(), "{:?}", p.errors);
+        let w = p.warnings.join(" | ");
+        assert!(w.contains("值为空"), "应有空值变量警告：{w}");
+        for k in ["SMTP_HOST", "SMTP_FROM", "SMTP_PORT"] {
+            assert!(w.contains(k), "应点名 {k}：{w}");
+        }
+        assert!(!w.contains("DOMAIN"), "非空变量不该被点名：{w}");
+        assert!(!w.contains("LOG_LEVEL"), "非空变量不该被点名：{w}");
+        // 空值仍然原样保留（用户的显式意图不能被执行层擅自改掉）
+        let env = &p.spec.services[0].env;
+        assert!(env.contains(&"SMTP_HOST=".to_string()), "{env:?}");
+    }
+
+    /// 负向对照：全部有值时**不能**报这条警告（否则警告恒亮＝没人再看）。
+    #[test]
+    fn import_no_empty_env_warning_when_all_set() {
+        let yaml = r#"
+services:
+  vw:
+    image: vaultwarden/server:latest
+    environment:
+      DOMAIN: https://vw.example.com
+      TZ: Asia/Shanghai
+"#;
+        let p = parse_compose_import(yaml, Some("LOG_LEVEL=warn\n")).expect("解析应成功");
+        let w = p.warnings.join(" | ");
+        assert!(!w.contains("值为空"), "全部有值就不该报：{w}");
+    }
+
+    /// 空值变量很多时列表要截断，别把真正的错误挤到看不见的地方。
+    #[test]
+    fn import_empty_env_warning_caps_listing() {
+        let mut env = String::new();
+        for i in 0..9 {
+            env.push_str(&format!("EMPTY_{i}=\n"));
+        }
+        let yaml = "services:\n  vw:\n    image: nginx:1.27-alpine\n";
+        let p = parse_compose_import(yaml, Some(&env)).expect("解析应成功");
+        let w = p.warnings.join(" | ");
+        assert!(w.contains("9 个环境变量的值为空"), "应报计数：{w}");
+        assert!(w.contains("EMPTY_0"), "{w}");
+        assert!(w.contains("…"), "超过 6 个应截断：{w}");
+        assert!(!w.contains("EMPTY_8"), "第 9 个应被省略：{w}");
     }
 }
