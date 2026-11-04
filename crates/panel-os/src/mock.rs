@@ -570,6 +570,11 @@ impl ContainerProvider for MockContainers {
         })
     }
 
+    async fn remove_image(&self, _image: &str) -> Result<()> {
+        // mock 不真正调用 docker：删除恒成功（用于前端联调确认流）。
+        Ok(())
+    }
+
     async fn logs(&self, _id: &str, opts: ContainerLogsOpts) -> Result<Vec<ContainerLogLine>> {
         // mock 不真正调用 docker：生成样例日志行，便于前端联调日志查看对话框。
         // 上限 20 行，避免 mock 造出与 tail 等量的无意义数据。

@@ -195,11 +195,12 @@ mod tests {
     /// 教训的同类：只能源码级断言。写法参照 auth.rs 的 LoginGuard 接线守卫。
     #[test]
     fn heavy_handlers_are_actually_wired() {
-        let cases: [(&str, &str, &str); 14] = [
+        let cases: [(&str, &str, &str); 15] = [
             (include_str!("routes/services/packages.rs"), "pkg.install", "services::install"),
             (include_str!("routes/services/packages.rs"), "pkg.upgrade", "services::package_upgrade"),
             (include_str!("routes/services/packages.rs"), "pkg.remove", "services::package_remove"),
             (include_str!("routes/containers.rs"), "image.pull", "containers::pull"),
+            (include_str!("routes/containers.rs"), "image.remove", "containers::remove_image"),
             (include_str!("routes/backups.rs"), "backup.run", "backups::run"),
             (include_str!("routes/cron.rs"), "cron.run", "cron::run"),
             // —— 以下 8 个是审计发现的"漏接限流"端点（C 组 P1-19）——

@@ -24,10 +24,9 @@
 //!   一键安装 Docker、把面板运行用户加入 docker 组、容器备注。
 //!
 //! ## 不提供的能力
-//! - **镜像删除**：磁盘回收风险（已拉取的层删了需重新下载），刻意不开放。
 //! - **暂未实现**（非安全刻意排除，后续可补）：进入容器 `docker exec`、
 //!   网络的创建/删除与容器接入/断开（**只读列举已开放**）、卷的创建/删除
-//!   （**只读列举已开放**；删除卷=数据丢失，与镜像删除同理）、compose 的
+//!   （**只读列举已开放**；删除卷=数据丢失，且卷数据不可重建）、compose 的
 //!   up/down/restart/logs 等生命周期写操作（**只读列举已开放**，影响面大，
 //!   交由 `docker compose` CLI 手动执行）、stack。
 //!
@@ -297,6 +296,39 @@ pub(crate) async fn pull(
         "size": img.size,
         "created": img.created,
     })))
+}
+
+/// 删除镜像查询参数：`?image=<repo:tag 或 sha256:id>`。
+///
+/// 用 query 而非路径参数：镜像引用含 `:` 与 `/`（如
+/// `ccr.ccs.tencentyun.com/ns/app:1.0`），塞进 path 需要 `%2F` 编码，
+/// 反向代理 / axum 对编码斜杠的处理不一致，走 query 无此坑。
+#[derive(Debug, Deserialize)]
+pub(crate) struct RemoveImageQ {
+    pub image: String,
+}
+
+/// 删除本地镜像（等价 `docker rmi`，**不带 `-f`**）。
+///
+/// 与容器删除同一纪律：被容器引用的镜像会失败（502，stderr 原样透传），
+/// 用户须先删相关容器——面板不替用户"强删"。
+/// 删除后如需再用须重新拉取，前端必须二次确认。
+pub(crate) async fn remove_image(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    Query(q): Query<RemoveImageQ>,
+) -> ApiResult<StatusCode> {
+    crate::auth::require(&s, perm::CONTAINER_MANAGE)?;
+    // 磁盘写 + 可能删掉大量层：按写档位限流（与 pull 同源）
+    crate::ratelimit::check_heavy(&state, &s.username, "image.remove")?;
+    ensure_supported(&state)?;
+    let image = q.image.trim();
+    if image.is_empty() {
+        return Err(ApiError::bad_request("image", "镜像引用不能为空"));
+    }
+    state.os.containers().remove_image(image).await?;
+    audit(&state, &s, "container.image_remove", image, "ok").await;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ─────────────── 生命周期 ───────────────

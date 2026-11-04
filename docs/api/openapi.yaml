@@ -3244,6 +3244,26 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/ContainerImage' } } } }
         '501': { description: 容器能力不可用 }
+    delete:
+      tags: [containers]
+      summary: 删除镜像（等价 `docker rmi`，不带 `-f`）
+      description: |
+        按 `repo:tag` 或镜像 ID（`sha256:...`）删除本地镜像。**不带 `-f`**：
+        被容器引用的镜像会被守护进程拒绝（502，stderr 原样透传），需先删除
+        相关容器；悬空镜像（`<none>:<none>`）只能按镜像 ID 删除。
+        删除后如需再用须重新拉取，前端强制二次确认。
+      security: [cookieAuth, csrfHeader]
+      parameters:
+        - name: image
+          in: query
+          required: true
+          schema: { type: string }
+          description: 镜像引用 `repo:tag` 或镜像 ID；后端校验无空白 / shell 元字符
+      responses:
+        '204': { description: 已删除 }
+        '400': { description: 校验失败（镜像引用为空或含非法字符） }
+        '501': { description: 容器能力不可用 }
+        '502': { description: docker rmi 失败（镜像不存在 / 仍被容器引用，stderr 透传） }
   /api/v1/containers/images/pull:
     post:
       tags: [containers]

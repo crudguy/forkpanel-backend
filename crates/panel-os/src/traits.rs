@@ -1762,6 +1762,15 @@ pub trait ContainerProvider: Send + Sync {
     /// 实现须校验引用安全（无空白 / shell 元字符），返回拉取后的镜像摘要。
     /// 拉取属网络写入（下载镜像到本地），需 container.manage。
     async fn pull(&self, image: &str) -> Result<ImageSummary>;
+    /// 删除本地镜像（等价 `docker rmi`，**不带 `-f`**）。
+    ///
+    /// `image` 为 `repo:tag` 或镜像 ID（`sha256:...`；`<none>:<none>` 的悬空镜像
+    /// 只能按 ID 删）。实现须校验引用安全（无空白 / shell 元字符）。
+    /// **被容器引用时由 docker 拒绝**（不带 `-f` 是刻意的安全默认：强删会先停容器、
+    /// 掩盖"还有容器在用"）——错误原样透传，由用户先删相关容器。
+    /// 删除后如需再用须重新拉取（网络下载），故前端必须二次确认。
+    /// 写操作，需 container.manage。
+    async fn remove_image(&self, image: &str) -> Result<()>;
     /// 读取容器日志（等价 `docker logs`，**不带 --follow** 避免阻塞）。
     /// `opts.tail` 上限 2000 行；`opts.timestamps` 控制是否带 RFC3339 前缀。
     /// 读操作，需 container.view；实现必须先校验 id 字符集。
@@ -1777,8 +1786,8 @@ pub trait ContainerProvider: Send + Sync {
 
     /// 列举 Docker 卷（等价 `docker volume ls`，只读）。需 container.view。
     /// 无 id 参数（一次返回所有卷），故无参数注入面。
-    /// **只列举**：创建/删除卷未实现（删除卷=数据丢失，与镜像删除同理刻意
-    /// 不开放，交由 `docker` CLI 手动执行）。
+    /// **只列举**：创建/删除卷未实现（删除卷=数据丢失，刻意不开放，交由
+    /// `docker` CLI 手动执行；与镜像删除不同——镜像可重新拉取，卷数据不可重建）。
     async fn volumes_all(&self) -> Result<Vec<ContainerVolumeLine>>;
 
     /// 列举 Docker Compose 项目（等价 `docker compose ls --all`）。只读，需
@@ -1821,8 +1830,8 @@ pub enum ComposeAction {
     /// `docker compose -p <name> down`
     ///
     /// ⚠ **永不传 `-v`**：`-v` 会删除该项目的命名卷，即数据丢失。这是刻意的
-    /// 功能缺失（与「不开放镜像删除 / 不开放卷删除」同一纪律），不是遗漏——
-    /// 真要删卷请用 CLI，并且那时用户能看见自己在打 `-v`。
+    /// 功能缺失（与「不开放卷删除」同一纪律），不是遗漏——真要删卷请用 CLI，
+    /// 并且那时用户能看见自己在打 `-v`。
     Down,
 }
 

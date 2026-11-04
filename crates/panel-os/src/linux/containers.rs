@@ -29,8 +29,10 @@
 //! **已开放**的 compose 生命周期写操作：`up` / `stop` / `restart` / `down`
 //! （`down` **永不传 `-v`**，见 [`ComposeAction::Down`]）；面板编排（stack 定义）
 //! 见 [`crate::linux::compose_stack`]。
-//! **未提供**（刻意，非遗漏）：镜像删除（磁盘回收风险）；`docker exec`；
-//! 卷的创建/删除（**只读列举已开放**；删除卷=数据丢失，与镜像删除同理）；
+//! **已提供**：删除镜像（`docker rmi`，**不带 `-f`**；被容器引用时由守护进程拒绝，
+//! 需先删除相关容器——不替用户"强删"）。
+//! **未提供**（刻意，非遗漏）：`docker exec`；
+//! 卷的创建/删除（**只读列举已开放**；删除卷=数据丢失，且卷数据不可重建）；
 //! compose **项目级日志**（`docker compose logs` 未接，请用 CLI）；
 //! `docker compose` 的 `pull` / `build` / `scale` 等其余子命令。
 //! 网络侧刻意**只读列举**：创建/删除网络、容器接入/断开网络等写操作未实现
@@ -354,6 +356,30 @@ impl ContainerProvider for LinuxContainers {
                 size: String::new(),
                 created: String::new(),
             }))
+    }
+
+    /// 删除本地镜像（等价 `docker rmi`，**不带 `-f`**）。
+    ///
+    /// 与容器删除同一纪律：非强制删除是默认安全行为——被容器引用的镜像会被
+    /// 守护进程拒绝（`conflict: unable to delete ... image is being used by ...`），
+    /// 错误原样透传，由用户先删相关容器，而不是面板替用户"强删"。
+    /// `image` 可为 `repo:tag` 或镜像 ID（悬空镜像只能按 ID 删）。
+    async fn remove_image(&self, image: &str) -> Result<()> {
+        self.ensure_ready()?;
+        // 注入防线：与 pull 同源——该值直接进 argv，须先校验无空白 / shell 元字符。
+        if !image_is_safe(image) {
+            return Err(PanelError::Validation {
+                field: "image",
+                reason: "镜像引用含非法字符（仅允许字母数字与 . _ : / -，不得含空白或 shell 元字符）".into(),
+            });
+        }
+        let out = crate::cmd::run(
+            Bin::Docker,
+            &["rmi", image],
+            CmdOpt { timeout: ACT_TIMEOUT, ..Default::default() },
+        ).await?;
+        LinuxContainers::check(&out, "docker rmi")?;
+        Ok(())
     }
 
     async fn logs(&self, id: &str, opts: ContainerLogsOpts) -> Result<Vec<ContainerLogLine>> {
@@ -1068,6 +1094,34 @@ mod tests {
         assert!(image_is_safe("nginx:1.27-alpine"));
         assert!(image_is_safe("registry.example.com/lib/app:latest"));
         assert!(image_is_safe("sha256:abcdef"));
+    }
+
+    /// ⭐ `docker rmi` **永不传 `-f`**：强删会先停容器、掩盖"还有容器在用"。
+    ///
+    /// 与 `ComposeAction::Down` 永不传 `-v` 同一纪律——删掉 `-f` 与否不影响
+    /// 任何行为测试（功能照常），只能源码级断言。
+    ///
+    /// ⚠ 必须只看**生产段**：本测试自身的 needle 字面量也在文件里，全文件
+    /// `contains` 会命中测试代码 → 断言恒红（判据指向了自己）。
+    #[test]
+    fn remove_image_never_passes_force_flag() {
+        let full = include_str!("containers.rs");
+        let prod = full
+            .split("#[cfg(test)]")
+            .next()
+            .expect("生产段必须存在于测试模块之前");
+        assert!(
+            prod.contains("async fn remove_image"),
+            "生产段必须包含 remove_image 实现（split 前提失效会立刻红，而不是静默空转）"
+        );
+        assert!(
+            prod.contains("&[\"rmi\", image]"),
+            "删除镜像必须走 `docker rmi <ref>`（不带 -f）"
+        );
+        assert!(
+            !prod.contains("rmi\", \"-f\"") && !prod.contains("rmi\", \"--force\""),
+            "`docker rmi` 不得带 -f / --force：强删会先停容器、掩盖镜像仍被引用的事实"
+        );
     }
 
     #[test]
