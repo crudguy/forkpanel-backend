@@ -312,7 +312,9 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/containers/{id}/start", post(containers::start))
         .route("/api/v1/containers/{id}/stop", post(containers::stop))
         .route("/api/v1/containers/{id}/restart", post(containers::restart))
-        .route("/api/v1/containers/{id}", delete(containers::remove))
+        .route("/api/v1/containers/{id}", delete(containers::remove).patch(containers::update_limits))
+        // 资源限制的只读快照（docker inspect 的 HostConfig 子集），供编辑弹窗预填
+        .route("/api/v1/containers/{id}/limits", get(containers::limits))
         // 一键安装 Docker（仅 binary_missing 时可用，高危二次确认）。
         // 复用 services 的 PackageTask 任务队列，按包管理器选对包名。
         .route("/api/v1/containers/install", post(containers::install))
@@ -606,7 +608,7 @@ mod tests {
             (include_str!("routes/firewall.rs"), ".get(cap_keys::FAIL2BAN)", 3, "firewall::*"),
             (include_str!("routes/cron.rs"), ".get(cap_keys::SCHEDULER_MANAGE)", 7, "cron::* 每个 handler 一道"),
             (include_str!("routes/containers.rs"), ".get(cap_keys::CONTAINER_MANAGE)", 1, "ensure_supported helper 内一道"),
-            (include_str!("routes/containers.rs"), "ensure_supported(&state)?", 12, "12 个 handler 的接线"),
+            (include_str!("routes/containers.rs"), "ensure_supported(&state)?", 14, "14 个 handler 的接线（含 docker update 与 limits）"),
             (include_str!("routes/processes.rs"), ".get(cap_keys::PROCESS_LIST)", 1, "processes::list（P1-22 修复）"),
             (include_str!("routes/processes.rs"), ".get(cap_keys::PROCESS_SIGNAL)", 1, "processes::kill（P2-5 修复）"),
             (include_str!("routes/databases.rs"), ".get(cap_keys::DBMS_MANAGE)", 1, "ensure_dbms helper 内一道"),

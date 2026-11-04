@@ -193,6 +193,38 @@ impl LinuxContainers {
         }
         Ok(())
     }
+
+    /// 容器 ID/名称的注入防线。该值直接进 argv，`--force` 之类会被 CLI 当选项解析
+    /// （参数注入，与 shell 注入同源），故一律先过白名单。
+    /// 抽成一处：`act` / 新增的 `limits` / `update` 三条路径共用同一判据。
+    fn validate_ref(id: &str) -> Result<()> {
+        if !panel_core::rules::is_valid_container_ref(id) {
+            return Err(PanelError::Validation {
+                field: "id",
+                reason: "容器 ID/名称含非法字符（仅允许字母数字与 . _ -，且不得以 - 开头）".into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// `docker inspect` 只取 `HostConfig` 里的四项（用 `|` 分隔、单行输出）。
+    ///
+    /// 为什么不取整份 JSON：里面含全量挂载 / 网络 / 标签，解析成本与出错面都大，
+    /// 而这三项恰好是 `docker ps` **不报**、`docker update` **能改**的交集。
+    async fn read_limits_raw(&self, id: &str) -> Result<RawLimits> {
+        let out = crate::cmd::run(
+            Bin::Docker,
+            &[
+                "inspect",
+                "--format",
+                "{{.HostConfig.NanoCpus}}|{{.HostConfig.Memory}}|{{.HostConfig.MemorySwap}}|{{.HostConfig.RestartPolicy.Name}}",
+                id,
+            ],
+            CmdOpt { timeout: ACT_TIMEOUT, ..Default::default() },
+        ).await?;
+        LinuxContainers::check(&out, "docker inspect")?;
+        parse_limits(&out.stdout)
+    }
 }
 
 #[async_trait]
@@ -238,12 +270,7 @@ impl ContainerProvider for LinuxContainers {
         self.ensure_ready()?;
         // 参数注入防线：该值直接进 argv，`--force` 会被 docker 当选项解析。
         // 白名单校验在调用点也要做（provider 不得假设上游已校验）。
-        if !panel_core::rules::is_valid_container_ref(id) {
-            return Err(PanelError::Validation {
-                field: "id",
-                reason: "容器 ID/名称含非法字符（仅允许字母数字与 . _ -，且不得以 - 开头）".into(),
-            });
-        }
+        LinuxContainers::validate_ref(id)?;
         let args: Vec<&str> = match action {
             ContainerAction::Start => vec!["start", id],
             ContainerAction::Stop => vec!["stop", "-t", STOP_GRACE_SECS, id],
@@ -325,6 +352,56 @@ impl ContainerProvider for LinuxContainers {
             compose_service: None,
         })
     }
+
+    /// 读取容器当前资源限制（`docker inspect` 的 `HostConfig` 子集）。
+    async fn limits(&self, id: &str) -> Result<ContainerLimits> {
+        self.ensure_ready()?;
+        LinuxContainers::validate_ref(id)?;
+        let raw = self.read_limits_raw(id).await?;
+        Ok(ContainerLimits {
+            cpu_quota: raw.cpu_quota(),
+            mem_limit: bytes_to_mem_limit(raw.memory),
+            restart: raw.restart,
+        })
+    }
+
+    /// 修改容器资源限制（等价 `docker update`）。
+    ///
+    /// 两个**真机实测**（docker 29.9.2）出来的坑，注释在此以免后来者"顺手优化"掉：
+    ///
+    /// ① 运行中的容器把内存上限**调大**会被守护进程拒绝：
+    ///    `Memory limit should be smaller than already set memoryswap limit`。
+    ///    所以改内存必须同步 `--memory-swap`。取值规则：原来的 swap 是 `-1`
+    ///    （无上限）就保持 `-1`；否则取 `max(2 × 新内存上限, 原 swap)`——
+    ///    **只放宽不收紧**，收紧 swap 会让原本不会 OOM 的容器被杀。
+    ///    （停止态下守护进程不校验这层关系，只改 `--memory` 也能过，但那会把
+    ///    swap 留在旧值上、与内存上限脱钩，下次启动行为就不可预期了。）
+    /// ② `--cpus 0` / `--memory 0` 会被**静默忽略**（rc=0 但值纹丝不动），
+    ///    `--memory -1` 直接报 `invalid size` ⇒ "取消限制"在 `docker update`
+    ///    里做不到，入参一律要求正数，界面如实说明"只能删容器重建"。
+    async fn update(&self, id: &str, req: ContainerUpdateReq) -> Result<()> {
+        self.ensure_ready()?;
+        LinuxContainers::validate_ref(id)?;
+        validate_update_req(&req)?;
+        // 只有改内存才需要读当前 swap（省一次子进程）；读不到就按"未设"处理，
+        // 由 build_update_args 走 2 倍默认比例
+        let cur_swap = if req.mem_limit.is_some() {
+            self.read_limits_raw(id).await.map(|r| r.memory_swap).unwrap_or(0)
+        } else {
+            0
+        };
+        let owned = build_update_args(id, &req, cur_swap);
+
+        let args: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+        let out = crate::cmd::run(
+            Bin::Docker,
+            &args,
+            CmdOpt { timeout: ACT_TIMEOUT, ..Default::default() },
+        ).await?;
+        // 成功时 stdout 是容器名（docker update 的惯例），不解析；非 0 退出透传 stderr
+        LinuxContainers::check(&out, "docker update")
+    }
+
     async fn pull(&self, image: &str) -> Result<ImageSummary> {
         self.ensure_ready()?;
         // 注入防线：image 直接进 argv，须先校验无空白 / shell 元字符（与 create 同源）。
@@ -862,6 +939,190 @@ pub(crate) fn mem_limit_is_safe(m: &str) -> bool {
         || unit.eq_ignore_ascii_case("g")
 }
 
+/// `512m` / `2g` / `1048576` → 字节数（k/m/g 均为 1024 进制，与 docker 一致）。
+///
+/// 只在**已过 `mem_limit_is_safe`** 的串上调用；即便如此也返回 `Option`，
+/// 让调用方把"浮点数溢出"之类当成错误报出去，而不是静默按 0 处理
+/// （按 0 处理等于悄悄不设上限，正是最难发现的一类 bug）。
+pub(crate) fn mem_limit_bytes(m: &str) -> Option<u64> {
+    let b = m.trim();
+    let digits: String = b.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let n: u64 = digits.parse().ok()?;
+    let mult: u64 = match &b[digits.len()..] {
+        "" => 1,
+        u if u.eq_ignore_ascii_case("k") => 1024,
+        u if u.eq_ignore_ascii_case("m") => 1024 * 1024,
+        u if u.eq_ignore_ascii_case("g") => 1024 * 1024 * 1024,
+        _ => return None,
+    };
+    n.checked_mul(mult)
+}
+
+/// 字节数 → 归一化的 CLI 单位串（就近取能整除的最大单位；除不尽就回退成纯字节）。
+/// `0` 表示**未设上限** ⇒ `None`（前端据此显示"不限制"）。
+fn bytes_to_mem_limit(bytes: u64) -> Option<String> {
+    if bytes == 0 {
+        return None;
+    }
+    const K: u64 = 1024;
+    const M: u64 = K * 1024;
+    const G: u64 = M * 1024;
+    if bytes.is_multiple_of(G) {
+        Some(format!("{}g", bytes / G))
+    } else if bytes.is_multiple_of(M) {
+        Some(format!("{}m", bytes / M))
+    } else if bytes.is_multiple_of(K) {
+        Some(format!("{}k", bytes / K))
+    } else {
+        Some(bytes.to_string())
+    }
+}
+
+/// `docker inspect --format` 取回的四项 `HostConfig` 原值。
+///
+/// 内部结构（不对外）：`memory_swap` 只在 `update` 里用来算新的 swap 上限，
+/// 不暴露给 API —— 面板没有"改 swap"这个功能，露出去等于暗示它可以改。
+struct RawLimits {
+    /// `--cpus 1.5` ⇒ 1500000000；0 表示未设上限。
+    nano_cpus: i64,
+    /// 内存上限（字节）；0 表示未设上限。
+    memory: u64,
+    /// 内存 + swap 合计上限（字节）；`-1` 表示 swap 无上限。**不进 API**。
+    memory_swap: i64,
+    /// `no` / `on-failure` / `always` / `unless-stopped`
+    restart: String,
+}
+
+impl RawLimits {
+    fn cpu_quota(&self) -> Option<f64> {
+        if self.nano_cpus > 0 {
+            Some(self.nano_cpus as f64 / 1_000_000_000.0)
+        } else {
+            None
+        }
+    }
+}
+
+/// 解析 [`RawLimits`] 那一行 `a|b|c|d`。
+///
+/// **不做宽容解析**：字段数不对、数字解析失败一律报错。理由是这三项会被回填进
+/// 编辑弹窗——若把 `<no value>` 之类当成 0（= 不限制）静默吞掉，用户会看到
+/// 一个"当前不限制"的假现状，然后基于假信息去改容器。
+fn parse_limits(stdout: &str) -> Result<RawLimits> {
+    let line = stdout
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .ok_or_else(|| PanelError::Internal("docker inspect 无输出（容器不存在？）".into()))?;
+    let parts: Vec<&str> = line.split('|').collect();
+    if parts.len() != 4 {
+        return Err(PanelError::Internal(format!(
+            "docker inspect 输出段数不符（期望 4，实得 {}）：{line}",
+            parts.len()
+        )));
+    }
+    let num = |s: &str, what: &str| -> Result<i64> {
+        s.trim().parse::<i64>().map_err(|e| {
+            PanelError::Internal(format!("docker inspect 的 {what} 不是整数（`{}`）：{e}", s.trim()))
+        })
+    };
+    let nano_cpus = num(parts[0], "HostConfig.NanoCpus")?;
+    let memory = num(parts[1], "HostConfig.Memory")?;
+    let memory_swap = num(parts[2], "HostConfig.MemorySwap")?;
+    Ok(RawLimits {
+        nano_cpus,
+        memory: if memory > 0 { memory as u64 } else { 0 },
+        memory_swap,
+        restart: parts[3].trim().to_string(),
+    })
+}
+
+// ─────────────── 编辑资源限制（纯函数，可离线单测） ───────────────
+//
+// 抽成纯函数的理由：`update` 的 argv 拼装是**唯一**能在这里被证明的东西——
+// 真机行为（daemon 拒收、swap 关系）只有跑一遍才知道，而"漏传 --memory-swap"
+// 这类回归在行为测试里表现为"某些机器上偶发 502"，极难定位。把拼装摊开成
+// 可断言的字符串列表，漏一项就当场变红。
+
+/// 校验 `docker update` 的请求（不含 id）。全部要求正数 / 白名单值：
+/// 0 会被守护进程**静默忽略**，放过去等于给用户一个点了没反应的按钮。
+fn validate_update_req(req: &ContainerUpdateReq) -> Result<()> {
+    if req.is_empty() {
+        return Err(PanelError::Validation {
+            field: "update",
+            reason: "至少要修改一项（CPU 配额 / 内存上限 / 重启策略）".into(),
+        });
+    }
+    if let Some(c) = req.cpu_quota {
+        if !c.is_finite() || c <= 0.0 {
+            return Err(PanelError::Validation {
+                field: "cpu_quota",
+                reason: "CPU 配额必须为正数（docker 会静默忽略 0）".into(),
+            });
+        }
+    }
+    if let Some(m) = &req.mem_limit {
+        if !mem_limit_is_safe(m) {
+            return Err(PanelError::Validation {
+                field: "mem_limit",
+                reason: "内存上限格式非法（如 512m / 2g）".into(),
+            });
+        }
+        if mem_limit_bytes(m).filter(|b| *b > 0).is_none() {
+            return Err(PanelError::Validation {
+                field: "mem_limit",
+                reason: "内存上限必须为正数（docker 会静默忽略 0）".into(),
+            });
+        }
+    }
+    if let Some(r) = &req.restart {
+        if !matches!(r.as_str(), "no" | "on-failure" | "always" | "unless-stopped") {
+            return Err(PanelError::Validation { field: "restart", reason: "未知重启策略".into() });
+        }
+    }
+    Ok(())
+}
+
+/// 拼 `docker update` 的 argv（**调用前必须先过 [`validate_update_req`]**）。
+///
+/// `cur_swap` = 容器当前 `HostConfig.MemorySwap`（字节，`-1` = swap 无上限）。
+///
+/// ⚠ 改内存时**必须**带上 `--memory-swap`：运行中的容器把内存上限调大，
+/// 守护进程会以 `Memory limit should be smaller than already set memoryswap
+/// limit` 拒收（真机实测 docker 29.9.2）。取值规则：
+/// - 原 swap 为 `-1`（无上限）⇒ 保持 `-1`；
+/// - 否则 `max(2 × 新内存上限, 原 swap)` —— **只放宽不收紧**：收紧 swap 会让
+///   原本不会 OOM 的容器被杀，而用户的意图只是调内存上限。
+fn build_update_args(id: &str, req: &ContainerUpdateReq, cur_swap: i64) -> Vec<String> {
+    // 与 create 同纪律：每个值都是独立 argv 元素，不整体拼串。
+    let mut owned: Vec<String> = vec!["update".into()];
+    if let Some(c) = req.cpu_quota {
+        owned.push("--cpus".into());
+        owned.push(c.to_string());
+    }
+    if let Some(m) = &req.mem_limit {
+        let bytes = mem_limit_bytes(m).unwrap_or(0);
+        owned.push("--memory".into());
+        owned.push(m.clone());
+        let swap: i64 = if cur_swap < 0 {
+            -1
+        } else {
+            cur_swap.max(bytes.saturating_mul(2) as i64)
+        };
+        // 用 `=` 形式：`-1` 作为独立 argv 元素会被 CLI 当成选项
+        owned.push(format!("--memory-swap={swap}"));
+    }
+    if let Some(r) = &req.restart {
+        owned.push("--restart".into());
+        owned.push(r.clone());
+    }
+    owned.push(id.to_string());
+    owned
+}
+
 /// 守护进程可达性探测：对 unix socket 做一次 connect。
 ///
 /// - 权限不足（不在 docker 组）→ `EACCES`，立即返回 false
@@ -1122,6 +1383,219 @@ mod tests {
             !prod.contains("rmi\", \"-f\"") && !prod.contains("rmi\", \"--force\""),
             "`docker rmi` 不得带 -f / --force：强删会先停容器、掩盖镜像仍被引用的事实"
         );
+    }
+
+    // ── 编辑资源限制（docker update）──
+
+    /// `docker inspect --format` 的四段输出解析。
+    #[test]
+    fn parse_limits_reads_host_config() {
+        let r = parse_limits("1500000000|536870912|1073741824|unless-stopped\n").expect("合法行");
+        assert_eq!(r.cpu_quota(), Some(1.5));
+        assert_eq!(r.memory, 512 * 1024 * 1024);
+        assert_eq!(r.memory_swap, 1024 * 1024 * 1024);
+        assert_eq!(r.restart, "unless-stopped");
+    }
+
+    /// 未设上限的容器：NanoCpus/Memory 都是 0 ⇒ 两个 Option 都是 None
+    /// （不是 Some(0.0)——那会让前端显示"0 核"而不是"不限制"）。
+    #[test]
+    fn parse_limits_maps_zero_to_unlimited() {
+        let r = parse_limits("0|0|0|no").expect("合法行");
+        assert_eq!(r.cpu_quota(), None, "NanoCpus=0 表示未设上限");
+        assert_eq!(bytes_to_mem_limit(r.memory), None, "Memory=0 表示未设上限");
+        assert_eq!(r.restart, "no");
+    }
+
+    /// ⭐ 解析**不做宽容**：段数不对 / 数字不是数字都必须报错。
+    ///
+    /// 这些值会被回填进编辑弹窗。若把 `<no value>` 之类当成 0（= 不限制）静默
+    /// 吞掉，用户会看到一份"当前不限制"的假现状，再基于假信息去改生产容器。
+    #[test]
+    fn parse_limits_is_strict() {
+        assert!(parse_limits("").is_err(), "空输出（容器不存在）必须报错");
+        assert!(parse_limits("1|2|3").is_err(), "少一段必须报错");
+        assert!(parse_limits("1|2|3|no|5").is_err(), "多一段必须报错");
+        assert!(parse_limits("<no value>|0|0|no").is_err(), "字段非整数必须报错");
+        assert!(parse_limits("0|x|0|no").is_err(), "Memory 非整数必须报错");
+    }
+
+    #[test]
+    fn mem_limit_bytes_handles_units() {
+        assert_eq!(mem_limit_bytes("512m"), Some(512 * 1024 * 1024));
+        assert_eq!(mem_limit_bytes("2g"), Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(mem_limit_bytes("64k"), Some(64 * 1024));
+        assert_eq!(mem_limit_bytes("1024"), Some(1024), "纯数字按字节");
+        assert_eq!(mem_limit_bytes("512M"), Some(512 * 1024 * 1024), "单位大小写不敏感");
+        assert_eq!(mem_limit_bytes(""), None);
+        assert_eq!(mem_limit_bytes("m"), None, "没有数字");
+        assert_eq!(mem_limit_bytes("512t"), None, "未知单位");
+    }
+
+    /// 字节数回填成单位串：能整除就取大单位，除不尽回退纯字节。
+    /// 这两个函数必须互为往返（否则弹窗一打开就把 512m 显示成 536870912）。
+    #[test]
+    fn bytes_to_mem_limit_prefers_largest_unit() {
+        assert_eq!(bytes_to_mem_limit(0), None);
+        assert_eq!(bytes_to_mem_limit(2 * 1024 * 1024 * 1024).as_deref(), Some("2g"));
+        assert_eq!(bytes_to_mem_limit(512 * 1024 * 1024).as_deref(), Some("512m"));
+        assert_eq!(bytes_to_mem_limit(64 * 1024).as_deref(), Some("64k"));
+        assert_eq!(bytes_to_mem_limit(1000).as_deref(), Some("1000"));
+        for m in ["512m", "2g", "64k", "1536m"] {
+            let b = mem_limit_bytes(m).expect("可解析");
+            assert_eq!(
+                mem_limit_bytes(&bytes_to_mem_limit(b).expect("非 0")).expect("可回解"),
+                b,
+                "{m} 往返后字节数必须一致"
+            );
+        }
+    }
+
+    /// ⭐⭐ **改内存必须同时带 `--memory-swap`**。
+    ///
+    /// 真机实测（docker 29.9.2）：运行中的容器把内存上限调大，守护进程会拒收
+    /// `Memory limit should be smaller than already set memoryswap limit`。
+    /// 这条约束在行为测试里表现为"某些机器上偶发 502"，很难定位——
+    /// 所以在 argv 层面钉死：出现 `--memory` 就必须出现 `--memory-swap=`。
+    #[test]
+    fn build_update_args_always_pairs_memory_with_swap() {
+        for cur in [0i64, 1024 * 1024 * 1024, -1] {
+            for m in ["256m", "512m", "2g"] {
+                let req = ContainerUpdateReq { mem_limit: Some(m.into()), ..Default::default() };
+                let a = build_update_args("abc", &req, cur);
+                assert!(a.contains(&"--memory".to_string()), "{m}/{cur}: 必须有 --memory");
+                assert!(
+                    a.iter().any(|s| s.starts_with("--memory-swap=")),
+                    "{m}/{cur}: 改内存必须同步 --memory-swap，否则运行态调大上限会被 daemon 拒收"
+                );
+            }
+        }
+        // 不改内存时不该凭空多出 swap 参数（那会顺手改了别的语义）
+        let req = ContainerUpdateReq { cpu_quota: Some(2.0), ..Default::default() };
+        let a = build_update_args("abc", &req, 1024);
+        assert!(!a.iter().any(|s| s.starts_with("--memory")), "未改内存不得传 --memory*");
+    }
+
+    /// swap 取值规则：只放宽不收紧；原值 `-1`（无上限）保持 `-1`。
+    #[test]
+    fn build_update_args_never_narrows_swap() {
+        // 原 swap 4G、内存改 512m ⇒ 2×512m=1G < 4G ⇒ 保持 4G（不收紧）
+        let req = ContainerUpdateReq { mem_limit: Some("512m".into()), ..Default::default() };
+        let a = build_update_args("abc", &req, 4 * 1024 * 1024 * 1024);
+        assert!(a.contains(&"--memory-swap=4294967296".to_string()), "不得收紧已有 swap：{a:?}");
+
+        // 原 swap 1G、内存改 2g ⇒ 2×2g=4G > 1G ⇒ 放宽到 4G（否则 daemon 拒收）
+        let req = ContainerUpdateReq { mem_limit: Some("2g".into()), ..Default::default() };
+        let a = build_update_args("abc", &req, 1024 * 1024 * 1024);
+        assert!(a.contains(&"--memory-swap=4294967296".to_string()), "调大上限须同步放宽 swap：{a:?}");
+
+        // 原 swap 无上限 ⇒ 保持无上限（用 `=` 形式，`-1` 作为独立元素会被当选项）
+        let req = ContainerUpdateReq { mem_limit: Some("2g".into()), ..Default::default() };
+        let a = build_update_args("abc", &req, -1);
+        assert!(a.contains(&"--memory-swap=-1".to_string()), "原 swap 无上限必须保持：{a:?}");
+        assert!(!a.contains(&"-1".to_string()), "`-1` 不能以独立 argv 元素出现（会被 CLI 当选项）");
+    }
+
+    /// argv 结构：子命令在最前、容器 ID 在最后、每个值各自成一个元素。
+    #[test]
+    fn build_update_args_shape() {
+        let req = ContainerUpdateReq {
+            cpu_quota: Some(1.5),
+            mem_limit: Some("512m".into()),
+            restart: Some("unless-stopped".into()),
+        };
+        let a = build_update_args("web-1", &req, 0);
+        assert_eq!(a[0], "update");
+        assert_eq!(a.last().map(String::as_str), Some("web-1"), "容器 ID 必须在最后");
+        assert!(a.contains(&"--cpus".to_string()) && a.contains(&"1.5".to_string()));
+        assert!(a.contains(&"--restart".to_string()) && a.contains(&"unless-stopped".to_string()));
+        assert!(a.contains(&"--memory".to_string()) && a.contains(&"512m".to_string()));
+        // 没有任何元素是"多个参数拼在一起"
+        assert!(!a.iter().any(|s| s.contains(' ') && !s.starts_with("--memory-swap=")),
+            "不得把多个参数拼进同一个 argv 元素：{a:?}");
+    }
+
+    /// ⭐ 0 会被守护进程**静默忽略**（rc=0 而值不变），必须在入口就拒掉，
+    /// 否则界面上就是"点了保存、看起来成功、实际没变"的假控制。
+    #[test]
+    fn validate_update_req_rejects_zero_and_empty() {
+        assert!(validate_update_req(&ContainerUpdateReq::default()).is_err(), "三项全空必须报错");
+
+        let zero_cpu = ContainerUpdateReq { cpu_quota: Some(0.0), ..Default::default() };
+        assert!(validate_update_req(&zero_cpu).is_err(), "cpu=0 会被 docker 静默忽略");
+
+        let neg_cpu = ContainerUpdateReq { cpu_quota: Some(-1.0), ..Default::default() };
+        assert!(validate_update_req(&neg_cpu).is_err());
+
+        let nan_cpu = ContainerUpdateReq { cpu_quota: Some(f64::NAN), ..Default::default() };
+        assert!(validate_update_req(&nan_cpu).is_err(), "NaN 不是合法核数");
+
+        let zero_mem = ContainerUpdateReq { mem_limit: Some("0".into()), ..Default::default() };
+        assert!(validate_update_req(&zero_mem).is_err(), "内存 0 会被 docker 静默忽略");
+
+        let bad_mem = ContainerUpdateReq { mem_limit: Some("512mb".into()), ..Default::default() };
+        assert!(validate_update_req(&bad_mem).is_err(), "单位只认单个 k/m/g");
+
+        let bad_restart = ContainerUpdateReq { restart: Some("alwayss".into()), ..Default::default() };
+        assert!(validate_update_req(&bad_restart).is_err());
+
+        // 合法项必须放行（含"只改重启策略"这种最常见的用法）
+        assert!(validate_update_req(&ContainerUpdateReq { restart: Some("no".into()), ..Default::default() }).is_ok());
+        assert!(validate_update_req(&ContainerUpdateReq { cpu_quota: Some(0.5), ..Default::default() }).is_ok());
+        assert!(validate_update_req(&ContainerUpdateReq { mem_limit: Some("2g".into()), ..Default::default() }).is_ok());
+    }
+
+    /// ⭐ argv 拼装只允许在 `build_update_args` 里发生。
+    ///
+    /// 一旦有人把某段 push 挪回 `update` 里（"就多加一个 flag"），
+    /// 「`--memory` 必带 `--memory-swap`」这条实测约束就绕过了，
+    /// 而上面那些纯函数测试照样全绿（它们测的是没被调用的函数）。
+    ///
+    /// ⚠ 判据必须**只框住 update 的函数体**，不能扫全生产段：`create` 里
+    /// 本来就有一处 `owned.push("--memory")`（它不需要 swap，`docker create`
+    /// 会自己按 2 倍算），扫全段会恒红。
+    #[test]
+    fn update_delegates_to_pure_arg_builder() {
+        let prod = panel_testutil::production_source(include_str!("containers.rs"));
+        let body = fn_body(&prod, "async fn update(");
+        assert!(
+            !body.contains("\"--memory\""),
+            "`update` 里不得直接拼 `--memory`：改内存必须与 `--memory-swap` 同批下发，\
+             走 build_update_args 才能保证这一点。\n函数体：\n{body}"
+        );
+        assert!(
+            body.contains("build_update_args(id, &req, cur_swap)"),
+            "`update` 必须走 build_update_args 拼 argv，不得在实现里另拼一份。\n函数体：\n{body}"
+        );
+        // 前提自检：确实取到了 update 的函数体（而不是空串）
+        assert!(body.starts_with('{') && body.len() > 80, "函数体提取失效，判据会静默空转：{body}");
+    }
+
+    /// 从 `anchor` 起的第一个 `{` 开始做花括号配对，返回整段函数体（含花括号）。
+    /// 测试内小工具：用来把断言**框在一个函数体里**，避免"扫全段恒红/恒绿"。
+    fn fn_body(src: &str, anchor: &str) -> String {
+        let at = src.find(anchor).unwrap_or_else(|| panic!("找不到 `{anchor}`"));
+        let bytes = src.as_bytes();
+        let mut depth = 0usize;
+        let mut start = None;
+        for (i, b) in bytes.iter().enumerate().skip(at) {
+            match b {
+                b'{' => {
+                    if start.is_none() {
+                        start = Some(i);
+                    }
+                    depth += 1;
+                }
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return src[start.expect("锚点后必须有函数体")..=i].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("`{anchor}` 的函数体未闭合");
     }
 
     #[test]

@@ -575,6 +575,28 @@ impl ContainerProvider for MockContainers {
         Ok(())
     }
 
+    async fn limits(&self, _id: &str) -> Result<ContainerLimits> {
+        // mock 不真正 inspect：给一组"有上限"的样例值，让前端编辑弹窗能预填出内容
+        // （返回全 None 会让"预填"这条路在前端联调里走空，等于没测到）。
+        Ok(ContainerLimits {
+            cpu_quota: Some(1.5),
+            mem_limit: Some("512m".into()),
+            restart: "unless-stopped".into(),
+        })
+    }
+
+    async fn update(&self, _id: &str, req: ContainerUpdateReq) -> Result<()> {
+        // mock 不真正调用 docker：但**保留**"三项全空必须报错"这条语义——
+        // 否则前端漏传字段时 mock 环境下看着成功、真机才炸。
+        if req.is_empty() {
+            return Err(PanelError::Validation {
+                field: "update",
+                reason: "至少要修改一项（CPU 配额 / 内存上限 / 重启策略）".into(),
+            });
+        }
+        Ok(())
+    }
+
     async fn logs(&self, _id: &str, opts: ContainerLogsOpts) -> Result<Vec<ContainerLogLine>> {
         // mock 不真正调用 docker：生成样例日志行，便于前端联调日志查看对话框。
         // 上限 20 行，避免 mock 造出与 tail 等量的无意义数据。

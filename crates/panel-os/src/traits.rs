@@ -1686,6 +1686,47 @@ pub struct ContainerCreateReq {
     pub privileged: bool,
 }
 
+/// 容器**创建后仍然可改**的资源限制子集（等价 `docker update` 能改的部分）。
+///
+/// Docker 的硬约束：容器一旦 `create` 成功，`image` / `ports` / `env` /
+/// `volumes` / `cmd` / `privileged` 就固化了（`name` 另有 `docker rename`，
+/// 面板未开放）。想改这些只能删容器重建。**面板只开放这一小撮**——
+/// 与其假装"编辑容器"是个万能表单，不如把边界摆在界面上。
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ContainerLimits {
+    /// CPU 核数（`None` = 未设上限）。后端已由 NanoCpus 换算回小数核。
+    pub cpu_quota: Option<f64>,
+    /// 内存上限，已规范化成 `512m` / `2g` 这类 CLI 单位串（`None` = 未设上限）。
+    pub mem_limit: Option<String>,
+    /// 重启策略：`no` / `on-failure` / `always` / `unless-stopped`。
+    pub restart: String,
+}
+
+/// 修改容器资源限制的请求（PATCH 语义：`None` = 保持原值不动）。
+///
+/// ⚠⚠ **刻意不支持"取消限制"**：`docker update --memory 0` / `--cpus 0`
+/// 会被守护进程**静默忽略**（实测 rc=0 但内存/CPU 上限仍是原值），
+/// `--memory -1` 则直接报 `invalid size`。也就是说"把限制去掉"这件事
+/// 在 `docker update` 里根本做不到（只有 `--memory-swap=-1` 能放开 swap）。
+/// 所以这里两个数值字段都要求**正数**，界面上如实告诉用户：要彻底取消
+/// 只能删容器重建——而不是给一个点了没反应的"无限制"选项。
+#[derive(Debug, Clone, Default)]
+pub struct ContainerUpdateReq {
+    /// CPU 核数；`None` = 不改。必须 > 0（0 会被 CLI 静默忽略）。
+    pub cpu_quota: Option<f64>,
+    /// 内存上限（`512m` / `2g`，须过 `mem_limit_is_safe`）；`None` = 不改。
+    pub mem_limit: Option<String>,
+    /// 重启策略；`None` = 不改。
+    pub restart: Option<String>,
+}
+
+impl ContainerUpdateReq {
+    /// 三个字段全空 ⇒ 没有任何可执行的动作（`docker update` 不接受空调用）。
+    pub fn is_empty(&self) -> bool {
+        self.cpu_quota.is_none() && self.mem_limit.is_none() && self.restart.is_none()
+    }
+}
+
 /// 面板编排的服务定义。
 ///
 /// ⚠⚠ **这是一个"类型层面的白名单"**：只有这里列出的字段会被渲染进
@@ -1758,6 +1799,20 @@ pub trait ContainerProvider: Send + Sync {
     /// 创建容器（等价 `docker create`，**不自动运行**）。`privileged`/宿主挂载/镜像
     /// 白名单等安全约束由实现强制；返回新建容器的摘要（含完整 id）。
     async fn create(&self, req: ContainerCreateReq) -> Result<ContainerSummary>;
+    /// 读取容器**当前**的资源限制（`docker inspect` 的 `HostConfig` 子集），
+    /// 供「编辑资源限制」弹窗预填——`docker ps` 不报这三项，只能 inspect。
+    /// `id` 必须先过字符集校验。
+    async fn limits(&self, id: &str) -> Result<ContainerLimits>;
+    /// 修改容器资源限制（等价 `docker update`）。
+    ///
+    /// 语义要点（均由实现保证）：
+    /// - PATCH：`ContainerUpdateReq` 里为 `None` 的项**不动**；三项全空 ⇒ 报
+    ///   `Validation`，不退化成一次无意义的空调用。
+    /// - **不重启容器**：CPU/内存是热改 cgroup，重启策略只是写 daemon 配置。
+    /// - 改 `mem_limit` 时须同步 `--memory-swap`，否则运行中的容器一旦把上限
+    ///   **调大**，守护进程会以 `Memory limit should be smaller than already
+    ///   set memoryswap limit` 拒绝（真机实测）。
+    async fn update(&self, id: &str, req: ContainerUpdateReq) -> Result<()>;
     /// 拉取镜像（等价 `docker pull`）。`image` 为 `repo:tag` 或 `repo`（默认 latest）；
     /// 实现须校验引用安全（无空白 / shell 元字符），返回拉取后的镜像摘要。
     /// 拉取属网络写入（下载镜像到本地），需 container.manage。

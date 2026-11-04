@@ -3490,6 +3490,41 @@ paths:
         '400': { description: ID/名称非法 }
         '501': { description: 容器能力不可用 }
   /api/v1/containers/{id}:
+    patch:
+      tags: [containers]
+      summary: 修改容器资源限制（`docker update`，**不重启容器**）
+      description: |
+        容器**创建后能改的只有这三项**：CPU 配额、内存上限、重启策略。
+        `image` / `ports` / `env` / `volumes` / `cmd` / `privileged` 在
+        `docker create` 成功那一刻就固化了，Docker 没有任何命令能改它们，
+        想改只能删容器重建（`name` 另有 `docker rename`，面板未开放）。
+
+        ⚠ **不支持"取消限制"**：`docker update --cpus 0` / `--memory 0` 会被
+        守护进程静默忽略（rc=0 而值不变），`--memory -1` 直接报 `invalid size`。
+        所以两个数值字段都必须是正数；要彻底去掉限制只能重建容器。
+
+        改 `mem_limit` 时后端会**自动同步** `--memory-swap`（否则运行中的容器
+        把上限调大时会被守护进程以 `Memory limit should be smaller than already
+        set memoryswap limit` 拒收）；swap 上限只放宽不收紧。
+      security: [cookieAuth, csrfHeader]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: PATCH 语义——未提供（或空串）的字段保持原值；三项全空则 400。
+              properties:
+                cpu_quota: { type: number, exclusiveMinimum: 0, description: CPU 核数（1.5 = 一个半核）；0 会被 docker 静默忽略 }
+                mem_limit: { type: string, description: '内存上限，如 512m / 2g（支持 k / m / g 后缀）' }
+                restart: { type: string, enum: [no, on-failure, always, unless-stopped] }
+      responses:
+        '204': { description: 已修改（不重启容器） }
+        '400': { description: "校验失败（ID 非法 / 三项全空 / 数值非正 / 单位非法 / 重启策略未知）" }
+        '501': { description: 容器能力不可用 }
+        '502': { description: "docker update 失败（stderr 透传，如内存上限与 swap 关系冲突）" }
     delete:
       tags: [containers]
       summary: 删除容器（默认 `docker rm`；运行中的容器会被拒绝，需先停止。`force=true` 走 `docker rm -f`）
@@ -3505,6 +3540,33 @@ paths:
         '204': { description: ok }
         '400': { description: ID/名称非法 }
         '501': { description: 容器能力不可用 }
+  /api/v1/containers/{id}/limits:
+    get:
+      tags: [containers]
+      summary: 读取容器当前资源限制（`docker inspect` 的 HostConfig 子集）
+      description: |
+        供「编辑资源限制」弹窗预填——`docker ps` 不报 CPU / 内存上限，只能 inspect。
+        `cpu_quota` / `mem_limit` 为 `null` 表示**未设上限**（不是 0）。
+        读操作，需 `container.view`。
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID" }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Envelope'
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      cpu_quota: { type: number, nullable: true, description: CPU 核数；null = 不限制 }
+                      mem_limit: { type: string, nullable: true, description: '如 512m；null = 不限制' }
+                      restart: { type: string, enum: [no, on-failure, always, unless-stopped] }
+        '400': { description: ID/名称非法 }
+        '501': { description: 容器能力不可用 }
+        '502': { description: "docker inspect 失败（容器不存在 / 输出格式异常）" }
 
   # ───────── 防火墙 ─────────
   /api/v1/firewall/status:

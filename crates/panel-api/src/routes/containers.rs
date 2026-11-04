@@ -22,8 +22,16 @@
 //!   **Compose 生命周期动作**（up / stop / restart / down，需 container.manage；
 //!   down 需手输项目名确认、**永不传 `-v`**）、
 //!   一键安装 Docker、把面板运行用户加入 docker 组、容器备注。
+//! - **资源限制编辑**（`docker update`）：只开 CPU 配额 / 内存上限 / 重启策略三项，
+//!   并配一个只读的「当前限制」端点（`docker inspect`）供弹窗预填。⚠ 这三项之外
+//!   （image / ports / env / volumes / cmd / privileged）创建后**不可改**，见下。
 //!
 //! ## 不提供的能力
+//! - **容器属性的编辑**：`docker create` 成功后 `image` / `ports` / `env` /
+//!   `volumes` / `cmd` / `privileged` 全部固化，Docker 没有任何命令能改它们
+//!   （`name` 另有 `docker rename`，面板未开放）。改这些只能删容器重建——
+//!   这不是面板的取舍，是引擎约束。同理**不支持"取消资源限制"**：
+//!   `docker update --cpus 0` / `--memory 0` 会被守护进程静默忽略。
 //! - **暂未实现**（非安全刻意排除，后续可补）：进入容器 `docker exec`、
 //!   网络的创建/删除与容器接入/断开（**只读列举已开放**）、卷的创建/删除
 //!   （**只读列举已开放**；删除卷=数据丢失，且卷数据不可重建）、compose 的
@@ -47,7 +55,9 @@ use axum::{
     Json,
 };
 use panel_core::{cap_keys, PanelError};
-use panel_os::{cmd, ComposeAction, ContainerAction, ContainerCreateReq, ContainerProvider};
+use panel_os::{
+    cmd, ComposeAction, ContainerAction, ContainerCreateReq, ContainerProvider, ContainerUpdateReq,
+};
 use serde::Deserialize;
 use std::time::Duration;
 use panel_task::{TaskRequest, TaskKind};
@@ -296,6 +306,91 @@ pub(crate) async fn pull(
         "size": img.size,
         "created": img.created,
     })))
+}
+
+// ─────────────── 编辑资源限制（docker update） ───────────────
+//
+// ⚠ **刻意不叫「编辑容器」**：`docker create` 一旦成功，`image` / `ports` /
+// `env` / `volumes` / `cmd` / `privileged` 就固化了（容器名另有 `docker rename`，
+// 面板未开放），想改只能删容器重建。`docker update` 能改的**只有** CPU 配额、
+// 内存上限、重启策略这三项。
+//
+// 与其给一张看着什么都能改、实际大半无效的表单，不如只开这三项并在界面上
+// 直接写清"其余字段不可改，须重建"——用户才不会以为面板坏了。
+//
+// ⚠ 还有一条反直觉的：**改不了"无限制"**。`docker update --cpus 0` /
+// `--memory 0` 会被守护进程静默忽略（rc=0 而值不变），`--memory -1` 直接
+// 报 `invalid size`。所以这里两个数值字段都要求正数，不提供"清空即不限制"
+// 这种点了没反应的假入口。
+
+/// 修改资源限制的请求体。PATCH 语义：**未提供（或空串）的字段保持原值**。
+#[derive(Debug, Deserialize)]
+pub struct UpdateLimitsReq {
+    /// CPU 核数（> 0）。
+    pub cpu_quota: Option<f64>,
+    /// 内存上限（`512m` / `2g`）。
+    pub mem_limit: Option<String>,
+    /// 重启策略：`no` / `on-failure` / `always` / `unless-stopped`。
+    pub restart: Option<String>,
+}
+
+/// 读取容器当前的资源限制（供编辑弹窗预填）。
+///
+/// `docker ps` 不报这三项，只能 `docker inspect`。读操作 ⇒ `container.view`。
+pub(crate) async fn limits(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    AxPath(id): AxPath<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::CONTAINER_VIEW)?;
+    // docker inspect 是子进程调用（容器页会轮询）——与 list 同档位限流
+    crate::ratelimit::check_read(&state, &s.username, "container.limits")?;
+    ensure_supported(&state)?;
+    if !panel_core::rules::is_valid_container_ref(&id) {
+        return Err(ApiError::bad_request(
+            "id",
+            "容器 ID/名称非法（仅允许字母数字与 . _ -，且不得以 - 开头）",
+        ));
+    }
+    let l = state.os.containers().limits(&id).await?;
+    Ok(ok(serde_json::json!({
+        "cpu_quota": l.cpu_quota,
+        "mem_limit": l.mem_limit,
+        "restart": l.restart,
+    })))
+}
+
+/// 修改容器资源限制（等价 `docker update`），**不重启容器**。
+pub(crate) async fn update_limits(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    AxPath(id): AxPath<String>,
+    PanelJson(req): PanelJson<UpdateLimitsReq>,
+) -> ApiResult<StatusCode> {
+    crate::auth::require(&s, perm::CONTAINER_MANAGE)?;
+    ensure_supported(&state)?;
+    if !panel_core::rules::is_valid_container_ref(&id) {
+        return Err(ApiError::bad_request(
+            "id",
+            "容器 ID/名称非法（仅允许字母数字与 . _ -，且不得以 - 开头）",
+        ));
+    }
+    // 空串按"未提供"处理：前端清空输入框等于"这项不改"，不该被当成格式错误骂回去
+    let clean = |s: Option<String>| s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let inner = ContainerUpdateReq {
+        cpu_quota: req.cpu_quota,
+        mem_limit: clean(req.mem_limit),
+        restart: clean(req.restart),
+    };
+    if inner.is_empty() {
+        return Err(ApiError::bad_request(
+            "update",
+            "至少要修改一项（CPU 配额 / 内存上限 / 重启策略）",
+        ));
+    }
+    state.os.containers().update(&id, inner).await?;
+    audit(&state, &s, "container.update", &id, "ok").await;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// 删除镜像查询参数：`?image=<repo:tag 或 sha256:id>`。
