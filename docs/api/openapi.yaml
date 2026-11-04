@@ -1655,6 +1655,29 @@ paths:
         '403':
           description: 需要 system.manage 且角色为 owner
 
+  /api/v1/system/reboot:
+    post:
+      tags: [system]
+      summary: 重启整台服务器（owner + system.manage；202 = 已向 init 请求重启）
+      description: |
+        执行 `systemctl reboot`：仅 owner 可调用，极度危险——会中断所有正在运行的服务、
+        连接与未保存数据，且无法撤销。这打破了「高危操作不暴露 Web UI」的默认纪律
+        （卸载面板即刻意不在 Web 暴露），仅应在可信内网 / 单人管理场景使用，且前端
+        强制「输入确认词」二次确认。机器重启会切断连接，前端轮询 `/api/v1/version`
+        判定恢复——请求失败 / 连接重置也视作已发起。
+      responses:
+        '202':
+          description: 已受理（已向 init 请求重启）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { accepted: { type: boolean } } } } }
+        '403':
+          description: 需要 system.manage 且角色为 owner
+        '501':
+          description: 缺少 systemctl，无法重启服务器
+        '502':
+          description: reboot 命令返回非零（重启请求未被 init 接受）
+
   /api/v1/system/upgrade/check:
     get:
       tags: [system]

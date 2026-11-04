@@ -497,3 +497,44 @@ pub async fn upgrade(
         ok(json!({ "accepted": true, "unit": "panel-upgrade", "version": version })),
     ))
 }
+
+
+/// 重启**整台服务器**（**仅 owner**）。
+///
+/// 极度危险：会中断所有正在运行的服务、连接与未保存数据，且无法撤销。
+///
+/// ⚠ 这打破了本项目「高危操作不暴露 Web UI」的默认纪律（卸载面板即刻意不在 Web
+/// 暴露，只走 root CLI）。重启系统比卸载面板更危险——它连机器一起重启。仅应在
+/// 可信内网 / 单人管理场景使用，且前端强制「输入确认词」二次确认，绝不只靠一次点击。
+///
+/// 与 `restart` 同理：机器重启时面板进程被 init 终止，HTTP 连接随之断开——
+/// 前端把请求失败也视作已发起，靠轮询 `/version` 判定恢复，超时则提示手动重连。
+/// `systemctl reboot` 仅向 PID1 发重启信号并很快返回；本进程随后被 init 杀掉，
+/// 故不依赖其返回码，仅用于记录审计。
+pub async fn reboot(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    crate::auth::require(&s, perm::SYSTEM_MANAGE)?;
+    if s.role != "owner" {
+        return Err(ApiError::new(
+            10003,
+            StatusCode::FORBIDDEN,
+            "仅 owner 可重启服务器",
+        ));
+    }
+    if !panel_os::Bin::Systemctl.available() {
+        return Err(ApiError::unsupported("缺少 systemctl，无法重启服务器"));
+    }
+    let out = panel_os::run_sync(panel_os::Bin::Systemctl, &["reboot"])?;
+    if out.code != Some(0) {
+        let detail: String = out.stderr.trim().chars().take(300).collect();
+        return Err(ApiError::new(
+            30001,
+            StatusCode::BAD_GATEWAY,
+            format!("reboot 命令失败：{detail}"),
+        ));
+    }
+    crate::routes::audit(&state, &s, "system.reboot", "server", "ok").await;
+    Ok((StatusCode::ACCEPTED, ok(json!({ "accepted": true }))))
+}

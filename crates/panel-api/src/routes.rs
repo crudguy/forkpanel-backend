@@ -108,6 +108,7 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/system/users", get(system::users))
         .route("/api/v1/system/directories", get(system::directories))
         .route("/api/v1/system/restart", post(system::restart))
+        .route("/api/v1/system/reboot", post(system::reboot))
         .route("/api/v1/system/upgrade/check", get(system::upgrade_check))
         .route("/api/v1/system/upgrade", post(system::upgrade))
         .route("/api/v1/metrics/snapshot", get(system::snapshot))
