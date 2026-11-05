@@ -160,6 +160,20 @@ fn now_unix() -> i64 {
 mod tests {
     use super::*;
 
+    /// 夹具时间：`days` 天前，再向「更近」方向挪 12 小时，刻意**避开保留期边界**。
+    ///
+    /// ⚠ 不能直接写 `now - days * 86_400`：`prune_audit` / `prune_notifications`
+    /// 内部各自再取一次 `now_unix()`，只要测试与生产这两次取时钟跨过整秒，边界上
+    /// 那条（`ts` 恰好等于 `now - 保留天数*86400`）就会从「保留」翻成「删除」，
+    /// 于是「应删 10 条」偶发变成 11 条。症状是**单独跑必过、`--workspace` 并行
+    /// 跑才翻车**（并行调度让两次取时钟跨秒的概率从 ~0 升到不可忽略）。
+    /// 挪 12 小时让边界两侧都有巨大余量，「91 天前才过期」的语义不变。
+    const BOUNDARY_MARGIN: i64 = 43_200;
+
+    fn ts_days_ago(now: i64, days: i64) -> i64 {
+        now - days * 86_400 + BOUNDARY_MARGIN
+    }
+
     #[test]
     fn batch_thresholds_match_measurements() {
         assert_eq!(batch_for(10_000), None, "1万行应一次性删除");
@@ -185,7 +199,7 @@ mod tests {
         // 91~100 天前那 10 条；若从 0 开始则只有 9 条，与保留语义对不上）
         for i in 1..=100u32 {
             c.execute("INSERT INTO audit_log(ts) VALUES(?1)",
-                      rusqlite::params![now - i as i64 * 86_400]).unwrap();
+                      rusqlite::params![ts_days_ago(now, i as i64)]).unwrap();
         }
         // 保留 90 天 → 删除 91 天之前的记录
         let ack = prune_audit(&c, 90, 50_000).unwrap();
@@ -207,8 +221,16 @@ mod tests {
         // 1~100 天前各一条：保留 90 天时，91~100 天前那 10 条应被删
         for i in 1..=100u32 {
             c.execute("INSERT INTO notifications(ts) VALUES(?1)",
-                      rusqlite::params![now - i as i64 * 86_400]).unwrap();
+                      rusqlite::params![ts_days_ago(now, i as i64)]).unwrap();
         }
+        // 夹具自检：不能有任何一条落在保留期边界 ±1 小时内。这条断言是
+        // ts_days_ago 存在的理由——谁把它改回 `now - days*86400`，本测试就会
+        // 立刻红，而不是变回「并行跑偶发多删一条」的幽灵。
+        let near: u64 = c.query_row(
+            "SELECT count(*) FROM notifications WHERE abs(ts - ?1) < 3600",
+            rusqlite::params![now - 90 * 86_400], |r| r.get(0)).unwrap();
+        assert_eq!(near, 0, "夹具不得把记录放在保留期边界上（会与生产侧取时钟跨秒抢跑）");
+
         let ack = prune_notifications(&c, 90, 50_000).unwrap();
         assert_eq!(ack.rows_changed, 10, "91~100 天前的 10 条应被删除");
 
@@ -220,7 +242,7 @@ mod tests {
 
         // 保留的是**最新**那些（ts 最大），最老的一条必须已消失
         let oldest: u64 = c.query_row("SELECT count(*) FROM notifications WHERE ts = ?1",
-            rusqlite::params![now - 90 * 86_400 + 86_400], |r| r.get(0)).unwrap();
+            rusqlite::params![ts_days_ago(now, 89)], |r| r.get(0)).unwrap();
         assert_eq!(oldest, 0, "删除顺序必须按 ts 升序（保留最新）");
     }
 
