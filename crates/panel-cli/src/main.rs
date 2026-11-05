@@ -1365,11 +1365,7 @@ async fn register_internal_jobs(
     }
 }
 
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
-}
-
+use panel_core::now_unix;
 /// 交互式（或经 `--owner`/`--owner-pass` 非交互）创建首个 owner 账号。
 ///
 /// 设计取舍：原方案是 `init` 打印一次性引导令牌、登录页用令牌建 owner，

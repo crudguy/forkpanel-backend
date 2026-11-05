@@ -269,6 +269,24 @@ else
   note_ok "无非 Linux 平台目录 / 源文件 / 条件编译分支"
 fi
 
+echo "== [10] 时间戳单一来源 =="
+# `now_unix()` 曾在 5 个 crate 里各写一份、合计 15 份副本。任一处要改语义（单位、
+# 时钟回拨、测试钩子）都得同步 15 处，漏改即行为分叉——而这类分叉只在"保留期边界"
+# 这种地方偶发暴露，极难查。唯一实现=panel-core/src/clock.rs，导出为
+# `panel_core::now_unix`。
+NOWUNIX=$(grep -rn --include="*.rs" -E '(pub(\([a-z]+\))? )?fn now_unix\(' crates/ 2>/dev/null | strip_comments | allow_filter 10)
+NOWUNIX_N=$(printf '%s' "$NOWUNIX" | grep -c . || true)
+if [ "$NOWUNIX_N" -eq 0 ]; then
+  note_fail "一处 now_unix() 定义都没扫到——提取失效，本规则会恒绿（panel-core/src/clock.rs 还在吗？）"
+elif [ "$NOWUNIX_N" -ne 1 ]; then
+  note_fail "now_unix() 应只有 1 处定义（panel-core/src/clock.rs），实得 $NOWUNIX_N 处："
+  printf '%s\n' "$NOWUNIX" | sed 's/^/      /'
+elif ! printf '%s' "$NOWUNIX" | grep -q 'panel-core/src/clock.rs'; then
+  note_fail "now_unix() 的定义不在 panel-core/src/clock.rs：$NOWUNIX"
+else
+  note_ok "now_unix() 唯一定义在 panel-core/src/clock.rs（各 crate 一律用 panel_core::now_unix）"
+fi
+
 echo
 if [ "$FAIL" -eq 0 ]; then
   echo "PASS：全部架构门禁通过"

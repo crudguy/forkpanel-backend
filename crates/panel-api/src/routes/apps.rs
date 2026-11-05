@@ -45,12 +45,7 @@ fn db_err(e: rusqlite::Error) -> PanelError {
 
 /// 当前时刻（秒）。各模块私有一份是既有范式（`files::now_unix` / `auth::now_unix`），
 /// 故不往 crate 根挪。
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
+use panel_core::now_unix;
 
 // ═══════════════════════════ DTO ═══════════════════════════
 

@@ -2,12 +2,19 @@
 //!
 //! 纪律：本 crate **不得依赖任何 IO**（无 std::fs / std::process / 网络 / 数据库），
 //! 以便平台实现与单元测试中零成本复用。
+//!
+//! 唯一例外是 `clock`：读系统时钟不属于上述任何一类 IO，但它是**全仓时间戳的唯一来源**——
+//! 让 5 个 crate 各写一份 `now_unix()`（曾有 15 份）的代价远大于这点纯度的损失，
+//! 那种复制只在「保留期边界」这类地方暴露行为分叉。详见 `clock.rs` 模块头。
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 pub mod crypto; // 应用层密钥加密（AES-256-GCM，关闭 M0 阻塞项）
 pub mod sync;   // 互斥锁中毒恢复（禁止裸 lock().unwrap()，见 ci/check_lock_unwrap.py）
+pub mod clock;  // 全仓唯一的 now_unix()（禁止各 crate 再自带一份）
+// 提到 crate 根，调用方统一写 `panel_core::now_unix()`——不必记住它在哪个子模块。
+pub use clock::now_unix;
 // 公网暴露参数校验（域名 / CIDR）：CLI 的 `panel expose` 与 Web 向导共用同一份规则，
 // 避免两处各写一份、漂移出"一个放行另一个拒绝"的扯皮。
 pub mod expose;

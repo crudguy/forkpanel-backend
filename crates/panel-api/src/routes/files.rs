@@ -379,12 +379,7 @@ fn trash_root(state: &Shared) -> PathBuf {
     state.os.paths().data_dir().join("trash")
 }
 
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
+use panel_core::now_unix;
 
 fn io_err(ctx: &str, e: std::io::Error) -> ApiError {
     ApiError::from(PanelError::Io(format!("{ctx}: {e}")))
