@@ -178,7 +178,7 @@ pub async fn get(
     // 两次查询合并进同一次阻塞任务，避免开两次线程。
     let (service_active, service_enabled) = match tokio::task::spawn_blocking(|| {
         let one = |verb: &str| -> Option<bool> {
-            panel_os::run_sync(panel_os::Bin::Systemctl, &[verb, "panel"])
+            crate::blocking::run_sync_in_blocking(panel_os::Bin::Systemctl, &[verb, "panel"])
                 .ok()
                 .and_then(|o| o.code)
                 .map(|c| c == 0)

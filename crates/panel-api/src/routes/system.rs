@@ -296,7 +296,7 @@ pub async fn restart(
 /// 调用点都必须包这一层；`expose.rs` 的源码守卫只钉住了它自己，这里补上。
 async fn run_systemctl_blocking(args: &'static [&'static str]) -> ApiResult<()> {
     match tokio::task::spawn_blocking(move || {
-        panel_os::run_sync(panel_os::Bin::Systemctl, args)
+        crate::blocking::run_sync_in_blocking(panel_os::Bin::Systemctl, args)
     })
     .await
     {
@@ -550,7 +550,7 @@ pub async fn reboot(
         return Err(ApiError::unsupported("缺少 systemctl，无法重启服务器"));
     }
     let out = match tokio::task::spawn_blocking(|| {
-        panel_os::run_sync(panel_os::Bin::Systemctl, &["reboot"])
+        crate::blocking::run_sync_in_blocking(panel_os::Bin::Systemctl, &["reboot"])
     })
     .await
     {

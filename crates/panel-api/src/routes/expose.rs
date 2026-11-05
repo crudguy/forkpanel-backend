@@ -5,7 +5,7 @@
 //! 面板默认只监听 `127.0.0.1`（零暴露默认）。要让小白用户"免命令行地开公网"，
 //! 只能把 `deploy/expose-public.sh` 的能力搬到网页上——但**绝不重写**它的
 //! fail-closed 逻辑（拒 `0.0.0.0/0`、拒已裸奔时再装反代、端口探测不可信即拒）。
-//! 本模块是**薄壳**：校验入参 → 拼 argv → 经 `panel_os::run_sync(Bin::Bash)` 调脚本。
+//! 本模块是**薄壳**：校验入参 → 拼 argv → 经 `crate::blocking::run_sync_in_blocking(Bin::Bash)` 调脚本。
 //!
 //! ## 状态从哪来
 //!
@@ -243,7 +243,7 @@ fn invoke_script(script_args: &[String]) -> std::result::Result<String, String> 
     for a in script_args {
         argv.push(a.as_str());
     }
-    let out = panel_os::run_sync(panel_os::Bin::Bash, &argv)
+    let out = crate::blocking::run_sync_in_blocking(panel_os::Bin::Bash, &argv)
         .map_err(|e| format!("调用 expose 脚本失败：{e}"))?;
     if out.code != Some(0) {
         return Err(format!(
@@ -265,7 +265,7 @@ mod tests {
     fn handlers_actually_invoke_the_script() {
         let prod = panel_testutil::production_source(include_str!("expose.rs"));
         assert!(
-            prod.contains("panel_os::run_sync(panel_os::Bin::Bash"),
+            prod.contains("run_sync_in_blocking(panel_os::Bin::Bash"),
             "必须经 Bin::Bash argv 直传调脚本（不得 shell 拼字符串、不得直接 spawn）"
         );
         assert!(

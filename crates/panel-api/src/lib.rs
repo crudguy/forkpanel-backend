@@ -25,6 +25,9 @@
 //! 反例与正确写法见 `routes/backups.rs` 的 `backup_file`（P1-1 的修复现场）。
 //! 新增同步调用时按这条判据自判，别照着邻近代码抄。
 
+// 阻塞子进程调用的唯一出口（Q-01）：`panel_os::run_sync` 只许出现在这里，
+// 由 ci/check-blocking-calls.sh 钉住。见该文件的模块文档。
+mod blocking;
 pub mod auth;
 pub mod ratelimit;
 pub mod extract;
