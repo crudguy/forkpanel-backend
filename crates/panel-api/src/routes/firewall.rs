@@ -143,6 +143,7 @@ pub async fn apply(
     PanelJson(req): PanelJson<ApplyReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FIREWALL_MANAGE)?;
+    crate::ratelimit::check_heavy(&state, &s.username, "firewall.apply")?;
     if !state.capabilities.get(cap_keys::FIREWALL_MANAGE).map(|c| c.supported).unwrap_or(false) {
         return Err(ApiError::unsupported("firewall.manage"));
     }
@@ -262,6 +263,7 @@ pub async fn set_active(
     State(state): State<Shared>, Auth(s): Auth, PanelJson(req): PanelJson<ActiveReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FIREWALL_MANAGE)?;
+    crate::ratelimit::check_heavy(&state, &s.username, "firewall.set_active")?;
     // 关闭防火墙会暴露所有端口 —— 这是高危操作，必须留痕
     state.os.firewall().set_active(req.active).await?;
     audit(&state, &s, "firewall.set_active",
@@ -299,6 +301,7 @@ pub async fn delete_rule(
     State(state): State<Shared>, Auth(s): Auth, AxPath(id): AxPath<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FIREWALL_MANAGE)?;
+    crate::ratelimit::check_heavy(&state, &s.username, "firewall.rule_delete")?;
     if !state.capabilities.get(cap_keys::FIREWALL_MANAGE).map(|c| c.supported).unwrap_or(false) {
         return Err(ApiError::unsupported("firewall.manage"));
     }
@@ -346,6 +349,7 @@ pub async fn fail2ban_set_jail(
     State(state): State<Shared>, Auth(s): Auth, PanelJson(req): PanelJson<JailReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FIREWALL_MANAGE)?;
+    crate::ratelimit::check_heavy(&state, &s.username, "fail2ban.set_jail")?;
     if !state.capabilities.get(cap_keys::FAIL2BAN).map(|c| c.supported).unwrap_or(false) {
         return Err(ApiError::unsupported("fail2ban.manage"));
     }
@@ -361,6 +365,7 @@ pub async fn fail2ban_unban(
     State(state): State<Shared>, Auth(s): Auth, PanelJson(req): PanelJson<UnbanReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::FIREWALL_MANAGE)?;
+    crate::ratelimit::check_heavy(&state, &s.username, "fail2ban.unban")?;
     if !state.capabilities.get(cap_keys::FAIL2BAN).map(|c| c.supported).unwrap_or(false) {
         return Err(ApiError::unsupported("fail2ban.manage"));
     }

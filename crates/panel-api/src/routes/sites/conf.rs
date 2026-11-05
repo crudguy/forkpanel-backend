@@ -296,6 +296,7 @@ pub async fn conf_put(
     PanelJson(req): PanelJson<ConfPutReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SITE_MANAGE)?;
+    crate::ratelimit::check_heavy(&state, &s.username, "site.conf_put")?;
     if s.role != "owner" {
         return Err(ApiError::forbidden("owner"));
     }
@@ -371,6 +372,7 @@ pub async fn conf_restore(
     AxPath(id): AxPath<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SITE_MANAGE)?;
+    crate::ratelimit::check_heavy(&state, &s.username, "site.conf_restore")?;
     if s.role != "owner" {
         return Err(ApiError::forbidden("owner"));
     }
@@ -613,6 +615,7 @@ pub async fn conf_rollback(
     PanelJson(req): PanelJson<ConfRollbackReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SITE_MANAGE)?;
+    crate::ratelimit::check_heavy(&state, &s.username, "site.conf_rollback")?;
     if s.role != "owner" {
         return Err(ApiError::forbidden("owner"));
     }

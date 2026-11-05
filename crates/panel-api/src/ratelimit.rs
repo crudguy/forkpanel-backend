@@ -195,7 +195,7 @@ mod tests {
     /// 教训的同类：只能源码级断言。写法参照 auth.rs 的 LoginGuard 接线守卫。
     #[test]
     fn heavy_handlers_are_actually_wired() {
-        let cases: [(&str, &str, &str); 15] = [
+        let cases: [(&str, &str, &str); 24] = [
             (include_str!("routes/services/packages.rs"), "pkg.install", "services::install"),
             (include_str!("routes/services/packages.rs"), "pkg.upgrade", "services::package_upgrade"),
             (include_str!("routes/services/packages.rs"), "pkg.remove", "services::package_remove"),
@@ -212,7 +212,28 @@ mod tests {
             (include_str!("routes/sites/apply.rs"), "site.apply", "sites::apply"),
             (include_str!("routes/sites/ssl.rs"), "ssl.apply", "sites::ssl::ssl_apply"),
             (include_str!("routes/sites/ssl.rs"), "ssl.renew", "sites::ssl::cert_renew"),
+            // —— 2026-11-05 复盘：补接「改系统状态/重活」但此前完全未限流的组 ——
+            (include_str!("routes/assistant.rs"), "assistant.diagnose", "assistant::diagnose"),
+            (include_str!("routes/firewall.rs"), "firewall.apply", "firewall::apply"),
+            (include_str!("routes/firewall.rs"), "firewall.set_active", "firewall::set_active"),
+            (include_str!("routes/firewall.rs"), "firewall.rule_delete", "firewall::delete_rule"),
+            (include_str!("routes/firewall.rs"), "fail2ban.set_jail", "firewall::fail2ban_set_jail"),
+            (include_str!("routes/firewall.rs"), "fail2ban.unban", "firewall::fail2ban_unban"),
+            (include_str!("routes/sites/conf.rs"), "site.conf_put", "sites::conf_put"),
+            (include_str!("routes/sites/conf.rs"), "site.conf_restore", "sites::conf_restore"),
+            (include_str!("routes/sites/conf.rs"), "site.conf_rollback", "sites::conf_rollback"),
         ];
+        // 清单只能证明「被点名的 action 还在」，证明不了「新加的写 handler 有没有接线」。
+        // 对高风险文件额外按文件钉住数量：删一行 / 新增一个没接线的 handler 都会红。
+        for (src, want, who) in [
+            (include_str!("routes/firewall.rs"), 5usize, "firewall"),
+            (include_str!("routes/sites/conf.rs"), 3usize, "sites::conf"),
+        ] {
+            let code = crate::test_support::production_source(src);
+            let got = code.matches("check_heavy(").count();
+            assert_eq!(got, want, "{who} 的 check_heavy 接线数量 = {got}，期望 {want}；\
+                新增写 handler 必须同步接线并更新本断言");
+        }
         for (src, action, who) in cases {
             // 生产段：剔注释行 + 剥离测试块（测试里出现同形 needle 会假绿，
             // 见 test_support::production_source 的说明）
@@ -243,13 +264,14 @@ mod tests {
     /// **没有任何行为测试会变红**（少一层保护，功能照常），只能源码级断言。
     #[test]
     fn read_handlers_are_actually_wired() {
-        let cases: [(&str, &str, &str); 6] = [
+        let cases: [(&str, &str, &str); 7] = [
             (include_str!("routes/databases.rs"), "db.rows", "databases::rows"),
             (include_str!("routes/databases.rs"), "db.export", "databases::export_csv"),
             (include_str!("routes/services/mod.rs"), "service.journal", "services::journal"),
             (include_str!("routes/services/packages.rs"), "pkg.upgradable", "services::packages_upgradable"),
             (include_str!("routes/containers.rs"), "container.list", "containers::list"),
             (include_str!("routes/sites/conf.rs"), "site.logs", "sites::logs"),
+            (include_str!("routes/databases.rs"), "db.query", "databases::query"),
         ];
         for (src, action, who) in cases {
             // 生产段：剔注释行 + 剥离测试块（测试里出现同形 needle 会假绿，

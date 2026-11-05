@@ -1138,6 +1138,7 @@ pub async fn query(
     AxPath(conn): AxPath<i64>, PanelJson(req): PanelJson<QueryReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::DB_VIEW)?;
+    crate::ratelimit::check_read(&state, &s.username, "db.query")?;
     ensure_dbms(&state)?;
     validate_read_only_sql(&req.sql)?;
     // 不额外要求 db 参数：SQL 自带库/表限定，再传一个库名只会让语义含糊
