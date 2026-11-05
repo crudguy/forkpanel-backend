@@ -397,10 +397,15 @@ pub fn build_router(state: Shared) -> Router {
         .layer(middleware::from_fn_with_state(state.clone(), crate::middleware::require_auth));
 
     // ── AI 助手（只读诊断）──
-    // 独立子路由 + 仅 require_auth：诊断是**只读**语义，只读模式下同样可用
-    // （不经 read_only_guard）；亦无写语义，不需要 guard_write 的 CSRF。
+    // 独立子路由：诊断是**只读**语义，只读模式下同样可用（刻意不经 read_only_guard）。
+    //
+    // ⚠ 但它仍是 POST，且一次调用会做全量采集、可选地外发 LLM——**必须过
+    // guard_write（Origin + 双提交 token）**。此前只挂 require_auth，等于给
+    // 跨站页面留了一个「诱导已登录用户触发昂贵诊断」的入口；POST 用错语义
+    // 不代表可以豁免 CSRF。
     let asst_r = Router::new()
         .route("/api/v1/assistant/diagnose", post(assistant::diagnose))
+        .layer(middleware::from_fn(crate::middleware::guard_write))
         .layer(middleware::from_fn_with_state(state.clone(), crate::middleware::require_auth));
 
     // ── 需登录的根路由 ──

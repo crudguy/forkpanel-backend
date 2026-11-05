@@ -703,6 +703,9 @@ pub async fn diagnose(
     PanelJson(req): PanelJson<DiagnoseReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SYSTEM_VIEW)?;
+    // 一次诊断会做全量采集（指标/进程/服务/日志/基线/备份），成本远高于普通读接口；
+    // 可选的 LLM 叙事还会外发请求 ⇒ 按重活档限流，避免脚本化空转打满宿主。
+    crate::ratelimit::check_heavy(&state, &s.username, "assistant.diagnose")?;
 
     let question = req.question.unwrap_or_default();
     let scope = route_scope(&question);
@@ -710,9 +713,16 @@ pub async fn diagnose(
     let findings = run_diagnosis(&ctx, scope);
     let summary = build_summary(&ctx, &findings);
     // LLM 叙事：仅当已配置且调用成功才填充；失败/未配置 → None（优雅降级）。
-    let narrative = match crate::routes::settings::llm_config(&state).await {
-        Ok(Some(cfg)) => generate_narrative(&cfg, scope, &summary, &findings).await,
-        _ => None,
+    //
+    // 只读模式下一律不外发：read_only 的语义是「不改变系统」，出站请求同样是副作用
+    // （把诊断摘要送到第三方），且持有最低读权限的人可反复触发。此时仍返回纯规则报告。
+    let narrative = if state.read_only {
+        None
+    } else {
+        match crate::routes::settings::llm_config(&state).await {
+            Ok(Some(cfg)) => generate_narrative(&cfg, scope, &summary, &findings).await,
+            _ => None,
+        }
     };
     let report = AssistantReport {
         question,
@@ -723,6 +733,8 @@ pub async fn diagnose(
         findings,
         ctx: brief(&ctx),
     };
+    // 诊断读取全量系统数据、并可能外发 LLM ⇒ 留痕（此前该端点无任何审计记录）。
+    crate::routes::audit(&state, &s, "assistant.diagnose", scope, "ok").await;
     Ok(ok(report))
 }
 
