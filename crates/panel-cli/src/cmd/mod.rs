@@ -9,8 +9,8 @@
 //! 建 layout），放在一起改一处就够。已迁：`serve`（187 行、独占一套启动装配）、
 //! `db`（migrate/backup/vacuum/verify-backup/restore-db，五个都动同一份 panel.db）。
 //! `system`（systemd-unit/healthcheck/capabilities/uninstall/upgrade，
-//! 都改这台机器的面板安装）、`security`（passwd/expose，都改变"谁能访问面板"）。
-//! 后续 `init`（init/doctor）按同样口径迁入。
+//! 都改这台机器的面板安装）、`security`（passwd/expose，都改变"谁能访问面板"）、
+//! `init`（init/doctor，装完立刻用的一对：建出来的东西正是自检的对象）。
 //!
 //! ⚠️ 迁移时有一条固定动作：`main.rs` 的 `wiring_guard_tests` 里有几条守卫靠
 //! `include_str!` 扫被搬走的代码（"这条调用必须挂在 serve 启动链上"这类）。
@@ -19,6 +19,7 @@
 //! 退化成恒绿。详见各守卫自身的注释。
 
 pub(crate) mod db;
+pub(crate) mod init;
 pub(crate) mod security;
 pub(crate) mod serve;
 pub(crate) mod system;

@@ -304,75 +304,12 @@ fn run(cli: Cli) -> Result<()> {
     }
     let cmd = cli.cmd.clone().unwrap();
     match cmd {
-        Cmd::Init { force, ref owner, ref owner_pass } => {
-            let layout0 = build_layout(&os, None);
-            let cfg_path = cli.config.clone().unwrap_or_else(|| layout0.config_dir().join("config.toml"));
+        // init / doctor 是一对：`init` 建出来的目录、主密钥、配置、库、owner，
+        // 正是 `doctor` 逐项体检的对象。两者路径推导必须同源，放同一文件才守得住。
+        Cmd::Init { force, ref owner, ref owner_pass } =>
+            cmd::init::init(&cli, os, force, owner, owner_pass),
 
-            // 配置不存在 → 全新初始化（写模板）；存在 → 复用既有配置（不覆盖，避免改掉 [paths] 等设置）
-            let cfg = if !cfg_path.exists() {
-                bootstrap::ensure_dirs(&layout0)?;
-                let _key = bootstrap::ensure_master_key(&layout0.data_dir())?;
-                if let Some(p) = cfg_path.parent() { std::fs::create_dir_all(p).ok(); }
-                std::fs::write(&cfg_path, config::template(
-                    &layout0.config_dir(), &layout0.data_dir(), &layout0.site_root())).ok();
-                load_cfg(&cli, &layout0)?
-            } else {
-                if force {
-                    // --force 按平台默认路径重建配置（会清掉既有 [paths] 覆盖，属破坏性操作）
-                    bootstrap::ensure_dirs(&layout0)?;
-                    let _key = bootstrap::ensure_master_key(&layout0.data_dir())?;
-                    std::fs::write(&cfg_path, config::template(
-                        &layout0.config_dir(), &layout0.data_dir(), &layout0.site_root())).ok();
-                } else {
-                    println!("（配置已存在，复用 {}，不覆盖）", cfg_path.display());
-                }
-                load_cfg(&cli, &layout0)?
-            };
-
-            // 目录与主密钥以最终 layout（含配置中的 [paths] 覆盖）为准
-            let layout = build_layout(&os, Some(&cfg));
-            bootstrap::ensure_dirs(&layout)?;
-            let _key = bootstrap::ensure_master_key(&layout.data_dir())?;
-
-            let tier = detect_tier(&*os, &cfg);
-            let db_path = layout.sqlite_path();
-            let mut conn = panel_db::open(&db_path, tier, &cfg.db.synchronous)?;
-            panel_db::migrate::apply(&mut conn)?;
-
-            // 幂等：已有 owner 则跳过
-            let owner_count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM users WHERE role = 'owner'",
-                [],
-                |r| r.get(0),
-            ).map_err(|e| PanelError::Database(e.to_string()))?;
-            if owner_count == 0 {
-                create_owner(&mut conn, tier, owner.clone(), owner_pass.clone())?;
-            } else {
-                println!("（已有 owner 账号，跳过创建）");
-            }
-            drop(conn);
-
-            println!("初始化完成");
-            println!("  配置文件：{}", cfg_path.display());
-            println!("  数据目录：{}", layout.data_dir().display());
-            println!();
-            println!("可用 owner 账号登录面板（生产 http://127.0.0.1:{}；开发模式前端 http://127.0.0.1:5173）。", cfg.server.port);
-            Ok(())
-        }
-
-        Cmd::Doctor => {
-            let layout0 = build_layout(&os, None);
-            let cfg = load_cfg(&cli, &layout0)?;
-            // 与 serve 同一套启动前校验（TLS 假控制 / 0 秒会话时长）：否则
-            // `panel doctor` 报全绿、serve 却起不来，而模板恰恰叫用户"改完跑 doctor"。
-            cfg.validate_implemented()?;
-            let layout = build_layout(&os, Some(&cfg));
-            let tier = detect_tier(&*os, &cfg);
-            let checks = doctor::run(&*os, &layout, &layout.sqlite_path(), tier, &cfg.db.synchronous);
-            print!("{}", doctor::render(&checks));
-            if doctor::has_fail(&checks) { std::process::exit(1); }
-            Ok(())
-        }
+        Cmd::Doctor => cmd::init::doctor(&cli, os),
 
         Cmd::Migrate => cmd::db::migrate(&cli, os.clone()),
 
@@ -1206,6 +1143,28 @@ mod wiring_guard_tests {
             prod.matches("cfg.validate_implemented()?;").count(),
             1,
             "serve 启动路径必须调用且只调用一次 validate_implemented()，否则 [server].tls 会被静默忽略"
+        );
+    }
+
+    /// `panel doctor` 必须与 `serve` 跑**同一套**启动前校验。
+    ///
+    /// 失败长什么样：`[server].tls` 配了却没有实现（或会话时长 0 秒），`serve` 拒绝
+    /// 启动，而 `panel doctor` 一路全绿——配置模板恰恰是叫用户"改完配置跑
+    /// `panel doctor`"来确认的。于是自检工具反过来把人往坑里带，且不会有任何报错
+    /// 提示"这两处判据不同源"。
+    ///
+    /// 与上一条 `tls_fake_control_is_wired_into_serve` 是一对：那条钉 serve 那一份，
+    /// 这条钉 doctor 这一份（两者已分居 `cmd/serve.rs` 与 `cmd/init.rs`）。
+    /// **别把它合并成"全仓计数 ≥ 2"**——那样删掉任意一处仍 `>= 1`，两条守卫一起恒绿。
+    #[test]
+    fn doctor_runs_the_same_startup_checks_as_serve() {
+        let src = include_str!("cmd/init.rs");
+        let prod = panel_testutil::production_source(src);
+        assert_eq!(
+            prod.matches("cfg.validate_implemented()?;").count(),
+            1,
+            "`panel doctor` 必须跑与 serve 相同的启动前校验：否则 serve 拒绝启动的配置，\
+             doctor 会报全绿，而模板正是让用户用 doctor 确认配置"
         );
     }
 
