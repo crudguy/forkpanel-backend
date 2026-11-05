@@ -9,11 +9,15 @@ pub async fn list(
     crate::auth::require(&s, perm::SITE_VIEW)?;
     let rows = fetch_all(&state).await?;
     let mut dtos: Vec<SiteOut> = rows.iter().map(to_out).collect();
-    // 外部修改检测（020）：`to_out` 是纯映射不做 IO，故在这里逐条补算——比对
+    // 外部修改检测（020）：`to_out` 是纯映射不做 IO，故在这里补算——比对
     // 「磁盘内容 hash」与「最新留档版本 hash」，不等 = 文件在面板之外被改过。
-    // 站点数量级很小（读 N 个配置文件），不必为此再引入缓存层。
-    for (dto, r) in dtos.iter_mut().zip(rows.iter()) {
-        dto.conf_external = external_of(r).await;
+    //
+    // **一次** offload 批量读完（Q-03）：原先逐条 `await` 是 N+1 IO，且 `conf_path`
+    // 可能落在慢盘 / 网络文件系统上，串行等待会把列表刷新延迟线性放大。语义不变
+    // （读不到不算外部修改），判定实现与详情接口共用 `external_flag`。
+    let flags = external_flags(&rows).await;
+    for (dto, ext) in dtos.iter_mut().zip(flags) {
+        dto.conf_external = ext;
     }
     Ok(ok(dtos))
 }

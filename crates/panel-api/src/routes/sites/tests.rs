@@ -295,3 +295,106 @@
         assert_eq!(m, 1);
         assert!(snap.is_none());
     }
+
+    // ── 外部修改检测（020 / Q-03）：单条与批量必须同一判据、同长同序 ──
+
+    /// 独占临时目录（pid + tag）：并发跑测试时同名目录会互删，沿用项目既有约定。
+    fn ext_tmp(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("fp-sites-ext-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("建临时目录");
+        d
+    }
+
+    #[test]
+    fn external_flag_covers_all_five_shapes() {
+        let dir = ext_tmp("flag");
+        let f = dir.join("a.conf");
+        std::fs::write(&f, "server {}").expect("写夹具");
+        let fp = f.to_str().expect("utf8 路径");
+
+        // ① 无路径 / ② 无留档 hash：无从判定 ⇒ 一律 false（不谎报「被改过」）
+        assert!(!external_flag("", "abc"), "无路径时无从判定，必须 false（不许谎报被改过）");
+        assert!(!external_flag(fp, ""), "无留档 hash 时无从判定，必须 false");
+        // ③ 内容与留档一致：未修改
+        assert!(!external_flag(fp, &conf_hash("server {}")), "内容与留档一致时必须判「未修改」");
+        // ④ 内容与留档不一致：确实在面板之外被改过
+        assert!(external_flag(fp, &conf_hash("server { listen 80; }")), "内容与留档不一致时必须判「被改过」");
+        // ⑤ 文件不存在：读不到不算「被改过」，交给「未下发 / 缺失」那套语义
+        assert!(
+            !external_flag("/nonexistent/fp-sites-ext.conf", &conf_hash("x")),
+            "文件不存在时不许谎报「被改过」——那是「未下发 / 缺失」的语义"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn external_flags_is_aligned_and_ordered() {
+        let dir = ext_tmp("batch");
+        let same = dir.join("same.conf");
+        let changed = dir.join("changed.conf");
+        std::fs::write(&same, "server {}").expect("写夹具");
+        std::fs::write(&changed, "server { listen 80; }").expect("写夹具");
+        let same_p = same.to_str().expect("utf8 路径").to_owned();
+        let changed_p = changed.to_str().expect("utf8 路径").to_owned();
+
+        let jobs = vec![
+            (same_p.clone(), conf_hash("server {}")),      // false：一致
+            (changed_p, conf_hash("server {}")),           // true：被改过
+            (String::new(), conf_hash("server {}")),       // false：无路径
+            (same_p, String::new()),                       // false：无留档
+        ];
+        let flags = external_flags_for(jobs);
+        assert_eq!(
+            flags,
+            vec![false, true, false, false],
+            "批量结果必须与入参同长同序，且逐条语义与单条版一致"
+        );
+        assert_eq!(
+            external_flags_for(Vec::new()),
+            Vec::<bool>::new(),
+            "空输入必须返回空——返回 [false] 会让长度与 rows 对不上"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 接线守卫：`list` 必须真的用批量入口，不许退回逐条 await（那正是 N+1）。
+    #[test]
+    fn list_uses_batch_external_detection() {
+        let prod = panel_testutil::production_source(include_str!("crud.rs"));
+        assert!(prod.len() > 1_000, "生产段提取异常（仅 {} 字节）", prod.len());
+        assert!(
+            prod.contains("external_flags(&rows).await"),
+            "list 必须调批量入口（逐条 await external_of 是 N+1 IO）"
+        );
+        assert!(
+            !prod.contains("external_of(r).await"),
+            "list 里不许退回逐条 external_of().await"
+        );
+        assert_eq!(
+            prod.matches("external_flags(&rows)").count(),
+            1,
+            "批量调用恰好一处（多一处就是重复读盘）"
+        );
+    }
+
+    /// 批量读取必须在阻塞池里跑：`std::fs::read_to_string` 直接写在 async fn 里
+    /// 会阻塞 runtime worker——那正是 Q-03 要消除的东西，不能换个位置又犯。
+    #[test]
+    fn batch_external_detection_is_offloaded() {
+        let prod = panel_testutil::production_source(include_str!("conf.rs"));
+        let start = prod
+            .find("pub(super) async fn external_flags(")
+            .expect("找不到批量入口 external_flags（改名后本守卫会失配，需同步）");
+        let body = &prod[start..(start + 900).min(prod.len())];
+        assert!(
+            body.contains("spawn_blocking"),
+            "批量入口必须 spawn_blocking：在 async worker 上读 N 个配置文件会阻塞 runtime"
+        );
+        assert!(
+            body.contains("external_flags_for(jobs)"),
+            "批量入口必须复用同步实现（否则判定逻辑会出现第二份）"
+        );
+    }

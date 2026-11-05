@@ -475,14 +475,74 @@ pub async fn conf_restore(
 /// 所以只如实标记，把决策交回用户（重新生成覆盖 / 改成自定义片段 / 手动接管）。
 /// 无留档（`last_ver_hash` 为 NULL）时无从判定，返回 false——宁可不报，也不谎报。
 pub(super) async fn external_of(r: &RawSite) -> bool {
-    let Some(p) = r.conf_path.as_deref().map(str::trim).filter(|p| !p.is_empty()) else {
+    let (p, last) = external_job(r);
+    if p.is_empty() || last.is_empty() {
         return false;
-    };
-    let Some(last) = r.last_ver_hash.as_deref() else { return false };
-    match tokio::fs::read_to_string(p).await {
+    }
+    match tokio::task::spawn_blocking(move || external_flag(&p, &last)).await {
+        Ok(v) => v,
+        Err(e) => {
+            // 与批量版同纪律：读不到就不谎报，但必须在服务端留痕
+            eprintln!("[panel] ⚠ [sites] 读取配置状态失败（本次按「未检测到外部修改」呈现）：{e}");
+            false
+        }
+    }
+}
+
+/// 单条判定的**唯一实现**：列表（批量）与详情（单条）共用，避免两份逻辑各自漂移。
+///
+/// 读不到文件不算「外部修改」——那是「未下发 / 缺失」的语义，不是「被别人改过」；
+/// 无留档 hash 同理（无从判定，按「无外部修改」处理，绝不谎报）。
+pub(super) fn external_flag(path: &str, last: &str) -> bool {
+    if path.is_empty() || last.is_empty() {
+        return false;
+    }
+    match std::fs::read_to_string(path) {
         Ok(c) => conf_hash(&c) != last,
-        // 文件被删 / 读不了：交给「未下发 / 缺失」那套语义处理，不算外部修改
         Err(_) => false,
+    }
+}
+
+/// 从数据行取判定所需的 `(conf_path, last_ver_hash)`；缺一即留空串（后续按 false 处理）。
+fn external_job(r: &RawSite) -> (String, String) {
+    let p = r
+        .conf_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .unwrap_or_default();
+    let last = r.last_ver_hash.as_deref().unwrap_or_default();
+    (p.to_owned(), last.to_owned())
+}
+
+/// 批量判定的同步实现：与入参同长、同序。抽成同步函数是为了能直接测（不必起运行时）。
+pub(super) fn external_flags_for(jobs: Vec<(String, String)>) -> Vec<bool> {
+    jobs.into_iter()
+        .map(|(p, last)| external_flag(&p, &last))
+        .collect()
+}
+
+/// 批量外部修改检测：**一次** offload 读完所有站点配置，返回与 `rows` 同长同序的标记。
+///
+/// 为什么批量（Q-03）：`list` 每次刷新都走这里，逐条 `await` 是 N+1 IO；`conf_path`
+/// 可能落在慢盘或网络文件系统上，串行等待会把延迟线性放大。读整个配置文件 + SHA-256
+/// 属于「耗时随数据量增长」，按 lib.rs 的约定应放进阻塞池。
+pub(super) async fn external_flags(rows: &[RawSite]) -> Vec<bool> {
+    let jobs: Vec<(String, String)> = rows.iter().map(external_job).collect();
+    if jobs.is_empty() {
+        return Vec::new();
+    }
+    let n = jobs.len();
+    match tokio::task::spawn_blocking(move || external_flags_for(jobs)).await {
+        Ok(v) => v,
+        Err(e) => {
+            // 不能静默降级成「全部未修改」：一次 panic 就让「外部改过」永远不提示，
+            // 而用户在页面上看不到任何痕迹。
+            eprintln!(
+                "[panel] ⚠ [sites] 批量读取配置状态失败（本次按「未检测到外部修改」呈现）：{e}"
+            );
+            vec![false; n]
+        }
     }
 }
 
