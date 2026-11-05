@@ -166,14 +166,17 @@ pub struct SslApplyReq {
     /// 留空则沿用站点现有域名
     #[serde(default)]
     pub domains: Vec<String>,
-    /// `self-signed`（缺省）| `http-01` | `dns-01`
+    /// 合法值：`self-signed`（缺省）| `http-01`。
+    /// `dns-01` 需 DNS 提供商 API、当前未实现；契约 enum 不含它，传入会拿 501。
     pub method: Option<String>,
     pub email: Option<String>,
 }
 
 /// 申请证书。按 `method` 分流：
 /// - `self-signed`：面板自签（**同步**完成，需 `ssl.selfsigned` + 主密钥，离线可用）；
-/// - `http-01`/`dns-01`：ACME，`ssl.acme` 门控，未接入时诚实 501（#61）。
+/// - `http-01`：ACME，`ssl.acme` 门控，未接入时诚实 501（#61）；
+/// - `dns-01`：需 DNS 提供商 API，明确返回 501；**契约 enum 不列为合法值**，
+///   避免按契约生成的调用方以为选了就能签发。
 pub async fn ssl_apply(
     State(state): State<Shared>,
     Auth(s): Auth,

@@ -199,5 +199,36 @@ else
   pass "契约未声明 tls_mode（后端暂无 TLS 实现，不伪装成已支持）"
 fi
 
+# ── [H] 契约不得把「实现恒 501」的 method 列为合法值（F-11）──
+# 背景：SslApply.method 的 enum 曾列 `dns-01`，而 ssl.rs 里该分支恒定
+# `ApiError::unsupported` ⇒ 按契约生成的调用方选它必拿非预期 501。这是
+# 「契约撒谎」的一种：字段存在、枚举合法、实现却根本没有成功路径。
+echo "== [H] 契约 enum 与实现分支一致（dns-01 不得伪装成可签发） =="
+# 活性自检：先证明扫到了 enum 行与实现里的拒绝分支。正则一失效抓到 0 行，
+# 下面「不含 dns-01」会恒绿——本项目「空集恒真」的头号坑。
+SSL_ENUM_LINES=$(grep -cE '^[[:space:]]+enum: \[self-signed' docs/api/openapi.yaml || true)
+DNS_REJECT=$(grep -c '"dns-01" =>' crates/panel-api/src/routes/sites/ssl.rs || true)
+if [ "$SSL_ENUM_LINES" -ne 1 ]; then
+  fail "活性自检失败：SslApply.method 的 enum 行恰好应有 1 行，实得 $SSL_ENUM_LINES"
+elif [ "$DNS_REJECT" -ne 1 ]; then
+  fail "活性自检失败：ssl.rs 里 dns-01 的显式拒绝分支恰好应有 1 处，实得 $DNS_REJECT"
+elif grep -qE '^[[:space:]]+enum: \[[^]]*dns-01' docs/api/openapi.yaml; then
+  fail "契约把 dns-01 列为合法 method，但实现恒定返回 501——按契约生成的调用方会拿到非预期错误"
+else
+  pass "SslApply.method enum 只含真实可签发值；dns-01 在实现里仍显式拒绝"
+fi
+# 只把 enum 里的 dns-01 删掉、描述也一并删光，上面仍会绿；故单独钉住成因说明。
+DNS_EXPLAIN=$(grep -c 'dns-01 需 DNS 提供商 API' docs/api/openapi.yaml || true)
+if [ "$DNS_EXPLAIN" -lt 1 ]; then
+  fail "契约 501 描述未说明 dns-01 未实现的成因"
+else
+  pass "契约 501 描述写明 dns-01 未实现的成因"
+fi
+if grep -qE "^[[:space:]]+'400': \{ description: method 取值非法" docs/api/openapi.yaml; then
+  pass "ssl/apply 端点补齐 400 成因描述"
+else
+  fail "ssl/apply 端点缺少 400 成因描述（method 非法 / 域名为空 / 缺邮箱）"
+fi
+
 echo
 if [ "$FAIL" -eq 0 ]; then echo "PASS：前后端契约一致"; exit 0; else echo "FAIL：契约不一致"; exit 1; fi

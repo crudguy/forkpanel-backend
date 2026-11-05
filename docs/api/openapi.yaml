@@ -827,9 +827,13 @@ components:
           description: 留空则沿用站点现有域名
         method:
           type: string
-          enum: [self-signed, http-01, dns-01]
+          enum: [self-signed, http-01]
           default: self-signed
-          description: self-signed=面板自签（同步、离线可用，需 openssl）；http-01/dns-01=ACME
+          description: |
+            self-signed=面板本地根 CA 签发（同步、离线可用，需 openssl）；
+            http-01=ACME 任务化签发（需 ssl.acme 能力位与账户邮箱）。
+            ⚠ dns-01 依赖 DNS 提供商 API，当前版本未实现、调用必得 501，
+            因此**不在合法枚举内**；调用方不要按「契约列了就能用」来生成选项。
         email: { type: [string, "null"] }
 
     # ───────────── 文件 ─────────────
@@ -2594,14 +2598,20 @@ paths:
     post:
       operationId: post_sites_id_ssl_apply
       tags: [sites]
-      summary: 申请证书（self-signed 同步完成 → 200；ACME 任务化 → 202；无 Web 服务器 → 501）
+      summary: 申请证书（self-signed 同步完成 → 200；ACME 任务化 → 202；能力位缺失或 method 未实现 → 501）
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SslApply' } } } }
       responses:
         '200': { description: 自签证书已签发并落盘（含 cert_path / not_after / days_left） }
-        '202': { description: ACME 申请已入队 }
-        '501': { description: 无 Web 服务器底座（webserver.manage）时不签发——证书没有进程可加载，只会造成「已配置」却不生效的假象 }
+        '202': { description: ACME http-01 申请已入队 }
+        '400': { description: method 取值非法（非 self-signed / http-01）、域名为空或格式不合法、http-01 缺账户邮箱 }
+        '501':
+          description: |
+            三种成因：① 无 Web 服务器底座（webserver.manage 不支持）——证书没有进程可加载，
+            只会造成「已配置」却不生效的假象；② ssl.acme / ssl.selfsigned 能力位缺失；
+            ③ method=dns-01 需 DNS 提供商 API，当前未实现（曾在 enum 中被误列为合法值）。
+            契约 enum 只保留真实可签发的 self-signed / http-01。
         '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' }
 
   /api/v1/ssl/ca:
