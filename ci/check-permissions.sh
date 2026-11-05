@@ -22,6 +22,8 @@
 #   C. 前端权限点必须是后端常量的子集（差集为空）
 #   D. 调用点覆盖度：每个 enabled()/can() 的权限参数都必须是**字面量**，
 #      否则该调用点被静默跳过（新形态 ⇒ 门禁照绿但没校验）
+#   D2. 集中式门控表（NAV_ITEMS / EXTRA_GATES）的 perm 声明必须是字面量，
+#      并已并入 [C] 校验——判据收敛成数据表后，权限点不再经过 can()/enabled()
 #
 # 用法：./ci/check-permissions.sh [后端仓根] [前端仓根]
 #   前端仓根默认 ../forkpanel-frontend；也可用 PANEL_FRONTEND_ROOT 覆盖。
@@ -64,11 +66,20 @@ pass "后端 $BE_SRC / 前端 $FE_DIR 均存在"
 BE=$(awk '/^pub mod perm \{/,/^\}/' "$BE_SRC" 2>/dev/null \
   | grep -oE '"[a-z]+\.[a-z]+"' | tr -d '"' | sort -u)
 
-# ── 抽取前端用到的权限点：只认 enabled(cap, perm) 与 can(perm) 两处调用 ──
+# ── 抽取前端用到的权限点 ──
+# 两类来源：① enabled(cap, perm) / can(perm) 调用的字面量参数；
+# ② 集中式门控表（NAV_ITEMS / EXTRA_GATES）里的 `perm: 'x.y'` 数据声明。
 # 不从整个 src 里捞 '[a-z]+.[a-z]+'，那会把路由名/i18n key 之类一并误提。
-FE=$( { grep -rhoE "enabled\([^)]*\)" "$FE_DIR" 2>/dev/null
-        grep -rhoE "\bcan\('[a-z]+\.[a-z]+'\)" "$FE_DIR" 2>/dev/null; } \
+# ② 是判据收敛到单一事实源后新增的形态：权限点不再经过 enabled()/can()，
+# 漏掉它，拼错的 perm 会**整张表绕过 [C]**（页面静默不可达且无人报错）。
+FE_LIT=$( { grep -rhoE "enabled\([^)]*\)" "$FE_DIR" 2>/dev/null
+            grep -rhoE "\bcan\('[a-z]+\.[a-z]+'\)" "$FE_DIR" 2>/dev/null; } \
   | grep -oE "'[a-z]+\.[a-z]+'" | tr -d "'" | sort -u)
+# 精确限定这两个文件：它们是唯一的集中式门控表，别处的 `perm:` 不算。
+FE_DECL=$(grep -hoE "perm: '[a-z]+\.[a-z]+'" \
+  "$FE_DIR/composables/navItems.ts" "$FE_DIR/composables/navPolicy.ts" 2>/dev/null \
+  | grep -oE "'[a-z]+\.[a-z]+'" | tr -d "'" | sort -u)
+FE=$(printf '%s\n%s\n' "$FE_LIT" "$FE_DECL" | grep -v '^$' | sort -u)
 
 count() { [ -n "$1" ] && printf '%s\n' "$1" | wc -l | tr -d ' ' || echo 0; }
 BE_N=$(count "$BE")
@@ -85,6 +96,14 @@ if [ "$FE_N" -eq 0 ]; then
   fail "未从前端提取到任何权限点（$FE_DIR）——enabled()/can() 调用形式变了？需同步更新提取规则"
 else
   pass "前端引用权限点 $FE_N 项"
+fi
+# 门控表声明的活性自检：正则失效抓到 0 项时，FE 会悄悄退回「只含调用点」，
+# [C] 照常绿而整张表没人校验——典型「空集恒真」，必须喊出来。
+DECL_N=$(count "$FE_DECL")
+if [ "$DECL_N" -lt 10 ]; then
+  fail "集中式门控表只提取到 $DECL_N 个权限声明（少于 10）——提取正则失效会让整张表绕过 [C]"
+else
+  pass "集中式门控表 $DECL_N 个权限点声明已并入 [C] 校验"
 fi
 # 权限点是成体系的一组（view/manage 成对），正常应远多于 10 项；过少多半是提取失败
 MIN=10
@@ -128,8 +147,12 @@ echo "== [D] 调用点覆盖度（防「新形态静默漏检」）=="
 # 排除：stores/auth.ts（can/enabled 的定义与转发处，参数本就是变量）、
 # *.test.ts（测试数据不是真实调用点，与 check-api-contract.sh 同口径）。
 strip_fe_comments() { grep -vE ':[0-9]+:[[:space:]]*(//|\*|/\*|<!--)' || true; }
+# 精确豁免：navPolicy.ts 的 auth.can(gate.perm) 是集中式判据的唯一转发点，
+# gate.perm 运行时查表得到，参数天然是变量（与已排除的 stores/auth.ts 同性质）。
+# 只豁免这一文件、这一形态；别处写动态 can() 仍然会红。声明本身由 [D2] 反钉。
 SITES=$(grep -rnE "(^|[^A-Za-z0-9_])(enabled|can)\(" "$FE_DIR" 2>/dev/null \
-  | grep -v "/stores/auth.ts:" | grep -v "\.test\.ts:" | strip_fe_comments || true)
+  | grep -v "/stores/auth.ts:" | grep -v "\.test\.ts:" | strip_fe_comments \
+  | grep -vE "/composables/navPolicy\.ts:[0-9]+:.*auth\.can\(gate\.perm\)" || true)
 CALLS=$(printf '%s\n' "$SITES" | grep -oE "(enabled|can)\([^)]*\)" || true)
 N_CALLS=$(count "$CALLS")
 N_LIT=$(printf '%s\n' "$CALLS" | grep -cE "'[a-z]+\.[a-z]+'" || true)
@@ -145,6 +168,30 @@ if [ "$N_LIT" -ne "$N_CALLS" ]; then
   printf '%s\n' "$UNCOVERED" | sed 's/^/      /'
 else
   pass "全部 $N_CALLS 处调用点都是字面量权限点（无静默漏检）"
+fi
+
+echo
+echo "== [D2] 集中式门控表的权限声明必须是字面量 =="
+# [C] 已把这些声明并进校验，但前提是它们**仍以字面量存在**；若有人改成
+# 模板串 / 变量 / 常量引用，FE_DECL 会静默抓不到，[C] 又退回漏检状态。
+# 故这里反过来钉住声明形态，并带活性自检（扫不到足量声明必须红）。
+DECL_SITES=$(grep -nE "perm:" \
+  "$FE_DIR/composables/navItems.ts" "$FE_DIR/composables/navPolicy.ts" 2>/dev/null \
+  | grep -vE ':[0-9]+:[[:space:]]*(//|\*|/\*)' || true)
+# 排除两种非声明形态：TS 类型注解 `perm: string`；gateForPath 里从
+# NAV_ITEMS 转发的 `perm: nav.perm`（值来源仍是上面的字面量表）。
+DECL_DATA=$(printf '%s\n' "$DECL_SITES" \
+  | grep -vE "perm: string([[:space:]]|$)" \
+  | grep -vE "/composables/navPolicy\.ts:[0-9]+:.*perm: nav\.perm" || true)
+DECL_TOTAL=$(count "$DECL_DATA")
+DECL_LIT=$(printf '%s\n' "$DECL_DATA" | grep -cE "perm: '[a-z]+\.[a-z]+'" || true)
+if [ "$DECL_TOTAL" -lt 20 ]; then
+  fail "活性自检失败：集中式门控表只扫到 $DECL_TOTAL 处 perm 声明（预期 ≥20）"
+elif [ "$DECL_LIT" -ne "$DECL_TOTAL" ]; then
+  fail "以下 perm 声明不是字面量权限点，会绕过 [C] 校验："
+  printf '%s\n' "$DECL_DATA" | grep -vE "perm: '[a-z]+\.[a-z]+'" | sed 's/^/      /'
+else
+  pass "$DECL_TOTAL 处门控表权限声明全部是字面量，且已并入 [C] 校验"
 fi
 
 echo
