@@ -272,7 +272,7 @@ pub async fn directories(State(state): State<Shared>, Auth(s): Auth) -> ApiResul
 /// 权限：`system.manage` + owner。admin 可以改设置，但重启服务是可用性操作，
 /// 影响所有在线用户，故比普通设置更严一档。
 pub async fn restart(
-    State(_state): State<Shared>,
+    State(state): State<Shared>,
     Auth(s): Auth,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     crate::auth::require(&s, perm::SYSTEM_MANAGE)?;
@@ -283,8 +283,31 @@ pub async fn restart(
             "仅 owner 可重启面板（admin 可改设置，但不能重启服务）",
         ));
     }
-    panel_os::run_sync(panel_os::Bin::Systemctl, &["--no-block", "restart", "panel"])?;
+    // 先留痕再执行：`--no-block` 之后本进程可能立刻被 systemd 杀掉，晚写的审计会丢。
+    crate::routes::audit(&state, &s, "system.restart", "panel", "ok").await;
+    run_systemctl_blocking(&["--no-block", "restart", "panel"]).await?;
     Ok((StatusCode::ACCEPTED, ok(json!({ "accepted": true }))))
+}
+
+/// 在阻塞线程池里跑 systemctl。
+///
+/// `run_sync` 内部是 `std::process` + `wait()`，直接在 async handler 里调用会占死
+/// tokio worker（systemd/D-Bus 卡顿时整个 API 无响应）。全仓 `run_sync` 的 async
+/// 调用点都必须包这一层；`expose.rs` 的源码守卫只钉住了它自己，这里补上。
+async fn run_systemctl_blocking(args: &'static [&'static str]) -> ApiResult<()> {
+    match tokio::task::spawn_blocking(move || {
+        panel_os::run_sync(panel_os::Bin::Systemctl, args)
+    })
+    .await
+    {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(ApiError::from(e)),
+        Err(e) => Err(ApiError::new(
+            30001,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("systemctl 执行被中断：{e}"),
+        )),
+    }
 }
 
 
@@ -526,7 +549,20 @@ pub async fn reboot(
     if !panel_os::Bin::Systemctl.available() {
         return Err(ApiError::unsupported("缺少 systemctl，无法重启服务器"));
     }
-    let out = panel_os::run_sync(panel_os::Bin::Systemctl, &["reboot"])?;
+    let out = match tokio::task::spawn_blocking(|| {
+        panel_os::run_sync(panel_os::Bin::Systemctl, &["reboot"])
+    })
+    .await
+    {
+        Ok(r) => r?,
+        Err(e) => {
+            return Err(ApiError::new(
+                30001,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("reboot 执行被中断：{e}"),
+            ))
+        }
+    };
     if out.code != Some(0) {
         let detail: String = out.stderr.trim().chars().take(300).collect();
         return Err(ApiError::new(
