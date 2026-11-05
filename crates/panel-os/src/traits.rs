@@ -461,6 +461,28 @@ pub trait PackageProvider: Send + Sync {
     /// 返回第一个**非模板**（不含 `@`）单元；没有任何 `.service` 则 `None`
     /// （certbot/ufw 之类无常驻服务可管，调用方据此不渲染入口）。
     async fn service_unit(&self, name: &str) -> Result<Option<String>>;
+    /// 批量版 [`service_unit`](Self::service_unit)：一次问清多个包各自 shipping 的主单元。
+    ///
+    /// 为什么需要批量：软件列表页要为一个白名单（二十余个包）逐个渲染「服务管理」
+    /// 入口，逐包调 `service_unit` 会 fork/exec 同样多次包管理器（Debian 上即
+    /// `dpkg -L <pkg>`，本机实测单次约 24ms）——一次页面刷新几十次往返，既是 N+1
+    /// 也把首屏拖成几百毫秒。实现方应改为**一次查询全量后本地分组**
+    /// （Debian 用一次 `dpkg -S '*.service'`，本机实测 0.20s 且与包数无关）。
+    ///
+    /// 返回映射的键是**入参包名**；`None` 表示「该包没有可管理的常驻服务」。
+    /// 调用方必须按「取不到键 = None」处理——实现方可能只给查得到的包建键。
+    ///
+    /// 默认实现逐条转发 `service_unit`，并把单条的错误吞成 `None`：这与单条路径
+    /// 「查不到就不渲染入口、不让整页挂掉」的语义一致。真实平台应覆盖它。
+    async fn service_units(&self, names: &[&str]) -> Result<HashMap<String, Option<String>>> {
+        let mut map = HashMap::with_capacity(names.len());
+        for n in names {
+            // ok().flatten()：Err 与 Ok(None) 都归为「没有服务」，与单条路径的
+            // `if let Ok(Some(u))` 判据逐字等价
+            map.insert((*n).to_string(), self.service_unit(n).await.ok().flatten());
+        }
+        Ok(map)
+    }
     /// 探测**给定包名**中「源里最高版本高于已安装版本」的项（只读，不改动系统）。
     ///
     /// 传名字列表而不做全系统扫描：调用方（软件页）只关心白名单这二十来个包，

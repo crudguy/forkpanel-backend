@@ -553,6 +553,31 @@ pub(crate) fn percent_from_lines(n: usize) -> u8 {
 }
 
 
+/// 把「主单元名 + 批量状态表」折成下发给前端的 `unit` 字段。
+///
+/// 三态必须与逐条实现（Q-02 批量化之前）**逐字对齐**——批量化最容易漂的就是这里，
+/// 而漂了不会报错，只会在卡片上显示一个错的状态：
+/// - 没有主单元 → `null`：该包没有可管理的常驻服务（certbot/ufw 之类），不渲染入口；
+/// - 有主单元且状态查得到 → `{name, state}`，`state` 取 `ServiceState` 的**小写变体名**
+///   （与 `/services` 列表同一口径，前端按同一套值渲染徽标）；
+/// - 有主单元但状态表里没有（批量调用失败 / 该单元没进批量入参）→ `state = "unknown"`。
+///   未知不是谎报，是"不知道"；**绝不能**在这里回落成 `active`——那会让一个挂掉的服务
+///   在卡片上显示为运行中。
+///
+/// 抽成纯函数是为了能被直接断言三态（handler 里的内联 `json!` 只能靠源码字符串守卫，
+/// 改坏了照样编译通过、测试全绿）。
+pub(super) fn unit_entry(
+    unit: Option<&str>,
+    states: &std::collections::HashMap<String, panel_os::ServiceState>,
+) -> Option<serde_json::Value> {
+    let u = unit?;
+    let st = states
+        .get(u)
+        .map(|s| format!("{s:?}").to_lowercase())
+        .unwrap_or_else(|| "unknown".to_string());
+    Some(serde_json::json!({ "name": u, "state": st }))
+}
+
 pub async fn packages_list(
     State(state): State<Shared>, Auth(s): Auth,
 ) -> ApiResult<Json<serde_json::Value>> {
@@ -582,11 +607,47 @@ pub async fn packages_list(
             Default::default()
         }
     };
-    // 软件卡片的「服务管理」入口：用 `dpkg -L` 直接问"这个包装了哪些 .service"，
+    // 软件卡片的「服务管理」入口：用 `dpkg -S '*.service'` 直接问"这些包装了哪些 .service"，
     // 绕过 systemctl list-units 对 enabled-but-dead 单元的遗漏（详见 PackageProvider::service_unit）。
     // 状态取自 systemd（is-active 口径，与 /services 同源），故 dead 的服务也能正确显示入口与状态。
+    //
+    // 批量口径（Q-02）：原实现是循环里逐包 `service_unit()`（每包一次 `dpkg -L`）+
+    // 逐包 `services().status()`（每包一次 `systemctl is-active`）——一次页面刷新
+    // 对已装的白名单包各 fork/exec 两遍，既是 N+1 又是重成本命令，串行 await 后
+    // 首屏稳定慢几百毫秒。现改为「一次查全量单元表 + 一次批量问状态」，命令次数
+    // 从 2N 降到 2（见 PackageProvider::service_units / ServiceProvider::statuses）。
+    let real_names: Vec<&str> = pkgs.iter().map(|p| p.name.as_str()).collect();
+    let units: std::collections::HashMap<String, Option<String>> =
+        match state.os.packages().service_units(&real_names).await {
+            Ok(m) => m,
+            Err(e) => {
+                // 降级=「本次不渲染服务入口」：卡片其余字段照常展示，
+                // 与逐条路径「某个包查不到就不渲染」同口径，不让整页挂掉。
+                eprintln!("[panel] ⚠ 批量查询包服务单元失败（本次不渲染服务入口）：{e}");
+                Default::default()
+            }
+        };
+    // 只有能被 `unit_name` 校验通过的单元才进批量入参：一个非法名会让整次
+    // `systemctl is-active` 失败，把**所有**卡片的入口状态拖成 unknown。
+    // 校验不通过的那个单元仍会渲染入口，只是状态回落 unknown（与逐条路径一致）。
+    let wanted: Vec<panel_core::UnitName> = pkgs
+        .iter()
+        .filter_map(|p| units.get(&p.name).and_then(|u| u.as_deref()))
+        .filter_map(|u| panel_core::unit_name(u).ok())
+        .collect();
+    let states: std::collections::HashMap<String, panel_os::ServiceState> = if wanted.is_empty() {
+        Default::default()
+    } else {
+        match state.os.services().statuses(&wanted).await {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[panel] ⚠ 批量查询服务状态失败（本次一律显示 unknown）：{e}");
+                Default::default()
+            }
+        }
+    };
     let mut items: Vec<serde_json::Value> = Vec::new();
-    for p in pkgs {
+    for p in &pkgs {
         // 探测到的是真实包名（Debian 上 redis 查 redis-server），先还原成逻辑名，
         // 再取对应 label；取不到（理论上不会）时退回逻辑名，保证 UI 至少有字可显示。
         let logical = logical_pkg_name(&p.name).unwrap_or(p.name.as_str());
@@ -594,17 +655,10 @@ pub async fn packages_list(
             Some(d) => (d.name.to_string(), d.label.to_string()),
             None => (logical.to_string(), logical.to_string()),
         };
-        let unit = if let Ok(Some(u)) = state.os.packages().service_unit(&p.name).await {
-            let st = match panel_core::unit_name(&u) {
-                Ok(un) => state.os.services().status(&un).await
-                    .map(|s| format!("{s:?}").to_lowercase())
-                    .unwrap_or_else(|_| "unknown".to_string()),
-                Err(_) => "unknown".to_string(),
-            };
-            Some(serde_json::json!({ "name": u, "state": st }))
-        } else { None };
+        // 三态（null / {name,state} / unknown）的映射住在 unit_entry 里，有直接断言
+        let unit = unit_entry(units.get(&p.name).and_then(|u| u.as_deref()), &states);
         items.push(serde_json::json!({
-            "name": name, "label": label, "version": p.version,
+            "name": name, "label": label, "version": p.version.clone(),
             "manager": p.manager, "unit": unit,
             // 按**真实包名**比对：apt-mark 只认真名（Debian 上 redis 的 hold 落在
             // redis-server 上），拿逻辑名去比会永远不命中，UI 显示「未钉住」的谎状态。

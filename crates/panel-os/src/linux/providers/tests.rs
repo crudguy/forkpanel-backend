@@ -1872,3 +1872,213 @@ redis-server:
         let kinds: Vec<&str> = out.iter().map(|t| t.kind.as_str()).collect();
         assert_eq!(kinds, vec!["table", "view", "view"]);
     }
+
+    // ── Q-02：批量服务单元查询（`dpkg -S '*.service'`）与单包路径的等价性 ──
+    //
+    // 背景：软件列表页原先是循环里逐包调 `service_unit()`（每包一次 `dpkg -L`），
+    // 白名单二十余个包就是二十余次 fork/exec。批量化的**唯一风险**是两条路径各自
+    // 演化——单包改了选择规则而批量没改，于是同一个软件在「刚装好」和「刷新一次」
+    // 之间服务入口会跳变，且没有任何报错。下面四条死死钉住这一点。
+
+    /// 一次 `dpkg -S '*.service'` 的真实片段（本机 Debian 13 实测输出的节选）：
+    /// `nginx` 同时 shipping `nginx.service` 与 `nginx-debug.service`；
+    /// `redis-server` 另有一个模板单元；`certbot` 只有可执行文件、没有任何单元。
+    const DPKG_SEARCH_FIXTURE: &str = "\
+nginx: /usr/lib/systemd/system/nginx-debug.service
+nginx: /usr/lib/systemd/system/nginx.service
+redis-server: /usr/lib/systemd/system/redis-server@.service
+redis-server: /usr/lib/systemd/system/redis-server.service
+certbot: /usr/bin/certbot
+";
+
+    /// 分组正确 + 模板单元被过滤 + 无单元包不建键。
+    #[test]
+    fn dpkg_search_groups_units_by_package_and_skips_templates() {
+        let table = service_units_from_dpkg_search(DPKG_SEARCH_FIXTURE);
+        // 活性自检：夹具若没被解析出东西，下面所有「不包含」类断言都会对空表恒真
+        assert!(
+            table.contains_key("nginx"),
+            "夹具未生效：nginx 没有被分组出来，后续断言全都无从判断"
+        );
+        assert_eq!(table["nginx"].len(), 2, "nginx 的非模板单元（nginx.service / nginx-debug.service）都该被收下");
+        assert!(
+            !table["redis-server"].iter().any(|u| u.contains('@')),
+            "模板单元 redis-server@.service 必须被过滤——它不是能单独启停的实例"
+        );
+        assert_eq!(
+            table["redis-server"],
+            vec!["redis-server.service".to_string()],
+            "redis-server 只该留下非模板的主单元"
+        );
+        assert!(
+            !table.contains_key("certbot"),
+            "只装可执行文件、没有 .service 的包不该在表里建键"
+        );
+    }
+
+    /// **核心等价性**：同一批路径，单包路径与批量路径必须给出逐字相同的单元。
+    #[test]
+    fn batch_and_single_paths_agree_on_every_package() {
+        // 四类样本各自钉住一条选择规则，缺一类就可能「两条路径一致地错」：
+        // 多候选精确命中 / 多候选回落到最短 / 更短但不相干的候选不得胜出 / 无单元
+        let cases: &[(&str, &[&str], Option<&str>)] = &[
+            ("nginx", &["nginx-debug.service", "nginx.service"], Some("nginx.service")),
+            ("redis-server", &["redis-server@.service", "redis-server.service"], Some("redis-server.service")),
+            // php-fpm.service 更短，但包名是 php8.4-fpm ⇒ 规则 1（精确）必须胜出
+            ("php8.4-fpm", &["php-fpm.service", "php8.4-fpm.service"], Some("php8.4-fpm.service")),
+            ("certbot", &[], None),
+        ];
+        for (pkg, paths, want) in cases {
+            // 单包路径：`dpkg -L <pkg>` 的输出就是路径各一行
+            let single_out: String = paths
+                .iter()
+                .map(|p| format!("/usr/lib/systemd/system/{p}\n"))
+                .collect();
+            let single = service_unit_from_dpkg_list(&single_out, pkg);
+            // 批量路径：`dpkg -S '*.service'` 的输出是 `包名: 路径`，再本地分组
+            let search_out: String = paths
+                .iter()
+                .map(|p| format!("{pkg}: /usr/lib/systemd/system/{p}\n"))
+                .collect();
+            let table = service_units_from_dpkg_search(&search_out);
+            let batch = table.get(*pkg).and_then(|c| {
+                let refs: Vec<&str> = c.iter().map(|s| s.as_str()).collect();
+                pick_primary_unit(&refs, pkg)
+            });
+            assert_eq!(
+                batch, single,
+                "包 {pkg} 的批量结果与单包结果不一致（批量={batch:?}，单包={single:?}）——两条路径已经各自演化"
+            );
+            assert_eq!(
+                single.as_deref(), *want,
+                "包 {pkg} 的主单元选错了：期望 {want:?}，实得 {single:?}"
+            );
+        }
+    }
+
+    /// 选择规则不得依赖候选的**输入顺序**：单包候选来自 `dpkg -L` 的输出序，
+    /// 批量候选来自 `dpkg -S` 的输出序，两者不同——等长候选若「先到先得」，
+    /// 同一个包在两条路径下会挑出不同单元，且无任何报错。
+    #[test]
+    fn pick_primary_unit_is_independent_of_candidate_order() {
+        let forward = ["b-worker.service", "a-worker.service"];
+        let backward = ["a-worker.service", "b-worker.service"];
+        assert_eq!(
+            pick_primary_unit(&forward, "some-pkg"),
+            pick_primary_unit(&backward, "some-pkg"),
+            "等长候选的选择结果随输入顺序变化——批量与单包会挑出不同单元"
+        );
+        assert_eq!(
+            pick_primary_unit(&forward, "some-pkg").as_deref(),
+            Some("a-worker.service"),
+            "等长时应取字典序最小者，才能给出唯一确定的答案"
+        );
+        // 空候选 → None（调用方据此不渲染服务入口）
+        assert_eq!(pick_primary_unit(&[], "nginx"), None, "没有候选时必须返回 None");
+    }
+
+    /// `dpkg -S` 的两类非「包-路径」行：
+    /// - 合并行 `pkgA, pkgB: /path`（同一路径属于多个包）→ 两个包都要建键；
+    /// - diversion 行 `diversion by pkg from: /path` → 整行忽略。
+    ///
+    /// ⚠ 合并行格式取自 dpkg 文档（searchoutput 用 `, ` 连接包名）——本机 467 行
+    /// 输出里没有样本可验，这里测的是**格式兼容**而非实机行为。diversion 行同理。
+    /// 真正的风险在 diversion：若只按 `.service` 后缀筛而不看冒号左侧，
+    /// `diversion by foo from: …nginx.service` 会让 **foo** 凭空多出一个服务入口。
+    #[test]
+    fn dpkg_search_handles_merged_and_diversion_lines() {
+        let out = "\
+pkg-a, pkg-b: /usr/lib/systemd/system/shared.service
+diversion by nginx from: /usr/lib/systemd/system/nginx.service
+diversion by nginx to: /usr/lib/systemd/system/nginx.service.distrib
+";
+        let table = service_units_from_dpkg_search(out);
+        assert_eq!(
+            table.get("pkg-a").map(|v| v.as_slice()),
+            Some(&["shared.service".to_string()][..]),
+            "合并行里的第一个包没被建键"
+        );
+        assert_eq!(
+            table.get("pkg-b").map(|v| v.as_slice()),
+            Some(&["shared.service".to_string()][..]),
+            "合并行里的第二个包没被建键"
+        );
+        assert!(
+            !table.contains_key("nginx"),
+            "diversion 行把 nginx 关联到了单元——卡片上会凭空出现一个服务入口"
+        );
+        assert!(
+            table.is_empty() || !table.keys().any(|k| k.contains(' ')),
+            "表里混进了含空格的「包名」：{table:?}"
+        );
+    }
+
+    /// 空入参必须早返回空表：调用方在「没有任何已装包」时不该跑命令。
+    #[tokio::test]
+    async fn service_units_returns_empty_for_empty_input() {
+        let prov = LinuxPackages::detect();
+        let r = prov.service_units(&[]).await.expect("空入参不该失败");
+        assert!(r.is_empty(), "空入参必须返回空表，实得 {r:?}");
+    }
+
+    /// **真机 oracle 对照**：批量路径必须与逐包 `dpkg -L` 在真实 dpkg 数据库上
+    /// 给出完全相同的主单元。
+    ///
+    /// 上面几条用的是手写夹具——本项目踩过「夹具不真实 ⇒ 负向不转红 ⇒ 误判守卫
+    /// 太宽」的坑。这条不造数据：直接跑真实 `dpkg -S '*.service'`，从结果里挑
+    /// 若干**真实存在**的包当样本，再逐包跑老的 `service_unit()` 对照。
+    ///
+    /// 机器上没有任何 shipping `.service` 的包（精简容器 / 非 Debian）时跳过并打印
+    /// `[skip]`——跳过不等于通过，所以必须留痕。
+    #[tokio::test]
+    async fn batch_matches_single_on_real_dpkg_database() {
+        let prov = LinuxPackages::detect();
+        if prov.manager() != Some("apt") {
+            eprintln!(
+                "[skip] 本机包管理器是 {:?} 而不是 apt，没有 dpkg oracle 可对照",
+                prov.manager()
+            );
+            return;
+        }
+        let out = match crate::cmd::run(
+            crate::cmd::Bin::Dpkg, &["-S", "*.service"], crate::cmd::CmdOpt::default(),
+        ).await {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("[skip] dpkg -S '*.service' 跑不起来（{e}），无法做 oracle 对照");
+                return;
+            }
+        };
+        let table = service_units_from_dpkg_search(&out.stdout);
+        if table.is_empty() {
+            eprintln!("[skip] 本机 dpkg 数据库里没有任何 shipping .service 的包");
+            return;
+        }
+        // 取样：按包名排序取前 8 个——顺序稳定，且不写死「本机一定装了 nginx」
+        let mut names: Vec<&str> = table.keys().map(|s| s.as_str()).collect();
+        names.sort_unstable();
+        let sample: Vec<&str> = names.into_iter().take(8).collect();
+
+        let batch = prov.service_units(&sample).await.expect("批量查询不该失败");
+        for name in &sample {
+            let single = prov.service_unit(name).await.ok().flatten();
+            let got = batch.get(*name).cloned().flatten();
+            assert_eq!(
+                got, single,
+                "包 {name}：批量给出 {got:?}，逐包 dpkg -L 给出 {single:?}——真实数据上两条路径已经不一致（用户会在刷新前后看到不同的服务入口）"
+            );
+        }
+        // 活性自检：样本里至少要有一个真的关联到单元的包，否则这条对照等于什么都没比
+        let with_unit = sample
+            .iter()
+            .filter(|n| batch.get(**n).cloned().flatten().is_some())
+            .count();
+        assert!(
+            with_unit > 0,
+            "样本 {sample:?} 里没有任何包关联到单元，oracle 对照没有实际比对内容"
+        );
+        eprintln!(
+            "[oracle] 真实 dpkg 对照通过：{with_unit}/{} 个样本包关联到单元",
+            sample.len()
+        );
+    }

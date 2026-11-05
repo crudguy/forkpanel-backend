@@ -677,4 +677,94 @@ mod tests {
              若确实是白名单整体改成无单元包，请同步更新这条下界与前端说明"
         );
     }
+
+    // ── Q-02：软件列表的服务入口批量化 ──
+
+    /// 三态必须与批量化之前的逐条实现逐字对齐。
+    ///
+    /// 这是**行为**断言（不是源码字符串）：批量化最容易漂的一处是状态映射，
+    /// 而漂了不报错——卡片上会把一个挂掉的服务显示成「运行中」，或者把有服务的包
+    /// 显示成「没有服务入口」。三种输入各一条，缺哪种就等于没验。
+    #[test]
+    fn unit_entry_keeps_the_three_states_exact() {
+        use panel_os::ServiceState;
+        let mut states: std::collections::HashMap<String, ServiceState> = std::collections::HashMap::new();
+        states.insert("nginx.service".to_string(), ServiceState::Active);
+        states.insert("redis-server.service".to_string(), ServiceState::Inactive);
+        states.insert("mysql.service".to_string(), ServiceState::Failed);
+        states.insert("odd.service".to_string(), ServiceState::Unknown);
+
+        // ① 没有主单元 → null（certbot/ufw 这类没有常驻服务的包，前端不渲染入口）
+        assert_eq!(
+            unit_entry(None, &states), None,
+            "没有主单元的包不该渲染服务入口（否则卡片上会出现一个点进去是空的链接）"
+        );
+
+        // ② 有主单元且状态查得到 → {name, state}，state 是 ServiceState 的小写变体名
+        let e = unit_entry(Some("nginx.service"), &states).expect("有主单元就必须给入口");
+        assert_eq!(e["name"], "nginx.service", "单元名必须原样下发（前端拿它跳服务详情）");
+        assert_eq!(e["state"], "active", "状态必须是 ServiceState 的小写变体名（与 /services 同口径）");
+        // 非 active 的变体也要正确透出——只测 active 会漏掉 to_lowercase 写错的实现
+        assert_eq!(
+            unit_entry(Some("redis-server.service"), &states).expect("有主单元就必须给入口")["state"],
+            "inactive", "inactive 变体没被正确转成小写字符串"
+        );
+        assert_eq!(
+            unit_entry(Some("mysql.service"), &states).expect("有主单元就必须给入口")["state"],
+            "failed", "failed 变体没被正确转成小写字符串"
+        );
+
+        // ③ 有主单元但状态表里没有键（批量整批失败 / 该单元没进批量入参）→ unknown
+        let e = unit_entry(Some("missing.service"), &states).expect("状态查不到仍要渲染入口");
+        assert_eq!(
+            e["state"], "unknown",
+            "状态查不到必须回落 unknown，绝不能谎报 active——那会把挂掉的服务显示成运行中"
+        );
+        assert!(e.get("state").is_some(), "unit 条目缺少 state 字段（上面的断言会对 null 也通过）");
+    }
+
+    /// Q-02 接线守卫：软件列表必须走**批量**查询，不许退回逐包往返。
+    ///
+    /// 为什么必须源码级钉住：`service_units` / `statuses` 的批量语义在 panel-os 侧有
+    /// 单测覆盖，`unit_entry` 的三态也有单测覆盖，但「handler 有没有真的调批量接口」
+    /// 单测覆盖不到——把 handler 改回逐包 `await`，上面所有测试照样全绿，
+    /// 唯一的症状是页面首屏慢几百毫秒（无报错、无功能差异，肉眼几乎发现不了）。
+    #[test]
+    fn packages_list_uses_batch_service_lookup() {
+        let prod = panel_testutil::production_source(include_str!("packages.rs"));
+        // 活性自检：先证明扫到的是真 handler，否则下面所有断言都可能对空串恒真
+        assert!(
+            prod.contains("pub async fn packages_list"),
+            "没扫到 packages_list 的生产段（{} 字节），判据失效", prod.len()
+        );
+        assert!(prod.len() > 3000, "生产段只有 {} 字节，疑似扫错文件", prod.len());
+
+        assert_eq!(
+            prod.matches("service_units(&real_names)").count(), 1,
+            "批量单元查询应恰好一处（多一处=一次刷新跑两遍 dpkg -S）"
+        );
+        assert_eq!(
+            prod.matches(".statuses(&wanted)").count(), 1,
+            "批量状态查询应恰好一处（多一处=一次刷新跑两遍 systemctl is-active）"
+        );
+        assert!(
+            !prod.contains("service_unit(&p.name).await"),
+            "handler 退回了逐包 service_unit().await——每包一次 dpkg -L，N+1 又回来了"
+        );
+        assert!(
+            !prod.contains("services().status(&"),
+            "handler 退回了逐条 status()——每包一次 systemctl is-active，N+1 又回来了"
+        );
+        // 只有能通过 unit_name 校验的单元才该进批量入参：一个非法名会让整次
+        // systemctl 失败，把**所有**卡片的状态一起拖成 unknown。
+        assert!(
+            prod.contains("panel_core::unit_name(u).ok()"),
+            "必须在入参前用 unit_name 过滤：非法单元名会让整批 systemctl 一起失败"
+        );
+        assert!(
+            prod.contains("unit_entry(units.get(&p.name)"),
+            "三态映射必须走 unit_entry（内联 json! 改坏了不会有任何测试变红）"
+        );
+    }
+
 }

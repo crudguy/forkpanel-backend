@@ -28,32 +28,83 @@ pub(crate) fn pkg_install_target(manager: &str, name: &str, version: Option<&str
     }
 }
 
-/// 从 `dpkg -L <pkg>` 的输出里挑出该包 shipping 的**主** systemd 单元：
-/// 位于 `.../systemd/system/` 下、以 `.service` 结尾、且**非模板**（不含 `@`）的单元。
+/// 从一组文件路径里筛出「可作为服务入口」的单元 basename：
+/// 位于 `.../systemd/system/` 下、以 `.service` 结尾、且**非模板**（不含 `@`）。
 ///
-/// 选择主单元的规则（避免 nginx 误选 `nginx-debug.service`）：
-/// 1. 优先 stem 与包名完全一致者（`nginx` → `nginx.service`，而非 `nginx-debug.service`）；
-/// 2. 否则取**最短**的 stem（主服务单元名通常最短，`*-debug`/`-worker` 等变体更长）。
-///
-/// 抽成纯函数以便单测——不依赖真实 dpkg，fixture 即 `dpkg -L` 的真实片段。
-pub(super) fn service_unit_from_dpkg_list(out: &str, pkg: &str) -> Option<String> {
-    let exact = format!("{pkg}.service");
-    let mut candidates: Vec<&str> = Vec::new();
-    for l in out.lines() {
+/// 这里刻意不关心路径来自哪条命令——`dpkg -L <pkg>` 的单包输出与
+/// `dpkg -S '*.service'` 的全量输出是同一批路径，筛法必须只有一份
+/// （见 `pick_primary_unit` 的说明：两条路径共用同一套选择规则，
+/// 否则「卡片上显示哪个单元」会随查询方式漂移且无任何报错）。
+pub(super) fn service_unit_candidates<'a>(paths: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+    let mut out: Vec<&'a str> = Vec::new();
+    for l in paths {
         if l.ends_with(".service") && l.contains("systemd/system/") {
             let base = l.rsplit('/').next().unwrap_or(l);
             if base.contains("@") { continue; }   // 跳过模板单元（postgresql@.service 等）
-            candidates.push(base);
+            out.push(base);
         }
     }
+    out
+}
+
+/// 从候选单元名里挑出该包的**主** systemd 单元。
+///
+/// 规则（避免 nginx 误选 `nginx-debug.service`）：
+/// 1. 优先 stem 与包名完全一致者（`nginx` → `nginx.service`，而非 `nginx-debug.service`）；
+/// 2. 否则取**最短**的 stem（主服务单元名通常最短，`*-debug`/`-worker` 等变体更长）；
+///    等长时按字典序取最小——**不能依赖候选的输入顺序**：单包路径的候选来自
+///    `dpkg -L` 的输出序，批量路径来自 `dpkg -S` 的输出序，两者不同，
+///    依赖顺序会让「卡片显示哪个单元」在两种查询方式之间漂移。
+pub(super) fn pick_primary_unit(candidates: &[&str], pkg: &str) -> Option<String> {
     if candidates.is_empty() { return None; }
     // 规则 1：stem 与包名完全一致优先
+    let exact = format!("{pkg}.service");
     if let Some(m) = candidates.iter().find(|b| **b == exact.as_str()) {
-        return Some(m.to_string());
+        return Some((*m).to_string());
     }
-    // 规则 2：否则取最短 stem（主服务单元名最短）
-    candidates.sort_by_key(|b| b.len());
-    Some(candidates[0].to_string())
+    // 规则 2：最短 stem；等长取字典序最小（确定性，与输入顺序无关）
+    candidates
+        .iter()
+        .min_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)))
+        .map(|s| (*s).to_string())
+}
+
+/// 从 `dpkg -L <pkg>` 的输出里挑出该包 shipping 的主 systemd 单元。
+///
+/// 单包路径：只做「筛选 + 选择」两步的组合，规则本身住在
+/// `service_unit_candidates` 与 `pick_primary_unit`，与批量路径共用。
+///
+/// 抽成纯函数以便单测——不依赖真实 dpkg，fixture 即 `dpkg -L` 的真实片段。
+pub(super) fn service_unit_from_dpkg_list(out: &str, pkg: &str) -> Option<String> {
+    let candidates = service_unit_candidates(out.lines());
+    pick_primary_unit(&candidates, pkg)
+}
+
+/// 解析 `dpkg-query -S '*.service'`（`dpkg -S`）的输出，得到「包名 → 候选单元 basename」。
+///
+/// 输出每行 `包名: /绝对路径`；dpkg 对**同一路径属于多个包**的情形会在冒号前用
+/// `, ` 连接（形如 `pkgA, pkgB: /path`，见 dpkg 的 searchoutput）。本机 Debian 13
+/// 实测 467 行里没有合并行（无样本可验），这里按文档格式兼容处理——多认几个包
+/// 最多让某个包多一个候选，选择规则仍会挑出正确的主单元，不会误报。
+///
+/// 跳过两类非包-路径行：`diversion by pkg from: /path` / `... to: /path`
+/// （冒号左侧含空格，不是包名）与任何右侧不是绝对路径的行。
+pub(super) fn service_units_from_dpkg_search(out: &str) -> std::collections::HashMap<String, Vec<String>> {
+    let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for line in out.lines() {
+        let Some((lhs, path)) = line.split_once(": ") else { continue };
+        if !path.starts_with('/') { continue; }
+        // 单元筛选规则与单包路径完全一致（同一函数，不另写一份）
+        let cands = service_unit_candidates(std::iter::once(path));
+        let Some(base) = cands.first() else { continue };
+        for name in lhs.split(',') {
+            let name = name.trim();
+            // 包名不含空格：这条同时挡掉 `diversion by <pkg> from` 这类行
+            if name.is_empty() || name.contains(' ') { continue; }
+            map.entry(name.to_string()).or_default().push((*base).to_string());
+        }
+    }
+    map
 }
 
 /// dpkg Status-Abbrev 是否表示「文件在盘上」——**当前状态位（第二位）== 'i'**。
@@ -183,6 +234,53 @@ impl PackageProvider for LinuxPackages {
                 Ok(service_unit_from_dpkg_list(&out.stdout, name))
             }
             _ => Ok(None),
+        }
+    }
+
+    /// 批量版：一次 `dpkg -S '*.service'` 拿全系统「服务文件 → 所属包」，
+    /// 本地按入参包名分组后再走与单条**完全相同**的选择规则。
+    ///
+    /// 为什么不是「循环调 service_unit」：软件列表页要为每个已装的白名单包渲染
+    /// 服务入口，逐包 `dpkg -L`（本机实测单次约 24ms）在二十余个包上就是二十余次
+    /// fork/exec、近半秒的串行等待；而一次全量 `dpkg -S '*.service'` 本机实测
+    /// 0.20s / 467 行，且与包数量无关。
+    ///
+    /// 失败语义与单条对齐：**查不到一律 `None`**（=「该包没有可管理的常驻服务」），
+    /// 不报错——否则一个包查不到就让整页软件列表挂掉。唯一例外是输出被截断
+    /// （`max_output` 上限），那说明分组表不全、继续用会**谎报**某些包「没有服务」，
+    /// 故返回 Err 让上层显式降级并留日志。
+    async fn service_units(&self, names: &[&str]) -> Result<std::collections::HashMap<String, Option<String>>> {
+        if names.is_empty() { return Ok(std::collections::HashMap::new()); }
+        let none_for_all = |names: &[&str]| -> std::collections::HashMap<String, Option<String>> {
+            names.iter().map(|n| ((*n).to_string(), None)).collect()
+        };
+        match self.manager {
+            Some("apt") => {
+                let out = crate::cmd::run(
+                    Bin::Dpkg, &["-S", "*.service"],
+                    CmdOpt { timeout: Duration::from_secs(10), ..Default::default() },
+                ).await?;
+                if out.truncated {
+                    // 不返回「部分结果」：缺的那部分会被当成「没有服务」，是静默谎报
+                    return Err(PanelError::Command {
+                        bin: Bin::Dpkg.as_str().into(),
+                        detail: format!(
+                            "dpkg -S '*.service' 输出被截断（上限 {} 字节），无法可靠关联服务单元",
+                            CmdOpt::default().max_output
+                        ),
+                    });
+                }
+                let table = service_units_from_dpkg_search(&out.stdout);
+                Ok(names.iter().map(|n| {
+                    let unit = table.get(*n).and_then(|c| {
+                        let refs: Vec<&str> = c.iter().map(|s| s.as_str()).collect();
+                        pick_primary_unit(&refs, n)
+                    });
+                    ((*n).to_string(), unit)
+                }).collect())
+            }
+            // 非 apt：无 `dpkg -S` 原语，也没有别的一次性反查手段，保持「无服务入口」语义
+            _ => Ok(none_for_all(names)),
         }
     }
 
