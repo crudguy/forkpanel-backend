@@ -44,8 +44,8 @@ impl LinuxFirewall {
 
 /// 安全 PATH 内查找二进制是否**可执行**。
 ///
-/// 与 `stub::which` 走同一判据（`cmd::is_executable_file`）：普通文件 + 有执行位。
-/// 原先这里自己拼了一份 `is_file()` 检查，与 `stub` 那份逐字重复——两处一旦
+/// 与 `providers::which` 走同一判据（`cmd::is_executable_file`）：普通文件 + 有执行位。
+/// 原先这里自己拼了一份 `is_file()` 检查，与 `providers::which` 那份逐字重复——两处一旦
 /// 漂移，就会出现「防火墙认 nft 可用、容器不认」这类怪现象。
 fn which(name: &str) -> bool {
     ["/usr/sbin", "/sbin", "/usr/bin", "/bin", "/usr/local/sbin", "/usr/local/bin"]

@@ -123,7 +123,7 @@ impl UserProvider for LinuxUsers {
     }
 }
 
-// 未在 stub 中使用的导入显式标记，避免 dead_code 警告干扰评审
+// 未在 providers 中使用的导入显式标记，避免 dead_code 警告干扰评审
 #[allow(dead_code)]
 fn _assert_types(_: Option<UnitName>) {}
 

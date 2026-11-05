@@ -1,7 +1,12 @@
-//! 未实现能力的**显式 stub** 与少量轻量实现。
+//! 按 trait 分组的能力域实现（packages / logs / webserver / databases / users /
+//! network / storage）。
 //!
-//! 纪律：未实现的能力必须返回 `PanelError::Unsupported`，**禁止**返回空 Vec 或 Ok(())
-//! 假装成功——那会让 UI 显示错误状态，是"假装可移植"的典型表现。
+//! ⚠ 目录名不是"待办清单"：这里绝大多数函数是**真实实现**（调 dpkg / systemctl /
+//! journalctl / docker，或直接读写配置），只有少数几处显式 `unsupported!`。历史名字
+//! 叫 `stub/`，那是骨架期的叫法，已作废——判断完成度请看能力矩阵与函数体。
+//!
+//! 纪律：未实现的能力必须返回 `PanelError::Unsupported`，**禁止**返回空 Vec 或
+//! `Ok(())` 假装成功——那会让 UI 显示错误状态，是"假装可移植"的典型表现。
 
 use crate::paths::{slug, LinuxPathLayout, PathLayout};
 use crate::traits::*;
@@ -55,7 +60,7 @@ fn which(name: &str) -> bool {
 // ─── 按 provider 拆分为子模块 ───
 // 各子模块文件顶部 `use super::*;` 取共享 imports / `which()`；`unsupported!` 宏经
 // 文本作用域（macro_rules 定义于本模块、子模块在其后声明）对子模块可见。
-// linux/mod.rs 里的 `stub::LinuxXxx` 经下方 `pub use` 重导出保持不变。
+// linux/mod.rs 里的 `providers::LinuxXxx` 经下方 `pub use` 重导出保持不变。
 // 防火墙 / 计划任务的真实实现已在 linux/firewall.rs / scheduler.rs，此处不再占位。
 
 mod process;

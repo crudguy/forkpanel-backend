@@ -1,8 +1,19 @@
 //! Linux 平台实现：当前唯一完整实现（设计方案 §0.3.3）。
 //!
-//! 已实现（骨架内可运行）：metrics、process、storage、services。
-//! 其余 provider 为**显式 stub**，返回 `Unsupported` 而非 panic —— 这样
-//! 能力矩阵能正确置灰 UI，也给出清晰的接入清单（对应里程碑 M2~M5）。
+//! 两个层次，别按目录名猜完成度：
+//! - 本目录下的**独立文件**按子系统切分：`metrics` / `process` / `storage` /
+//!   `services` / `containers` / `firewall` / `terminal` / `compose_stack` …
+//! - `providers/` 是「一个 trait 一个文件」的能力域实现：`packages` / `logs` /
+//!   `webserver` / `databases` / `users` / `network` / `storage`。这些文件体量大、
+//!   函数多，按契约分组便于与 `traits.rs` 逐条对照。
+//!
+//! ⚠ `providers/` **曾经叫 `stub/`**：那是骨架期只有个位数 `Unsupported` 占位时的
+//! 名字。后来它们大量落地成真实实现（调 dpkg / systemctl / journalctl / docker），
+//! 目录名就成了误导——评审时容易被当成占位整目录跳过。判断某能力是否真做了，
+//! 看能力矩阵与该函数体，不要看目录名。
+//!
+//! 纪律：**未实现**的能力必须返回 `PanelError::Unsupported`，禁止返回空 Vec 或
+//! `Ok(())` 假装成功——能力矩阵靠它把 UI 正确置灰。
 
 pub mod containers;
 /// 面板编排（Compose stack）的存储与渲染：JSON 单一事实源 + 生成 compose.yaml。
@@ -17,7 +28,7 @@ pub mod metrics;
 pub mod scheduler;
 pub mod security;
 pub mod services;
-pub mod stub;
+pub mod providers;
 pub mod terminal;
 
 use crate::{
@@ -34,17 +45,17 @@ pub struct LinuxOsAdapter {
     pub metrics: Arc<metrics::LinuxMetrics>,
     pub services: Arc<services::LinuxServices>,
     pub firewall: Arc<dyn FirewallProvider>,
-    pub packages: Arc<stub::LinuxPackages>,
-    pub logs: Arc<stub::LinuxLogs>,
+    pub packages: Arc<providers::LinuxPackages>,
+    pub logs: Arc<providers::LinuxLogs>,
     pub scheduler: Arc<scheduler::LinuxScheduler>,
     pub security: Arc<security::LinuxSecurity>,
-    pub webserver: Arc<stub::LinuxWebServer>,
-    pub databases: Arc<stub::LinuxDatabases>,
+    pub webserver: Arc<providers::LinuxWebServer>,
+    pub databases: Arc<providers::LinuxDatabases>,
     pub containers: Arc<containers::LinuxContainers>,
     pub terminal: Arc<terminal::LinuxTerminal>,
-    pub users: Arc<stub::LinuxUsers>,
-    pub network: Arc<stub::LinuxNetwork>,
-    pub storage: Arc<stub::LinuxStorage>,
+    pub users: Arc<providers::LinuxUsers>,
+    pub network: Arc<providers::LinuxNetwork>,
+    pub storage: Arc<providers::LinuxStorage>,
     pub files: Arc<files::LinuxFileProvider>,
     pub platform: PlatformInfo,
 }
@@ -56,20 +67,20 @@ impl LinuxOsAdapter {
             metrics: Arc::new(metrics::LinuxMetrics::new()),
             services: Arc::new(services::LinuxServices::detect()),
             firewall: make_firewall(),
-            packages: Arc::new(stub::LinuxPackages::detect()),
-            logs: Arc::new(stub::LinuxLogs::detect(paths.clone())),
+            packages: Arc::new(providers::LinuxPackages::detect()),
+            logs: Arc::new(providers::LinuxLogs::detect(paths.clone())),
             scheduler: Arc::new(scheduler::LinuxScheduler),
             security: Arc::new(security::LinuxSecurity),
             // webserver 需要路径布局（站点 conf 落盘到 web_conf_dir），故显式注入
-            webserver: Arc::new(stub::LinuxWebServer::detect(paths.clone())),
-            databases: Arc::new(stub::LinuxDatabases),
+            webserver: Arc::new(providers::LinuxWebServer::detect(paths.clone())),
+            databases: Arc::new(providers::LinuxDatabases),
             // 容器探测依赖 socket 路径（走 PathLayout，不硬编码），故注入 paths
             containers: Arc::new(containers::LinuxContainers::detect(paths.clone())),
             // 终端只需探测 shell 是否存在（纯文件检查），无需 paths
             terminal: Arc::new(terminal::LinuxTerminal::detect()),
-            users: Arc::new(stub::LinuxUsers),
-            network: Arc::new(stub::LinuxNetwork),
-            storage: Arc::new(stub::LinuxStorage),
+            users: Arc::new(providers::LinuxUsers),
+            network: Arc::new(providers::LinuxNetwork),
+            storage: Arc::new(providers::LinuxStorage),
             files: Arc::new(files::LinuxFileProvider),
             platform: detect_platform(),
             paths,
@@ -83,8 +94,8 @@ impl LinuxOsAdapter {
     /// `[paths]` 覆盖不生效（落入 `LinuxPathLayout::default()` = /var/www）。
     pub fn with_paths(paths: Arc<LinuxPathLayout>) -> Self {
         let mut s = Self::new();
-        s.webserver = Arc::new(stub::LinuxWebServer::detect(paths.clone()));
-        s.logs = Arc::new(stub::LinuxLogs::detect(paths.clone()));
+        s.webserver = Arc::new(providers::LinuxWebServer::detect(paths.clone()));
+        s.logs = Arc::new(providers::LinuxLogs::detect(paths.clone()));
         s.containers = Arc::new(containers::LinuxContainers::detect(paths.clone()));
         s.paths = paths;
         s

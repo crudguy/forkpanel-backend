@@ -152,12 +152,7 @@ fn temp_from_parts(
     }
 }
 
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64).unwrap_or(0)
-}
-
+use panel_core::now_unix;
 /// /proc/stat 首行：user nice system idle iowait irq softirq steal
 fn parse_cpu(stat: &str, prev: &mut Prev) -> CpuSample {
     let mut total = CpuSample::default();

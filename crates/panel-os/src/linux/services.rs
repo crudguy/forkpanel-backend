@@ -7,7 +7,7 @@
 
 use crate::{
     cmd::{self, Bin, CmdOpt},
-    linux::stub::parse_journal_json,
+    linux::providers::parse_journal_json,
     traits::{
         JournalQuery, ServiceConfig, ServiceFilter, ServiceProvider, ServiceState, ServiceUnit,
     },
