@@ -105,5 +105,46 @@ else
   fi
 fi
 
+# 7) 命名纪律：受控文档 / README / 源码注释里**不得点名同类商业产品**
+#    纪律来源：对外文档与代码注释一律用「主流集中式面板」这类泛称，保留对比结论但不点名。
+#    ⚠ 这份名单是**唯一**允许出现这些名字的地方（机器可读的黑名单）；文档正文里
+#      出现即失败——否则"上次清干净了、下次又抄回来"会反复发生（D-02）。
+COMPETITOR_RE='宝塔|bt\.cn|aaPanel|aapanel|1Panel|1panel|cPanel|Plesk|DirectAdmin|Webmin|HestiaCP|CloudPanel'
+# 正则活性自检：名字写错一个字母，下面就变成"永远扫不到"的恒绿检查。
+if ! printf '%s' 'probe-宝塔-探针' | grep -qEi "$COMPETITOR_RE"; then
+  bad "竞品关键词正则自身失效（连探针都匹配不到）——这条会恒绿，必须修"
+else
+  DOC_MD="$(find "$HERE/docs" -name '*.md' -type f | head -1)"
+  if [ -z "$DOC_MD" ]; then
+    bad "docs/ 下没扫到任何 .md——路径变了，命名纪律检查会恒绿"
+  else
+    # ⚠ 文件清单必须走 NUL 分隔的临时文件：`$(find -print0)` 会把 NUL 丢掉，
+    #   多个文件名连成一串 ⇒ grep 一个也打不开 ⇒ 扫描静默失效（恒绿）。
+    LIST="$(mktemp)"; trap 'rm -f "$LIST"' EXIT
+    {
+      printf '%s\0' "$HERE/README.md" "$FE/README.md"
+      find "$HERE/docs" -name '*.md' -type f -print0
+      find "$CRATES" -name '*.rs' -type f -print0
+      [ -d "$FE/src" ] && find "$FE/src" -type f \( -name '*.ts' -o -name '*.vue' \) -print0
+    } >"$LIST" 2>/dev/null
+    N_FILES="$(tr '\0' '\n' <"$LIST" | grep -c . || true)"
+    # 扫描面自检：清单塌成个位数说明 find 路径坏了，下面必然"零命中"
+    if [ "${N_FILES:-0}" -lt 40 ]; then
+      bad "命名纪律只扫到 ${N_FILES:-0} 个文件（期望 ≥40）——扫描面失效，这条会恒绿"
+    else
+      # ⚠ 这里**不能**复用上面的「剔注释」过滤式：命名纪律要抓的恰恰是注释
+      #   （"与 X 的同类实现对照"这类说明）。别处的断言剔注释是为了只认代码事实，
+      #   此处的断言对象包含说明文字本身。
+      HITS="$(xargs -0 -r grep -nEi "$COMPETITOR_RE" <"$LIST" 2>/dev/null)"
+      if [ -n "$HITS" ]; then
+        bad "文档/注释点名了同类商业产品（统一改用「主流集中式面板」等泛称）："
+        printf '%s\n' "$HITS" | sed 's/^/      /' >&2
+      else
+        ok "扫过 $N_FILES 个文档/源码文件，未点名同类产品（正则自校验通过）"
+      fi
+    fi
+  fi
+fi
+
 [ $fail -eq 0 ] || exit 1
 echo "PASS：文档 ↔ 代码一致性通过"
