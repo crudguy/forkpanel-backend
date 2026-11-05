@@ -19,12 +19,13 @@
 //! （404 / SPA miss）会整条绕过日志层——冒烟实测过：每个 404 都无日志行、其余全有。
 use std::sync::Arc;
 
-use panel_core::{PanelError, Result, Tier};
+use panel_core::{now_unix, PanelError, Result, Tier};
 use panel_os::PathLayout;
 
+use crate::config::Config;
 use crate::{
-    build_layout, detect_tier, embed, load_cfg, load_master_key, register_internal_jobs,
-    warn_if_exposed, write_bootstrap_token_file, Cli,
+    build_layout, detect_tier, embed, load_cfg, load_master_key, warn_if_exposed,
+    write_bootstrap_token_file, Cli,
 };
 
 /// 启动并阻塞在 HTTP 服务上，直到进程被信号终止或 serve 出错。
@@ -222,3 +223,280 @@ pub(crate) fn run(cli: &Cli, os: Arc<dyn panel_os::OsAdapter>) -> Result<()> {
     sched.shutdown();
     r
 }
+
+/// 注册内部周期任务的实现。
+///
+/// **为什么住在 serve.rs**：全站只有 `run()` 一处调用它，它注册的每个任务都是
+/// 服务启动后才有意义的后台循环。放在 `main.rs` 时，17 条子命令的分派表下面直接
+/// 挂着 270 行装配代码，想知道"面板有哪几个命令"要翻过整段任务注册。
+///
+/// ⚠️ 本函数被 `main.rs::wiring_guard_tests` 的两条守卫盯着——`backup_sweep` 与
+/// `session_sweep` 必须在 `builtin_schedules` 声明之后**真的被注册**。漏注册时
+/// 调度器每轮 `jobs.get(name)` 取到 None 就静默跳过：定时备份永远不跑、会话 map
+/// 单调增长，而且没有任何报错。那些守卫的 `include_str!` 指向本文件，搬动本函数
+/// 必须同步改目标，别改成"全仓 grep 到就算过"。
+#[allow(clippy::too_many_arguments)]
+async fn register_internal_jobs(
+    sched: &panel_task::InternalScheduler,
+    os: &Arc<dyn panel_os::OsAdapter>,
+    writer: Arc<panel_db::WriterActor>,
+    metrics: Arc<std::sync::Mutex<panel_db::aggregator::Aggregator>>,
+    layout: &Arc<dyn panel_os::PathLayout>,
+    cfg: &Config,
+    tier: Tier,
+    // 供证书自动续期使用（需要任务队列、读连接池与主密钥）
+    state: std::sync::Arc<panel_api::AppState>,
+) {
+    // ── 指标采样：只写内存环形缓冲，不落库 ──
+    {
+        let os = os.clone();
+        let metrics = metrics.clone();
+        // 闭包是 move 且会被周期反复调用，故在这里 clone 一份，进 async 块前再 clone，
+        // 否则外层 state 会被移走（E0382）/ 闭包第二次调用时无值可用。
+        let state_for_sample = state.clone();
+        sched.register("metrics.sample", move || {
+            let os = os.clone();
+            let metrics = metrics.clone();
+            let state_for_sample = state_for_sample.clone();
+            async move {
+                let snap = os.metrics().snapshot().await?;
+                // 采集循环是**唯一**的采样者：把结果缓存起来供 HTTP 接口读。
+                // 否则每个调 snapshot() 的请求都会重置 panel-os 的共享采样基准，
+                // 既拿到抖动值、又截短下一次采样窗口（见 AppState::cached_snapshot）。
+                let snap = Arc::new(snap);
+                state_for_sample.record_snapshot(snap.clone()).await;
+                let mut g = metrics.lock().unwrap_or_else(|e| e.into_inner());
+                g.record(panel_db::ring::Sample {
+                    ts: snap.ts_unix,
+                    cpu_pct: snap.cpu.total_pct,
+                    mem_used_kib: snap.mem.used_kib,
+                    mem_total_kib: snap.mem.total_kib,
+                    swap_used_kib: snap.mem.swap_used_kib,
+                    // 与 /system/overview 保持同一口径：所有本地盘求和、排除网络文件系统；
+                    // 网络速率排除回环接口 lo。否则概览首屏（求和）与实时跳动（首个盘）会口径跳变。
+                    disk_used_bytes: snap.disks.iter().filter(|d| !d.is_network_fs).map(|d| d.used_bytes).sum(),
+                    disk_total_bytes: snap.disks.iter().filter(|d| !d.is_network_fs).map(|d| d.total_bytes).sum(),
+                    // SystemSnapshot 字段是 nets（复数）；NetSample 速率字段是 rx/tx_rate_bps
+                    net_in_bps: snap.nets.iter().filter(|n| n.iface != "lo").map(|n| n.rx_rate_bps).sum(),
+                    net_out_bps: snap.nets.iter().filter(|n| n.iface != "lo").map(|n| n.tx_rate_bps).sum(),
+                    load1: snap.cpu.load1,
+                });
+                Ok(())
+            }
+        }).await;
+    }
+
+    // ── 分片上传残包清理（P2-1）：1h 一次，让闲置面板也能回收 ──
+    {
+        let state = state.clone();
+        sched.register("uploads.sweep", move || {
+            let state = state.clone();
+            async move {
+                panel_api::routes::multipart::sweep_expired(&state).await;
+                Ok(())
+            }
+        }).await;
+    }
+
+    // ── 会话过期回收（P1-9）：sessions 内存 map 与 sessions 表此前单调增长——
+    // `SessionCache::sweep()` 已实现却从未被调用。挂上唯一消费者：每 5 分钟清理
+    // 一次过期会话（按 expires_at 判，与登录/访问续期口径一致）。
+    {
+        let state = state.clone();
+        sched.register("session.sweep", move || {
+            let state = state.clone();
+            async move {
+                // sweep 同步、内部自行向 DB 派发清理；返回清理条数仅用于日志
+                let n = state.sessions.sweep();
+                if n > 0 {
+                    tracing::info!("会话过期回收：清理 {n} 个过期会话");
+                }
+                Ok(())
+            }
+        }).await;
+    }
+
+    // ── 1m 聚合：nano 档位是 no-op（不落盘）──
+    {
+        let writer = writer.clone();
+        let metrics = metrics.clone();
+        sched.register("metrics.aggregate_1m", move || {
+            let writer = writer.clone();
+            let metrics = metrics.clone();
+            async move {
+                let n = match tier { Tier::Nano => 12, _ => 60 };
+                let agg = {
+                    let g = metrics.lock().unwrap_or_else(|e| e.into_inner());
+                    g.ring().aggregate(n)
+                };
+                let Some(a) = agg else { return Ok(()) };
+                writer.exec(move |conn| {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO metrics_1m
+                         (ts, cpu_pct, mem_used_kib, mem_total_kib, swap_used_kib,
+                          disk_used_bytes, disk_total_bytes, net_in_bps, net_out_bps, load1)
+                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                        rusqlite::params![
+                            a.ts - (a.ts % 60), a.cpu_pct, a.mem_used_kib, a.mem_total_kib,
+                            a.swap_used_kib, a.disk_used_bytes, a.disk_total_bytes,
+                            a.net_in_bps, a.net_out_bps, a.load1,
+                        ],
+                    ).map_err(|e| panel_core::PanelError::Database(e.to_string()))?;
+                    Ok(panel_db::WriteAck { rows_changed: 1 })
+                }).await?;
+                Ok(())
+            }
+        }).await;
+    }
+
+    // ── 1h rollup：聚合后再清理过期指标 ──
+    {
+        let writer = writer.clone();
+        sched.register("metrics.rollup_1h", move || {
+            let writer = writer.clone();
+            async move {
+                writer.exec(|conn| {
+                    let mut st = conn.prepare(
+                        "INSERT OR REPLACE INTO metrics_1h
+                         (ts, cpu_pct, mem_used_kib, mem_total_kib, swap_used_kib,
+                          disk_used_bytes, disk_total_bytes, net_in_bps, net_out_bps, load1)
+                         SELECT ts - (ts % 3600), AVG(cpu_pct), MAX(mem_used_kib), MAX(mem_total_kib),
+                                MAX(swap_used_kib), MAX(disk_used_bytes), MAX(disk_total_bytes),
+                                MAX(net_in_bps), MAX(net_out_bps), AVG(load1)
+                         FROM metrics_1m WHERE ts < ?1 GROUP BY ts - (ts % 3600)",
+                    ).map_err(|e| panel_core::PanelError::Database(e.to_string()))?;
+                    let cutoff = now_unix() - 86_400;
+                    let n = st.execute(rusqlite::params![cutoff])
+                        .map_err(|e| panel_core::PanelError::Database(e.to_string()))?;
+                    Ok(panel_db::WriteAck { rows_changed: n })
+                }).await?;
+                Ok(())
+            }
+        }).await;
+    }
+
+    // ── 清理：指标 + 审计 + 任务记录 + 通知 ──
+    {
+        let writer = writer.clone();
+        let retention = cfg.audit.retention_days;
+        let max_rows = cfg.audit.max_rows;
+        sched.register("db.cleanup", move || {
+            let writer = writer.clone();
+            async move {
+                writer.exec(move |conn| {
+                    // 指标：7 天 1m + 90 天 1h（均 ≤5 万行，一次性删除最快）
+                    panel_db::cleanup::prune_metrics(conn, panel_db::aggregator::Retention::default())?;
+                    // 审计：默认 90 天 + 5 万行上限（实测 180 天 = 4.12MB）
+                    panel_db::cleanup::prune_audit(conn, retention, max_rows)?;
+                    panel_db::cleanup::prune_task_runs(conn, retention)?;
+                    // 通知此前是唯一没有 prune 的业务表（只增不减：WAF 告警 /
+                    // 任务完成 / 备份结果都会写一行）。保留期与审计同口径。
+                    panel_db::cleanup::prune_notifications(conn, retention, max_rows)?;
+                    Ok(panel_db::WriteAck { rows_changed: 0 })
+                }).await?;
+                // 清理后回收 WAL（实测：无界时 5 万行即 7.71MB）
+                writer.exec(|conn| {
+                    panel_db::cleanup::checkpoint_truncate(conn)?;
+                    Ok(panel_db::WriteAck { rows_changed: 0 })
+                }).await?;
+                Ok(())
+            }
+        }).await;
+    }
+
+    // ── 每日备份（nano 档位未注册该任务）──
+    if cfg.db.daily_backup && !matches!(tier, Tier::Nano) {
+        let backup_dir = layout.backup_dir();
+        let db_path = layout.sqlite_path();
+        // 保留份数必须在**注册时**取出：闭包里再读 cfg 会活不过 'static。
+        // 这个值是真消费者——写完后立刻按它裁剪，否则 `panel-*.db` 只增不减，
+        // 一年堆 365 份把磁盘慢慢吃满（且此前页面完全看不到这些文件）。
+        let keep = cfg.db.backup_keep;
+        sched.register("db.backup", move || {
+            let backup_dir = backup_dir.clone();
+            let db_path = db_path.clone();
+            async move {
+                std::fs::create_dir_all(&backup_dir).ok();
+                let ts = now_unix();
+                let dest = backup_dir.join(format!("panel-{ts}.db"));
+                // 独立连接备份：写者把 op 包在事务里，事务内不能 VACUUM INTO。
+                // VACUUM INTO 是同步阻塞调用（实测占死 2~3 个 worker 线程数秒），
+                // 用 spawn_blocking 丢到阻塞线程池，避免卡住 tokio 的异步 worker
+                // 导致同进程内其它周期任务一起停摆（P1-11）。
+                let db_path_bk = db_path.clone();
+                let dest_bk = dest.clone();
+                let bak = tokio::task::spawn_blocking(move || panel_db::backup_file(&db_path_bk, &dest_bk))
+                    .await
+                    .map_err(|e| panel_core::PanelError::Internal(format!("每日备份线程崩溃（join 失败）: {e}")))?;
+                bak.map_err(|e| panel_core::PanelError::Internal(format!("每日备份失败: {e}")))?;
+                let pruned = panel_api::routes::backups::prune_daily_db(&backup_dir, keep);
+                if !pruned.is_empty() {
+                    tracing::info!("每日备份已裁剪 {} 份旧文件（保留 {keep}）", pruned.len());
+                }
+                Ok(())
+            }
+        }).await;
+    }
+
+    // ── 证书自动续期扫描 ──
+    // 扫描 ssl_certs 中「30 天内到期 + auto_renew=1 + source=acme」的证书，
+    // 逐个提交 AcmeTask{Renew}。能力位缺失（certbot 不在）时内部自行跳过返回 0。
+    {
+        let state = state.clone();
+        sched.register("cert.renew_check", move || {
+            let state = state.clone();
+            async move {
+                match panel_api::routes::sites::auto_renew_sweep(state).await {
+                    Ok(n) => {
+                        if n > 0 {
+                            tracing::info!("证书自动续期扫描：已入队 {n} 张到期证书");
+                        }
+                        Ok(())
+                    }
+                    Err(e) => {
+                        tracing::warn!("证书自动续期扫描失败: {e}");
+                        Err(e)
+                    }
+                }
+            }
+        }).await;
+    }
+
+    // ── 备份计划的 cron 扫描（每分钟）──
+    //
+    // `backup_jobs.cron_expr` / `enabled` 此前**只存不读**：页面上配了"每天 3 点"，
+    // 实际永远只有手动执行（典型「配置项假控制」）。这里挂上唯一消费者——
+    // 定时表在 `panel-task::builtin_schedules`，注册在这里，两处名字必须一致。
+    {
+        let state = state.clone();
+        sched.register("backup.sweep", move || {
+            let state = state.clone();
+            async move {
+                match panel_api::routes::backups::sweep_due(&state).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!("定时备份：本轮提交 {n} 个计划"),
+                    Err(e) => tracing::warn!("定时备份扫描失败: {e}"),
+                }
+                Ok(())
+            }
+        }).await;
+    }
+
+    // ── 拦截事件采集（027）：读开日志站点的 access log 增量，落 403/405/429 事件 ──
+    {
+        let state = state.clone();
+        sched.register("waf.collect", move || {
+            let state = state.clone();
+            async move {
+                match panel_api::routes::waf_events::collect_block_events(&state).await {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        tracing::warn!("拦截事件采集失败: {e}");
+                        Err(e)
+                    }
+                }
+            }
+        }).await;
+    }
+}
+

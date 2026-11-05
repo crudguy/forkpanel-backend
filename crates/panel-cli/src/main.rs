@@ -350,276 +350,6 @@ fn run(cli: Cli) -> Result<()> {
     }
 }
 
-/// 注册内部周期任务的实现。
-///
-/// 刻意集中在一处：`builtin_schedules` 里加了名字，这里就必须有对应实现，
-/// 否则调度器会静默跳过（代码里已用 warn 记录这种漏配）。
-// 参数多是有意的：内部任务的注册入口要把调度器/存储/路径/配置/状态一次性交齐，
-// 拆成 builder 只会让调用点更难核对（漏一个依赖＝该任务静默不注册）。
-#[allow(clippy::too_many_arguments)]
-async fn register_internal_jobs(
-    sched: &panel_task::InternalScheduler,
-    os: &Arc<dyn panel_os::OsAdapter>,
-    writer: Arc<panel_db::WriterActor>,
-    metrics: Arc<std::sync::Mutex<panel_db::aggregator::Aggregator>>,
-    layout: &Arc<dyn panel_os::PathLayout>,
-    cfg: &Config,
-    tier: Tier,
-    // 供证书自动续期使用（需要任务队列、读连接池与主密钥）
-    state: std::sync::Arc<panel_api::AppState>,
-) {
-    // ── 指标采样：只写内存环形缓冲，不落库 ──
-    {
-        let os = os.clone();
-        let metrics = metrics.clone();
-        // 闭包是 move 且会被周期反复调用，故在这里 clone 一份，进 async 块前再 clone，
-        // 否则外层 state 会被移走（E0382）/ 闭包第二次调用时无值可用。
-        let state_for_sample = state.clone();
-        sched.register("metrics.sample", move || {
-            let os = os.clone();
-            let metrics = metrics.clone();
-            let state_for_sample = state_for_sample.clone();
-            async move {
-                let snap = os.metrics().snapshot().await?;
-                // 采集循环是**唯一**的采样者：把结果缓存起来供 HTTP 接口读。
-                // 否则每个调 snapshot() 的请求都会重置 panel-os 的共享采样基准，
-                // 既拿到抖动值、又截短下一次采样窗口（见 AppState::cached_snapshot）。
-                let snap = Arc::new(snap);
-                state_for_sample.record_snapshot(snap.clone()).await;
-                let mut g = metrics.lock().unwrap_or_else(|e| e.into_inner());
-                g.record(panel_db::ring::Sample {
-                    ts: snap.ts_unix,
-                    cpu_pct: snap.cpu.total_pct,
-                    mem_used_kib: snap.mem.used_kib,
-                    mem_total_kib: snap.mem.total_kib,
-                    swap_used_kib: snap.mem.swap_used_kib,
-                    // 与 /system/overview 保持同一口径：所有本地盘求和、排除网络文件系统；
-                    // 网络速率排除回环接口 lo。否则概览首屏（求和）与实时跳动（首个盘）会口径跳变。
-                    disk_used_bytes: snap.disks.iter().filter(|d| !d.is_network_fs).map(|d| d.used_bytes).sum(),
-                    disk_total_bytes: snap.disks.iter().filter(|d| !d.is_network_fs).map(|d| d.total_bytes).sum(),
-                    // SystemSnapshot 字段是 nets（复数）；NetSample 速率字段是 rx/tx_rate_bps
-                    net_in_bps: snap.nets.iter().filter(|n| n.iface != "lo").map(|n| n.rx_rate_bps).sum(),
-                    net_out_bps: snap.nets.iter().filter(|n| n.iface != "lo").map(|n| n.tx_rate_bps).sum(),
-                    load1: snap.cpu.load1,
-                });
-                Ok(())
-            }
-        }).await;
-    }
-
-    // ── 分片上传残包清理（P2-1）：1h 一次，让闲置面板也能回收 ──
-    {
-        let state = state.clone();
-        sched.register("uploads.sweep", move || {
-            let state = state.clone();
-            async move {
-                panel_api::routes::multipart::sweep_expired(&state).await;
-                Ok(())
-            }
-        }).await;
-    }
-
-    // ── 会话过期回收（P1-9）：sessions 内存 map 与 sessions 表此前单调增长——
-    // `SessionCache::sweep()` 已实现却从未被调用。挂上唯一消费者：每 5 分钟清理
-    // 一次过期会话（按 expires_at 判，与登录/访问续期口径一致）。
-    {
-        let state = state.clone();
-        sched.register("session.sweep", move || {
-            let state = state.clone();
-            async move {
-                // sweep 同步、内部自行向 DB 派发清理；返回清理条数仅用于日志
-                let n = state.sessions.sweep();
-                if n > 0 {
-                    tracing::info!("会话过期回收：清理 {n} 个过期会话");
-                }
-                Ok(())
-            }
-        }).await;
-    }
-
-    // ── 1m 聚合：nano 档位是 no-op（不落盘）──
-    {
-        let writer = writer.clone();
-        let metrics = metrics.clone();
-        sched.register("metrics.aggregate_1m", move || {
-            let writer = writer.clone();
-            let metrics = metrics.clone();
-            async move {
-                let n = match tier { Tier::Nano => 12, _ => 60 };
-                let agg = {
-                    let g = metrics.lock().unwrap_or_else(|e| e.into_inner());
-                    g.ring().aggregate(n)
-                };
-                let Some(a) = agg else { return Ok(()) };
-                writer.exec(move |conn| {
-                    conn.execute(
-                        "INSERT OR REPLACE INTO metrics_1m
-                         (ts, cpu_pct, mem_used_kib, mem_total_kib, swap_used_kib,
-                          disk_used_bytes, disk_total_bytes, net_in_bps, net_out_bps, load1)
-                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-                        rusqlite::params![
-                            a.ts - (a.ts % 60), a.cpu_pct, a.mem_used_kib, a.mem_total_kib,
-                            a.swap_used_kib, a.disk_used_bytes, a.disk_total_bytes,
-                            a.net_in_bps, a.net_out_bps, a.load1,
-                        ],
-                    ).map_err(|e| panel_core::PanelError::Database(e.to_string()))?;
-                    Ok(panel_db::WriteAck { rows_changed: 1 })
-                }).await?;
-                Ok(())
-            }
-        }).await;
-    }
-
-    // ── 1h rollup：聚合后再清理过期指标 ──
-    {
-        let writer = writer.clone();
-        sched.register("metrics.rollup_1h", move || {
-            let writer = writer.clone();
-            async move {
-                writer.exec(|conn| {
-                    let mut st = conn.prepare(
-                        "INSERT OR REPLACE INTO metrics_1h
-                         (ts, cpu_pct, mem_used_kib, mem_total_kib, swap_used_kib,
-                          disk_used_bytes, disk_total_bytes, net_in_bps, net_out_bps, load1)
-                         SELECT ts - (ts % 3600), AVG(cpu_pct), MAX(mem_used_kib), MAX(mem_total_kib),
-                                MAX(swap_used_kib), MAX(disk_used_bytes), MAX(disk_total_bytes),
-                                MAX(net_in_bps), MAX(net_out_bps), AVG(load1)
-                         FROM metrics_1m WHERE ts < ?1 GROUP BY ts - (ts % 3600)",
-                    ).map_err(|e| panel_core::PanelError::Database(e.to_string()))?;
-                    let cutoff = now_unix() - 86_400;
-                    let n = st.execute(rusqlite::params![cutoff])
-                        .map_err(|e| panel_core::PanelError::Database(e.to_string()))?;
-                    Ok(panel_db::WriteAck { rows_changed: n })
-                }).await?;
-                Ok(())
-            }
-        }).await;
-    }
-
-    // ── 清理：指标 + 审计 + 任务记录 + 通知 ──
-    {
-        let writer = writer.clone();
-        let retention = cfg.audit.retention_days;
-        let max_rows = cfg.audit.max_rows;
-        sched.register("db.cleanup", move || {
-            let writer = writer.clone();
-            async move {
-                writer.exec(move |conn| {
-                    // 指标：7 天 1m + 90 天 1h（均 ≤5 万行，一次性删除最快）
-                    panel_db::cleanup::prune_metrics(conn, panel_db::aggregator::Retention::default())?;
-                    // 审计：默认 90 天 + 5 万行上限（实测 180 天 = 4.12MB）
-                    panel_db::cleanup::prune_audit(conn, retention, max_rows)?;
-                    panel_db::cleanup::prune_task_runs(conn, retention)?;
-                    // 通知此前是唯一没有 prune 的业务表（只增不减：WAF 告警 /
-                    // 任务完成 / 备份结果都会写一行）。保留期与审计同口径。
-                    panel_db::cleanup::prune_notifications(conn, retention, max_rows)?;
-                    Ok(panel_db::WriteAck { rows_changed: 0 })
-                }).await?;
-                // 清理后回收 WAL（实测：无界时 5 万行即 7.71MB）
-                writer.exec(|conn| {
-                    panel_db::cleanup::checkpoint_truncate(conn)?;
-                    Ok(panel_db::WriteAck { rows_changed: 0 })
-                }).await?;
-                Ok(())
-            }
-        }).await;
-    }
-
-    // ── 每日备份（nano 档位未注册该任务）──
-    if cfg.db.daily_backup && !matches!(tier, Tier::Nano) {
-        let backup_dir = layout.backup_dir();
-        let db_path = layout.sqlite_path();
-        // 保留份数必须在**注册时**取出：闭包里再读 cfg 会活不过 'static。
-        // 这个值是真消费者——写完后立刻按它裁剪，否则 `panel-*.db` 只增不减，
-        // 一年堆 365 份把磁盘慢慢吃满（且此前页面完全看不到这些文件）。
-        let keep = cfg.db.backup_keep;
-        sched.register("db.backup", move || {
-            let backup_dir = backup_dir.clone();
-            let db_path = db_path.clone();
-            async move {
-                std::fs::create_dir_all(&backup_dir).ok();
-                let ts = now_unix();
-                let dest = backup_dir.join(format!("panel-{ts}.db"));
-                // 独立连接备份：写者把 op 包在事务里，事务内不能 VACUUM INTO。
-                // VACUUM INTO 是同步阻塞调用（实测占死 2~3 个 worker 线程数秒），
-                // 用 spawn_blocking 丢到阻塞线程池，避免卡住 tokio 的异步 worker
-                // 导致同进程内其它周期任务一起停摆（P1-11）。
-                let db_path_bk = db_path.clone();
-                let dest_bk = dest.clone();
-                let bak = tokio::task::spawn_blocking(move || panel_db::backup_file(&db_path_bk, &dest_bk))
-                    .await
-                    .map_err(|e| panel_core::PanelError::Internal(format!("每日备份线程崩溃（join 失败）: {e}")))?;
-                bak.map_err(|e| panel_core::PanelError::Internal(format!("每日备份失败: {e}")))?;
-                let pruned = panel_api::routes::backups::prune_daily_db(&backup_dir, keep);
-                if !pruned.is_empty() {
-                    tracing::info!("每日备份已裁剪 {} 份旧文件（保留 {keep}）", pruned.len());
-                }
-                Ok(())
-            }
-        }).await;
-    }
-
-    // ── 证书自动续期扫描 ──
-    // 扫描 ssl_certs 中「30 天内到期 + auto_renew=1 + source=acme」的证书，
-    // 逐个提交 AcmeTask{Renew}。能力位缺失（certbot 不在）时内部自行跳过返回 0。
-    {
-        let state = state.clone();
-        sched.register("cert.renew_check", move || {
-            let state = state.clone();
-            async move {
-                match panel_api::routes::sites::auto_renew_sweep(state).await {
-                    Ok(n) => {
-                        if n > 0 {
-                            tracing::info!("证书自动续期扫描：已入队 {n} 张到期证书");
-                        }
-                        Ok(())
-                    }
-                    Err(e) => {
-                        tracing::warn!("证书自动续期扫描失败: {e}");
-                        Err(e)
-                    }
-                }
-            }
-        }).await;
-    }
-
-    // ── 备份计划的 cron 扫描（每分钟）──
-    //
-    // `backup_jobs.cron_expr` / `enabled` 此前**只存不读**：页面上配了"每天 3 点"，
-    // 实际永远只有手动执行（典型「配置项假控制」）。这里挂上唯一消费者——
-    // 定时表在 `panel-task::builtin_schedules`，注册在这里，两处名字必须一致。
-    {
-        let state = state.clone();
-        sched.register("backup.sweep", move || {
-            let state = state.clone();
-            async move {
-                match panel_api::routes::backups::sweep_due(&state).await {
-                    Ok(0) => {}
-                    Ok(n) => tracing::info!("定时备份：本轮提交 {n} 个计划"),
-                    Err(e) => tracing::warn!("定时备份扫描失败: {e}"),
-                }
-                Ok(())
-            }
-        }).await;
-    }
-
-    // ── 拦截事件采集（027）：读开日志站点的 access log 增量，落 403/405/429 事件 ──
-    {
-        let state = state.clone();
-        sched.register("waf.collect", move || {
-            let state = state.clone();
-            async move {
-                match panel_api::routes::waf_events::collect_block_events(&state).await {
-                    Ok(()) => Ok(()),
-                    Err(e) => {
-                        tracing::warn!("拦截事件采集失败: {e}");
-                        Err(e)
-                    }
-                }
-            }
-        }).await;
-    }
-}
 
 use panel_core::now_unix;
 /// 交互式（或经 `--owner`/`--owner-pass` 非交互）创建首个 owner 账号。
@@ -1097,7 +827,8 @@ mod wiring_guard_tests {
     /// 只 `split("#[cfg(test)]")` 的版本依然全绿（定时备份静默不跑，门禁一声不吭）。
     #[test]
     fn backup_sweep_is_registered_in_serve() {
-        let src = include_str!("main.rs");
+        // 判据跟着被检查的那份文件走：任务注册已搬进 cmd/serve.rs
+        let src = include_str!("cmd/serve.rs");
         let prod = panel_testutil::production_source(src);
         assert!(
             prod.contains("sched.register(\"backup.sweep\", move ||"),
@@ -1107,6 +838,13 @@ mod wiring_guard_tests {
             prod.contains("backups::sweep_due(&state)"),
             "注册的实现必须真的调用 sweep_due"
         );
+        // 反向：注册不许以任何形式留在 main.rs。只断言 serve.rs "有"是不够的——
+        // 有人把注册复制回 main.rs 并从这里删掉时，serve.rs 仍是绿的。
+        let main = panel_testutil::production_source(include_str!("main.rs"));
+        assert!(
+            !main.contains("sched.register("),
+            "main.rs 不得再注册内部任务：注册入口已收敛到 cmd/serve.rs 的 register_internal_jobs 一处"
+        );
     }
 
     /// **判据必须指向生产代码那一份**：会话回收在 `panel-task` 声明、在 `panel-cli`
@@ -1115,7 +853,8 @@ mod wiring_guard_tests {
     /// 表单调增长（P1-9）。同样走 `production_source`（剔测试段 + 剔注释）。
     #[test]
     fn session_sweep_is_registered_in_serve() {
-        let src = include_str!("main.rs");
+        // 判据跟着被检查的那份文件走：任务注册已搬进 cmd/serve.rs
+        let src = include_str!("cmd/serve.rs");
         let prod = panel_testutil::production_source(src);
         assert!(
             prod.contains("sched.register(\"session.sweep\", move ||"),
@@ -1124,6 +863,11 @@ mod wiring_guard_tests {
         assert!(
             prod.contains("state.sessions.sweep()"),
             "注册的实现必须真的调用 SessionCache::sweep()"
+        );
+        let main = panel_testutil::production_source(include_str!("main.rs"));
+        assert!(
+            !main.contains("sched.register("),
+            "main.rs 不得再注册内部任务：注册入口已收敛到 cmd/serve.rs 的 register_internal_jobs 一处"
         );
     }
 
