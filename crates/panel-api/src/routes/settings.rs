@@ -172,11 +172,27 @@ pub async fn get(
     let layout = state.os.paths();
     // systemctl 可能不存在/不可用（非 systemd、精简镜像）⇒ 用 Option 如实表达
     // 「无法判定」，绝不能把「查不到」渲染成「已停止」。
-    let svc = |verb: &str| -> Option<bool> {
-        panel_os::run_sync(panel_os::Bin::Systemctl, &[verb, "panel"])
-            .ok()
-            .and_then(|o| o.code)
-            .map(|c| c == 0)
+    //
+    // ⚠ 必须 spawn_blocking：`run_sync` 是 `std::process` + `wait()`，在 async
+    // handler 里直接调用会占死 tokio worker（systemd/D-Bus 卡顿时整个 API 无响应）。
+    // 两次查询合并进同一次阻塞任务，避免开两次线程。
+    let (service_active, service_enabled) = match tokio::task::spawn_blocking(|| {
+        let one = |verb: &str| -> Option<bool> {
+            panel_os::run_sync(panel_os::Bin::Systemctl, &[verb, "panel"])
+                .ok()
+                .and_then(|o| o.code)
+                .map(|c| c == 0)
+        };
+        (one("is-active"), one("is-enabled"))
+    })
+    .await
+    {
+        Ok(v) => v,
+        // JoinError 只在阻塞任务 panic 时出现：如实当「无法判定」，但必须留痕。
+        Err(e) => {
+            eprintln!("[WARN] 读取 panel 服务状态时阻塞任务失败: {e}");
+            (None, None)
+        }
     };
     let deployment = json!({
         "read_only": state.read_only,
@@ -200,8 +216,8 @@ pub async fn get(
             "data_dir": layout.data_dir().display().to_string(),
             "log_dir": layout.log_dir().display().to_string(),
             "service_manager": "systemd",
-            "service_active": svc("is-active"),
-            "service_enabled": svc("is-enabled"),
+            "service_active": service_active,
+            "service_enabled": service_enabled,
             "can_restart": s.role == "owner",
             // Web 升级三道门：owner + [danger] allow_web_upgrade + systemd-run 可用。
             // 默认关闭；不满足时给出**具体**原因，UI 显示说明而不是一个点了 501 的按钮。
@@ -376,10 +392,48 @@ pub async fn patch(
 
 /// endpoint 合法性。**PATCH 与「测试连接」必须共用这一条约束**——同一约束拆在
 /// 两条路径上是本仓踩过的高频 bug（一处校验一处不校验 → "能存但测不通"）。
+///
+/// 本机/内网网关（`http://127.0.0.1:11434/v1`）是**刻意保留的合法用例**：面板的
+/// 典型部署就是连本机 Ollama。因此这里不做「禁私网」的一刀切，而是堵住三个真实
+/// 放大面（见 `test_llm`）：URL 内嵌 userinfo、跟随重定向、回显对方响应体。
 fn valid_endpoint(url: &str) -> bool {
     (url.starts_with("http://") || url.starts_with("https://"))
         && url.len() <= 256
         && !url.ends_with('/')
+        && url_host(url).is_some()
+}
+
+/// 取出 URL 的 host 段（不含 scheme / userinfo / 端口 / 路径）。
+///
+/// 只做结构校验，不做 DNS 解析：`None` 表示结构不合法——空 host、带 userinfo
+/// （`http://user:pass@host`，会把凭据写进 URL）、端口非数字、IPv6 括号未闭合。
+fn url_host(url: &str) -> Option<&str> {
+    let rest = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://"))?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    if let Some(stripped) = authority.strip_prefix('[') {
+        let end = stripped.find(']')?;
+        let tail = &stripped[end + 1..];
+        if !tail.is_empty() {
+            let port = tail.strip_prefix(':')?;
+            if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+        }
+        return Some(&stripped[..end]);
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (authority, None),
+    };
+    if let Some(p) = port {
+        if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+    }
+    if host.is_empty() { None } else { Some(host) }
 }
 
 /// 探测超时。宁可让用户等 8 秒后拿到明确超时，也不要挂住一个 axum worker。
@@ -409,11 +463,17 @@ pub struct TestLlmResp {
     pub detail: String,
 }
 
-/// 非 2xx 的失败原因。**只回显响应体前 200 字符且不含任何请求侧内容**——
-/// 端点由管理员填写，本函数回显的内容可能是内网服务的报错，截断是必要的。
+/// 非 2xx 的失败原因。**不回显对方响应体**——端点由管理员填写，响应可能来自
+/// 内网服务（错误页常带内部主机名、路径、版本号）。只保留「是否 JSON」这一条
+/// 排障线索，正文按安全策略隐去；具体原因由状态码给出。
 fn status_detail(status: u16, body: &str) -> String {
-    let tail: String = body.chars().take(200).collect();
-    let brief = if tail.is_empty() { String::new() } else { format!("：{tail}") };
+    let brief = if body.is_empty() {
+        String::new()
+    } else if serde_json::from_str::<Value>(body).is_ok() {
+        "（对方返回了 JSON 错误体，内容已按安全策略隐去）".to_string()
+    } else {
+        "（对方返回了非 JSON 响应，内容已按安全策略隐去）".to_string()
+    };
     match status {
         401 => format!("密钥被拒绝（HTTP 401）——API Key 无效或已撤销{brief}"),
         403 => format!("无访问权限（HTTP 403）——Key 可能没有该模型/接口的权限{brief}"),
@@ -501,7 +561,13 @@ pub async fn test_llm(
             .and_then(|raw| plain_api_key(&state, raw)),
     };
 
-    let client = match reqwest::Client::builder().timeout(TEST_TIMEOUT).build() {
+    // 禁跟随重定向：否则一个公网 URL 可以 302 到内网/回环，`valid_endpoint`
+    // 的结构校验就形同虚设。测试连接只读一次 `/models`，不需要跳转。
+    let client = match reqwest::Client::builder()
+        .timeout(TEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
         Ok(c) => c,
         Err(e) => {
             return Ok(ok(TestLlmResp {
@@ -663,19 +729,31 @@ mod tests {
         assert!(!valid_endpoint("https://api.openai.com/v1/"), "尾斜杠会拼出 //models");
         assert!(!valid_endpoint("ftp://x/v1"), "非 http(s)");
         assert!(!valid_endpoint("api.openai.com/v1"), "缺 scheme");
+        // 结构校验：这些都能通过「starts_with http」但会把请求带向意料之外的路径
+        assert!(!valid_endpoint("http://"), "空 host");
+        assert!(!valid_endpoint("http:///v1"), "空 host + 路径");
+        assert!(!valid_endpoint("http://admin:secret@10.0.0.1/v1"), "URL 内嵌 userinfo");
+        assert!(!valid_endpoint("http://host:abc/v1"), "端口非数字");
+        assert!(!valid_endpoint("http://[::1/v1"), "IPv6 括号未闭合");
+        assert!(valid_endpoint("http://[::1]:11434/v1"), "IPv6 本机网关仍合法");
         let long = format!("https://{}", "a".repeat(300));
         assert!(!valid_endpoint(&long), "超长");
     }
 
     #[test]
-    fn status_detail_names_the_cause_and_truncates_body() {
+    fn status_detail_names_the_cause_and_hides_body() {
         assert!(status_detail(401, "").contains("密钥被拒绝"));
         assert!(status_detail(404, "").contains("Endpoint 可能少写了 /v1"));
         assert!(status_detail(503, "").contains("服务端错误"));
-        // 端点由管理员填写 ⇒ 回显必须截断（否则可能把内网服务的整页报错带出来）。
-        // 数回显字符而不是字节：detail 里有中文，String::len() 是字节数。
-        let d = status_detail(401, &"x".repeat(5000));
-        assert_eq!(d.chars().filter(|c| *c == 'x').count(), 200, "回显须截断到 200 字符：{d}");
+        // 端点由管理员填写 ⇒ 对方响应体可能来自内网服务（内部主机名/路径/版本）。
+        // 正文一律隐去，只保留「是否 JSON」这条排障线索。
+        let d = status_detail(401, "Internal-Service: vaultwarden.local /admin");
+        assert!(!d.contains("vaultwarden"), "不得回显对方响应体：{d}");
+        assert!(!d.contains("Internal-Service"), "不得回显对方响应体：{d}");
+        assert!(d.contains("非 JSON"), "应保留响应形态线索：{d}");
+        let j = status_detail(503, r#"{"error":"upstream connect timeout at 10.1.2.3"}"#);
+        assert!(!j.contains("10.1.2.3"), "不得回显对方响应体：{j}");
+        assert!(j.contains("JSON"), "应保留响应形态线索：{j}");
     }
 
     /// P0-2：叙事开关的纯函数语义。缺省/坏值/false 一律关，只有显式 "true" 开——
