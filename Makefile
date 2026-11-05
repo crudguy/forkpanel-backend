@@ -41,6 +41,10 @@ guards:
 	python3 ci/check_lock_unwrap.py
 	# 前端单文件行数上限：挡住 .vue/.ts 无限膨胀（大视图的直接后果是"纯逻辑没法单测"）
 	bash ci/check-frontend-loc.sh
+	# 前端 UI 守卫（18 个）：此前只有前端仓 package.json 的 `check:ui` 手动入口，
+	# `make check`（CI 实际跑的）从不执行 ⇒ 18 个守卫「存在但不跑」。它们只依赖
+	# node 内置模块，CI 自带 node 即可；前端仓未检出时**判红**（与 check-api-contract 同口径）。
+	bash ci/check-ui-guards.sh
 	# 阻塞子进程调用出口唯一性：run_sync 是同步的，裸调会钉住 tokio worker（Q-01）
 	bash ci/check-blocking-calls.sh
 	# 无终端初始化的引导令牌：仅 localhost 可取 + bootstrap 后即删 + 文件 0600。
