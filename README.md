@@ -84,7 +84,8 @@ L6 任务/调度 tokio 后台任务 · 采样 · 续期 · 备份 · cron
 ```
 Cargo.toml            workspace（release: opt-level=z / lto=fat / panic=abort / strip）
 crates/
-  panel-core/         零 IO 领域模型：错误码、能力矩阵、档位、强类型标识、校验器、crypto
+  panel-core/         零 IO 领域模型：错误码、能力矩阵、档位、强类型标识、校验器、crypto；
+                       外加全仓唯一的 `clock::now_unix`（各 crate 不得再自带一份）
   panel-os/            ★ OS 抽象层：trait + linux 实现 + cmd.rs + validate + mock
   panel-db/            SQLite：WriterActor 单写串行化 + ReadPool + 迁移 + 备份 + 环形缓冲
   panel-api/           axum：router、middleware、handler、SSE、错误码
