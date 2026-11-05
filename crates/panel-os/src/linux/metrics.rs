@@ -66,14 +66,38 @@ impl MetricsProvider for LinuxMetrics {
 
     async fn top_processes(&self, n: usize, sort: ProcessSort) -> Result<Vec<ProcessInfo>> {
         let mut list = scan_processes(&mut self.prev.lock().unwrap_or_else(|e| e.into_inner()))?;
-        match sort {
-            ProcessSort::Cpu => list.sort_by(|a, b| b.cpu_pct.partial_cmp(&a.cpu_pct).unwrap()),
-            ProcessSort::Memory => list.sort_by_key(|a| std::cmp::Reverse(a.rss_kib)),
-            ProcessSort::Pid => list.sort_by_key(|p| p.pid),
-        }
+        sort_processes(&mut list, sort);
         // n==0 表示不截断（展示全部进程）；否则截断并兜底上限 8192，防异常大请求。
         if n > 0 { list.truncate(n.min(8192)); }
         Ok(list)
+    }
+}
+
+/// CPU 百分比的排序键。原始写法 `b.cpu_pct.partial_cmp(&a.cpu_pct).unwrap()`
+/// 在遇到 NaN 时返回 `None` ⇒ `unwrap()` panic ⇒ 整个指标接口挂掉。
+///
+/// **当前实现不会产生非有限值**：`hz` / `n_cpu` 都有 `> 0` 的回退，`dt > 0` 与
+/// `ticks >= pt` 也各自拦了一道（见 `cpu_pct` 的计算）。所以这属于**防回归**，
+/// 不是修一个现存 bug——但那条公式一旦有人改动（例如少了 `dt` 的护栏、把
+/// 除数换成可为零的量），panic 就会在线上出现。
+///
+/// 这里有两层，各管一件事，别只留一层：
+/// - `cpu_rank` 管**语义**：NaN 按 0 处理（「算不出来」落到底部）。若让它原样
+///   参与比较，`total_cmp` 虽能给出全序，但会把 NaN 顶到**最前**，等于把脏值
+///   显示成 CPU 第一名。+inf 则**保留**——它是「占用极高」而不是「没有占用」，
+///   压到 0 再排到最底是错的。
+/// - `total_cmp` 管**不 panic**：即使日后有人把 `cpu_rank` 改坏或删掉，比较器
+///   依然是全序，不会因为 `partial_cmp` 返回 `None` 而炸。
+fn cpu_rank(v: f32) -> f32 {
+    if v.is_nan() { 0.0 } else { v }
+}
+
+/// 进程排序抽成纯函数：便于用构造的 NaN 夹具真测，不必依赖 /proc。
+fn sort_processes(list: &mut [ProcessInfo], sort: ProcessSort) {
+    match sort {
+        ProcessSort::Cpu => list.sort_by(|a, b| cpu_rank(b.cpu_pct).total_cmp(&cpu_rank(a.cpu_pct))),
+        ProcessSort::Memory => list.sort_by_key(|a| std::cmp::Reverse(a.rss_kib)),
+        ProcessSort::Pid => list.sort_by_key(|p| p.pid),
     }
 }
 
@@ -395,6 +419,64 @@ fn scan_processes(prev: &mut Prev) -> Result<Vec<ProcessInfo>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn proc(pid: i32, cpu: f32, rss: u64) -> ProcessInfo {
+        ProcessInfo {
+            pid, ppid: 1, name: format!("p{pid}"), cpu_pct: cpu,
+            rss_kib: rss, cmdline: String::new(), user: None,
+        }
+    }
+
+    #[test]
+    fn cpu_sort_handles_non_finite_values_without_panicking() {
+        let mut list = vec![
+            proc(1, f32::NAN, 10),
+            proc(2, 50.0, 20),
+            proc(3, 10.0, 30),
+            proc(4, f32::INFINITY, 40),
+        ];
+        sort_processes(&mut list, ProcessSort::Cpu);
+        let ids: Vec<i32> = list.iter().map(|p| p.pid).collect();
+        // 精确顺序，别用 `&ids[..2]` 这种只看前缀的写法——那种断言在
+        // 「NaN 与 inf 互相调换了位置」时仍然绿。
+        //   inf(4) 占用极高 ⇒ 第一；50(2) > 10(3) > NaN(1，按 0 处理) ⇒ 垫底。
+        assert_eq!(ids, vec![4, 2, 3, 1], "CPU 降序必须把 inf 排最前、NaN 排最后：{ids:?}");
+    }
+
+    /// 真机兜底：真扫一遍 /proc 再按 CPU 排序，不许 panic、不许少进程。
+    /// 构造的夹具只能证明纯函数，证明不了 `scan_processes` 交出来的值可用。
+    #[test]
+    fn cpu_sort_on_real_procfs_is_finite() {
+        let list = scan_processes(&mut Prev::default()).expect("扫描 /proc 失败");
+        if list.is_empty() {
+            eprintln!("[skip] /proc 里扫不到进程，本环境不具备");
+            return;
+        }
+        let bad: Vec<i32> = list.iter().filter(|p| !p.cpu_pct.is_finite()).map(|p| p.pid).collect();
+        assert!(bad.is_empty(), "真实 /proc 上出现了非有限 cpu_pct（排序会踩 panic 口）：{bad:?}");
+    }
+
+    #[test]
+    fn memory_and_pid_sorts_unchanged() {
+        let mut list = vec![proc(3, 1.0, 300), proc(1, 2.0, 100), proc(2, 3.0, 200)];
+        sort_processes(&mut list, ProcessSort::Pid);
+        assert_eq!(list.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![1, 2, 3]);
+        sort_processes(&mut list, ProcessSort::Memory);
+        assert_eq!(list.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![3, 2, 1]);
+    }
+
+    /// 接线守卫：行为测试测的是抽出的纯函数，必须钉住 top_processes 真的调它，
+    /// 且生产段不许再出现 `partial_cmp(...).unwrap()`。
+    #[test]
+    fn top_processes_really_uses_safe_sort() {
+        let prod = panel_testutil::production_source(include_str!("metrics.rs"));
+        assert!(prod.len() > 10_000, "生产段提取异常（仅 {} 字节）——守卫前提不成立", prod.len());
+        assert!(prod.contains("fn sort_processes("), "活性自检：没扫到排序函数定义");
+        assert_eq!(prod.matches("sort_processes(&mut list, sort)").count(), 1,
+            "top_processes 必须且只能调用一次共用排序");
+        assert!(!prod.contains("partial_cmp(&a.cpu_pct).unwrap()"),
+            "不许退回 NaN 时 panic 的 partial_cmp().unwrap()");
+    }
 
     #[test]
     fn meminfo_parser() {
