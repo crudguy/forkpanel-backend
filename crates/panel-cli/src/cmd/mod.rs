@@ -6,8 +6,9 @@
 //! `Cmd::X => …` 一行一条，看分派关系不用跳转。
 //!
 //! 分文件的口径是**能力域**而非行数：同一域的命令共用同一套前置（读配置 → 建库 →
-//! 建 layout），放在一起改一处就够。目前只有 `serve`（187 行、独占一套启动装配），
-//! 后续 `db`（migrate/backup/vacuum/verify-backup/restore-db）、`system`
+//! 建 layout），放在一起改一处就够。已迁：`serve`（187 行、独占一套启动装配）、
+//! `db`（migrate/backup/vacuum/verify-backup/restore-db，五个都动同一份 panel.db）。
+//! 后续 `system`
 //! （systemd-unit/healthcheck/capabilities/uninstall/upgrade）、`security`
 //! （passwd/expose）、`init`（init/doctor）按同样口径迁入。
 //!
@@ -17,4 +18,5 @@
 //! grep 得到就算过"，那会把"恰好一次""在 fallback 之后"这类次序/唯一性判据
 //! 退化成恒绿。详见各守卫自身的注释。
 
+pub(crate) mod db;
 pub(crate) mod serve;
