@@ -385,65 +385,7 @@ fn run(cli: Cli) -> Result<()> {
 
         Cmd::Vacuum => cmd::db::vacuum(&cli, os.clone()),
 
-        Cmd::Passwd { ref user, ref pass } => {
-            let layout0 = build_layout(&os, None);
-            let cfg = load_cfg(&cli, &layout0)?;
-            let layout = build_layout(&os, Some(&cfg));
-            let tier = detect_tier(&*os, &cfg);
-            let mut conn = panel_db::open(&layout.sqlite_path(), tier, &cfg.db.synchronous)?;
-
-            // 只改**已存在**用户的口令：passwd 不得具备建号能力，
-            // 否则同机任意能执行 CLI 的进程都能给自己开账号（等于绕过引导令牌）。
-            let exists: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM users WHERE username = ?1",
-                    rusqlite::params![user],
-                    |r| r.get(0),
-                )
-                .map_err(|e| PanelError::Database(e.to_string()))?;
-            if exists == 0 {
-                return Err(PanelError::Validation {
-                    field: "user",
-                    reason: format!("用户 {user} 不存在"),
-                });
-            }
-
-            // 口令：命令行 > 交互关回显（--pass 会进 shell history / ps，仅脚本场景使用）
-            let password = match pass.clone() {
-                Some(p) => p,
-                None => {
-                    if !std::io::stdin().is_terminal() {
-                        return Err(PanelError::Validation {
-                            field: "pass",
-                            reason: "非交互环境请提供 --pass".into(),
-                        });
-                    }
-                    bootstrap::read_password("请输入新口令（≥10 位，含两类字符）：")?
-                }
-            };
-            panel_api::auth::check_password_policy(&password)?;
-            let hash =
-                panel_api::auth::hash_password(&password, &panel_api::auth::HashParams::for_tier(tier))?;
-            let now = now_unix();
-
-            // 单写事务：更新口令 + 审计要么都成，要么都不成
-            let tx = conn.transaction().map_err(|e| PanelError::Database(e.to_string()))?;
-            tx.execute(
-                "UPDATE users SET pwd_hash = ?1 WHERE username = ?2",
-                rusqlite::params![hash, user],
-            )
-            .map_err(|e| PanelError::Database(e.to_string()))?;
-            tx.execute(
-                "INSERT INTO audit_log(ts, actor, actor_ip, action, target, result, detail_json)
-                 VALUES (?1, ?2, 'cli', 'auth.passwd', ?2, 'ok', '{}')",
-                rusqlite::params![now, user],
-            )
-            .map_err(|e| PanelError::Database(e.to_string()))?;
-            tx.commit().map_err(|e| PanelError::Database(e.to_string()))?;
-
-            println!("用户 {user} 的口令已更新");
-            Ok(())
-        }
+        Cmd::Passwd { ref user, ref pass } => cmd::security::passwd(&cli, os.clone(), user, pass),
 
         Cmd::SystemdUnit { install } => cmd::system::systemd_unit(&cli, os.clone(), install),
 
@@ -463,85 +405,8 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Upgrade { check, dry_run, ref version, ref base_url, ref pubkey_file } =>
             cmd::system::upgrade(&cli, os.clone(), check, dry_run, version, base_url, pubkey_file),
 
-        Cmd::Expose { domain, allow, self_signed, fullchain, key, no_firewall, uninstall } => {
-            // 写 /etc/nginx 反代、systemd 单元与防火墙规则都需要 root；非 root 提前报错，
-            // 绝不半途留下「服务还指着未生效配置」的残态（与 uninstall 同纪律）。
-            if !panel_os::fs::is_root() {
-                return Err(PanelError::Internal(
-                    "expose: 需要 root 权限（要写 /etc/nginx 反代、systemd 单元与防火墙规则）".into(),
-                ));
-            }
-
-            // 卸载模式：直接透传 --uninstall，无需域名/网段。
-            if uninstall {
-                return invoke_expose(&["--uninstall".to_string()]);
-            }
-
-            // 证书二选一：给了 fullchain 就必须给 key（反之亦然）；都不给则脚本默认自签。
-            if fullchain.is_some() != key.is_some() {
-                return Err(PanelError::Validation {
-                    field: "cert",
-                    reason: "--fullchain 与 --key 必须成对提供（要么都给，要么都不给用自签）".into(),
-                });
-            }
-
-            // 收集域名：命令行优先，省略则交互询问（非 TTY 直接报错，不放过）。
-            let domain = match domain {
-                Some(d) => d,
-                None => {
-                    if !std::io::stdin().is_terminal() {
-                        return Err(PanelError::Validation {
-                            field: "domain",
-                            reason: "非交互环境请提供 --domain".into(),
-                        });
-                    }
-                    prompt_line("对外域名（如 panel.example.com）: ")?
-                }
-            };
-            validate_expose_domain(&domain)
-                .map_err(|e| PanelError::Validation { field: "domain", reason: e })?;
-
-            // 收集来源网段（可重复）：命令行优先，省略则交互询问，至少要有一个。
-            let mut allow = allow;
-            if allow.is_empty() {
-                if !std::io::stdin().is_terminal() {
-                    return Err(PanelError::Validation {
-                        field: "allow",
-                        reason: "非交互环境请提供 -a/--allow <CIDR>（可重复）".into(),
-                    });
-                }
-                let raw = prompt_line("允许访问的来源网段（IPv4 CIDR，可多个，逗号/空格分隔，如 1.2.3.4/32）: ")?;
-                for part in raw.split(|c| [',', ' '].contains(&c)).filter(|s| !s.is_empty()) {
-                    allow.push(part.to_string());
-                }
-            }
-            if allow.is_empty() {
-                return Err(PanelError::Validation {
-                    field: "allow",
-                    reason: "必须至少指定一个来源网段（-a/--allow）；拒绝开无来源限制的反代".into(),
-                });
-            }
-            for c in &allow {
-                validate_expose_cidr(c)
-                    .map_err(|e| PanelError::Validation { field: "allow", reason: e })?;
-            }
-
-            // 组装透传给脚本的参数（脚本再做一次 fail-closed 校验，纵深防御）。
-            let mut args: Vec<String> = Vec::new();
-            args.push("-d".into());
-            args.push(domain);
-            for c in &allow {
-                args.push("-a".into());
-                args.push(c.clone());
-            }
-            if self_signed { args.push("--self-signed".into()); }
-            if let Some(f) = fullchain { args.push("--fullchain".into()); args.push(f); }
-            if let Some(k) = key { args.push("--key".into()); args.push(k); }
-            if no_firewall { args.push("--no-firewall".into()); }
-            invoke_expose(&args)?;
-            println!("（已通过 `panel expose` 调用 expose-public.sh 完成。若需撤销：sudo panel expose --uninstall）");
-            Ok(())
-        }
+        Cmd::Expose { domain, allow, self_signed, fullchain, key, no_firewall, uninstall } =>
+            cmd::security::expose(domain, allow, self_signed, fullchain, key, no_firewall, uninstall),
 
         Cmd::Config { action } => run_config(&cli, &os, action),
         Cmd::Menu => run_menu(&cli, &os),
@@ -1558,6 +1423,17 @@ mod expose_tests {
         assert!(
             prod.contains("panel_os::run_sync(panel_os::Bin::Bash"),
             "expose 必须经 Bin::Bash argv 直传调脚本（不得 shell 拼字符串）"
+        );
+
+        // ⚠ 上面三条断的都是**辅助函数** `invoke_expose` 里的事，而 arm 已经搬进
+        //   `cmd/security.rs`。只守上面三条就等于只证明"工具还在"，"arm 还调它"
+        //   没人钉——把 arm 里两支 `invoke_expose(..)` 删掉，上面三条照样全绿。
+        //   故补一支计数断言：--uninstall 透传 + 正常签发，恰好两支。
+        let arm = panel_testutil::production_source(include_str!("cmd/security.rs"));
+        assert_eq!(
+            arm.matches("invoke_expose(").count(),
+            2,
+            "expose 两条路径（--uninstall 透传 / 正常签发）都必须经 invoke_expose 调脚本"
         );
     }
 
