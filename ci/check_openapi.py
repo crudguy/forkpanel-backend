@@ -33,6 +33,12 @@ PyYAML 都能"解析成功"，只有按语义消费契约的读取方才拿得�
    system/users 响应 schema 行 10 开 11 闭，整份文件从该行起不可解析）
    ——第 1 项只看非法位置的开括号，PyYAML 缺席时第 2 项跳过，第 3/4 项
    不依赖括号闭合，全靠本项兜住。
+6. operation 字段完整性（[E6]，零依赖）：每个 operation 必须有非空 `tags`、
+   非空 `summary`、以及至少一个 2xx 响应。**这是唯一能抓住「内容被掏空」的
+   一项**——曾真实发生：一个「给受限流端点补 429」的行区间脚本把 31 个
+   operation 的 tags/summary/security/parameters/requestBody 整段替换掉，
+   只留下 operationId 与 responses；而 YAML 仍可解析、路径数仍是 180、
+   括号仍平衡、$ref 仍全在 ⇒ [E1]~[E5] 全绿，没人发现。
 
 用法：
     python3 ci/check_openapi.py [后端仓根目录]
@@ -308,6 +314,84 @@ def collect_refs(text):
             | set(re.findall(r'\$ref:\s*"#/([^"]+)"', text)))
 
 
+METHOD_KEYS = ('get', 'post', 'put', 'patch', 'delete', 'head', 'options', 'trace')
+
+
+def _indent(line):
+    return len(line) - len(line.lstrip(' '))
+
+
+def _is_key(line):
+    s = line.strip()
+    return bool(s) and not s.startswith('#') and bool(re.match(r'^[^\s:#][^:]*:(\s|$)', s))
+
+
+def scan_operations(path):
+    """按缩进切出每个 operation 块，收集它的顶层字段与 2xx 响应码。
+
+    为什么需要
+    ----------
+    缩进错位 / 行区间替换这类破坏**不会**让 YAML 解析失败：一个 operation 就算
+    被掏空成只剩 `operationId` + `responses`，文件依然合法可读、路径数不变。
+    [E1]~[E5] 查的是语法与落点，没有任何一项问「该有的字段还在不在」。本函数
+    提供字段清单，供 [E6] 做完整性断言。
+
+    返回 (operations, lines)，每个 operation：
+      {'path', 'method', 'line', 'fields': {字段名: 行下标}, 'statuses': set(2xx)}
+    `fields` 只收方法块的直属子级（缩进 6 的键）。
+    """
+    lines = open(path, encoding='utf-8').read().splitlines()
+    ops = []
+    try:
+        start = next(i for i, l in enumerate(lines) if l.rstrip() == 'paths:')
+    except StopIteration:
+        return ops, lines
+    cur_path = None
+    for i in range(start + 1, len(lines)):
+        l = lines[i]
+        if not l.strip() or l.lstrip().startswith('#'):
+            continue
+        ind = _indent(l)
+        if ind <= 0:
+            break
+        # 新的 path / method 开始 ⇒ 先关闭上一个 operation 块
+        if ops and ops[-1]['end'] is None and ind <= 4 and _is_key(l):
+            ops[-1]['end'] = i
+        s = l.strip()
+        if ind == 2 and s.startswith('/'):
+            cur_path = s.rstrip(':')
+        elif ind == 4 and s.rstrip(':') in METHOD_KEYS:
+            ops.append({'path': cur_path, 'method': s.rstrip(':'), 'line': i + 1,
+                        'end': None, 'fields': {}, 'statuses': set()})
+    for op in ops:
+        if op['end'] is None:
+            op['end'] = len(lines)
+        for j in range(op['line'], op['end']):        # line 是 1 基，正好跳过 method 行
+            if _indent(lines[j]) == 6 and _is_key(lines[j]):
+                op['fields'].setdefault(lines[j].strip().split(':', 1)[0].strip(), j)
+    return ops, lines
+
+
+def operation_statuses(lines, op):
+    """该 operation 声明的所有 2xx / 其它响应码（flow 与块状两种写法）。"""
+    out = set()
+    j = op['fields'].get('responses')
+    if j is None:
+        return out
+    line = lines[j]
+    if '{' in line:                      # flow：单行内全部状态码
+        return set(re.findall(r"'?([1-5]\d\d)'?\s*:", line))
+    for k in range(j + 1, op['end']):
+        if not lines[k].strip():
+            continue
+        if _indent(lines[k]) <= 6:
+            break
+        m = re.match(r"^\s*'?([1-5]\d\d)'?\s*:", lines[k])
+        if m:
+            out.add(m.group(1))
+    return out
+
+
 def main():
     root = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_ROOT
     backend = os.path.join(root, BACKEND_REL)
@@ -438,6 +522,42 @@ def main():
         fails.append(f"{len(problems)} 处括号不平衡")
     else:
         print(f"  ✓ {stats['brace_lines']} 个括号行全部平衡（共 {stats['lines']} 行）")
+
+    # ── 6. operation 字段完整性（兜住「内容被整段掏空」）──
+    print("== [E6] operation 字段完整性（tags / summary / 2xx 响应）==")
+    ops, olines = scan_operations(backend)
+    # 前提断言：路径数 180 ⇒ operation 应远多于 150；扫到的太少 = 切块逻辑失效，
+    # 绝不能因「没切出 operation」而报绿（那正是本项的典型失效方式）。
+    if len(ops) < 150:
+        print(f"  ✗ 提取异常：只切出 {len(ops)} 个 operation（期望 ≥150）——解析前提不成立")
+        print("      修法：确认 paths 块未被截断；若是书写风格变化，需同步升级 scan_operations")
+        fails.append("operation 提取前提不成立（检查器需维护）")
+    else:
+        problems = []
+        for op in ops:
+            where = f"{op['method'].upper()} {op['path']}（{BACKEND_REL}:{op['line']}）"
+            it = op['fields'].get('tags')
+            if it is None or olines[it].split(':', 1)[1].strip() in ('', '[]'):
+                problems.append(f"{where} 缺 tags（OpenAPI 要求至少一个 tag）")
+            it = op['fields'].get('summary')
+            if it is None or not olines[it].split(':', 1)[1].strip():
+                problems.append(f"{where} 缺 summary（路径列表里会显示为空白）")
+            statuses = operation_statuses(olines, op)
+            op['statuses'] = statuses
+            # 101 是 WebSocket 升级的成功码（GET /terminal 就是），不算 2xx 但同样是
+            # 「成功响应」；只认 2xx 会把它误判成缺响应。
+            if not any(c.startswith('2') or c == '101' for c in statuses):
+                problems.append(f"{where} 无成功响应 2xx/101（responses={sorted(statuses) or '缺失'}）")
+        if problems:
+            for p in problems[:10]:
+                print(f"  ✗ {p}")
+            if len(problems) > 10:
+                print(f"  …另有 {len(problems) - 10} 条")
+            print("      修法：多为「行区间替换」式脚本把 operation 的字段整段吞掉；"
+                  "按字段补回 tags/summary/responses，别只看 YAML 能不能解析")
+            fails.append(f"{len(problems)} 处 operation 字段缺失")
+        else:
+            print(f"  ✓ {len(ops)} 个 operation 均有 tags / summary / 成功响应")
 
     print()
     if fails:

@@ -200,7 +200,7 @@ components:
       properties:
         supported: { type: boolean }
         backend:   { type: [string, "null"], description: 实际后端，如 "systemd"/"nftables"/"apt" }
-        reason:    { type: [string, "null"], enum: [null, not_implemented, binary_missing, daemon_unreachable, no_package_manager, init_unknown, unsupported_os, no_log_source, no_engine, openssl_missing, caddy_render_not_implemented], description: "不可用原因。`daemon_unreachable` 特指：二进制已安装但守护进程 socket 不可连（权限不足或未运行）——UI 应据此给出'加入 docker 组 / 启动服务'的可操作提示，而非笼统的'不支持'" }
+        reason:    { type: [string, "null"], enum: [null, not_implemented, binary_missing, daemon_unreachable, no_package_manager, init_unknown, unsupported_os, no_log_source, no_engine, openssl_missing, caddy_render_not_implemented, non_root, need_nginx, script_missing, certbot_missing, compose_unavailable, nftables_detected, iptables_detected, firewalld_detected], description: "不可用原因。`daemon_unreachable` 特指：二进制已安装但守护进程 socket 不可连（权限不足或未运行）——UI 应据此给出'加入 docker 组 / 启动服务'的可操作提示，而非笼统的'不支持'" }
     PlatformInfo:
       type: object
       properties:
@@ -1466,6 +1466,7 @@ paths:
   # ───────── 版本 / 认证 ─────────
   /api/v1/version:
     get:
+      operationId: get_version
       tags: [system]
       security: []
       summary: 版本与契约协商
@@ -1483,6 +1484,7 @@ paths:
 
   /api/v1/auth/status:
     get:
+      operationId: get_auth_status
       tags: [auth]
       security: []
       summary: 首启状态（前端据此切换登录页/首启向导）
@@ -1495,6 +1497,7 @@ paths:
 
   /api/v1/auth/bootstrap-token:
     get:
+      operationId: get_auth_bootstrap_token
       tags: [auth]
       security: []
       summary: 取引导令牌（仅 localhost，供首启页「从文件读取令牌」）
@@ -1514,6 +1517,7 @@ paths:
 
   /api/v1/auth/bootstrap:
     post:
+      operationId: post_auth_bootstrap
       tags: [auth]
       security: []
       summary: 首启创建 owner（需 serve 首启打印的一次性引导令牌）
@@ -1528,6 +1532,7 @@ paths:
 
   /api/v1/auth/login:
     post:
+      operationId: post_auth_login
       tags: [auth]
       security: []
       summary: 登录（204 + Set-Cookie）
@@ -1538,12 +1543,14 @@ paths:
 
   /api/v1/auth/logout:
     post:
+      operationId: post_auth_logout
       tags: [auth]
       summary: 登出（清会话）
       responses: { '204': { description: ok } }
 
   /api/v1/auth/me:
     get:
+      operationId: get_auth_me
       tags: [auth]
       summary: 当前用户 + 权限 + 能力矩阵
       responses:
@@ -1555,6 +1562,7 @@ paths:
 
   /api/v1/auth/password:
     post:
+      operationId: post_auth_password
       tags: [auth]
       summary: 修改密码（需 CSRF）
       security: [cookieAuth, csrfHeader]
@@ -1568,6 +1576,7 @@ paths:
   # 否则用户 enroll 后没完成绑定就会把自己锁在门外。
   /api/v1/auth/mfa/enroll:
     post:
+      operationId: post_auth_mfa_enroll
       tags: [auth]
       summary: 生成 TOTP 密钥与 10 个一次性恢复码（**尚未生效**）
       security: [cookieAuth, csrfHeader]
@@ -1580,6 +1589,7 @@ paths:
         '400': { description: 已启用 MFA（需先关闭才能更换） }
   /api/v1/auth/mfa/verify:
     post:
+      operationId: post_auth_mfa_verify
       tags: [auth]
       summary: 用动态口令确认绑定并正式启用（只认动态口令，不认恢复码）
       security: [cookieAuth, csrfHeader]
@@ -1593,6 +1603,7 @@ paths:
         '400': { description: 动态口令不正确 / 尚未 enroll }
   /api/v1/auth/mfa/disable:
     post:
+      operationId: post_auth_mfa_disable
       tags: [auth]
       summary: 关闭 MFA（**必须出示**动态口令或恢复码，防被劫持会话顺手关闭）
       security: [cookieAuth, csrfHeader]
@@ -1608,6 +1619,7 @@ paths:
   # ───────── 系统 / 能力 / 指标 ─────────
   /api/v1/system/capabilities:
     get:
+      operationId: get_system_capabilities
       tags: [system]
       summary: 能力矩阵（前端菜单唯一开关）
       responses:
@@ -1619,6 +1631,7 @@ paths:
 
   /api/v1/system/overview:
     get:
+      operationId: get_system_overview
       tags: [system]
       summary: 一次性快照（仪表盘卡片）
       responses:
@@ -1629,6 +1642,7 @@ paths:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/Overview' } } }
   /api/v1/system/directories:
     get:
+      operationId: get_system_directories
       tags: [system]
       summary: 目录与文件位置（装到哪/数据/日志/Web服务器/前端内嵌）
       responses:
@@ -1640,6 +1654,7 @@ paths:
 
   /api/v1/system/restart:
     post:
+      operationId: post_system_restart
       tags: [system]
       summary: 重启面板（owner + system.manage；202 = job 已交给 PID 1）
       description: |
@@ -1657,6 +1672,7 @@ paths:
 
   /api/v1/system/reboot:
     post:
+      operationId: post_system_reboot
       tags: [system]
       summary: 重启整台服务器（owner + system.manage；202 = 已向 init 请求重启）
       description: |
@@ -1680,6 +1696,7 @@ paths:
 
   /api/v1/system/upgrade/check:
     get:
+      operationId: get_system_upgrade_check
       tags: [system]
       summary: 检查是否有新版本（只读；system.manage + 只读限流）
       responses:
@@ -1691,6 +1708,7 @@ paths:
 
   /api/v1/system/upgrade:
     post:
+      operationId: post_system_upgrade
       tags: [system]
       summary: 触发 Web 升级（默认关闭；owner + [danger] allow_web_upgrade + systemd-run）
       description: |
@@ -1715,6 +1733,7 @@ paths:
 
   /api/v1/system/expose/status:
     get:
+      operationId: get_system_expose_status
       tags: [system]
       summary: 公网暴露状态（是否已对外暴露 / 是否启用 TLS / 能力位是否支持）
       description: 只读。探测 nginx 反代配置与 TLS drop-in 是否存在，不触达脚本。
@@ -1727,6 +1746,7 @@ paths:
 
   /api/v1/system/expose/apply:
     post:
+      operationId: post_system_expose_apply
       tags: [system]
       summary: 开启公网访问（域名反代 + 防火墙白名单 + TLS）
       description: |
@@ -1750,6 +1770,7 @@ paths:
 
   /api/v1/system/expose/remove:
     post:
+      operationId: post_system_expose_remove
       tags: [system]
       summary: 撤销公网访问（等同脚本 --uninstall；面板仍绑回环，ssh 隧道可用）
       security: [cookieAuth, csrfHeader]
@@ -1764,10 +1785,12 @@ paths:
 
   /api/v1/server/notes:
     get:
+      operationId: get_server_notes
       tags: [system]
       summary: 本机便签列表（025，多条；全部登录用户可读）
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/ServerNote' } } } } } } } }
     post:
+      operationId: post_server_notes
       tags: [system]
       summary: 新建便签（025，写需 system.manage；上限 50 条，超出 400）
       security: [cookieAuth, csrfHeader]
@@ -1775,22 +1798,26 @@ paths:
       responses: { '200': { description: ok }, '400': { description: 内容为空/超长/条数达上限 } }
   /api/v1/server/notes/{id}:
     patch:
+      operationId: patch_server_notes_id
       tags: [system]
       summary: 更新便签（025，写需 system.manage；id 不存在 → 404）
       security: [cookieAuth, csrfHeader]
       requestBody: { required: true, content: { application/json: { schema: { type: object, required: [content], properties: { content: { type: string, description: 便签内容，trim 后非空、≤500 字 } } } } } }
       responses: { '200': { description: ok }, '400': { description: 内容为空/超长 }, '404': { description: 便签不存在 } }
     delete:
+      operationId: delete_server_notes_id
       tags: [system]
       summary: 删除便签（025，写需 system.manage；id 不存在 → 404）
       security: [cookieAuth, csrfHeader]
       responses: { '200': { description: ok }, '404': { description: 便签不存在 } }
   /api/v1/waf/templates:
     get:
+      operationId: get_waf_templates
       tags: [sites]
       summary: WAF 策略模板列表（026，读需 site.view）
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/WafTemplate' } } } } } } } }
     post:
+      operationId: post_waf_templates
       tags: [sites]
       summary: 新建 WAF 策略模板（026，写需 site.manage；重名 409、超量 400）
       security: [cookieAuth, csrfHeader]
@@ -1798,22 +1825,26 @@ paths:
       responses: { '200': { description: ok }, '400': { description: 校验失败（空名/超长/未知档位/数值越界/burst 无限速/非法 IP） }, '409': { description: 模板名已存在或数量达上限 } }
   /api/v1/waf/templates/{id}:
     get:
+      operationId: get_waf_templates_id
       tags: [sites]
       summary: WAF 策略模板详情（026，读需 site.view）
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/WafTemplate' } } } } } }, '404': { description: 模板不存在 } }
     patch:
+      operationId: patch_waf_templates_id
       tags: [sites]
       summary: 更新 WAF 策略模板（026，写需 site.manage；可改名，重名 409）
       security: [cookieAuth, csrfHeader]
       requestBody: { required: true, content: { application/json: { schema: { type: object, required: [name], properties: { name: { type: string }, profile: { type: string, enum: [basic, strict] }, rate_per_sec: { type: integer }, burst: { type: integer }, ip_allow: { type: string }, ip_deny: { type: string } } } } } }
       responses: { '200': { description: ok }, '400': { description: 校验失败 }, '404': { description: 模板不存在 }, '409': { description: 模板名已存在 } }
     delete:
+      operationId: delete_waf_templates_id
       tags: [sites]
       summary: 删除 WAF 策略模板（026，写需 site.manage）
       security: [cookieAuth, csrfHeader]
       responses: { '200': { description: ok }, '404': { description: 模板不存在 } }
   /api/v1/waf/events:
     get:
+      operationId: get_waf_events
       tags: [sites]
       summary: 拦截事件列表（027，威胁日志；读需 site.view）
       parameters:
@@ -1825,10 +1856,12 @@ paths:
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/BlockEvent' } } } } } } } }
   /api/v1/waf/alert:
     get:
+      operationId: get_waf_alert
       tags: [sites]
       summary: WAF 拦截告警配置（028，读需 site.view）
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/WafAlertCfg' } } } } } } }
     put:
+      operationId: put_waf_alert
       tags: [sites]
       summary: 更新 WAF 拦截告警配置（028，写需 site.manage；缺省字段保留现值）
       security: [cookieAuth, csrfHeader]
@@ -1836,6 +1869,7 @@ paths:
       responses: { '200': { description: ok }, '400': { description: 阈值或窗宽越界 } }
   /api/v1/system/users:
     get:
+      operationId: get_system_users
       tags: [system]
       summary: 枚举本机系统账户（运行用户下拉数据源）
       responses:
@@ -1847,6 +1881,7 @@ paths:
 
   /api/v1/metrics/realtime:
     get:
+      operationId: get_metrics_realtime
       tags: [system]
       summary: 内存环形缓冲最近 N 秒
       parameters:
@@ -1860,6 +1895,7 @@ paths:
 
   /api/v1/metrics/history:
     get:
+      operationId: get_metrics_history
       tags: [system]
       summary: 历史聚合（nano 档位不落盘 → 返回 empty）
       parameters:
@@ -1874,6 +1910,7 @@ paths:
 
   /api/v1/metrics/snapshot:
     get:
+      operationId: get_metrics_snapshot
       tags: [system]
       summary: 即时完整采样快照（未聚合的原始 SystemSnapshot）
       description: >
@@ -1889,6 +1926,7 @@ paths:
   # ───────── 进程 ─────────
   /api/v1/processes:
     get:
+      operationId: get_processes
       tags: [processes]
       summary: 进程列表（Top N by CPU）
       parameters:
@@ -1903,6 +1941,7 @@ paths:
 
   /api/v1/processes/{pid}/kill:
     post:
+      operationId: post_processes_pid_kill
       tags: [processes]
       summary: 发送信号（禁止 pid 1 与面板自身）
       security: [cookieAuth, csrfHeader]
@@ -1916,6 +1955,7 @@ paths:
   # ───────── 服务 ─────────
   /api/v1/services:
     get:
+      operationId: get_services
       tags: [services]
       summary: 服务列表
       parameters:
@@ -1930,6 +1970,7 @@ paths:
 
   /api/v1/services/{unit}:
     get:
+      operationId: get_services_unit
       tags: [services]
       summary: 按单元名查单个服务（绕开 list，dead 服务也能查到）
       parameters: [{ name: unit, in: path, required: true, schema: { type: string } }]
@@ -1944,7 +1985,9 @@ paths:
 
   /api/v1/services/{unit}/status:
     get:
+      operationId: get_services_unit_status
       tags: [services]
+      summary: 单元状态（active/enabled）
       parameters: [{ name: unit, in: path, required: true, schema: { type: string } }]
       responses:
         '200':
@@ -1955,6 +1998,7 @@ paths:
 
   /api/v1/services/{unit}/start:
     post:
+      operationId: post_services_unit_start
       tags: [services]
       summary: 启动
       security: [cookieAuth, csrfHeader]
@@ -1962,6 +2006,7 @@ paths:
       responses: { '204': { description: ok } }
   /api/v1/services/{unit}/stop:
     post:
+      operationId: post_services_unit_stop
       tags: [services]
       summary: 停止
       security: [cookieAuth, csrfHeader]
@@ -1969,6 +2014,7 @@ paths:
       responses: { '204': { description: ok } }
   /api/v1/services/{unit}/restart:
     post:
+      operationId: post_services_unit_restart
       tags: [services]
       summary: 重启
       security: [cookieAuth, csrfHeader]
@@ -1977,6 +2023,7 @@ paths:
 
   /api/v1/services/{unit}/enabled:
     put:
+      operationId: put_services_unit_enabled
       tags: [services]
       summary: 开机自启开关
       security: [cookieAuth, csrfHeader]
@@ -1986,6 +2033,7 @@ paths:
 
   /api/v1/services/{unit}/journal:
     get:
+      operationId: get_services_unit_journal
       tags: [services]
       summary: 服务日志（最近 N 行）
       parameters:
@@ -1997,9 +2045,11 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: string } } }
+        '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' }
 
   /api/v1/services/{unit}/journal/stream:
     get:
+      operationId: get_services_unit_journal_stream
       tags: [services]
       summary: 服务日志跟随（SSE；先补最近 N 行历史，再 journalctl -f 增量）
       parameters:
@@ -2015,6 +2065,7 @@ paths:
 
   /api/v1/services/{unit}/config:
     get:
+      operationId: get_services_unit_config
       tags: [services]
       summary: 读取服务配置（unit=单元文件本体 / dropin=override.conf）
       parameters:
@@ -2028,6 +2079,7 @@ paths:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/ServiceConfig' } } }
         '10009': { description: 该平台/单元不支持配置编辑 }
     put:
+      operationId: put_services_unit_config
       tags: [services]
       summary: 写回配置并 daemon-reload（可选重启）；target=dropin 时写 override.conf
       security: [cookieAuth, csrfHeader]
@@ -2050,6 +2102,7 @@ paths:
   # ───────── 软件包 ─────────
   /api/v1/packages:
     get:
+      operationId: get_packages
       tags: [packages]
       summary: 已探测软件（名称/版本/路径）
       responses:
@@ -2060,6 +2113,7 @@ paths:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { packages: { type: array, items: { $ref: '#/components/schemas/Package' } }, catalog: { type: array, items: { $ref: '#/components/schemas/PackageCatalog' } } } } } }
   /api/v1/packages/install:
     post:
+      operationId: post_packages_install
       tags: [packages]
       summary: 安装（任务化 → 202）
       description: |
@@ -2077,8 +2131,10 @@ paths:
         '202': { description: 已入队, content: { application/json: { schema: { $ref: '#/components/schemas/TaskAccepted' } } } }
         '409': { description: 跨主版本升级需二次确认（detail.kind=major_upgrade，附 from/to/note）；前端弹窗确认后带 confirm_major=true 重发 }
         '80001': { description: 队列满 }
+        '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' }
   /api/v1/packages/{name}/versions:
     get:
+      operationId: get_packages_name_versions
       tags: [packages]
       summary: 查询该包在软件源里可供安装的版本（新→旧；空=查不到，按最新版安装）
       security: [cookieAuth, csrfHeader]
@@ -2096,6 +2152,7 @@ paths:
                   installed: { type: [string, "null"], description: 当前已安装版本（由包管理器给出）；未安装为 null，用于在下拉里标注 }
   /api/v1/packages/upgradable:
     get:
+      operationId: get_packages_upgradable
       tags: [packages]
       summary: 探测白名单内已安装且源里有新版的包（只读；空=无可升级项，非错误）
       description: |
@@ -2126,8 +2183,10 @@ paths:
                         candidate: { type: string, description: 可升级到的版本（版本表最高版，跨源） }
                         major: { type: boolean, description: 是否跨主版本升级（current 与 candidate 首段数字不同）；跨主版本可能不向后兼容，需数据迁移，前端据此弹窗二次确认 }
         '501': { description: 本机无可用包管理器（能力位 package.upgrade 不支持） }
+        '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' }
   /api/v1/packages/upgrade:
     post:
+      operationId: post_packages_upgrade
       tags: [packages]
       summary: 升级到指定版本（任务化 → 202；不传 version = 升到源里最新版）
       description: |
@@ -2156,15 +2215,18 @@ paths:
         '400': { description: 包不在白名单，或版本号含非法字符 }
         '409': { description: 跨主版本升级需二次确认（detail.kind=major_upgrade，附 from/to/note）；前端弹窗确认后带 confirm_major=true 重发 }
         '501': { description: 本机无可用包管理器（能力位 package.upgrade 不支持） }
+        '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' }
   /api/v1/packages/{name}:
     delete:
+      operationId: delete_packages_name
       tags: [packages]
       summary: 卸载（任务化 → 202）
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: name, in: path, required: true, schema: { type: string } }]
-      responses: { '202': { description: 已入队 } }
+      responses: { '202': { description: 已入队 }, '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' } }
   /api/v1/packages/{name}/hold:
     post:
+      operationId: post_packages_name_hold
       tags: [packages]
       summary: 设置/取消升级钉住（apt-mark hold/unhold；非 apt 管理器 501）
       description: |
@@ -2187,6 +2249,7 @@ paths:
   # ───────── 站点 / SSL ─────────
   /api/v1/sites:
     get:
+      operationId: get_sites
       tags: [sites]
       summary: 站点列表
       responses:
@@ -2196,6 +2259,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/Site' } } } }
     post:
+      operationId: post_sites
       tags: [sites]
       summary: 新建站点（写入站点定义；要求本机已有 Web 服务器底座）
       security: [cookieAuth, csrfHeader]
@@ -2203,6 +2267,7 @@ paths:
       responses: { '201': { description: 已创建（此时站点尚未对外服务，需一次 apply，或在编辑页打开 enabled） }, '400': { description: 参数非法 }, '501': { description: '本机未接入 Web 服务器（webserver.manage 为 no，例如未安装 nginx）：拒绝建站，以免产生永远打不开的站点' } }
   /api/v1/sites/root:
     get:
+      operationId: get_sites_root
       tags: [sites]
       summary: 站点托管根目录（只读；前端「选择目录」的初始定位）
       responses:
@@ -2213,6 +2278,7 @@ paths:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { site_root: { type: string } } } } }
   /api/v1/sites/apply:
     post:
+      operationId: post_sites_apply
       tags: [sites]
       summary: 应用站点配置（配置闭环：render→validate→deploy→reload→落库）
       description: |
@@ -2226,12 +2292,16 @@ paths:
       responses:
         '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope' } } } }
         '40002': { description: 配置校验失败（已回滚，旧配置原封不动） }
+        '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' }
   /api/v1/sites/{id}:
     get:
+      operationId: get_sites_id
       tags: [sites]
+      summary: 站点详情
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/Site' } } } } } } }
     patch:
+      operationId: patch_sites_id
       tags: [sites]
       summary: 更新站点（enabled 翻转时真正同步 Web 服务器配置：停用=摘配置+reload）
       security: [cookieAuth, csrfHeader]
@@ -2239,6 +2309,7 @@ paths:
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SitePatch' } } } }
       responses: { '204': { description: ok }, '502': { description: 配置已写入但 reload 失败（30000；此时库未改动，站点状态保持原样） } }
     delete:
+      operationId: delete_sites_id
       tags: [sites]
       summary: 删除站点（可选保留根目录）
       security: [cookieAuth, csrfHeader]
@@ -2246,6 +2317,7 @@ paths:
       responses: { '204': { description: ok } }
   /api/v1/sites/{id}/remark:
     patch:
+      operationId: patch_sites_id_remark
       tags: [sites]
       summary: 更新站点说明（对象备注，022）
       security: [cookieAuth, csrfHeader]
@@ -2254,6 +2326,7 @@ paths:
       responses: { '204': { description: ok } }
   /api/v1/apps:
     get:
+      operationId: get_apps
       tags: [apps]
       summary: 应用列表（含 systemd 状态；探测失败时该项 state 为 null）
       responses:
@@ -2263,6 +2336,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/App' } } } }
     post:
+      operationId: post_apps
       tags: [apps]
       summary: 新建应用（渲染 systemd 单元 + 自动建反向代理站点）
       description: |
@@ -2281,6 +2355,7 @@ paths:
         '409': { description: 同名应用已存在 }
   /api/v1/apps/catalog:
     get:
+      operationId: get_apps_catalog
       tags: [apps]
       summary: 受支持运行时目录（前端下拉的**唯一**数据源，勿在前端另硬编码一份）
       responses:
@@ -2291,7 +2366,9 @@ paths:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { runtimes: { type: array, items: { $ref: '#/components/schemas/AppRuntimeInfo' } } } } } }
   /api/v1/apps/{id}:
     get:
+      operationId: get_apps_id
       tags: [apps]
+      summary: 应用详情
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       responses:
         '200':
@@ -2301,6 +2378,7 @@ paths:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/App' } } }
         '404': { description: 应用不存在 }
     patch:
+      operationId: patch_apps_id
       tags: [apps]
       summary: 更新应用（enabled 切到 false 时撤下站点并删除单元文件）
       security: [cookieAuth, csrfHeader]
@@ -2308,6 +2386,7 @@ paths:
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/AppPatch' } } } }
       responses: { '200': { description: ok }, '400': { description: 校验失败 }, '404': { description: 应用不存在 } }
     delete:
+      operationId: delete_apps_id
       tags: [apps]
       summary: 删除应用（顺序：撤站点 → 停单元 → 删单元文件 → 删库行）
       security: [cookieAuth, csrfHeader]
@@ -2315,6 +2394,7 @@ paths:
       responses: { '204': { description: ok }, '404': { description: 应用不存在 } }
   /api/v1/apps/{id}/act:
     post:
+      operationId: post_apps_id_act
       tags: [apps]
       summary: 启停/重启单元（act=start|stop|restart；stop 不删单元文件）
       security: [cookieAuth, csrfHeader]
@@ -2327,9 +2407,10 @@ paths:
               type: object
               required: [act]
               properties: { act: { type: string, enum: [start, stop, restart] } }
-      responses: { '200': { description: ok }, '400': { description: 不支持的 act } }
+      responses: { '200': { description: ok }, '400': { description: 不支持的 act }, '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' } }
   /api/v1/sites/{id}/reload:
     post:
+      operationId: post_sites_id_reload
       tags: [sites]
       summary: 重新生成配置并 reload（先 nginx -t 校验）
       security: [cookieAuth, csrfHeader]
@@ -2337,6 +2418,7 @@ paths:
       responses: { '204': { description: ok } }
   /api/v1/sites/{id}/conf:
     get:
+      operationId: get_sites_id_conf
       tags: [sites]
       summary: 读取站点当前的 Web 服务器配置文件（路径取落库 conf_path，不接受前端指定路径）
       description: |
@@ -2353,6 +2435,7 @@ paths:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { path: { type: [string, "null"] }, content: { type: [string, "null"] }, manual: { type: boolean }, stale: { type: boolean }, external: { type: boolean, description: "外部修改（020）：磁盘内容与最后一次留档的版本不一致——文件在面板之外被改过" } } } } }
         '404': { description: 站点不存在 }
     put:
+      operationId: put_sites_id_conf
       tags: [sites]
       summary: 保存站点原始配置（nginx -t 校验 → 原子替换 → reload；成功后置「手动维护」；仅 owner）
       description: |
@@ -2378,8 +2461,10 @@ paths:
         '403': { description: 仅 owner 可编辑原始配置 }
         '404': { description: 站点不存在 }
         '501': { description: 无 Web 服务器底座（webserver.manage） }
+        '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' }
   /api/v1/sites/{id}/conf/restore:
     post:
+      operationId: post_sites_id_conf_restore
       tags: [sites]
       summary: 恢复面板托管（按表单规格重新渲染覆盖手动内容，清零 manual_conf；仅 owner）
       description: |
@@ -2393,8 +2478,10 @@ paths:
         '403': { description: 仅 owner }
         '404': { description: 站点不存在 }
         '501': { description: 无 Web 服务器底座（webserver.manage） }
+        '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' }
   /api/v1/sites/{id}/conf/versions:
     get:
+      operationId: get_sites_id_conf_versions
       tags: [sites]
       summary: 配置历史版本列表（最新在前，每站保留 20 版）
       description: |
@@ -2409,6 +2496,7 @@ paths:
         '404': { description: 站点不存在 }
   /api/v1/sites/{id}/conf/versions/{vid}:
     get:
+      operationId: get_sites_id_conf_versions_vid
       tags: [sites]
       summary: 单个历史版本的正文（回滚前预览）
       description: 版本必须属于该站点（`AND site_id` 校验；跨站读取返回 404）。成功响应 data：id、content、hash、source、operator、created_at。
@@ -2421,6 +2509,7 @@ paths:
         '404': { description: 站点或版本不存在 }
   /api/v1/sites/{id}/conf/rollback:
     post:
+      operationId: post_sites_id_conf_rollback
       tags: [sites]
       summary: 回滚到指定历史版本（nginx -t 校验 → 现场留档 → 原子替换 → reload；仅 owner）
       description: |
@@ -2446,8 +2535,10 @@ paths:
         '403': { description: 仅 owner }
         '404': { description: 站点或版本不存在 }
         '501': { description: 无 Web 服务器底座（webserver.manage） }
+        '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' }
   /api/v1/sites/{id}/logs:
     get:
+      operationId: get_sites_id_logs
       tags: [sites]
       summary: 站点访问/错误日志（SSE，kind=access|error）
       parameters:
@@ -2455,9 +2546,10 @@ paths:
         - { name: kind, in: query, schema: { type: string, enum: [access, error] } }
         - { name: filter, in: query, schema: { type: string }, description: 关键词过滤 }
         - { name: limit, in: query, schema: { type: integer }, description: 回溯行数上限 }
-      responses: { '200': { description: text/event-stream } }
+      responses: { '200': { description: text/event-stream }, '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' } }
   /api/v1/sites/{id}/log/download:
     get:
+      operationId: get_sites_id_log_download
       tags: [sites]
       summary: 下载站点独立日志（021，kind=access|error）
       description: |
@@ -2475,6 +2567,7 @@ paths:
         '404': { description: 站点不存在 }
   /api/v1/sites/{id}/log/clear:
     post:
+      operationId: post_sites_id_log_clear
       tags: [sites]
       summary: 清空站点独立日志（021，kind=access|error）
       description: |
@@ -2499,6 +2592,7 @@ paths:
         '404': { description: 站点不存在 }
   /api/v1/sites/{id}/ssl/apply:
     post:
+      operationId: post_sites_id_ssl_apply
       tags: [sites]
       summary: 申请证书（self-signed 同步完成 → 200；ACME 任务化 → 202；无 Web 服务器 → 501）
       security: [cookieAuth, csrfHeader]
@@ -2508,9 +2602,11 @@ paths:
         '200': { description: 自签证书已签发并落盘（含 cert_path / not_after / days_left） }
         '202': { description: ACME 申请已入队 }
         '501': { description: 无 Web 服务器底座（webserver.manage）时不签发——证书没有进程可加载，只会造成「已配置」却不生效的假象 }
+        '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' }
 
   /api/v1/ssl/ca:
     get:
+      operationId: get_ssl_ca
       tags: [sites]
       summary: 下载面板本地根证书（ca.crt）
       description: |
@@ -2526,6 +2622,7 @@ paths:
         '401': { description: 未登录 }
   /api/v1/certs:
     get:
+      operationId: get_certs
       tags: [sites]
       summary: 证书列表（含到期倒计时）
       responses:
@@ -2536,6 +2633,7 @@ paths:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/Cert' } } } }
   /api/v1/certs/{id}/renew:
     post:
+      operationId: post_certs_id_renew
       tags: [sites]
       summary: 手动续期（自签同步 → 200；ACME 任务化 → 202；无 Web 服务器 → 501）
       security: [cookieAuth, csrfHeader]
@@ -2544,8 +2642,10 @@ paths:
         '200': { description: 自签证书已重新签发 }
         '202': { description: ACME 续期已入队 }
         '501': { description: 无 Web 服务器底座（webserver.manage）时不续期 }
+        '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' }
   /api/v1/certs/{id}/auto-renew:
     patch:
+      operationId: patch_certs_id_auto_renew
       tags: [sites]
       summary: 开关证书自动续期（仅 ACME 证书有效；后台每日扫描 30 天内到期者入队续期）
       security: [cookieAuth, csrfHeader]
@@ -2562,6 +2662,7 @@ paths:
         '501': { description: 平台未接入 ACME 能力 }
   /api/v1/certs/{id}:
     delete:
+      operationId: delete_certs_id
       tags: [sites]
       summary: 删除证书
       security: [cookieAuth, csrfHeader]
@@ -2569,6 +2670,7 @@ paths:
       responses: { '204': { description: ok } }
   /api/v1/certs/renew-sweep:
     get:
+      operationId: get_certs_renew_sweep
       tags: [sites]
       summary: 证书自动续期扫描的运行状态（上次/下次扫描时间）
       security: [cookieAuth]
@@ -2591,6 +2693,7 @@ paths:
   # ───────── 文件 ─────────
   /api/v1/files/list:
     get:
+      operationId: get_files_list
       tags: [files]
       summary: 文件列表（排序 + 隐藏文件开关；单次上限 1000，超限置 truncated）
       parameters:
@@ -2606,6 +2709,7 @@ paths:
         '50001': { description: 路径越界 }
   /api/v1/files/stat:
     get:
+      operationId: get_files_stat
       tags: [files]
       summary: 单文件/目录元信息
       security: [cookieAuth]
@@ -2618,6 +2722,7 @@ paths:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/FileStatOut' } } }
   /api/v1/files/upload:
     put:
+      operationId: put_files_upload
       tags: [files]
       summary: 上传（body=原始字节 octet-stream；上限 min(100MB, 平台上限)；原子替换）
       description: |
@@ -2633,6 +2738,7 @@ paths:
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/FileUploadResult' } } } } } } }
   /api/v1/files/multipart/init:
     post:
+      operationId: post_files_multipart_init
       tags: [files]
       summary: 开始分片上传（分片大小由服务端定档，客户端不得自选）
       description: |
@@ -2658,6 +2764,7 @@ paths:
         '400': { description: 大小为 0 / 超限 / 路径非法或命中敏感路径 }
   /api/v1/files/multipart/chunk:
     put:
+      operationId: put_files_multipart_chunk
       tags: [files]
       summary: 上传单个分片（非末片必须恰好 chunk_size）
       description: |
@@ -2679,6 +2786,7 @@ paths:
         '400': { description: 下标越界 / 分片大小不符 / 会话不存在或不属于当前用户 }
   /api/v1/files/multipart/{id}:
     get:
+      operationId: get_files_multipart_id
       tags: [files]
       summary: 查询已上传分片（**断点续传就靠它**）
       security: [cookieAuth, csrfHeader]
@@ -2690,6 +2798,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/MultipartStatus' } } }
     delete:
+      operationId: delete_files_multipart_id
       tags: [files]
       summary: 中止上传并清理分片（幂等：会话已不存在也返回 204）
       security: [cookieAuth, csrfHeader]
@@ -2697,6 +2806,7 @@ paths:
       responses: { '204': { description: ok } }
   /api/v1/files/multipart/{id}/complete:
     post:
+      operationId: post_files_multipart_id_complete
       tags: [files]
       summary: 合并分片并落盘（缺片则拒绝并**保留会话**，供续传）
       description: |
@@ -2712,6 +2822,7 @@ paths:
         '500': { description: 合并后字节数与声明不符（已放弃该次上传） }
   /api/v1/files/download:
     get:
+      operationId: get_files_download
       tags: [files]
       summary: 下载（octet-stream + attachment 头；上限同上传；目录 400）
       security: [cookieAuth]
@@ -2722,6 +2833,7 @@ paths:
         '50001': { description: 路径越界 }
   /api/v1/files/read:
     get:
+      operationId: get_files_read
       tags: [files]
       summary: 文本读取（≤2MB，二进制拒绝）
       parameters:
@@ -2732,6 +2844,7 @@ paths:
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: string } } } } } } }
   /api/v1/files/write:
     put:
+      operationId: put_files_write
       tags: [files]
       summary: 保存文本（生成 .bak）
       security: [cookieAuth, csrfHeader]
@@ -2743,18 +2856,23 @@ paths:
       responses: { '204': { description: ok } }
   /api/v1/files/mkdir:
     post:
+      operationId: post_files_mkdir
       tags: [files]
+      summary: 新建目录
       security: [cookieAuth, csrfHeader]
       requestBody: { required: true, content: { application/json: { schema: { type: object, required: [path, name], properties: { path: { type: string }, name: { type: string } } } } } }
       responses: { '204': { description: ok } }
   /api/v1/files/delete:
     post:
+      operationId: post_files_delete
       tags: [files]
+      summary: 删除文件/目录
       security: [cookieAuth, csrfHeader]
       requestBody: { required: true, content: { application/json: { schema: { type: object, required: [path], properties: { path: { type: string } } } } } }
       responses: { '204': { description: ok } }
   /api/v1/files/trash:
     get:
+      operationId: get_files_trash
       tags: [files]
       summary: 回收站列表（新 → 旧；最多 1000 条；元数据损坏的条目跳过且不删除）
       security: [cookieAuth, csrfHeader]
@@ -2765,6 +2883,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/TrashEntry' } } } } } }
     post:
+      operationId: post_files_trash
       tags: [files]
       summary: 移入回收站（软删除；先归档后删除，任一步失败即回滚）
       security: [cookieAuth, csrfHeader]
@@ -2777,6 +2896,7 @@ paths:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/TrashEntry' } } }
   /api/v1/files/trash/restore:
     post:
+      operationId: post_files_trash_restore
       tags: [files]
       summary: 从回收站恢复（目标重新走沙箱校验；原位置已有同名文件则拒绝，绝不覆盖）
       security: [cookieAuth, csrfHeader]
@@ -2789,6 +2909,7 @@ paths:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { restored: { type: string } } } } }
   /api/v1/files/trash/purge:
     post:
+      operationId: post_files_trash_purge
       tags: [files]
       summary: 彻底删除（给 id 删一条；不给则清空回收站。幂等）
       security: [cookieAuth, csrfHeader]
@@ -2801,18 +2922,23 @@ paths:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { purged: { type: integer } } } } }
   /api/v1/files/rename:
     post:
+      operationId: post_files_rename
       tags: [files]
+      summary: 重命名/移动
       security: [cookieAuth, csrfHeader]
       requestBody: { required: true, content: { application/json: { schema: { type: object, required: [path, name], properties: { path: { type: string }, name: { type: string } } } } } }
       responses: { '204': { description: ok } }
   /api/v1/files/chmod:
     post:
+      operationId: post_files_chmod
       tags: [files]
+      summary: 修改权限（mode/属主）
       security: [cookieAuth, csrfHeader]
       requestBody: { required: true, content: { application/json: { schema: { type: object, required: [path, mode], properties: { path: { type: string }, mode: { type: string, example: "0644" } } } } } }
       responses: { '204': { description: ok } }
   /api/v1/files/action:
     post:
+      operationId: post_files_action
       tags: [files]
       summary: 批量动作（move/copy/delete/trash/chmod；逐项执行逐项报告）
       description: |
@@ -2833,6 +2959,7 @@ paths:
   # ───────── 数据库 ─────────
   /api/v1/db/connections:
     get:
+      operationId: get_db_connections
       tags: [db]
       summary: 数据库引擎连接列表
       responses:
@@ -2842,6 +2969,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/DbConnection' } } } }
     post:
+      operationId: post_db_connections
       tags: [db]
       summary: 新增连接（口令主密钥加密存储）
       security: [cookieAuth, csrfHeader]
@@ -2849,23 +2977,28 @@ paths:
       responses: { '201': { description: 已创建 } }
   /api/v1/db/connections/{id}:
     patch:
+      operationId: patch_db_connections_id
       tags: [db]
       summary: 更新数据库连接（写需 db.manage；字段缺省保留现值，口令留空=不修改）
       security: [cookieAuth, csrfHeader]
       requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { name: { type: string, description: 连接名 }, engine: { type: string, enum: [mysql, postgres, sqlite], description: 引擎 }, host: { type: string, description: 主机 }, port: { type: integer, description: 端口 }, user: { type: string, description: 账号（mysql/postgres 必填） }, password: { type: string, description: 口令，留空=不修改 }, default_db: { type: string, description: 默认库（sqlite 为 .db 文件路径） } } } } } }
       responses: { '200': { description: ok }, '400': { description: 校验失败 }, '404': { description: 连接不存在 }, '409': { description: 连接名已存在 } }
     delete:
+      operationId: delete_db_connections_id
       tags: [db]
       summary: 删除数据库连接（写需 db.manage；仅删面板登记，不动真实库/文件）
       security: [cookieAuth, csrfHeader]
       responses: { '200': { description: ok }, '404': { description: 连接不存在 } }
   /api/v1/db/{conn}/databases:
     get:
+      operationId: get_db_conn_databases
       tags: [db]
+      summary: 库列表
       parameters: [{ name: conn, in: path, required: true, schema: { type: integer } }]
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { type: string } } } } } } } }
   /api/v1/db/{conn}/{db}/schemas:
     get:
+      operationId: get_db_conn_db_schemas
       tags: [db]
       summary: 「库」的下一级（PostgreSQL → schema；MySQL/SQLite → 空数组）
       description: |
@@ -2879,13 +3012,16 @@ paths:
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/DbSchema' } } } } } } } }
   /api/v1/db/{conn}/{db}/tables:
     get:
+      operationId: get_db_conn_db_tables
       tags: [db]
+      summary: 表列表
       parameters:
         - { name: conn, in: path, required: true, schema: { type: integer } }
         - { name: db, in: path, required: true, schema: { type: string } }
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/DbTable' } } } } } } } }
   /api/v1/db/{conn}/{db}/{table}/rows:
     get:
+      operationId: get_db_conn_db_table_rows
       tags: [db]
       summary: 数据预览（只读，分页 50 行）
       parameters:
@@ -2894,9 +3030,10 @@ paths:
         - { name: table, in: path, required: true, schema: { type: string } }
         - { $ref: '#/components/parameters/Page' }
         - { $ref: '#/components/parameters/PageSize' }
-      responses: { '200': { description: ok } }
+      responses: { '200': { description: ok }, '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' } }
   /api/v1/db/{conn}/{db}/{table}/export:
     get:
+      operationId: get_db_conn_db_table_export
       tags: [db]
       summary: 全量表数据导出为 CSV（只读）
       description: |
@@ -2929,8 +3066,10 @@ paths:
             text/csv:
               schema: { type: string }
         '400': { description: 超过 20000 行导出上限，或标识符非法 }
+        '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' }
   /api/v1/db/{conn}/query:
     post:
+      operationId: post_db_conn_query
       tags: [db]
       summary: 只读 SQL 查询（SQLite 与 PostgreSQL）
       description: |
@@ -2969,8 +3108,10 @@ paths:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { columns: { type: array, items: { type: string } }, rows: { type: array, items: { type: array, items: { type: [string, 'null'] } } }, truncated: { type: boolean }, limit: { type: integer } } } } }
         '400': { description: 写操作 / 多语句 / 超长语句 }
         '501': { description: MySQL（无服务端只读护栏） }
+        '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' }
   /api/v1/db/{conn}/sql-meta:
     get:
+      operationId: get_db_conn_sql_meta
       tags: [db]
       summary: SQL 控制台元数据（能力位 + 引擎相关的默认语句与示例）
       description: |
@@ -2988,13 +3129,15 @@ paths:
 
   /api/v1/db/{conn}/backup:
     post:
+      operationId: post_db_conn_backup
       tags: [db]
       summary: 备份（任务化 → 202）
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: conn, in: path, required: true, schema: { type: integer } }]
-      responses: { '202': { description: 已入队 } }
+      responses: { '202': { description: 已入队 }, '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' } }
   /api/v1/db/{conn}/remark:
     patch:
+      operationId: patch_db_conn_remark
       tags: [databases]
       summary: 更新数据库连接说明（对象备注，022）
       security: [cookieAuth, csrfHeader]
@@ -3003,16 +3146,18 @@ paths:
       responses: { '204': { description: ok } }
   /api/v1/db/{conn}/restore:
     post:
+      operationId: post_db_conn_restore
       tags: [db]
       summary: 还原（二次确认 + 自动先备份当前库）
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: conn, in: path, required: true, schema: { type: integer } }]
       requestBody: { required: true, content: { application/json: { schema: { type: object, required: [file, confirm_token], properties: { file: { type: string }, confirm_token: { type: string } } } } } }
-      responses: { '202': { description: 已入队 } }
+      responses: { '202': { description: 已入队 }, '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' } }
 
   # ───────── 备份计划（本地） ─────────
   /api/v1/backups:
     get:
+      operationId: get_backups
       tags: [backups]
       summary: 备份计划列表
       responses:
@@ -3022,6 +3167,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/BackupPlan' } } } }
     post:
+      operationId: post_backups
       tags: [backups]
       summary: 新建备份计划
       description: |
@@ -3048,6 +3194,7 @@ paths:
       responses: { '201': { description: 已创建 } }
   /api/v1/backups/test-remote:
     post:
+      operationId: post_backups_test_remote
       tags: [backups]
       summary: 远端连接自检（PUT 探针对象 → DELETE）
       description: |
@@ -3072,6 +3219,7 @@ paths:
         '502': { description: "远端拒绝或不可达；curl 的 stderr 在 detail.stderr" }
   /api/v1/backups/system:
     get:
+      operationId: get_backups_system
       tags: [backups]
       summary: 系统自动备份列表（面板库每日快照）
       description: |
@@ -3107,6 +3255,7 @@ paths:
 
   /api/v1/backups/system/{name}:
     get:
+      operationId: get_backups_system_name
       tags: [backups]
       summary: 下载某份系统自动备份
       description: |
@@ -3121,6 +3270,7 @@ paths:
 
   /api/v1/backups/{id}:
     patch:
+      operationId: patch_backups_id
       tags: [backups]
       summary: 更新备份计划
       description: 各字段缺省 = 不改动；`remote` 的字段级语义见 `RemoteConfig`。
@@ -3141,6 +3291,7 @@ paths:
                 remote:     { $ref: '#/components/schemas/RemoteConfig' }
       responses: { '200': { description: ok } }
     delete:
+      operationId: delete_backups_id
       tags: [backups]
       summary: 删除备份计划（**不删产物**）
       security: [cookieAuth, csrfHeader]
@@ -3148,13 +3299,15 @@ paths:
       responses: { '204': { description: ok } }
   /api/v1/backups/{id}/run:
     post:
+      operationId: post_backups_id_run
       tags: [backups]
       summary: 立即执行备份（任务化 → 202）
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
-      responses: { '202': { description: 已入队 } }
+      responses: { '202': { description: 已入队 }, '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' } }
   /api/v1/backups/{id}/artifacts:
     get:
+      operationId: get_backups_id_artifacts
       tags: [backups]
       summary: 该计划的产物列表
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
@@ -3166,6 +3319,7 @@ paths:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/BackupArtifact' } } } }
   /api/v1/backups/{id}/artifacts/{name}:
     get:
+      operationId: get_backups_id_artifacts_name
       tags: [backups]
       summary: 下载某份计划产物
       description: |
@@ -3181,6 +3335,7 @@ paths:
 
   /api/v1/backups/{id}/remote/artifacts:
     get:
+      operationId: get_backups_id_remote_artifacts
       tags: [backups]
       summary: 列远端副本（本地盘出事后唯一能问的地方）
       description: |
@@ -3205,6 +3360,7 @@ paths:
 
   /api/v1/backups/{id}/restore:
     post:
+      operationId: post_backups_id_restore
       tags: [backups]
       summary: 从产物恢复（**高危**：确认词 + 产物名白名单 + 自动先备份当前态）
       description: >
@@ -3238,6 +3394,7 @@ paths:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { task_id: { type: string } } } } }
         '400': { description: "确认词不符 / 产物名非法" }
         '501': { description: "kind=panel（面板库不可在线覆盖）" }
+        '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' }
 
   # ───────── 容器（Docker）─────────
   #
@@ -3246,6 +3403,7 @@ paths:
   # `binary_missing` / `daemon_unreachable`，供前端直接显示可操作提示。
   /api/v1/containers:
     get:
+      operationId: get_containers
       tags: [containers]
       summary: 容器列表（等价 `docker ps -a`，含已停止）
       responses:
@@ -3255,7 +3413,9 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/ContainerSummary' } } } }
         '501': { description: "容器能力不可用（detail.reason：binary_missing / daemon_unreachable）" }
+        '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' }
     post:
+      operationId: post_containers
       tags: [containers]
       summary: 创建容器（`docker create`，**默认不启动**）
       security: [cookieAuth, csrfHeader]
@@ -3288,6 +3448,7 @@ paths:
         '501': { description: 容器能力不可用 }
   /api/v1/containers/images:
     get:
+      operationId: get_containers_images
       tags: [containers]
       summary: 镜像列表（等价 `docker images`，含悬空镜像）
       responses:
@@ -3298,6 +3459,7 @@ paths:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/ContainerImage' } } } }
         '501': { description: 容器能力不可用 }
     delete:
+      operationId: delete_containers_images
       tags: [containers]
       summary: 删除镜像（等价 `docker rmi`，不带 `-f`）
       description: |
@@ -3317,8 +3479,10 @@ paths:
         '400': { description: 校验失败（镜像引用为空或含非法字符） }
         '501': { description: 容器能力不可用 }
         '502': { description: docker rmi 失败（镜像不存在 / 仍被容器引用，stderr 透传） }
+        '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' }
   /api/v1/containers/images/pull:
     post:
+      operationId: post_containers_images_pull
       tags: [containers]
       summary: 拉取镜像（等价 `docker pull`；可用来更新已有镜像）
       security: [cookieAuth, csrfHeader]
@@ -3339,8 +3503,10 @@ paths:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/ContainerImage' } } }
         '400': { description: 校验失败（镜像引用非法） }
         '501': { description: 容器能力不可用 }
+        '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' }
   /api/v1/containers/install:
     post:
+      operationId: post_containers_install
       tags: [containers]
       summary: 一键安装 Docker（仅当 docker 二进制缺失时可用）
       description: |
@@ -3361,13 +3527,16 @@ paths:
       responses:
         '200': { description: 已入队，返回 task_id / created / package }
         '400': { description: 已安装或守护进程不可达（无需重装），或确认词不正确 }
+        '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' }
   /api/v1/containers/{id}/remark:
     get:
+      operationId: get_containers_id_remark
       tags: [containers]
       summary: 读取容器备注（022，容器不入库，存 container_remarks 引用表）
       parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID；表按名称索引（ID 随重建变化，名称通常保留），不强制 Docker 可达" }]
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { remark: { type: string } } } } } } } } }
     patch:
+      operationId: patch_containers_id_remark
       tags: [containers]
       summary: 更新容器备注（022）
       security: [cookieAuth, csrfHeader]
@@ -3377,6 +3546,7 @@ paths:
 
   /api/v1/containers/{id}/logs:
     get:
+      operationId: get_containers_id_logs
       tags: [containers]
       summary: 读取容器日志（docker logs，只读最近 N 行快照，不带 --follow 避免阻塞）
       parameters:
@@ -3392,6 +3562,7 @@ paths:
 
   /api/v1/containers/stats:
     get:
+      operationId: get_containers_stats
       tags: [containers]
       summary: 读取全部容器的资源用量快照（docker stats --no-stream --all，非流式）
       responses:
@@ -3401,6 +3572,7 @@ paths:
         '501': { description: 容器能力不可用 }
   /api/v1/containers/networks:
     get:
+      operationId: get_containers_networks
       tags: [containers]
       summary: 列举 Docker 网络（docker network ls --no-trunc，只读）
       responses:
@@ -3410,6 +3582,7 @@ paths:
         '501': { description: 容器能力不可用 }
   /api/v1/containers/volumes:
     get:
+      operationId: get_containers_volumes
       tags: [containers]
       summary: 列举 Docker 卷（docker volume ls，只读）
       responses:
@@ -3419,6 +3592,7 @@ paths:
         '501': { description: 容器能力不可用 }
   /api/v1/containers/compose:
     get:
+      operationId: get_containers_compose
       tags: [containers]
       summary: 列举 Docker Compose 项目（docker compose ls --all --format json，只读）
       responses:
@@ -3428,6 +3602,7 @@ paths:
         '501': { description: "容器能力不可用，或 Compose 插件缺失（detail.reason：binary_missing / daemon_unreachable / compose_unavailable）。⚠ compose 是 CLI 插件，与 daemon 可达性无关：docker 可用但没装 docker-compose-plugin 时会返回 compose_unavailable（而非 502）" }
   /api/v1/containers/compose/{project}/act:
     post:
+      operationId: post_containers_compose_project_act
       tags: [containers]
       summary: 对 Compose 项目执行生命周期动作（up / stop / restart / down）
       description: |
@@ -3455,6 +3630,7 @@ paths:
         '501': { description: 容器能力不可用，或 Compose 插件缺失 }
   /api/v1/containers/stacks:
     get:
+      operationId: get_containers_stacks
       tags: [containers]
       summary: 列表面板创建的编排项目（Compose stack 定义）
       description: 只扫 `<data_dir>/compose-stacks/` 下带 `.forkpanel-compose.json` 的目录；不识别用户手写的 compose 项目。⚠ 本组端点不检查 docker 可用性——编排定义的读写与 daemon 无关。
@@ -3464,6 +3640,7 @@ paths:
           content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/ComposeStack' } } } } } }
   /api/v1/containers/stacks/{project}:
     get:
+      operationId: get_containers_stacks_project
       tags: [containers]
       summary: 读取单个编排项目
       parameters:
@@ -3474,6 +3651,7 @@ paths:
           content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/ComposeStack' } } } } }
         '404': { description: 编排项目不存在 }
     put:
+      operationId: put_containers_stacks_project
       tags: [containers]
       summary: 创建或更新编排项目（幂等），需 container.manage
       description: |
@@ -3500,6 +3678,7 @@ paths:
         '409': { description: compose.yaml 已被外部修改，拒绝覆盖 }
   /api/v1/containers/stacks/import-preview:
     post:
+      operationId: post_containers_stacks_import_preview
       tags: [containers]
       summary: 安全导入预览（解析外部 compose YAML，抽取白名单子集）
       description: |
@@ -3528,6 +3707,7 @@ paths:
         '400': { description: YAML 解析失败或体积超限 }
   /api/v1/containers/join-docker-group:
     post:
+      operationId: post_containers_join_docker_group
       tags: [containers]
       summary: 把面板进程用户加入 docker 组（修复 daemon_unreachable）
       description: |
@@ -3542,6 +3722,7 @@ paths:
         '30000': { description: usermod 执行失败（如面板非 root 运行） }
   /api/v1/containers/{id}/start:
     post:
+      operationId: post_containers_id_start
       tags: [containers]
       summary: 启动容器
       security: [cookieAuth, csrfHeader]
@@ -3552,6 +3733,7 @@ paths:
         '501': { description: 容器能力不可用 }
   /api/v1/containers/{id}/stop:
     post:
+      operationId: post_containers_id_stop
       tags: [containers]
       summary: 停止容器（优雅停机 10s 后强制）
       security: [cookieAuth, csrfHeader]
@@ -3562,6 +3744,7 @@ paths:
         '501': { description: 容器能力不可用 }
   /api/v1/containers/{id}/restart:
     post:
+      operationId: post_containers_id_restart
       tags: [containers]
       summary: 重启容器
       security: [cookieAuth, csrfHeader]
@@ -3572,6 +3755,7 @@ paths:
         '501': { description: 容器能力不可用 }
   /api/v1/containers/{id}:
     patch:
+      operationId: patch_containers_id
       tags: [containers]
       summary: 修改容器资源限制（`docker update`，**不重启容器**）
       description: |
@@ -3607,6 +3791,7 @@ paths:
         '501': { description: 容器能力不可用 }
         '502': { description: "docker update 失败（stderr 透传，如内存上限与 swap 关系冲突）" }
     delete:
+      operationId: delete_containers_id
       tags: [containers]
       summary: 删除容器（默认 `docker rm`；运行中的容器会被拒绝，需先停止。`force=true` 走 `docker rm -f`）
       security: [cookieAuth, csrfHeader]
@@ -3623,6 +3808,7 @@ paths:
         '501': { description: 容器能力不可用 }
   /api/v1/containers/{id}/limits:
     get:
+      operationId: get_containers_id_limits
       tags: [containers]
       summary: 读取容器当前资源限制（`docker inspect` 的 HostConfig 子集）
       description: |
@@ -3652,6 +3838,7 @@ paths:
   # ───────── 防火墙 ─────────
   /api/v1/firewall/status:
     get:
+      operationId: get_firewall_status
       tags: [firewall]
       summary: 防火墙开关与后端
       responses:
@@ -3662,13 +3849,15 @@ paths:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/FirewallStatus' } } }
   /api/v1/firewall/enabled:
     put:
+      operationId: put_firewall_enabled
       tags: [firewall]
       summary: 开关（大按钮 + 二次确认防误关）
       security: [cookieAuth, csrfHeader]
       requestBody: { required: true, content: { application/json: { schema: { type: object, required: [enabled], properties: { enabled: { type: boolean } } } } } }
-      responses: { '204': { description: ok } }
+      responses: { '204': { description: ok }, '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' } }
   /api/v1/firewall/rules:
     get:
+      operationId: get_firewall_rules
       tags: [firewall]
       summary: 端口规则列表
       responses:
@@ -3678,21 +3867,24 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/FirewallRule' } } } }
     post:
+      operationId: post_firewall_rules
       tags: [firewall]
       summary: 应用规则（声明式 RulePlan）
       security: [cookieAuth, csrfHeader]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/FirewallRuleCreate' } } } }
-      responses: { '201': { description: 已创建 } }
+      responses: { '201': { description: 已创建 }, '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' } }
   /api/v1/firewall/rules/{id}:
     delete:
+      operationId: delete_firewall_rules_id
       tags: [firewall]
       summary: 删除规则
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID；表按名称索引（ID 随重建变化，名称通常保留），不强制 Docker 可达" }]
-      responses: { '204': { description: ok } }
+      responses: { '204': { description: ok }, '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' } }
 
   /api/v1/firewall/fail2ban:
     get:
+      operationId: get_firewall_fail2ban
       tags: [firewall]
       summary: fail2ban 总览（可用性与各 jail 封禁统计）
       security: [cookieAuth, csrfHeader]
@@ -3705,6 +3897,7 @@ paths:
         '501': { description: fail2ban 不可用（未装 fail2ban-client） }
   /api/v1/firewall/fail2ban/jail:
     post:
+      operationId: post_firewall_fail2ban_jail
       tags: [firewall]
       summary: 启停某 jail
       security: [cookieAuth, csrfHeader]
@@ -3713,9 +3906,10 @@ paths:
         content:
           application/json:
             schema: { type: object, required: [name, enabled], properties: { name: { type: string }, enabled: { type: boolean } } }
-      responses: { '200': { description: ok }, '501': { description: fail2ban 不可用 } }
+      responses: { '200': { description: ok }, '501': { description: fail2ban 不可用 }, '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' } }
   /api/v1/firewall/fail2ban/unban:
     post:
+      operationId: post_firewall_fail2ban_unban
       tags: [firewall]
       summary: 解封某 jail 下指定 IP
       security: [cookieAuth, csrfHeader]
@@ -3724,11 +3918,12 @@ paths:
         content:
           application/json:
             schema: { type: object, required: [jail, ip], properties: { jail: { type: string }, ip: { type: string } } }
-      responses: { '200': { description: ok }, '501': { description: fail2ban 不可用 } }
+      responses: { '200': { description: ok }, '501': { description: fail2ban 不可用 }, '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' } }
 
   # ───────── 安全 ─────────
   /api/v1/security/baseline:
     get:
+      operationId: get_security_baseline
       tags: [security]
       summary: SSH / 系统安全基线检查（只读）
       responses:
@@ -3739,6 +3934,7 @@ paths:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/SecurityBaselineItem' } } } }
   /api/v1/security/baseline/apply:
     post:
+      operationId: post_security_baseline_apply
       tags: [security]
       summary: 应用某项基线修复（二次确认词 + 先备份 → 写 → sshd -t 校验 → 失败回滚）
       description: >
@@ -3767,6 +3963,7 @@ paths:
         '400': { description: "确认词不符 / 不支持的基线项 / sshd 不可用" }
   /api/v1/security/sessions:
     get:
+      operationId: get_security_sessions
       tags: [security]
       summary: 当前活跃会话（内存快照；重启即清零，如实行为）
       security: [cookieAuth]
@@ -3778,6 +3975,7 @@ paths:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { sessions: { type: array, items: { $ref: '#/components/schemas/SessionInfo' } }, total: { type: integer } } } } }
   /api/v1/security/sessions/{id}:
     delete:
+      operationId: delete_security_sessions_id
       tags: [security]
       summary: 吊销会话（允许吊销自己的当前会话=自我登出）
       security: [cookieAuth, csrfHeader]
@@ -3787,6 +3985,7 @@ paths:
   # ───────── 计划任务 ─────────
   /api/v1/cron/jobs:
     get:
+      operationId: get_cron_jobs
       tags: [cron]
       summary: 计划任务列表
       responses:
@@ -3796,6 +3995,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/CronJob' } } } }
     post:
+      operationId: post_cron_jobs
       tags: [cron]
       summary: 新建（表达式服务端校验）
       security: [cookieAuth, csrfHeader]
@@ -3803,29 +4003,37 @@ paths:
       responses: { '201': { description: 已创建 }, '80002': { description: 表达式非法 } }
   /api/v1/cron/jobs/{id}:
     get:
+      operationId: get_cron_jobs_id
       tags: [cron]
+      summary: 计划任务详情
       parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID；表按名称索引（ID 随重建变化，名称通常保留），不强制 Docker 可达" }]
       responses: { '200': { description: ok } }
     patch:
+      operationId: patch_cron_jobs_id
       tags: [cron]
+      summary: 修改计划任务（表达式/命令/启用状态）
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID；表按名称索引（ID 随重建变化，名称通常保留），不强制 Docker 可达" }]
       requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { enabled: { type: boolean }, expr: { type: string }, timeout_sec: { type: integer } } } } } }
       responses: { '204': { description: ok } }
     delete:
+      operationId: delete_cron_jobs_id
       tags: [cron]
+      summary: 删除计划任务
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID；表按名称索引（ID 随重建变化，名称通常保留），不强制 Docker 可达" }]
       responses: { '204': { description: ok } }
   /api/v1/cron/jobs/{id}/run:
     post:
+      operationId: post_cron_jobs_id_run
       tags: [cron]
       summary: 手动执行（任务化）
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID；表按名称索引（ID 随重建变化，名称通常保留），不强制 Docker 可达" }]
-      responses: { '202': { description: 已入队 } }
+      responses: { '202': { description: 已入队 }, '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' } }
   /api/v1/cron/jobs/{id}/webhook:
     post:
+      operationId: post_cron_jobs_id_webhook
       tags: [cron]
       summary: 测试该任务已配置的 Webhook（POST 一条 test 事件）
       security: [cookieAuth, csrfHeader]
@@ -3833,12 +4041,14 @@ paths:
       responses: { '200': { description: ok } }
   /api/v1/cron/jobs/{id}/runs:
     get:
+      operationId: get_cron_jobs_id_runs
       tags: [cron]
       summary: 执行记录（最近 100 条/任务）
       parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID；表按名称索引（ID 随重建变化，名称通常保留），不强制 Docker 可达" }]
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/CronRun' } } } } } } } }
   /api/v1/cron/preview:
     post:
+      operationId: post_cron_preview
       tags: [cron]
       summary: 下次 5 次执行时间预览（本地时区语义；next 可为空 = 一年内无命中）
       requestBody: { required: true, content: { application/json: { schema: { type: object, required: [expr], properties: { expr: { type: string } } } } } }
@@ -3850,6 +4060,7 @@ paths:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { expr: { type: string }, next: { type: array, items: { type: integer } } } } } }
   /api/v1/cron/webhook/test:
     post:
+      operationId: post_cron_webhook_test
       tags: [cron]
       summary: 测试任意 Webhook URL 可达性（POST 一条 test 事件）
       security: [cookieAuth, csrfHeader]
@@ -3859,6 +4070,7 @@ paths:
   # ───────── 日志 ─────────
   /api/v1/logs/sources:
     get:
+      operationId: get_logs_sources
       tags: [logs]
       summary: 日志来源（panel/system/service/site-access/site-error/custom）
       responses:
@@ -3869,6 +4081,7 @@ paths:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/LogSource' } } } }
   /api/v1/logs/stream:
     get:
+      operationId: get_logs_stream
       tags: [logs]
       summary: 统一日志浏览器（SSE，服务端过滤）
       parameters:
@@ -3882,6 +4095,7 @@ paths:
       responses: { '200': { description: text/event-stream } }
   /api/v1/logs/{id}/download:
     get:
+      operationId: get_logs_id_download
       tags: [logs]
       summary: 日志下载（text/plain 附件；行数 ≤10_000 且累计 ≤8MB，超限 X-Capped:1）
       parameters:
@@ -3901,6 +4115,7 @@ paths:
 
   /api/v1/logs/{id}/stats:
     get:
+      operationId: get_logs_id_stats
       tags: [logs]
       summary: 日志聚合统计（level 分布 + 时间直方图 + 高频消息模式）
       parameters:
@@ -3919,6 +4134,7 @@ paths:
 
   /api/v1/logs/{id}:
     get:
+      operationId: get_logs_id
       tags: [logs]
       summary: 读取单个日志源（行数上限 2000，grep 字面量非正则）
       parameters:
@@ -3940,6 +4156,7 @@ paths:
   # 而依赖预算门禁 [8] 上限 38。站内通知零新增依赖，覆盖单机面板主要诉求。
   /api/v1/notifications:
     get:
+      operationId: get_notifications
       tags: [notifications]
       summary: 通知列表（时间倒序）
       parameters:
@@ -3953,6 +4170,7 @@ paths:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/Notification' } } } }
   /api/v1/notifications/unread-count:
     get:
+      operationId: get_notifications_unread_count
       tags: [notifications]
       summary: 未读条数（前端徽章用，单行聚合）
       responses:
@@ -3963,12 +4181,14 @@ paths:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { count: { type: integer } } } } }
   /api/v1/notifications/read-all:
     post:
+      operationId: post_notifications_read_all
       tags: [notifications]
       summary: 全部标记已读
       security: [cookieAuth, csrfHeader]
       responses: { '200': { description: ok } }
   /api/v1/notifications/{id}/read:
     post:
+      operationId: post_notifications_id_read
       tags: [notifications]
       summary: 单条标记已读
       security: [cookieAuth, csrfHeader]
@@ -3978,6 +4198,7 @@ paths:
         '404': { description: 通知不存在 }
   /api/v1/notifications/{id}:
     delete:
+      operationId: delete_notifications_id
       tags: [notifications]
       summary: 删除通知（需 system.manage）
       security: [cookieAuth, csrfHeader]
@@ -3989,6 +4210,7 @@ paths:
   # ───────── 任务中心 ─────────
   /api/v1/tasks:
     get:
+      operationId: get_tasks
       tags: [tasks]
       summary: 任务列表（进行中/完成/失败）
       responses:
@@ -3999,12 +4221,14 @@ paths:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/Task' } } } }
   /api/v1/tasks/{id}:
     get:
+      operationId: get_tasks_id
       tags: [tasks]
       summary: 单任务详情（含 duration_secs 派生字段；404 对不存在任务）
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/Task' } } } } } } }
   /api/v1/tasks/{id}/cancel:
     post:
+      operationId: post_tasks_id_cancel
       tags: [tasks]
       summary: 取消任务（任务体在检查点优雅退出，不强杀子进程组）
       security: [cookieAuth, csrfHeader]
@@ -4015,6 +4239,7 @@ paths:
         '409': { description: 任务已结束（queued/running 之外），无法取消 }
   /api/v1/tasks/{id}/output:
     get:
+      operationId: get_tasks_id_output
       tags: [tasks]
       summary: 任务输出尾部读取
       parameters: [{ name: id, in: path, required: true, schema: { type: integer }, description: "task_runs 的行 id（整数）——不是容器名" }]
@@ -4025,11 +4250,13 @@ paths:
   # ───────── 设置 / 用户 / 审计 ─────────
   /api/v1/settings:
     get:
+      operationId: get_settings
       tags: [settings]
       summary: 面板设置（三段诚实模型）
       security: [cookieAuth]
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/SettingsReport' } } } } } } }
     patch:
+      operationId: patch_settings
       tags: [settings]
       summary: 修改 runtime 设置（当前仅 AI 助手 LLM 四键；api_key 经主密钥加密，GET 永不明文）
       description: |
@@ -4042,6 +4269,7 @@ paths:
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/SettingsReport' } } } } } } }
   /api/v1/settings/dashboard:
     get:
+      operationId: get_settings_dashboard
       tags: [settings]
       summary: 概览页卡片布局（指标卡顺序与显隐）
       description: |
@@ -4050,6 +4278,7 @@ paths:
       security: [cookieAuth]
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/DashboardLayout' } } } } } } }
     put:
+      operationId: put_settings_dashboard
       tags: [settings]
       summary: 保存概览页卡片布局（整体替换，需 settings.manage）
       description: |
@@ -4060,6 +4289,7 @@ paths:
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/DashboardLayout' } } } } } } }
   /api/v1/settings/llm/test:
     post:
+      operationId: post_settings_llm_test
       tags: [settings]
       summary: 测试 AI 助手 LLM 接入（真实探测 OpenAI 兼容 /v1/models，需 settings.manage）
       description: |
@@ -4081,6 +4311,7 @@ paths:
         '400': { description: 未配置 Endpoint / Endpoint 不是合法 http(s) URL }
   /api/v1/roles:
     get:
+      operationId: get_roles
       tags: [users]
       summary: 角色列表（内置 builtin=true + 自定义）+ 已知权限白名单
       security: [cookieAuth, csrfHeader]
@@ -4091,6 +4322,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { roles: { type: array, items: { $ref: '#/components/schemas/Role' } }, known_permissions: { type: array, items: { type: string } } } } } }
     post:
+      operationId: post_roles
       tags: [users]
       summary: 新建自定义角色（防提权：权限必须是调用者自身权限的子集）
       security: [cookieAuth, csrfHeader]
@@ -4109,6 +4341,7 @@ paths:
         '400': { description: 名称非法 / 权限未知 / 超出自身权限 / 与内置同名 }
   /api/v1/roles/{name}:
     patch:
+      operationId: patch_roles_name
       tags: [users]
       summary: 修改自定义角色权限（**不开放改名**——users.role 存的是名字，改名会让引用悬空）
       security: [cookieAuth, csrfHeader]
@@ -4126,6 +4359,7 @@ paths:
         '200': { description: ok }
         '400': { description: 内置角色不可改 / 权限超出自身 }
     delete:
+      operationId: delete_roles_name
       tags: [users]
       summary: 删除自定义角色（内置拒绝；**仍被用户引用时拒绝**，避免那些账号静默变成零权限）
       security: [cookieAuth, csrfHeader]
@@ -4136,10 +4370,12 @@ paths:
 
   /api/v1/users:
     get:
+      operationId: get_users
       tags: [users]
       summary: 用户列表
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/User' } } } } } } } }
     post:
+      operationId: post_users
       tags: [users]
       summary: 新建用户
       security: [cookieAuth, csrfHeader]
@@ -4147,12 +4383,15 @@ paths:
       responses: { '201': { description: 已创建 } }
   /api/v1/users/{id}:
     patch:
+      operationId: patch_users_id
       tags: [users]
+      summary: 修改用户（角色/可访问目录/禁用/重置口令）
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/UserPatch' } } } }
       responses: { '204': { description: ok } }
     delete:
+      operationId: delete_users_id
       tags: [users]
       summary: 删除用户（owner 不可删）
       security: [cookieAuth, csrfHeader]
@@ -4160,6 +4399,7 @@ paths:
       responses: { '204': { description: ok } }
   /api/v1/audit:
     get:
+      operationId: get_audit
       tags: [audit]
       summary: 审计日志查询（分页 + 筛选）
       parameters:
@@ -4177,16 +4417,19 @@ paths:
   # ───────── SSE 实时频道 ─────────
   /api/v1/events/metrics:
     get:
+      operationId: get_events_metrics
       tags: [events]
       summary: SSE：指标推送（nano 档位关闭，前端改轮询）
       responses: { '200': { description: text/event-stream } }
   /api/v1/events/tasks:
     get:
+      operationId: get_events_tasks
       tags: [events]
       summary: SSE：任务进度/输出推送
       responses: { '200': { description: text/event-stream } }
   /api/v1/events/logs:
     get:
+      operationId: get_events_logs
       tags: [events]
       summary: SSE：日志增量推送
       responses: { '200': { description: text/event-stream } }
@@ -4194,6 +4437,7 @@ paths:
   # ───────── AI 运维助手（只读诊断） ─────────
   /api/v1/assistant/diagnose:
     post:
+      operationId: post_assistant_diagnose
       tags: [assistant]
       summary: 诊断问答（内置规则引擎，只读）
       description: |
@@ -4212,10 +4456,12 @@ paths:
                 question: { type: [string, "null"], description: 自然语言问句，可空 }
       responses:
         '200': { description: 诊断报告, content: { application/json: { schema: { $ref: '#/components/schemas/AssistantReport' } } } }
+        '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' }
 
   # ───────── 内置 Web 终端（WebSocket） ─────────
   /api/v1/terminal:
     get:
+      operationId: get_terminal
       tags: [terminal]
       summary: 内置 Web 终端（WebSocket 升级，101）
       description: |

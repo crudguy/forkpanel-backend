@@ -197,9 +197,11 @@ impl FirewallProvider for LinuxFirewall {
             // 用户一点删除才收到 501，是典型的"能力位撒谎"。
             FirewallBackend::Ufw => Capability::yes("ufw"),
             FirewallBackend::None => Capability::no("binary_missing"),
-            FirewallBackend::Nftables => Capability::no("仅支持 ufw，当前检测到 nftables"),
-            FirewallBackend::Iptables => Capability::no("仅支持 ufw，当前检测到 iptables"),
-            FirewallBackend::Firewalld => Capability::no("仅支持 ufw，当前检测到 firewalld"),
+            // reason 是**机器码**（契约里是闭合 enum），中文说明由 UI 侧映射；
+            // 把整句中文塞进 reason 会让按枚举分支的前端落到未知值。
+            FirewallBackend::Nftables => Capability::no("nftables_detected"),
+            FirewallBackend::Iptables => Capability::no("iptables_detected"),
+            FirewallBackend::Firewalld => Capability::no("firewalld_detected"),
         }
     }
 
