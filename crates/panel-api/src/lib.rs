@@ -4,7 +4,13 @@
 //! - handler 只做三件事：参数校验 → 权限断言 → 调 service（本骨架直接调 OsAdapter）→ 包装响应。
 //! - handler **禁止**出现 SQL（走 panel-db）、**禁止**出现进程调用（走 panel-os）、
 //!   **禁止**出现路径字面量（走 PathLayout）。
-//! - 所有写操作必须可审计：由 `Audit` 中间件在响应阶段落库。
+//! - 所有写操作必须可审计，且**没有中间件代劳**：必须由 handler 自己显式调用
+//!   `crate::routes::audit(&state, &s, "<action>", "<target>", "ok")`（全仓 100+ 处）。
+//!   ⚠ 这里曾写着「由 `Audit` 中间件在响应阶段落库」，但该中间件**从未存在**
+//!   （`middleware.rs` 只有 require_auth / guard_write / security_headers /
+//!   read_only_guard / request_log）。这条假注释的直接后果是
+//!   `system::restart` 十年没人补审计——照着注释以为中间件已经记了。
+//!   新增写 handler 时把 audit 调用当作必填项，而不是可选装饰。
 //!
 //! ## 同步 IO 约定（P1-1 / P2-3）
 //!

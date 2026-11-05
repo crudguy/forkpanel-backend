@@ -128,7 +128,7 @@ panel serve                       # 监听地址取自 config.toml 的 [server].
 
 ## 质量门禁（`make check` 一条命令跑全部；CI 同路径自动跑）
 
-`make check` = 5 个静态门禁 + `cargo test --workspace`；`make audit` 单独成目标
+`make check` = 静态门禁（清单以 `Makefile` 的 `guards` 目标为准）+ `cargo test --workspace`；`make audit` 单独成目标
 （依赖安全扫描，GitHub Actions 里也是独立 job——避免本机没装 cargo-audit 就红主门禁）。
 按改动类型可单独跑对应 `ci/` 门禁：
 

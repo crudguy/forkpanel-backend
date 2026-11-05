@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # 依赖安全审计门禁：cargo audit 扫 Cargo.lock 的已知漏洞（RustSec advisory-db）。
 #
-# 与 ci/check-layering.sh / check-api-contract.sh 等并列的**手动门禁**（本项目无自动
-# CI 流水线，由开发者/编排者运行）。用法：./ci/check-audit.sh [仓库根目录]
+# 与 ci/check-layering.sh / check-api-contract.sh 等并列的静态门禁。本地用 `make audit`
+# 跑；CI 上由 .github/workflows/ci.yml 的 audit job 单独跑（不并入 check job，网络抖动
+# 时不连带拖红主门禁）。用法：./ci/check-audit.sh [仓库根目录]
 #
 # 恒绿纪律（与 check-api-contract.sh 同范式）：cargo-audit **找不到就失败**，绝不静默
 # 跳过——「恒绿的门禁比没有门禁更危险」。缺失时给出可操作的安装提示。

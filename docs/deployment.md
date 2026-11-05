@@ -343,7 +343,7 @@ sudo panel --config /etc/forkpanel/config.toml passwd admin --pass '<新口令>'
 
 1. **守住 `localhost_only = true`**。远程访问走 SSH 隧道，不要改成 `0.0.0.0`。确需公网暴露时先接 TLS（M3 ACME）再改，并自行承担暴露面。
 2. **`--owner-pass` / `--pass` 只用于脚本**。命令行参数会进 shell history 且 `ps` 可见；手工部署一律用交互模式（口令关回显）。
-3. **不做多用户注册**。面板账号即服务器管理员。未来有团队需求应做"owner 邀请子账号"，而非注册页——主流面板（如 1Panel / CasaOS）都是这个模型。
+3. **不做多用户注册**。面板账号即服务器管理员。未来有团队需求应做"owner 邀请子账号"，而非注册页——主流集中式面板都是这个模型。
 
 ---
 

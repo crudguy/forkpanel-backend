@@ -1,6 +1,6 @@
 # ForkPanel 后端门禁——一条命令跑完全部门禁。
 #
-# 背景：ci/ 下 6 个门禁脚本质量很高，但此前没有任何东西把它们与
+# 背景：ci/ 下的门禁脚本质量很高，但此前没有任何东西把它们与
 # `cargo test --workspace` 串起来，全靠人记得逐个跑（审计 P1-3）。
 # 本 Makefile 与 .github/workflows/ci.yml 共用同一份目标。
 #
