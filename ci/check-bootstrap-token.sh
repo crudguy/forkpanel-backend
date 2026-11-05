@@ -17,6 +17,10 @@ pass() { echo "  ✓ $1"; }
 
 AUTH="crates/panel-api/src/routes/auth.rs"
 MAIN="crates/panel-cli/src/main.rs"
+# `axum::serve` 的启动装配住在 cmd/serve.rs（Q-07 第 1 刀 add6824 从 main.rs 搬走）。
+# ⚠ 判据**不再盯死某个文件名**：那次搬迁没同步本脚本，[3] 就一直红，而它当时
+# 没接进 make guards，于是谁都没发现。现在扫整个 panel-cli/src，文件再搬也不会瞎。
+CLI_SRC="crates/panel-cli/src"
 
 # 前提断言：文件必须存在且非空，否则下面 grep / awk 塌成 0 会恒绿（与 check-api-contract.sh 同教训）
 [ -s "$AUTH" ] || fail "$AUTH 不存在或为空——提取前提不成立，绝不能当作通过"
@@ -43,10 +47,19 @@ else
 fi
 
 echo "== [3] serve 真正把 ConnectInfo 接进连接（否则回环判定永远读不到真实 peer）=="
-if grep -nE 'into_make_service_with_connect_info' "$MAIN" | grep -vE '^[0-9]+:[[:space:]]*//' | grep -q .; then
-  pass "serve 已接线 into_make_service_with_connect_info"
-else
+# 判据形态（与 check-api-contract.sh 的「定义处恰好 N 处」同范式）：
+#   ① 先剔注释行（递归 grep 的前缀是 `文件:行号:`，故按 `:[0-9]+:\s*//` 过滤，
+#      不能照抄单文件版的 `^[0-9]+:`——那对递归输出恒不命中，等于没剔）；
+#   ② 再断言**恰好 1 处**：0 处=没接线（真漏洞）；多出来=有人又开了一条连接入口，
+#      也该看一眼。只判 `>0` 时，注释里写着这个词也会假绿。
+CC_N=$(grep -rnE 'into_make_service_with_connect_info' "$CLI_SRC" --include='*.rs' \
+        | grep -vE ':[0-9]+:[[:space:]]*//' | grep -c . || true)
+if [ "$CC_N" = "1" ]; then
+  pass "serve 已接线 into_make_service_with_connect_info（panel-cli/src 下恰好 1 处）"
+elif [ "$CC_N" = "0" ]; then
   fail "serve 未接线 ConnectInfo：bootstrap_token 的回环判定取不到真实来源地址，判定形同虚设"
+else
+  fail "into_make_service_with_connect_info 出现 $CC_N 处（期望恰好 1 处）——新增连接入口须同步复核该判据"
 fi
 
 echo "== [4] 令牌文件权限收紧到 0600（非属主 / 非 root 读不到）=="

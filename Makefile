@@ -43,6 +43,10 @@ guards:
 	bash ci/check-frontend-loc.sh
 	# 阻塞子进程调用出口唯一性：run_sync 是同步的，裸调会钉住 tokio worker（Q-01）
 	bash ci/check-blocking-calls.sh
+	# 无终端初始化的引导令牌：仅 localhost 可取 + bootstrap 后即删 + 文件 0600。
+	# ⚠ 此前它是**孤儿守卫**：脚本写好却没人调用，且 [3] 的判据在 Q-07 搬迁后
+	#   一直指向已搬空的文件（恒红）⇒ 「守卫存在」不等于「守卫在跑」。
+	bash ci/check-bootstrap-token.sh
 
 # 内嵌前端新鲜度：改完前端只 cargo build **不会**重新 embed，必须
 # ① vite build → ② rm -rf web/dist/* → ③ cp -a → ④ touch embed.rs → ⑤ cargo build。
