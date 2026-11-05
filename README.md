@@ -1,6 +1,6 @@
 # ForkPanel（叉叉面板）· 轻量 Linux 服务器管理面板 · 后端
 
-**技术栈**：Rust（edition 2021，MSRV 1.75）+ axum + rusqlite(SQLite) + tokio
+**技术栈**：Rust（edition 2021，MSRV 1.98）+ axum + rusqlite(SQLite) + tokio
 **形态**：单文件静态二进制，内嵌前端产物，无运行时依赖，面向低配 Linux VPS 单机部署
 **配套前端**：[forkpanel-frontend](https://github.com/crudguy/forkpanel-frontend)（独立仓库）
 
@@ -89,24 +89,25 @@ crates/
   panel-db/            SQLite：WriterActor 单写串行化 + ReadPool + 迁移 + 备份 + 环形缓冲
   panel-api/           axum：router、middleware、handler、SSE、错误码
   panel-task/          任务队列、调度器、cron 执行器
-  panel-cli/           二进制入口：init/doctor/migrate/serve/backup/systemd-unit
+  panel-cli/           二进制入口：17 个子命令（init / serve / upgrade / uninstall / backup / menu …），
+                       完整清单以 `panel --help` 为准——别在这里抄一份会过期的
 migrations/            内嵌 SQL（编号 + 校验和）
 docs/api/openapi.yaml  ★ 前后端唯一接口契约（事实源）
-docs/abi/             抽象层接口冻结文档
-docs/                  deployment / coverage / env；审查报告见
-                       audit-2026-10-17.md（全文）与 audit-2026-10-17-summary.md（归纳版）
+docs/                  deployment / coverage / env；抽象层接口契约见 crates/panel-os/src/traits.rs
+                       审查报告：audit-2026-10-24.md（全文）/ -summary（速览）为**当前结论**；
+                       audit-2026-10-17 两份是上一轮，P0/P1/P2 已全部闭环，仅作历史对照
 deploy/               systemd unit、安装/卸载脚本、默认配置
 ci/                   分层门禁 + 注入/鉴权/CLI/任务/模块仿真用例集
 ```
 
-> **新人建议先读** [`docs/audit-2026-10-17-summary.md`](docs/audit-2026-10-17-summary.md)：
-> 全项目审查结论、19 项发现的处置记录，以及「哪些看着像问题其实不是」的清单
-> （避免重复排查）。
+> **新人建议先读** [`docs/audit-2026-10-24-summary.md`](docs/audit-2026-10-24-summary.md)：
+> 按**缺陷类型**横切的第二轮审计（假控制 / 静默失败 / 恒绿守卫 / 不可观测 /
+> 安全护栏 / 契约漂移）及其处置记录。上一轮 10-17 的发现已全部闭环。
 
 ## 构建与运行
 
 ```bash
-# 需要 Rust 工具链（建议 1.75+；交叉编译用 cargo-zigbuild 出 musl 静态二进制）
+# 需要 Rust 工具链（1.98.1+，版本锁在 rust-toolchain.toml；交叉编译用 cargo-zigbuild 出 musl 静态二进制）
 cargo build --release
 cargo test  --workspace
 
