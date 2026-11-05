@@ -1928,11 +1928,17 @@ mod expose_tests {
     /// 判据指向生产段，避免重复实现时把横幅删了还全绿。
     #[test]
     fn serve_prints_localhost_only_banner() {
-        let src = include_str!("main.rs");
+        // 判据跟着被检查的那份文件走：横幅在 cmd/serve.rs。
+        // ⚠ 必须计数而不是 contains：`sudo panel expose` 在 main.rs 另有 4 处
+        //   （Expose arm 的 println、改 bind 的拒绝文案、帮助文本两行），
+        //   所以旧版在 main.rs 上做 contains **从来没检查过 serve**——把 serve 里
+        //   的横幅整段删掉它照样绿。这是拆分时「没红的守卫」暴露出来的存量假绿。
+        let src = include_str!("cmd/serve.rs");
         let prod = panel_testutil::production_source(src);
-        assert!(
-            prod.contains("sudo panel expose"),
-            "serve 在 localhost_only 时必须提示 `sudo panel expose`，否则小白仍以为能 IP:端口 访问"
+        assert_eq!(
+            prod.matches("sudo panel expose").count(),
+            1,
+            "serve 在 localhost_only 时必须且只提示一次 `sudo panel expose`，否则小白仍以为能 IP:端口 访问"
         );
     }
 }
