@@ -495,6 +495,8 @@ impl panel_task::TaskBody for CronRunTask {
         };
 
         let tx_cb = tx;
+        // 通道关闭后继续 send 只会静默丢日志行；用 AtomicBool 只报一次，避免刷屏。
+        let channel_closed_logged = std::sync::atomic::AtomicBool::new(false);
         // 用户脚本走 cmd 唯一出口，超时/降权/输出上限统一在这里生效。
         // command 作为 `sh -c` 的**单个参数**传入，不参与 argv 拼接，无额外注入面。
         // 仅当面板以 root 运行、且任务指定非 root 用户时才降权（非 root 无法降权）。
@@ -511,13 +513,19 @@ impl panel_task::TaskBody for CronRunTask {
                 timeout: job.timeout,
                 run_as,
                 on_line: Some(std::sync::Arc::new(move |line: &str| {
-                    let _ = tx_cb.send(line.to_string());
+                    if tx_cb.send(line.to_string()).is_err()
+                        && !channel_closed_logged.swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        eprintln!("[panel] ⚠ [cron] 输出通道已关闭，后续日志行丢弃（任务仍在执行）");
+                    }
                 })),
                 ..Default::default()
             },
         ).await;
         // CmdOpt 随 run 返回而释放 → 闭包与 tx 一起 drop → 通道关闭 → 消费者自然退出
-        let _ = consumer.await;
+        if let Err(e) = consumer.await {
+            eprintln!("[panel] ⚠ [cron] 输出消费任务异常（任务日志可能不完整）：{e}");
+        }
 
         let mut output_path = None;
         let lines: Vec<String> = panel_core::sync::lock_recover(&buf).clone();
@@ -525,12 +533,23 @@ impl panel_task::TaskBody for CronRunTask {
             // 日志写进专属子目录而非 temp_dir 根：id 递增 → 每次都是新文件，
             // 若散落在 /tmp 根既无法定向清理，也会污染临时目录。
             let dir = std::env::temp_dir().join(panel_task::TASK_LOG_DIRNAME);
-            let _ = tokio::fs::create_dir_all(&dir).await;
+            if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+                eprintln!("[panel] ⚠ [cron] 创建任务日志目录 {} 失败：{e}", dir.display());
+            }
             let p = dir.join(format!("{}{}.log", panel_task::TASK_LOG_PREFIX, progress.id()));
-            if tokio::fs::write(&p, lines.join("\n")).await.is_ok() {
-                output_path = Some(p);
-                // 只保留最近若干份（清理失败不影响任务结果，函数内部静默）
-                panel_os::prune_keep_newest(&dir, panel_task::TASK_LOG_PREFIX, panel_task::TASK_LOG_KEEP);
+            match tokio::fs::write(&p, lines.join("\n")).await {
+                Ok(()) => {
+                    output_path = Some(p);
+                    // 只保留最近若干份（清理失败不影响任务结果，函数内部静默）
+                    panel_os::prune_keep_newest(&dir, panel_task::TASK_LOG_PREFIX, panel_task::TASK_LOG_KEEP);
+                }
+                Err(e) => {
+                    // 落盘失败要让用户看得见：否则任务中心只显示「无输出」，
+                    // 服务端也无日志可查，与「任务成功」的结论对不上。
+                    let msg = format!("任务日志落盘失败：{e}");
+                    progress.log(&msg).await;
+                    eprintln!("[panel] ⚠ [cron] {msg}");
+                }
             }
         }
 
@@ -573,14 +592,20 @@ impl panel_task::TaskBody for CronRunTask {
         // Webhook 回调（P2-3）：成功/失败时按订阅事件 POST JSON。
         // 失败只记日志，绝不污染主任务状态（通知失败不应让任务本身失败）。
         let job_id = self.job_id.clone();
-        if let Ok((Some(url), events_str)) = self.pool.with(move |conn| {
+        let hook_cfg = self.pool.with(move |conn| {
             let mut st = conn.prepare(
                 "SELECT webhook_url, webhook_events FROM cron_jobs WHERE name = ?1")
                 .map_err(|e| PanelError::Database(e.to_string()))?;
             st.query_row([job_id.as_str()], |r| Ok((
                 r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?,
             ))).map_err(|e| PanelError::Database(e.to_string()))
-        }).await {
+        }).await;
+        // 原写法 `if let Ok(...)` 把读库失败整段吞掉：订阅了 failure 的任务
+        // 失败时既不投递、服务端也无痕。这里先留痕，再按 Ok 分支继续。
+        if let Err(e) = &hook_cfg {
+            eprintln!("[panel] ⚠ [cron] 读取 Webhook 配置失败（本次不投递通知）：{e}");
+        }
+        if let Ok((Some(url), events_str)) = hook_cfg {
             let events: Vec<String> = split_events(&events_str);
             let want = if failed { "failure" } else { "success" };
             if events.iter().any(|e| e == want) {
@@ -597,7 +622,10 @@ impl panel_task::TaskBody for CronRunTask {
                 });
                 match webhook::fire(&url, &payload).await {
                     Ok(()) => progress.log(&format!("已回调 Webhook：{want}")).await,
-                    Err(e) => progress.log(&format!("Webhook 投递失败：{e}")).await,
+                    Err(e) => {
+                        progress.log(&format!("Webhook 投递失败：{e}")).await;
+                        eprintln!("[panel] ⚠ [cron] Webhook 投递失败（不影响任务结局）：{e}");
+                    }
                 }
             }
         }
@@ -788,6 +816,40 @@ mod tests {
         assert!(bad, "未取得退出码必须判为失败，绝不能当成 0");
         assert_ne!(code, 0, "退出码绝不能是 0（会让列表页显示 ok）");
         assert!(text.contains("killed") || text.contains("终止"), "文案要说清是被终止：{text}");
+    }
+
+    /// F-13：执行链的错误分支必须留痕，不许退回静默吞错。
+    ///
+    /// 为什么是源码级守卫：这些分支分别依赖「输出通道关闭」「消费任务 panic」
+    /// 「临时目录不可写」「读库失败」，单测里如实造出来成本远高于收益；但
+    /// 「把 eprintln 删掉照样编译通过、测试全绿」必须被挡住。
+    /// `production_source` 剔注释并剥掉 cfg(test) 块，所以本守卫自身与注释
+    /// 里提到的旧写法都不会污染计数。
+    #[test]
+    fn cron_execution_chain_never_silently_drops_errors() {
+        let prod = panel_testutil::production_source(include_str!("cron.rs"));
+        assert!(prod.len() > 20_000, "生产段提取异常（仅 {} 字节）——守卫前提不成立", prod.len());
+        assert!(prod.contains("panel_os::run_shell("), "活性自检：没扫到执行链主体");
+        assert!(prod.contains("UPDATE cron_jobs SET last_run_at"), "活性自检：没扫到结果回写段");
+
+        for bad in [
+            "let _ = tx_cb.send",
+            "let _ = consumer.await",
+            "let _ = tokio::fs::create_dir_all",
+            ".write(&p, lines.join(\"\\n\")).await.is_ok()",
+            "if let Ok((Some(url), events_str)) = self.pool.with",
+        ] {
+            assert!(!prod.contains(bad), "静默吞错写法复活：{bad}");
+        }
+
+        let marks = prod.matches("[panel] ⚠ [cron]").count();
+        assert!(marks >= 6, "错误留痕点只有 {marks} 处，期望 ≥6（含既有的 last_status 回写）");
+        assert_eq!(prod.matches("if let Err(e) = &hook_cfg").count(), 1,
+            "Webhook 配置读取失败必须有且仅有一处显式留痕");
+        assert!(prod.contains("progress.log(&msg).await"),
+            "日志落盘失败必须回写进任务输出，否则任务中心只显示「无输出」");
+        assert!(prod.contains("channel_closed_logged.swap("),
+            "输出通道关闭只报一次，避免每行都刷服务端日志");
     }
 
 }
