@@ -1398,11 +1398,11 @@ components:
           items: { $ref: '#/components/schemas/DashboardCardPref' }
     LlmTestReq:
       type: object
-      description: 省略/null 字段回落到库里已存值；填写则以本次为准（先测后存，避免保存后才发现配错）
+      description: F-02①：endpoint 仅用于与已保存值的一致性校验（不参与探测目标）；api_key 仅用本次输入，省略则完全不携带密钥，绝不回退到库里已存值
       properties:
-        endpoint: { type: string }
-        model:    { type: string }
-        api_key:  { type: string, description: 明文密钥，仅用于本次探测：不落库、不回显、不入日志 }
+        endpoint: { type: string, description: 必须与已保存的 API Endpoint 相同；改动请先调用 PATCH 保存 }
+        model:    { type: string, description: 省略则取库里已保存值（先测后存） }
+        api_key:  { type: string, description: 本次输入的明文密钥，仅用于本次探测：不落库、不回显、不入日志；省略则不携带任何密钥 }
     LlmTestResult:
       type: object
       description: 探测结论。**探测失败一律 ok:false + detail，不返回 500**——配置错是用户的事，不是服务器错误
@@ -4307,8 +4307,15 @@ paths:
       tags: [settings]
       summary: 测试 AI 助手 LLM 接入（真实探测 OpenAI 兼容 /v1/models，需 settings.manage）
       description: |
-        请求体三个字段都可省略：省略即测库里已存的配置，填写即测当前输入
-        （**先测后存**，避免保存后才发现配错）。
+        **F-02① 彻底收紧**：目标 Endpoint 锁定为库里已保存的值，请求体里的
+        endpoint 仅用于一致性校验，不一致直接 400（改动请先保存配置）。
+        同时**绝不读取库里已存的 api_key**：只携带本次请求里输入的明文密钥，
+        未输入就不带 Authorization 头（匿名探测）。这两条一起切断了把已保存的
+        LLM 密钥外带到任意主机的通路；本机 / 内网网关（已保存的 127.0.0.1
+        Ollama）不受影响。
+
+        请求体 model / api_key 可省略：model 省略时取已保存值，api_key 省略时
+        不携带任何密钥（**先测后存**仅对这两项成立，避免保存后才发现配错）。
 
         判定：HTTP 2xx 且响应可解析为 OpenAI 兼容 JSON ⇒ ok=true，并核对
         配置的 model 是否在 /v1/models 列表里（model_found）。
@@ -4316,13 +4323,14 @@ paths:
         **探测失败一律 ok:false + detail，不返回 500**——密钥填错是配置问题，
         不是服务器错误；返回 500 会让前端把「密钥无效」显示成「请求失败」。
 
-        端点由管理员填写 ⇒ 这是一次管理员发起的外发请求：仅 settings.manage
-        可调用，响应体回显截断到 200 字符，密钥不落日志、不回显。
+        这是一次管理员发起的外发请求：仅 settings.manage 可调用，禁跟随
+        重定向、不回显对方响应体、密钥不落日志不回显，且按重活档限流
+        （10 次/60 秒）。
       security: [cookieAuth, csrfHeader]
       requestBody: { required: false, content: { application/json: { schema: { $ref: '#/components/schemas/LlmTestReq' } } } }
       responses:
         '200': { description: 探测完成（成功与失败都在这里，看 data.ok）, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/LlmTestResult' } } } } } }
-        '400': { description: 未配置 Endpoint / Endpoint 不是合法 http(s) URL }
+        '400': { description: 未配置 Endpoint / Endpoint 不是合法 http(s) URL / 请求体的 Endpoint 与已保存值不一致 }
         '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' }
   /api/v1/roles:
     get:

@@ -394,8 +394,9 @@ pub async fn patch(
 /// 两条路径上是本仓踩过的高频 bug（一处校验一处不校验 → "能存但测不通"）。
 ///
 /// 本机/内网网关（`http://127.0.0.1:11434/v1`）是**刻意保留的合法用例**：面板的
-/// 典型部署就是连本机 Ollama。因此这里不做「禁私网」的一刀切，而是堵住三个真实
-/// 放大面（见 `test_llm`）：URL 内嵌 userinfo、跟随重定向、回显对方响应体。
+/// 典型部署就是连本机 Ollama。因此这里不做「禁私网」的一刀切；SSRF 的收敛放在
+/// `test_llm`：URL 内嵌 userinfo、禁跟随重定向、不回显对方响应体，以及 F-02① 的
+/// 「目标 Endpoint 锁定为已保存值 + 绝不携带已存密钥」。
 fn valid_endpoint(url: &str) -> bool {
     (url.starts_with("http://") || url.starts_with("https://"))
         && url.len() <= 256
@@ -434,6 +435,24 @@ fn url_host(url: &str) -> Option<&str> {
         }
     }
     if host.is_empty() { None } else { Some(host) }
+}
+
+/// F-02①：测试连接的目标 Endpoint **只能取库里已保存的值**。
+///
+/// 请求体里的 endpoint 只做一致性校验，绝不拿它当探测目标：目标主机由配置者保存，
+/// 调用者无法把请求（以及任何密钥）导向自己控制的机器。再配合 `test_llm` 里
+/// 「绝不读取已存 api_key」，整条 admin → 明文密钥 的外带链就断了。
+/// 本机 / 内网网关不受影响——已保存的 127.0.0.1 照样能测。
+fn resolve_probe_endpoint(saved: &str, requested: Option<&str>) -> Result<String, &'static str> {
+    if let Some(p) = requested.map(str::trim).filter(|s| !s.is_empty()) {
+        if p != saved {
+            return Err("测试连接只允许使用已保存的 API Endpoint；Endpoint 有改动请先保存再测试");
+        }
+    }
+    if saved.trim().is_empty() {
+        return Err("尚未配置 API Endpoint，无法测试");
+    }
+    Ok(saved.to_string())
 }
 
 /// 探测超时。宁可让用户等 8 秒后拿到明确超时，也不要挂住一个 axum worker。
@@ -515,13 +534,15 @@ fn plain_api_key(state: &Shared, raw: &str) -> Option<String> {
 /// `POST /api/v1/settings/llm/test`——真实探测 OpenAI 兼容的 `/v1/models`。
 ///
 /// 设计要点：
-/// - **先测后存**：请求里带的 endpoint/model/api_key 优先于库里的值，用户改完
-///   输入框就能验证，不必先保存才知道配错了（C10 原话："避免保存后才报错"）。
+/// - **先测后存（仅 model / api_key）**：这两项可用当前输入验证，不必先保存
+///   （C10 原话："避免保存后才报错"）。⚠ F-02①：Endpoint 与已存密钥是例外——
+///   Endpoint 锁定为已保存值（改动须先保存），已存密钥绝不参与测试，只带本次
+///   输入的 key。理由见 [`resolve_probe_endpoint`]。
 /// - **绝不 500**：所有探测失败都落成 `ok:false + detail`，配置错了是用户的事，
 ///   不是服务器错误——返回 500 会让前端把"密钥填错"显示成"请求失败"。
-/// - **密钥不落日志、不回显**：只回布尔与结论。
-/// - 端点由管理员填写 ⇒ 这是一次由管理员发起的外发请求（SSRF 面）；仅
-///   `settings.manage` 可调用，且响应体截断到 200 字符。
+/// - **密钥不落日志、不回显**：只回布尔与结论；库里已存的密钥连解密都不做。
+/// - 这是一次由管理员发起的外发请求（SSRF 面）；仅 `settings.manage` 可调用，
+///   目标锁定为已保存的 Endpoint、禁跟随重定向、不回显对方响应体（截断到 200 字符）。
 pub async fn test_llm(
     State(state): State<Shared>,
     Auth(s): Auth,
@@ -540,13 +561,12 @@ pub async fn test_llm(
             .and_then(|v| v.as_str().map(str::to_string))
     };
 
-    let endpoint = match req.endpoint.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(e) => e.to_string(),
-        None => stored(K_LLM_ENDPOINT).unwrap_or_default(),
+    // F-02①：目标 Endpoint **只能取库里已保存的值**，请求体不得临时覆盖。
+    let saved_endpoint = stored(K_LLM_ENDPOINT).unwrap_or_default();
+    let endpoint = match resolve_probe_endpoint(&saved_endpoint, req.endpoint.as_deref()) {
+        Ok(e) => e,
+        Err(msg) => return Err(ApiError::bad_request("endpoint", msg)),
     };
-    if endpoint.is_empty() {
-        return Err(ApiError::bad_request("endpoint", "尚未配置 API Endpoint，无法测试"));
-    }
     if !valid_endpoint(&endpoint) {
         return Err(ApiError::bad_request(
             "endpoint",
@@ -557,12 +577,10 @@ pub async fn test_llm(
         Some(m) => Some(m.to_string()),
         None => stored(K_LLM_MODEL),
     };
-    let api_key = match req.api_key.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(k) => Some(k.to_string()),
-        None => table
-            .get(K_LLM_API_KEY)
-            .and_then(|raw| plain_api_key(&state, raw)),
-    };
+    // F-02①：**绝不读取库里已存的 api_key**。测试连接只带本次输入的明文密钥，
+    // 未输入就不带 Authorization 头（匿名探测）。已存密钥只供叙事层使用。
+    let api_key = req.api_key.as_deref().map(str::trim)
+        .filter(|s| !s.is_empty()).map(str::to_string);
 
     // 禁跟随重定向：否则一个公网 URL 可以 302 到内网/回环，`valid_endpoint`
     // 的结构校验就形同虚设。测试连接只读一次 `/models`，不需要跳转。
@@ -741,6 +759,24 @@ mod tests {
         assert!(valid_endpoint("http://[::1]:11434/v1"), "IPv6 本机网关仍合法");
         let long = format!("https://{}", "a".repeat(300));
         assert!(!valid_endpoint(&long), "超长");
+    }
+
+    /// F-02①：探测目标永远锁定为已保存值，请求体带别的主机一律拒绝。
+    #[test]
+    fn probe_endpoint_is_locked_to_saved_value() {
+        let saved = "http://127.0.0.1:11434/v1";
+        // 没传 / 传空 / 传相同值 ⇒ 都取已保存值（本机网关照常可用）
+        assert_eq!(resolve_probe_endpoint(saved, None).unwrap(), saved);
+        assert_eq!(resolve_probe_endpoint(saved, Some("")).unwrap(), saved);
+        assert_eq!(resolve_probe_endpoint(saved, Some(saved)).unwrap(), saved);
+        // 传别处 ⇒ 拒绝，绝不能拿它当探测目标
+        let err = resolve_probe_endpoint(saved, Some("http://attacker.example/v1")).unwrap_err();
+        assert!(err.contains("先保存"), "拒绝理由要给出可操作动作：{err}");
+        assert!(
+            resolve_probe_endpoint("", Some("https://api.openai.com/v1")).is_err(),
+            "库里未保存时不许临时指定目标"
+        );
+        assert!(resolve_probe_endpoint("", None).is_err(), "未配置要报 400");
     }
 
     #[test]
