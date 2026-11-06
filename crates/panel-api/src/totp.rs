@@ -55,10 +55,32 @@ pub fn gen_secret() -> [u8; 20] {
 }
 
 /// `otpauth://` URI——验证器 App 扫码录入用。
+///
+/// 账号部分必须百分号编码（Key URI 规范按 RFC 3986）：`validate_username` 只校验
+/// 长度 1..=64，用户名里可以有空格、`:`、`?`、`#` 或中文；未编码时这些字符会被
+/// 验证器当成 label/query 的分隔符，导致 App 里显示的账号名错位，甚至整个 URI
+/// 解析失败（扫码后「无法识别二维码」，而面板这边毫无报错）。
+/// issuer 的 `:` 是「issuer:account」分隔符，只编码账号本身。
 pub fn otpauth_uri(username: &str, secret_b32: &str) -> String {
     format!(
-        "otpauth://totp/ForkPanel:{username}?secret={secret_b32}&issuer=ForkPanel&digits=6&period=30"
+        "otpauth://totp/ForkPanel:{}?secret={secret_b32}&issuer=ForkPanel&digits=6&period=30",
+        encode_component(username)
     )
+}
+
+/// RFC 3986 百分号编码：unreserved（`A-Z a-z 0-9 - . _ ~`）原样保留，其余按
+/// UTF-8 字节写成 `%XX`（大写十六进制）。
+fn encode_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        let keep = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~');
+        if keep {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 // ─────────────── base32（RFC 4648，无 padding） ───────────────
@@ -148,6 +170,25 @@ mod tests {
         assert_eq!(hotp(&rfc_secret(), 37037036), 7081804 % 1_000_000);
         // 注：本实现按 RFC 取 6 位，故断言值是官方 8 位结果的**后 6 位**
         assert_eq!(hotp(&rfc_secret(), 41152263), 89005924 % 1_000_000);
+    }
+
+    #[test]
+    fn otpauth_uri_encodes_account_component() {
+        // 纯 ASCII 用户名不该被改动（绝大多数部署是这种）
+        let ascii = otpauth_uri("admin", "JBSWY3DPEHPK3PXP");
+        assert_eq!(
+            ascii,
+            "otpauth://totp/ForkPanel:admin?secret=JBSWY3DPEHPK3PXP&issuer=ForkPanel&digits=6&period=30"
+        );
+        // 空格 / 冒号 / 问号 / 中文：一律百分号编码，否则验证器会把它们当分隔符
+        let weird = otpauth_uri("张 三:a?b", "JBSWY3DPEHPK3PXP");
+        assert!(
+            weird.starts_with("otpauth://totp/ForkPanel:%E5%BC%A0%20%E4%B8%89%3Aa%3Fb?secret="),
+            "实际：{weird}"
+        );
+        // 全串只允许 scheme 的 `otpauth:` 与 label 的 `issuer:account` 两个冒号；
+        // 用户名里的冒号必须编码掉，否则 App 解析出的账号名会被截断
+        assert_eq!(weird.matches(':').count(), 2, "实际：{weird}");
     }
 
     #[test]
