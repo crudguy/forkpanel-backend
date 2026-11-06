@@ -184,19 +184,33 @@ impl FirewallProvider for NftFirewall {
 
     async fn restore_snapshot(&self, data: &[u8]) -> Result<()> {
         self.ensure_nft()?;
+        let text = String::from_utf8_lossy(data);
+
+        // 空快照 = 当时表还不存在（首次 enable 之前的 apply 就会走到这里）。
+        // 此时"恢复"的正确语义是让表回到不存在，而不是建一张空表：
+        // 空表会让 is_active() 变成 true，等于失败回滚反而偷偷把防火墙启用了。
+        if text.trim().is_empty() {
+            let _ = self.nft(&["delete", "table", "inet", TABLE], Duration::from_secs(10)).await;
+            return Ok(());
+        }
+
         // 绕开 nft 的 stdin 限制：删表重建，再按快照里的规则重加（保留原 panel-managed id）
         let _ = self.nft(&["delete", "table", "inet", TABLE], Duration::from_secs(10)).await;
         self.ensure_table().await?;
-        let text = String::from_utf8_lossy(data);
         for r in parse_panel_rules(&text) {
             // 先取 id（借用 r.1），再整体把 r 交给 to_rule（按值消费），否则 move 后无法再用
             let id = panel_id(&r.1).unwrap_or_else(|| "restored".into());
             if let Some(rule) = to_rule(r) {
                 let expr = render_rule(&rule, &id);
-                let _ = self.nft(
+                // 回滚失败必须冒泡：以前这里用 `let _ =` 吞掉错误，回滚"假成功"会让上层
+                // 以为规则已复原，实际停在半应用状态，连日志都没有一行。
+                self.nft_checked(
                     &["add", "rule", "inet", TABLE, CHAIN, expr.as_str()],
                     Duration::from_secs(20),
-                ).await;
+                ).await.map_err(|e| PanelError::Command {
+                    bin: "nft".into(),
+                    detail: format!("回滚重放 {} 失败: {}", rule.id, e),
+                })?;
             }
         }
         Ok(())
@@ -285,7 +299,11 @@ fn to_rule((handle, comment, expr): (u32, String, String)) -> Option<FirewallRul
         action,
         direction,
         source_cidr,
-        comment: Some(comment),
+        // 存成"用户备注"而不是原始 comment：原始值里含 `panel-managed <id>` 前缀，
+        // 下次 render_rule 会再拼一层标记（现场已出现
+        // `panel-managed pA panel-managed pB` 的双层数据，每回滚/重放一次多一层）。
+        // 读取侧的兼容由 `user_comment` 的循环剥前缀兜住，这里只保证新写入不再嵌套。
+        comment: user_comment(Some(&comment)),
         panel_managed: true,
     })
 }
@@ -547,5 +565,29 @@ table inet panelfw {
             crate::linux::fail2ban::Fail2ban::capability().supported,
             "nft 后端的 fail2ban 能力位必须与共享实现一致，不得硬编码 no"
         );
+    }
+
+    /// 回滚重放不得让 comment 层层嵌套。
+    /// 现场数据已出现 `panel-managed pA panel-managed pB ssh`：旧实现把整条 comment
+    /// （含前缀）当用户备注回灌，重放一次多一层，最终撞上 sanitize_comment 的 200 字符截断。
+    #[test]
+    fn restore_replay_does_not_nest_panel_mark() {
+        const OUT: &str = "\
+table inet panelfw {
+    chain input {
+        tcp dport 22 accept comment \"panel-managed pNew panel-managed pOld ssh\" # handle 9
+    }
+}
+";
+        let r = parse_panel_rules(OUT).into_iter().next().expect("应解析出 1 条");
+        let rule = to_rule(r).expect("应能转成 FirewallRule");
+        assert_eq!(rule.comment.as_deref(), Some("ssh"), "读取侧必须剥掉全部面板标记");
+
+        // 模拟 restore_snapshot：用新 id 重写同一条规则
+        let expr = render_rule(&rule, "pNext");
+        assert_eq!(expr.matches("panel-managed").count(), 1,
+                   "重写后只允许一层标记，实际: {expr}");
+        assert!(expr.contains("comment \"panel-managed pNext ssh\""),
+                "用户备注必须原样保留: {expr}");
     }
 }
