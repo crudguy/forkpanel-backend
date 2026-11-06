@@ -528,6 +528,9 @@ pub async fn test_llm(
     PanelJson(req): PanelJson<TestLlmReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SETTINGS_MANAGE)?;
+    // F-02②：单次探测最长 8s 且会外发请求，按重活档限流（10 次/60 秒）。
+    // 此前实测 8 秒连发 40 次、429 出现 0 次，等价于把面板当内网扫描器用。
+    crate::ratelimit::check_heavy(&state, &s.username, "settings.llm_test")?;
 
     let table = load_table(&state).await?;
     let stored = |k: &str| -> Option<String> {

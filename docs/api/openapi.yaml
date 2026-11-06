@@ -4323,6 +4323,7 @@ paths:
       responses:
         '200': { description: 探测完成（成功与失败都在这里，看 data.ok）, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/LlmTestResult' } } } } } }
         '400': { description: 未配置 Endpoint / Endpoint 不是合法 http(s) URL }
+        '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' }
   /api/v1/roles:
     get:
       operationId: get_roles

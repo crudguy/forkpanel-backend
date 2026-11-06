@@ -195,7 +195,7 @@ mod tests {
     /// 教训的同类：只能源码级断言。写法参照 auth.rs 的 LoginGuard 接线守卫。
     #[test]
     fn heavy_handlers_are_actually_wired() {
-        let cases: [(&str, &str, &str); 24] = [
+        let cases: [(&str, &str, &str); 25] = [
             (include_str!("routes/services/packages.rs"), "pkg.install", "services::install"),
             (include_str!("routes/services/packages.rs"), "pkg.upgrade", "services::package_upgrade"),
             (include_str!("routes/services/packages.rs"), "pkg.remove", "services::package_remove"),
@@ -222,18 +222,50 @@ mod tests {
             (include_str!("routes/sites/conf.rs"), "site.conf_put", "sites::conf_put"),
             (include_str!("routes/sites/conf.rs"), "site.conf_restore", "sites::conf_restore"),
             (include_str!("routes/sites/conf.rs"), "site.conf_rollback", "sites::conf_rollback"),
+            // 2026-11-06 F-02②：LLM 测试连接单次最长 8s 外发，曾实测 8 秒 40 次无 429。
+            (include_str!("routes/settings.rs"), "settings.llm_test", "settings::test_llm"),
         ];
         // 清单只能证明「被点名的 action 还在」，证明不了「新加的写 handler 有没有接线」。
         // 对高风险文件额外按文件钉住数量：删一行 / 新增一个没接线的 handler 都会红。
         for (src, want, who) in [
             (include_str!("routes/firewall.rs"), 5usize, "firewall"),
             (include_str!("routes/sites/conf.rs"), 3usize, "sites::conf"),
+            (include_str!("routes/settings.rs"), 1usize, "settings"),
         ] {
             let code = crate::test_support::production_source(src);
             let got = code.matches("check_heavy(").count();
             assert_eq!(got, want, "{who} 的 check_heavy 接线数量 = {got}，期望 {want}；\
                 新增写 handler 必须同步接线并更新本断言");
         }
+        // ⭐ 活性自检：cases 是定长数组，删一条会直接编译失败；但「清单里少登记一个
+        // 已接线的 action」不会让任何 needle 断言变红。再按文件钉一次全仓生产代码里
+        // check_heavy 的总数，并要求每个文件至少扫到 1 处（防路径失效静默归零）：
+        // 删掉任一行接线、或多出一行没登记的接线，都会在这里红。
+        // ⚠ 边界：抓不到「新增一个完全没接线的重活 handler」——总数不变。
+        //   那要靠新增端点时的评审纪律（定长清单 + 按文件计数）兜，别写成全覆盖。
+        let all_route_sources: [(&str, &str); 13] = [
+            ("containers", include_str!("routes/containers.rs")),
+            ("firewall", include_str!("routes/firewall.rs")),
+            ("backups", include_str!("routes/backups.rs")),
+            ("packages", include_str!("routes/services/packages.rs")),
+            ("apps", include_str!("routes/apps.rs")),
+            ("sites::apply", include_str!("routes/sites/apply.rs")),
+            ("sites::conf", include_str!("routes/sites/conf.rs")),
+            ("sites::ssl", include_str!("routes/sites/ssl.rs")),
+            ("assistant", include_str!("routes/assistant.rs")),
+            ("system", include_str!("routes/system.rs")),
+            ("databases", include_str!("routes/databases.rs")),
+            ("cron", include_str!("routes/cron.rs")),
+            ("settings", include_str!("routes/settings.rs")),
+        ];
+        let total: usize = all_route_sources.iter().map(|(who, src)| {
+            let code = crate::test_support::production_source(src);
+            let n = code.matches("check_heavy(").count();
+            assert!(n > 0, "{who} 未扫到任何限流接线（扫描失效，绝不能算通过）");
+            n
+        }).sum();
+        assert_eq!(total, 26, "全仓 check_heavy 接线总数 = {total}，期望 26；\
+            删掉任一接线或新增未接线的重活 handler 都必须显式更新本断言");
         for (src, action, who) in cases {
             // 生产段：剔注释行 + 剥离测试块（测试里出现同形 needle 会假绿，
             // 见 test_support::production_source 的说明）
