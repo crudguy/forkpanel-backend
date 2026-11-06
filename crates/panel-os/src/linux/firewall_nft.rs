@@ -23,14 +23,23 @@ use crate::cmd::{Bin, CmdOpt};
 use crate::traits::*;
 use async_trait::async_trait;
 use panel_core::{Capability, FirewallBackend, PanelError, Result};
+use std::path::PathBuf;
 use std::time::Duration;
 
 const TABLE: &str = "panelfw";
 const CHAIN: &str = "input";
 
-pub struct NftFirewall;
+pub struct NftFirewall {
+    /// 规则持久化文件：内容是 `nft list table` 的原样输出，可被 `nft -f` 直接重放。
+    /// `None` = 不持久化（单测 / 无数据目录场景）。
+    persist_path: Option<PathBuf>,
+}
 
 impl NftFirewall {
+    pub fn new(persist_path: Option<PathBuf>) -> Self {
+        Self { persist_path }
+    }
+
     /// 探测是否可用（仅 `nft` 二进制存在时启用）。
     pub fn available() -> bool {
         Bin::Nft.available()
@@ -78,6 +87,44 @@ impl NftFirewall {
         }
         Ok(parse_panel_rules(&out.stdout))
     }
+
+    /// 把当前内核态规则落到 `persist_path`（`nft list table` 的输出本身就能被 `nft -f` 重放）。
+    /// 表不存在（已停用）时删除文件——否则下次启动会把"已停用"恢复成启用。
+    async fn persist(&self) -> Result<()> {
+        let Some(path) = &self.persist_path else { return Ok(()) };
+        let out = self.nft(&["list", "table", "inet", TABLE], Duration::from_secs(10)).await?;
+
+        if out.code != Some(0) {
+            match tokio::fs::remove_file(path).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(PanelError::Internal(
+                    format!("删除持久化文件 {} 失败: {e}", path.display()))),
+            }
+            return Ok(());
+        }
+
+        let Some(dir) = path.parent() else {
+            return Err(PanelError::Internal(format!("持久化路径无父目录: {}", path.display())));
+        };
+        tokio::fs::create_dir_all(dir).await.map_err(|e| PanelError::Internal(
+            format!("创建目录 {} 失败: {e}", dir.display())))?;
+
+        // 先写临时文件再 rename：写到一半掉电不会留下半截脚本（半截 = 下次启动校验失败）
+        let tmp = path.with_extension("nft.tmp");
+        tokio::fs::write(&tmp, &out.stdout).await.map_err(|e| PanelError::Internal(
+            format!("写入 {} 失败: {e}", tmp.display())))?;
+        tokio::fs::rename(&tmp, path).await.map_err(|e| PanelError::Internal(
+            format!("rename {} → {} 失败: {e}", tmp.display(), path.display())))?;
+        Ok(())
+    }
+
+    /// 落盘失败不让主操作失败（规则已在内核生效），但必须留痕——绝不静默。
+    async fn persist_warn(&self, op: &str) {
+        if let Err(e) = self.persist().await {
+            eprintln!("[warn] firewall {op}: 操作已生效，但规则持久化失败（重启后会丢失）: {e}");
+        }
+    }
 }
 
 #[async_trait]
@@ -108,6 +155,8 @@ impl FirewallProvider for NftFirewall {
             // 停用 = 删掉整张面板表（只含面板规则，不碰用户其它规则）
             let _ = self.nft(&["delete", "table", "inet", TABLE], Duration::from_secs(10)).await;
         }
+        // 启用后落盘（哪怕只是空表）、停用后删文件：否则下次启动会把"已停用"恢复成启用
+        self.persist_warn("set_active").await;
         Ok(())
     }
 
@@ -138,7 +187,7 @@ impl FirewallProvider for NftFirewall {
         let mut added = 0;
         // apply 不再删除任何规则：removed 恒 0；失败也不吞成 warning（假成功）。
         let removed = 0;
-        let warnings = Vec::new();
+        let mut warnings = Vec::new();
 
         for i in additions {
             let rule = &plan.rules[i];
@@ -155,6 +204,10 @@ impl FirewallProvider for NftFirewall {
                 });
             }
             added += 1;
+        }
+        // 落盘失败不升级为 apply 失败（规则已在内核生效），但必须让前端看见
+        if let Err(e) = self.persist().await {
+            warnings.push(format!("规则已写入内核但持久化失败（重启后会丢失）: {e}"));
         }
         Ok(ApplyReport { added, removed, unchanged, warnings })
     }
@@ -173,6 +226,7 @@ impl FirewallProvider for NftFirewall {
             &["delete", "rule", "inet", TABLE, CHAIN, "handle", &h],
             Duration::from_secs(15),
         ).await?;
+        self.persist_warn("delete_rule").await;
         Ok(())
     }
 
@@ -191,6 +245,7 @@ impl FirewallProvider for NftFirewall {
         // 空表会让 is_active() 变成 true，等于失败回滚反而偷偷把防火墙启用了。
         if text.trim().is_empty() {
             let _ = self.nft(&["delete", "table", "inet", TABLE], Duration::from_secs(10)).await;
+            self.persist_warn("restore_snapshot").await;
             return Ok(());
         }
 
@@ -213,6 +268,47 @@ impl FirewallProvider for NftFirewall {
                 })?;
             }
         }
+        self.persist_warn("restore_snapshot").await;
+        Ok(())
+    }
+
+    async fn restore_persisted(&self) -> Result<()> {
+        let Some(path) = &self.persist_path else { return Ok(()) };
+        self.ensure_nft()?;
+
+        // 表已存在 = 本次开机后已经生效过（用户刚操作，或上一次恢复已装回）。
+        // 此时用文件覆盖会抹掉现行状态，必须跳过。
+        let out = self.nft(&["list", "table", "inet", TABLE], Duration::from_secs(10)).await?;
+        if out.code == Some(0) {
+            return Ok(());
+        }
+
+        let bytes = match tokio::fs::read(path).await {
+            Ok(b) => b,
+            // 从未启用过 → 没有文件，正常
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(PanelError::Internal(
+                format!("读取持久化文件 {} 失败: {e}", path.display()))),
+        };
+        if bytes.iter().all(|b| b.is_ascii_whitespace()) {
+            return Ok(());
+        }
+        let p = path.to_string_lossy().to_string();
+
+        // 先 `-c` 干跑校验：坏文件（例如掉电截断）不能把内核表建成半残状态
+        let check = self.nft(&["-c", "-f", &p], Duration::from_secs(20)).await?; // ci-allow-layering[2]: nft 的 -c 是 dry-run check 开关，不是 sh -c；argv 直传不经 shell
+        if check.code != Some(0) {
+            return Err(PanelError::Command {
+                bin: "nft".into(),
+                detail: format!("持久化文件 {} 校验失败: {}", path.display(), check.stderr.trim()),
+            });
+        }
+        self.nft_checked(&["-f", &p], Duration::from_secs(20)).await.map_err(|e| {
+            PanelError::Command {
+                bin: "nft".into(),
+                detail: format!("从 {} 恢复规则失败: {e}", path.display()),
+            }
+        })?;
         Ok(())
     }
 
@@ -550,7 +646,7 @@ table inet panelfw {
     fn capability_is_honest() {
         // 本测试环境若无 nft 二进制，capability 必须 no；有则 yes。
         // 不假设二进制存在，只验证与 Bin::Nft.available() 一致。
-        let fw = NftFirewall;
+        let fw = NftFirewall::new(None);
         assert_eq!(fw.capability().supported, Bin::Nft.available(),
                    "能力位必须与二进制实际可用性一致，否则前端会伪造成功");
     }
@@ -559,7 +655,7 @@ table inet panelfw {
     /// 不得因后端是 nft 就被判死）。防未来有人回退成硬编码 `no`。
     #[test]
     fn fail2ban_capability_delegates_to_shared_impl() {
-        let fw = NftFirewall;
+        let fw = NftFirewall::new(None);
         assert_eq!(
             fw.fail2ban_capability().supported,
             crate::linux::fail2ban::Fail2ban::capability().supported,

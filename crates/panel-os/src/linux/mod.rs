@@ -33,7 +33,7 @@ pub mod terminal;
 
 use crate::{
     cmd::Bin,
-    paths::LinuxPathLayout,
+    paths::{LinuxPathLayout, PathLayout},
     traits::*,
 };
 use panel_core::{PlatformInfo, Result};
@@ -63,10 +63,11 @@ pub struct LinuxOsAdapter {
 impl LinuxOsAdapter {
     pub fn new() -> Self {
         let paths = Arc::new(LinuxPathLayout::default());
+        let firewall = make_firewall(&paths);
         Self {
             metrics: Arc::new(metrics::LinuxMetrics::new()),
             services: Arc::new(services::LinuxServices::detect()),
-            firewall: make_firewall(),
+            firewall,
             packages: Arc::new(providers::LinuxPackages::detect()),
             logs: Arc::new(providers::LinuxLogs::detect(paths.clone())),
             scheduler: Arc::new(scheduler::LinuxScheduler),
@@ -94,6 +95,8 @@ impl LinuxOsAdapter {
     /// `[paths]` 覆盖不生效（落入 `LinuxPathLayout::default()` = /var/www）。
     pub fn with_paths(paths: Arc<LinuxPathLayout>) -> Self {
         let mut s = Self::new();
+        // 防火墙的持久化文件落在 data_dir，必须跟着覆盖后的 paths 重建（否则写到默认路径）
+        s.firewall = make_firewall(&paths);
         s.webserver = Arc::new(providers::LinuxWebServer::detect(paths.clone()));
         s.logs = Arc::new(providers::LinuxLogs::detect(paths.clone()));
         s.containers = Arc::new(containers::LinuxContainers::detect(paths.clone()));
@@ -113,11 +116,13 @@ impl Default for LinuxOsAdapter { fn default() -> Self { Self::new() } }
 ///
 /// 注意：`Arc<dyn FirewallProvider>` 是 trait object——能力位由具体实现决定，
 /// 路由层据此置灰 UI，绝不伪造成功。
-fn make_firewall() -> Arc<dyn FirewallProvider> {
+fn make_firewall(paths: &Arc<LinuxPathLayout>) -> Arc<dyn FirewallProvider> {
     if Bin::Ufw.available() {
+        // ufw 自带 /etc/ufw 持久化，不需要面板落盘
         Arc::new(firewall::LinuxFirewall::detect())
     } else if firewall_nft::NftFirewall::available() {
-        Arc::new(firewall_nft::NftFirewall)
+        // nft 规则是纯内存态：落盘到 data_dir，由 serve 启动时 restore_persisted() 装回
+        Arc::new(firewall_nft::NftFirewall::new(Some(paths.data_dir().join("panelfw.nft"))))
     } else {
         Arc::new(firewall::LinuxFirewall::detect())
     }

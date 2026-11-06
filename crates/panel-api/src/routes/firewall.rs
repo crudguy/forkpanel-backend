@@ -50,8 +50,10 @@ pub async fn list(
     let active = state.os.firewall().is_active().await?;
 
     let dtos: Vec<RuleDto> = rules.into_iter().map(|r| RuleDto {
-        panel_managed: r.comment.as_deref()
-            .map(|c| c.contains(PANEL_MARK)).unwrap_or(false),
+        // 用规则自身的标记位，而不是回看 comment 前缀：`to_rule` 已把标记剥成纯用户备注
+        // （不剥的话回滚重放会层层嵌套），再拿 comment 判断会让所有面板规则变成 false，
+        // 前端因此不再给它们显示删除入口。
+        panel_managed: r.panel_managed,
         id: r.id,
         ports: render_ports(&r.ports),
         protocol: match r.protocol { panel_os::Protocol::Tcp => "tcp",
@@ -189,9 +191,10 @@ pub async fn apply(
             action,
             direction: panel_os::Direction::Inbound,
             source_cidr: r.source.clone(),
-            // 打标记 + 带 id：这是"只删自己写的、且删对那一条"能成立的前提
-            comment: Some(format!("{} {} {}", PANEL_MARK, rid,
-                r.comment.clone().unwrap_or_default()).trim().to_string()),
+            // 只存用户备注：面板标记由实现层（nft / ufw）写 comment 时统一加一次。
+            // 这里再拼一次会得到 `panel-managed <impl_id> panel-managed <rid>` 的双层前缀
+            // （现场已有这类数据），回滚重放还会层层累加，最终撞上 comment 长度上限。
+            comment: r.comment.clone(),
             panel_managed: true,
         });
     }

@@ -95,6 +95,12 @@ pub(crate) fn run(cli: &Cli, os: Arc<dyn panel_os::OsAdapter>) -> Result<()> {
             tracing::warn!("发现 {orphans} 个中断任务，需在界面上人工确认后重试");
         }
 
+        // 防火墙规则是 nft 的内存态，进程/机器重启即丢；上次退出前落在 data_dir，
+        // 这里装回。**失败不阻断启动**（附属能力），但必须留痕，不许静默。
+        if let Err(e) = os.firewall().restore_persisted().await {
+            tracing::warn!("恢复上次落盘的防火墙规则失败（可手工重建）: {e}");
+        }
+
         let metrics = Arc::new(std::sync::Mutex::new(panel_db::aggregator::Aggregator::new(tier)));
 
         // ── 主密钥：SSL 私钥 / 数据库口令的 AES-256-GCM 加密密钥（M0 阻塞项已关闭）──

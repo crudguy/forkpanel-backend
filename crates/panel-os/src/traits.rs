@@ -651,6 +651,14 @@ pub trait FirewallProvider: Send + Sync {
     /// 规则快照用于"误操作应急恢复"（防 SSH 失联，设计方案 §4-M5）
     async fn snapshot(&self) -> Result<Vec<u8>>;
     async fn restore_snapshot(&self, data: &[u8]) -> Result<()>;
+    /// 启动时把上次进程落盘的规则重新装回内核。
+    ///
+    /// nft 的规则是**纯内存态**（不像 ufw 自带 `/etc/ufw` 持久化），进程退出/机器重启即丢；
+    /// 由 `serve` 启动时调用一次。实现约定：
+    /// - **只在表不存在时恢复**，绝不覆盖本 boot 内已经生效的现行规则；
+    /// - 没有落盘文件（从未启用过）视为成功，不是错误；
+    /// - 默认实现为空——ufw/firewalld 等自带持久化的后端无需处理。
+    async fn restore_persisted(&self) -> Result<()> { Ok(()) }
     /// fail2ban 能力位（独立于防火墙后端，按 fail2ban-client 存在性判定）。
     fn fail2ban_capability(&self) -> Capability;
     /// 总览：可用性与各 jail 状态。
