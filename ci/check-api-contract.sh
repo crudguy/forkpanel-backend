@@ -233,5 +233,36 @@ else
   fail "ssl/apply 端点缺少 400 成因描述（method 非法 / 域名为空 / 缺邮箱）"
 fi
 
+# ── [I] 前端静态路径必须已在契约中声明（契约完整性）──
+# 背景：[A] 只证明「后端有这条真实路由」，[E] 只校验契约文件自身结构与副本一致。
+#   两者合起来仍有盲区：**路由存在但 openapi 漏写**——前端跑得通、A/E 全绿，
+#   但契约是唯一事实源，漏写会让按契约生成的客户端、第三方集成、审计全部看不到该端点。
+#   这类漏写此前只在人工 review 里偶发发现（无自动判据）。
+# 判据：FRONTEND（前端静态字面量）⊆ CONTRACT（openapi 顶层路径键，缩进 2 空格）。
+#   模板化路径（{id} / ${expr}）不在本段范围——它们由 [F] 归一化后比对。
+echo
+echo "== [I] 前端静态路径必须已在契约中声明 =="
+CONTRACT=$(grep -oE '^  /api/v1/[^:]+:' docs/api/openapi.yaml 2>/dev/null \
+  | sed -E 's/^  //; s/:$//' | sort -u)
+CONTRACT_N=$(printf '%s\n' "$CONTRACT" | grep -c .)
+# 空集自检：抽取塌成 0 时下面的比对会对每条前端路径都"不在契约中"或干脆空转，
+# 两种都会给出错误结论（恒红或恒绿）。锚定一个明显低于当前的量级，风格变化即报警。
+if [ "$CONTRACT_N" -lt 100 ]; then
+  fail "契约路径提取异常：仅 ${CONTRACT_N} 条（应 ≥100）——缩进或路径键写法变了，判据前提不成立"
+else
+  CONTRACT_MISS=""
+  for p in $FRONTEND; do
+    # here-string 而非管道：本脚本开了 pipefail，grep -q 命中即退出会让写端收
+    # SIGPIPE，把"确实存在"误判成缺失（[A] 踩过同一个坑）。
+    grep -qxF -- "$p" <<< "$CONTRACT" || CONTRACT_MISS="$CONTRACT_MISS $p"
+  done
+  if [ -n "$CONTRACT_MISS" ]; then
+    fail "前端调用了契约未声明的路径：$CONTRACT_MISS"
+    echo "      修法：补进 docs/api/openapi.yaml（并同步前端副本），或修正前端路径"
+  else
+    pass "全部前端静态路径均已在契约声明（契约 ${CONTRACT_N} 条）"
+  fi
+fi
+
 echo
 if [ "$FAIL" -eq 0 ]; then echo "PASS：前后端契约一致"; exit 0; else echo "FAIL：契约不一致"; exit 1; fi
