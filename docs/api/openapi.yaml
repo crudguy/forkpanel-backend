@@ -1183,28 +1183,39 @@ components:
       type: object
       properties:
         active:  { type: boolean }
-        backend: { type: [string, "null"], example: nftables }
-        snapshot_id: { type: [string, "null"], description: "最近一次规则快照，用于应急恢复" }
+        backend: { type: [string, "null"], example: nftables, description: "nftables / ufw / iptables / firewalld / none" }
     FirewallRule:
       type: object
       properties:
-        id:      { type: string }
-        port:    { type: string, example: "443" }
-        proto:   { type: string, enum: [tcp, udp] }
+        id:      { type: string, description: "规则 id（写进内核 comment，删除时用它定位）" }
+        ports:   { type: string, example: "443", description: "端口规格：单端口 / 范围 a-b / 逗号分隔列表" }
+        protocol: { type: string, enum: [tcp, udp, icmp, any] }
         direction: { type: string, enum: [in, out] }
-        action:  { type: string, enum: [allow, deny] }
+        action:  { type: string, enum: [allow, deny, reject] }
         source:  { type: [string, "null"], description: "CIDR 或 null=任意" }
-        note:    { type: [string, "null"] }
-    FirewallRuleCreate:
-      required: [port, action]
+        comment: { type: [string, "null"], description: "用户备注（面板标记已剥离）" }
+        panel_managed: { type: boolean, description: "是否由面板创建；只有这些允许删除" }
+    FirewallRuleList:
       type: object
       properties:
-        port: { type: string }
-        proto: { type: string, enum: [tcp, udp], default: tcp }
-        direction: { type: string, enum: [in, out], default: in }
-        action: { type: string, enum: [allow, deny] }
-        source: { type: [string, "null"] }
-        note: { type: string }
+        active:  { type: boolean }
+        backend: { type: string, example: nftables }
+        rules:   { type: array, items: { $ref: '#/components/schemas/FirewallRule' } }
+    FirewallRuleInput:
+      required: [ports]
+      type: object
+      properties:
+        ports:    { type: string, example: "8080", description: "端口规格：单端口 / 范围 a-b / 逗号分隔列表" }
+        protocol: { type: string, enum: [tcp, udp, icmp, any], default: tcp }
+        action:   { type: string, enum: [allow, deny, reject], default: allow }
+        source:   { type: [string, "null"], description: "CIDR 或 null=任意" }
+        comment:  { type: string, description: "用户备注（面板标记由服务端统一加）" }
+    FirewallRuleApplyReq:
+      required: [rules]
+      type: object
+      properties:
+        rules: { type: array, items: { $ref: '#/components/schemas/FirewallRuleInput' } }
+        allow_lockout_risk: { type: boolean, description: "显式承担 SSH 失联风险（deny/reject 命中 22 时必填）" }
 
     # ───────────── 安全 ─────────────
     SecurityBaselineItem:
@@ -3864,7 +3875,7 @@ paths:
       summary: 开关（大按钮 + 二次确认防误关）
       security: [cookieAuth, csrfHeader]
       requestBody: { required: true, content: { application/json: { schema: { type: object, required: [enabled], properties: { enabled: { type: boolean } } } } } }
-      responses: { '204': { description: ok }, '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' } }
+      responses: { '200': { description: "已切换，返回 { active }" }, '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' } }
   /api/v1/firewall/rules:
     get:
       operationId: get_firewall_rules
@@ -3875,7 +3886,7 @@ paths:
           description: ok
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/FirewallRule' } } } }
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/FirewallRuleList' } } }
     post:
       operationId: post_firewall_rules
       tags: [firewall]
@@ -3885,16 +3896,22 @@ paths:
         幂等且不重复新增。**不会删除任何既有规则**——删除请走 DELETE 端点。
         F-20 之前按「期望最终状态」实现，放行第二个端口会把第一个删掉。
       security: [cookieAuth, csrfHeader]
-      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/FirewallRuleCreate' } } } }
-      responses: { '201': { description: 已创建 }, '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' } }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/FirewallRuleApplyReq' } } } }
+      responses:
+        '200':
+          description: "已应用；added/unchanged 为本次新增与已存在的条数，warnings 非空表示落盘失败等非致命问题"
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { added: { type: integer }, removed: { type: integer }, unchanged: { type: integer }, warnings: { type: array, items: { type: string } }, snapshot_bytes: { type: integer } } } } }
+        '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' }
   /api/v1/firewall/rules/{id}:
     delete:
       operationId: delete_firewall_rules_id
       tags: [firewall]
       summary: 删除规则
       security: [cookieAuth, csrfHeader]
-      parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: "容器名称或 ID；表按名称索引（ID 随重建变化，名称通常保留），不强制 Docker 可达" }]
-      responses: { '204': { description: ok }, '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' } }
+      parameters: [{ name: id, in: path, required: true, schema: { type: string }, description: "规则 id（GET /rules 返回的 id）；只允许删面板自己创建的规则" }]
+      responses: { '200': { description: "已删除，返回 { deleted: id }" }, '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' } }
 
   /api/v1/firewall/fail2ban:
     get:
