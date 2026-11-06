@@ -85,7 +85,10 @@ echo
 echo "== [A] 前端路径必须在后端存在 =="
 MISSING=""
 for p in $FRONTEND; do
-  if ! echo "$BACKEND" | grep -qxF "$p"; then
+  # ⚠ 不能用 `echo "$BACKEND" | grep -qxF`：本脚本开了 pipefail，grep -q 命中即退出，
+  #   写端有可能收 SIGPIPE ⇒ 管道返回非 0 ⇒ 把「后端确实存在的路由」误判成缺失
+  #   （2026-11-06 make check 偶发报过一次 /api/v1/auth/password）。here-string 不产生管道。
+  if ! grep -qxF -- "$p" <<< "$BACKEND"; then
     MISSING="$MISSING $p"
   fi
 done
@@ -163,7 +166,7 @@ if [ "$BE_TPL_N" -lt 20 ] || [ "$FE_TPL_N" -lt 20 ]; then
 else
   TPL_MISS=""
   for p in $FE_TPL; do
-    printf '%s\n' "$BE_TPL" | grep -qxF "$p" || TPL_MISS="$TPL_MISS $p"
+    grep -qxF -- "$p" <<< "$BE_TPL" || TPL_MISS="$TPL_MISS $p"
   done
   if [ -n "$TPL_MISS" ]; then
     fail "前端调用的模板化路径在后端无对应路由（归一化后）：$TPL_MISS"
