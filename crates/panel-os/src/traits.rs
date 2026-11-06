@@ -2,8 +2,10 @@
 //!
 //! 设计原则（设计方案 §0.3）：
 //! 1. 定义"能做什么"（能力），而非"怎么做"（命令）—— 业务层禁止出现命令名。
-//! 2. 写操作一律**声明式**：提交"期望的最终状态"（如 `RulePlan`），由平台实现翻译成
-//!    `nft` / `iptables` / `netsh` / `pfctl` 的具体命令。这是跨平台零改动的根本保证。
+//! 2. 多数写操作是**声明式**（提交期望的最终状态）；**防火墙规则是例外**：
+//!    `RulePlan` 是「本次要确保存在的规则集合」，实现只新增缺失的、幂等跳过已有的，
+//!    **绝不删不在集合里的既有规则**；删除必须走 `delete_rule(id)` 显式端点。
+//!    （F-20：曾按全量替换实现，导致「放行第二个端口就删掉第一个」。）
 //! 3. 所有可能阻塞的操作都是 async；所有返回路径的签名都使用 `SafePath`（已校验）。
 //! 4. 不支持的能力返回 `PanelError::Unsupported`，**绝不能 panic 或返回空数据假装成功**。
 
@@ -550,12 +552,18 @@ pub struct FirewallRule {
     pub panel_managed: bool,
 }
 
-/// 期望的最终状态 —— 实现必须做到**幂等**（一致性测试会验证）
+/// 本次要**确保存在**的规则集合（追加语义，不是全量最终状态）。
+///
+/// 硬约束（F-20）：实现只写入 [`plan_additions`] 判出的缺失规则，已存在且功能一致的
+/// 计 `unchanged`；**不得删除任何不在集合里的既有规则**。删除只能由调用方显式走
+/// `delete_rule(id)`。实现必须幂等（一致性测试会验证）。
+///
+/// 「只管理面板自己写的规则」由实现层保证：幂等比对只读带 `panel-managed` 标记的
+/// 规则，`delete_rule` 也只接受带标记者。这不该由调用方传开关——旧字段
+/// `replace_panel_managed_only` 从未被任何实现读取（配置项假控制），已删除。
 #[derive(Debug, Clone, Default)]
 pub struct RulePlan {
     pub rules: Vec<FirewallRule>,
-    /// 面板只管理自己写入的规则（以注释/标记识别），不得破坏用户既有规则
-    pub replace_panel_managed_only: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -564,6 +572,43 @@ pub struct ApplyReport {
     pub removed: usize,
     pub unchanged: usize,
     pub warnings: Vec<String>,
+}
+
+/// 两条规则「功能上是否一致」：比较端口 / 协议 / 动作 / 方向 / 来源，
+/// 忽略内部随机 id 与注释（随每次写入变化，不代表语义变化）。
+pub fn rules_functionally_eq(a: &FirewallRule, b: &FirewallRule) -> bool {
+    a.ports == b.ports
+        && a.protocol == b.protocol
+        && a.action == b.action
+        && a.direction == b.direction
+        && a.source_cidr == b.source_cidr
+}
+
+/// 决策：plan 里哪些规则需要写入（返回下标），其余计 `unchanged`。
+///
+/// ⚠ F-20 的核心判据：**只读 existing，绝不产出「要删什么」**。ufw / nft 两个真实
+/// 后端与测试共用这一份，避免各自实现时把「过期清理」又写回来。
+pub fn plan_additions(existing: &[FirewallRule], wanted: &[FirewallRule]) -> Vec<usize> {
+    wanted.iter().enumerate()
+        .filter(|(_, w)| !existing.iter().any(|e| rules_functionally_eq(e, w)))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// 把内部标记 comment 洗成用户备注，供规则列表展示。
+///
+/// 面板写入格式是 `panel-managed <id> <用户备注>`；路由层与实现层历史上各拼过一次
+/// 标记，因此这里**循环剥前缀**以兼容已落盘的双层标记数据。非面板规则原样返回。
+pub fn user_comment(comment: Option<&str>) -> Option<String> {
+    let mut s = comment?;
+    while let Some(rest) = s.strip_prefix("panel-managed ") {
+        s = match rest.split_once(' ') {
+            Some((_id, tail)) => tail.trim_start(),
+            None => "",
+        };
+    }
+    let s = s.trim();
+    if s.is_empty() { None } else { Some(s.to_string()) }
 }
 
 /// fail2ban 监狱（jail）状态——防 SSH 等服务被暴力破解的封禁统计。

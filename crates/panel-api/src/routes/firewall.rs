@@ -4,7 +4,8 @@
 //!
 //! 1. **改规则前必须先快照**：`apply` 之前无条件 `snapshot()`。
 //!    误封 SSH 端口是自建面板最经典的"把自己锁在门外"事故。
-//! 2. **只管理自己写的规则**：`RulePlan::replace_panel_managed_only` 必须为 true。
+//! 2. **只管理自己写的规则**：幂等比对只认带 `panel-managed` 标记的规则，
+//!    `delete_rule` 拒绝删用户自建规则；`apply` 一律追加，不删既有规则（F-20）。
 //!    面板绝不能清掉用户手动加的规则——那会让用户别的安全措施一起失效。
 //! 3. **SSH 端口保护**：拒绝任何会阻断当前 SSH 连接端口的规则，
 //!    除非请求里显式声明 `allow_lockout_risk`（且 UI 必须二次确认）。
@@ -63,7 +64,8 @@ pub async fn list(
         direction: match r.direction { panel_os::Direction::Inbound => "in",
                                        _ => "out" },
         source: r.source_cidr,
-        comment: r.comment,
+        // 面板规则的 comment 里存着内部标记与 id，展示前洗成用户备注（F-20）。
+        comment: panel_os::user_comment(r.comment.as_deref()),
     }).collect();
 
     Ok(ok(serde_json::json!({
@@ -197,7 +199,8 @@ pub async fn apply(
     // ── 应用前无条件快照 ──
     let snapshot = state.os.firewall().snapshot().await?;
 
-    let plan = panel_os::RulePlan { rules, replace_panel_managed_only: true };
+    // F-20：apply 是「确保存在」的追加语义，绝不删既有规则；删除走 delete_rule(id)。
+    let plan = panel_os::RulePlan { rules };
     let report = match state.os.firewall().apply(plan).await {
         Ok(r) => r,
         Err(e) => {
@@ -217,7 +220,7 @@ pub async fn apply(
         "removed": report.removed,
         "unchanged": report.unchanged,
         "warnings": report.warnings,
-        // 返回快照 id，UI 提供"撤销本次变更"入口
+        // 快照只用于本次 apply 失败时的自动回滚；前端目前没有撤销入口，别写成已有。
         "snapshot_bytes": snapshot.len(),
     })))
 }

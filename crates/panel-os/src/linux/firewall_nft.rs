@@ -3,7 +3,7 @@
 //! 与 ufw 后端同样严格落实三条硬约束：
 //! 1. 改规则前无条件 `snapshot()`（路由 `apply` 已调用）；
 //! 2. **只管理面板自己写的规则**：规则 comment 带 `panel-managed <id>` 标记，
-//!    `delete_rule` / `apply`（先删全部面板规则再重加）都只碰这些规则，绝不删用户既有规则；
+//!    `delete_rule` / `apply` 的幂等比对都只认这些规则，绝不删用户既有规则；
 //! 3. SSH(22) 端口保护在路由层（`locks_out_ssh` + `allow_lockout_risk`）拦截。
 //!
 //! 设计要点：
@@ -127,34 +127,36 @@ impl FirewallProvider for NftFirewall {
         self.ensure_nft()?;
         self.ensure_table().await?;
 
-        // 1) 先删所有面板自有规则（按 handle，逆序避免删一条后 handle 前移）
-        let mut removed = 0;
-        for (h, _, _) in self.list_panel_handles().await?.into_iter().rev() {
-            let hs = h.to_string();
-            if self.nft(
-                &["delete", "rule", "inet", TABLE, CHAIN, "handle", &hs],
-                Duration::from_secs(15),
-            ).await.is_ok() {
-                removed += 1;
-            }
-        }
+        // 现状：只取面板自有规则，**仅用于幂等判定**。
+        // ⚠ F-20：apply 是追加语义，绝不删既有规则；删除只走 delete_rule(id)。
+        let existing: Vec<FirewallRule> = self.list_panel_handles().await?
+            .into_iter().filter_map(to_rule).collect();
 
-        // 2) 加新规则（每条带 panel-managed <id> 标记）
+        // 与 ufw 后端共用同一份判据：只回答「要加哪几条」，不产出「要删什么」。
+        let additions = plan_additions(&existing, &plan.rules);
+        let unchanged = plan.rules.len() - additions.len();
         let mut added = 0;
-        let mut warnings = Vec::new();
-        for rule in &plan.rules {
+        // apply 不再删除任何规则：removed 恒 0；失败也不吞成 warning（假成功）。
+        let removed = 0;
+        let warnings = Vec::new();
+
+        for i in additions {
+            let rule = &plan.rules[i];
             let id = gen_id();
             let expr = render_rule(rule, &id);
             let e = expr.as_str();
-            match self.nft_checked(
+            if let Err(err) = self.nft_checked(
                 &["add", "rule", "inet", TABLE, CHAIN, e],
                 Duration::from_secs(20),
             ).await {
-                Ok(_) => added += 1,
-                Err(err) => warnings.push(format!("add {} 失败: {}", rule.id, err)),
+                return Err(PanelError::Command {
+                    bin: "nft".into(),
+                    detail: format!("add {} 失败: {}", rule.id, err),
+                });
             }
+            added += 1;
         }
-        Ok(ApplyReport { added, removed, unchanged: 0, warnings })
+        Ok(ApplyReport { added, removed, unchanged, warnings })
     }
 
     async fn delete_rule(&self, id: &str) -> Result<()> {

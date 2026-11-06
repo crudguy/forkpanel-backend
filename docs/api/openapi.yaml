@@ -3879,7 +3879,11 @@ paths:
     post:
       operationId: post_firewall_rules
       tags: [firewall]
-      summary: 应用规则（声明式 RulePlan）
+      summary: 新增/确保规则存在（追加语义）
+      description: |
+        只写入本次提交中尚不存在的规则，功能等价的既有规则计为 unchanged，
+        幂等且不重复新增。**不会删除任何既有规则**——删除请走 DELETE 端点。
+        F-20 之前按「期望最终状态」实现，放行第二个端口会把第一个删掉。
       security: [cookieAuth, csrfHeader]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/FirewallRuleCreate' } } } }
       responses: { '201': { description: 已创建 }, '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' } }

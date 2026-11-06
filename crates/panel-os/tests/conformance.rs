@@ -119,7 +119,7 @@ async fn firewall_apply_is_idempotent() {
         comment: Some("conformance test".into()),
         panel_managed: true,
     };
-    let plan = RulePlan { rules: vec![rule], replace_panel_managed_only: true };
+    let plan = RulePlan { rules: vec![rule] };
 
     match os.firewall().apply(plan.clone()).await {
         Ok(_) => {
