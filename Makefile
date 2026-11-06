@@ -46,6 +46,8 @@ guards:
 	# ⇒ 这批守卫「存在但不跑」。它们只依赖
 	# node 内置模块，CI 自带 node 即可；前端仓未检出时**判红**（与 check-api-contract 同口径）。
 	bash ci/check-ui-guards.sh
+	# F-20：两个防火墙后端的 apply 必须只新增、不删（行为测试挡不住各写一份）
+	python3 ci/check_firewall_append_only.py
 	# 阻塞子进程调用出口唯一性：run_sync 是同步的，裸调会钉住 tokio worker（Q-01）
 	bash ci/check-blocking-calls.sh
 	# 无终端初始化的引导令牌：仅 localhost 可取 + bootstrap 后即删 + 文件 0600。
