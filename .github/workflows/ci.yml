@@ -51,6 +51,35 @@ jobs:
           PANEL_FRONTEND_OPENAPI: ${{ github.workspace }}/forkpanel-frontend/src/api/openapi.yaml
           FE_DIST: ${{ github.workspace }}/forkpanel-frontend/dist
 
+  e2e:
+    name: 真机端到端（自包含临时实例）
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.98.1"
+      - uses: Swatinem/rust-cache@v2
+
+      # RustEmbed 的 #[folder="../../web/dist"] 在编译期要求目录存在；
+      # CI 只需让二进制能编译，不需要真实前端（SPA 由 release.yml 单独打包）。
+      - name: 生成占位 web/dist（供 RustEmbed 编译）
+        run: |
+          mkdir -p web/dist
+          if [ ! -f web/dist/index.html ]; then
+            printf '<!doctype html><meta charset="utf-8"><title>ForkPanel CI placeholder</title>\n' > web/dist/index.html
+          fi
+
+      # ⚠ 退出码是权威信号：e2e-all.sh 在任一域 [skip] 时非零退出，
+      #   「跳过 ≠ 通过」。这里绝不加 continue-on-error / || true，
+      #   否则会重演「什么都没验证却报绿」。runner 自带 curl/python3/ss，
+      #   脚本在临时目录拉起独立实例，不碰 /etc 与 /var/lib、不需要 root。
+      - name: 零 root 端到端（run-e2e-ci.sh）
+        run: bash ci/run-e2e-ci.sh
+        env:
+          PANEL_E2E_TIMEOUT: "900"
+
   audit:
     name: 依赖安全审计（cargo audit）
     runs-on: ubuntu-latest

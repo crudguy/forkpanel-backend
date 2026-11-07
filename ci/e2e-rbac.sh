@@ -96,7 +96,9 @@ trap cleanup EXIT
 # ── 0. 探活 + 登录（owner）──
 if ! curl -s -m 3 "$B/api/v1/version" > /dev/null; then
   say "[skip] 后端不可达：$B —— 本脚本未验证任何东西（请先启动 dev 服务）"
-  exit 0
+  # 跳过 ≠ 通过：单独挂进 CI 时返回 0 会让「什么都没验证」变成绿灯。
+  # e2e-all.sh 靠输出里的 ^\[skip\] 聚合并整体判红，这里只保证单跑也不冒充通过。
+  exit 2
 fi
 say "=== 0. 登录 $B ==="
 curl -s -c "$CJ" -X POST "$B/api/v1/auth/login" -H 'Content-Type: application/json' \
