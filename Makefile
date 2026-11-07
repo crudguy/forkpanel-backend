@@ -56,6 +56,9 @@ guards:
 	# ⚠ 此前它是**孤儿守卫**：脚本写好却没人调用，且 [3] 的判据在 Q-07 搬迁后
 	#   一直指向已搬空的文件（恒红）⇒ 「守卫存在」不等于「守卫在跑」。
 	bash ci/check-bootstrap-token.sh
+	# release panic 策略必须与 CatchPanicLayer 兼容：panic="abort" 下兜底层整体失效，
+	# 而 panic_guard 的单测跑在 dev(unwind) 下恒绿 ⇒ 只能源码级守卫钉住（本轮 P0）。
+	bash ci/check-release-panic.sh
 
 # 内嵌前端新鲜度：改完前端只 cargo build **不会**重新 embed，必须
 # ① vite build → ② rm -rf web/dist/* → ③ cp -a → ④ touch embed.rs → ⑤ cargo build。

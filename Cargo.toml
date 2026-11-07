@@ -31,11 +31,16 @@ rusqlite    = { version = "0.32", features = ["bundled"] }
 arc-swap    = "1"
 
 # ============ Release profile：体积优先，静态链接 ============
+# ⚠ panic 必须是 "unwind"：路由链挂了 CatchPanicLayer（panic_guard.rs），它靠
+#   catch_unwind 把 handler panic 转成结构化 500。设成 "abort" 时 panic 不展开，
+#   整个以 root 运行的面板进程会直接终止，而兜底单测跑在 dev profile 下恒绿、
+#   编译/类型/测试全绿也发现不了。体积代价换「单请求崩溃不拖垮整台面板」。
+#   判据与负向对照见 ci/check-release-panic.sh。
 [profile.release]
 opt-level     = "z"        # 面板是 IO 密集而非计算密集；若压测显示 IO 受影响则改 "s"
 lto           = "fat"
 codegen-units = 1
-panic         = "abort"    # 去掉 unwind 表；若某依赖不兼容则回退 "unwind"
+panic         = "unwind"
 strip         = "symbols"
 incremental   = false
 
