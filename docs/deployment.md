@@ -216,7 +216,16 @@ localhost_only = true     # ← 它会强制覆盖 bind
 
 **方式二：用 `deploy/expose-public.sh` 生成（脚本化，推荐给自动化 / 批量场景）**
 
-不用面板站点模型时，仓库自带一个"一次跑完"的脚本，它上面三步全包了，而且**失败就退干净**：
+不用面板站点模型时，仓库自带一个"一次跑完"的脚本，它上面三步全包了，而且**失败就退干净**。
+
+> ⚠ **前置硬闸：执行前必须先完成 owner 初始化**。经 SSH 隧道或本机走完首启向导
+> （或 `panel init --owner/--owner-pass`），并确认
+> `curl -s http://127.0.0.1:<面板端口>/api/v1/auth/status` 返回 `needs_bootstrap=false`。
+> 原因：官方安装不建账号，首个 owner 由 Web 向导创建；而引导令牌端点只校验 TCP peer
+> 是否回环，本反代从 `127.0.0.1` 转发会让**公网请求被当成 loopback 可信请求**。
+> 若先开反代再首启，白名单网段内任何人都能取到一次性令牌并抢注 owner（面板以 root
+> 运行，内置终端等价 root shell）。脚本会主动探测并拒绝，且生成的 nginx 配置对
+> `/api/v1/auth/bootstrap*` 加了 `deny all` 作为不依赖运行时状态的纵深防御。
 
 ```bash
 sudo ./deploy/expose-public.sh -d panel.example.com -a 203.0.113.0/24 [-a 1.2.3.4/32] \
@@ -229,6 +238,7 @@ sudo ./deploy/expose-public.sh --uninstall          # 撤下反代，面板仍�
 | 步骤 | 做什么 | 漏了会怎样 |
 | --- | --- | --- |
 | 校验 | 不给 `-a/--allow` **直接拒绝**；域名/CIDR 不合法拒绝 | 没有来源限制的反代＝把 root 面板开放到公网任人触达 |
+| 首启检查 | 向 `/api/v1/auth/status` 确认 `needs_bootstrap=false`；未初始化 / 服务不可达 / 响应异常一律拒绝；nginx 层 `deny` 两条引导端点 | 先开反代再首启＝白名单内可抢注 root 面板 |
 | 探测 | 用 `ss -ltn` 看**真实监听**（而非配置文件里的 bind）：非回环即拒绝；`ss` 输出连表头都没有也拒绝 | "没检测到＝没监听"会把裸奔判成安全 |
 | 证书 | 自带 `--fullchain/--key`，或 `--self-signed` 现场生成；CN 没变就**复用**（不会每次重签） | 每次重签会换指纹、也会把用户后放的受信任证书悄悄替回自签 |
 | 配置 | 80 跳 HTTPS + ACME 挑战路径放行、443 终结 TLS、IP 白名单 `deny all`、WebSocket/SSE 转发、放开上传体积 | 少 SSE 那条会表现为"日志流看着卡住" |
@@ -236,7 +246,7 @@ sudo ./deploy/expose-public.sh --uninstall          # 撤下反代，面板仍�
 | 防火墙 | ufw / firewalld 放行 **80 与 443**（80 是续期挑战要走的） | 只开 443：跳转正常，三个月后证书续不上才炸 |
 | 收尾 | 写 systemd drop-in `PANEL_TLS=1` 并重启面板（当前会话会断开，重登即可） | cookie 不带 `Secure`：HTTPS 装了也白装 |
 
-脚本本身有 E2E（`make e2e-expose`）：在 user namespace 里用 tmpfs + systemctl/nginx/ss/ufw 的 shim 真跑一遍，把上面三条拒绝与配置逐条钉住；不具备 `unshare` 时 `[skip]` 退出 2，不冒充通过。
+脚本本身有 E2E（`make e2e-expose`）：在 user namespace 里用 tmpfs + systemctl/nginx/ss/ufw/curl 的 shim 真跑一遍，把上面四条拒绝与配置逐条钉住（含「未初始化必须拒绝」「引导端点块内必须 deny」的负向场景）；不具备 `unshare` 时 `[skip]` 退出 2，不冒充通过。
 
 **方式三：纯手写 nginx（供裁剪参考）**
 
@@ -271,6 +281,10 @@ server {
     # IP 白名单：只放行自己的出口网段，其余一律拒绝（宁可收紧）
     allow 203.0.113.0/24;
     deny  all;
+
+    # 首启引导端点：公网一律拒绝。同机反代会让端点误判为 loopback，
+    # 白名单内任何人都能在 owner 创建前取到令牌抢注 root 面板。
+    location ^~ /api/v1/auth/bootstrap { deny all; }
 
     location / {
         proxy_pass http://127.0.0.1:<面板随机端口>;   # ← 换成实际端口

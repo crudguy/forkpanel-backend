@@ -13,16 +13,20 @@
 #                             [--fullchain F --key K | --self-signed] [--no-firewall]
 #   ./deploy/expose-public.sh --uninstall
 #
-# ## 三条 fail-closed（宁可不做，也不留敞开的大门）
+# ## 四条 fail-closed（宁可不做，也不留敞开的大门）
 #   1) 不给 -a/--allow 直接拒绝：没有来源限制的反代 = 把 root 面板开放到公网任人触达；
 #   2) 面板本身已在非回环监听（已经裸奔）→ 拒绝：此时装反代不但没用，还会让人误以为
 #      “装了就安全”，反而掩盖真实风险；
 #   3) 端口探测跑不起来（ss 输出连表头都没有）→ 拒绝：判据不可信时不能放行，
 #      否则“没检测到 = 没监听”会一路放行会把裸奔判成安全。
+#   4) 尚未完成 owner 初始化（或状态探测不可信）→ 拒绝：官方安装不建账号，首个 owner
+#      走 Web 首启向导；而 bootstrap-token 端点只认 TCP peer 是否 loopback，本反代从
+#      127.0.0.1 转发会让公网请求被当成"本机可信"。先开反代再首启 = 白名单网段内
+#      任何人可抢注一个以 root 运行的面板（内置终端等价 root shell）。
 #
 # ★ 改动本脚本前请看 `ci/e2e-expose-public.sh`：它在 user namespace 里把 /etc、
 #   /var/lib 换成一次性 tmpfs，用 systemctl / nginx / ss / ufw 的 shim 真跑一遍本脚本，
-#   逐条钉住上述三条与生成的 nginx 配置（`make e2e-expose`）。
+#   逐条钉住上述四条与生成的 nginx 配置（`make e2e-expose`）。
 set -euo pipefail
 
 CONF_FILE="${FORKPANEL_CONFIG:-/etc/forkpanel/config.toml}"
@@ -64,7 +68,10 @@ usage() {
 注意：
   -a 必须填**具体的**出口网段：不给就拒绝；给掩码 0（如 0.0.0.0/0）等于不设限制，
     同样拒绝（查自己的出口 IP：curl -s ifconfig.me，再按 /32 填）。
-  本机需要有 nginx；脚本会连带放行防火墙的 **80 与 443**（80 留给证书续期挑战）。
+  本机需要有 nginx 与 curl；脚本会连带放行防火墙的 **80 与 443**（80 留给证书续期挑战）。
+  ★ 前置条件：必须**先完成 owner 初始化**再跑本脚本。脚本会向面板的
+    /api/v1/auth/status 确认 needs_bootstrap=false；尚未初始化、服务不可达或响应
+    异常一律拒绝。请先经 SSH 隧道或本机完成首启向导（或 panel init --owner）。
   生产环境更推荐用面板 UI 自建反代站点（站点→新建→反向代理），那样证书由面板签发
   并随 010_cert_auto_renew 自动续期；本脚本是不走面板站点模型时的轻量路径。
 EOF
@@ -308,6 +315,25 @@ while IFS= read -r addr; do
 done <<< "$HITS"
 echo "· 面板正在 127.0.0.1:$PORT 监听（本体未对外暴露，符合前提）"
 
+# ── ②' 首启初始化状态（fail-closed 第 4 条）────────────────────────────
+# 判据取后端真实状态而非配置：装完面板还没建 owner 时，若先把反代放出去，
+# /api/v1/auth/bootstrap-token 会把经反代进来的请求当成 loopback peer 放行，
+# 白名单网段内任何人都能读到一次性令牌并抢注 owner。故对外开放前必须
+# 确认 needs_bootstrap=false；curl 失败 / 超时 / 响应里没有明确 false 一律拒绝，
+# 绝不把"探测不到"当成"已经初始化"（与第 3 条同款的判据不可信不放行）。
+need_cmd curl
+STATUS_JSON="$(curl -fsS --max-time 5 "http://127.0.0.1:$PORT/api/v1/auth/status" 2>/dev/null || true)"
+STATUS_COMPACT="$(printf '%s' "$STATUS_JSON" | tr -d '[:space:]')"
+case "$STATUS_COMPACT" in
+  *'"needs_bootstrap":false'*) ;;
+  *) die "面板尚未完成 owner 初始化（或状态探测不可信），拒绝开放公网反代。
+  原因：同机反代会让引导令牌端点误判为 loopback，白名单内可抢注 root 面板。
+  请先在本机或 SSH 隧道完成首启向导（或 panel init --owner/--owner-pass），
+  再确认 curl -s http://127.0.0.1:$PORT/api/v1/auth/status 返回 needs_bootstrap=false 后重跑。
+  应急后门：ssh -L $PORT:127.0.0.1:$PORT <user>@<server>" ;;
+esac
+echo "· owner 已初始化（needs_bootstrap=false）"
+
 # ── ③ 证书 ──────────────────────────────────────────────────────────────
 if [ "$SELF_SIGNED" -eq 1 ]; then
   need_cmd openssl
@@ -440,6 +466,17 @@ NGINX
   for c in "${ALLOW[@]}"; do printf '    allow %s;\n' "$c"; done
   cat <<NGINX
     deny all;
+
+    # ── 首启引导端点：公网一律拒绝（纵深防御，不依赖运行时探测）──
+    # 面板的 bootstrap-token 只校验 TCP peer 是否 loopback，而本反代从
+    # 127.0.0.1 转发 ⇒ peer 恒为回环，端点会把公网请求当本机可信请求。
+    # 即使上面已用 /api/v1/auth/status 做过前置检查，这里仍必须封死：
+    # 脚本跑完后若换库 / 重启重新进入首启态，配置层不能依赖一次性探测结果。
+    # ^~ 前缀匹配同时覆盖 /api/v1/auth/bootstrap 与 /bootstrap-token，
+    # 且优先于下面的普通前缀 location /（^~ 命中后不再检查正则 location）。
+    location ^~ /api/v1/auth/bootstrap {
+        deny all;
+    }
 
     location / {
         proxy_pass http://127.0.0.1:$PORT;

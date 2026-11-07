@@ -3,12 +3,13 @@
 #
 # ## 为什么需要
 # `expose-public.sh` 干的是**把 root 权限面板放到公网边缘**这种一步走错就出大事的活：
-# 它会写 nginx 配置、动防火墙、重启面板。它的全部安全性建立在三条 fail-closed 之上
-# （不给 allow 就拒绝 / 面板已裸奔就拒绝 / 端口探测不可信就拒绝），而这类检查最典型的
+# 它会写 nginx 配置、动防火墙、重启面板。它的全部安全性建立在四条 fail-closed 之上
+# （不给 allow 就拒绝 / 面板已裸奔就拒绝 / 端口探测不可信就拒绝 / 未初始化就拒绝），而这类检查最典型的
 # 失效方式是**没人真的跑过它**——写的时候觉得对，某次重构顺手删掉一行，静默退化。
 #
 # ## 边界（诚实说明，不假装覆盖）
-#  - `systemctl` / `nginx` / `ss` / `ufw` 全是 **shim**，只记录调用、**不做真事**。
+#  - `systemctl` / `nginx` / `ss` / `ufw` / `curl` 全是 **shim**，只记录调用、**不做真事**。
+#    故首启状态也是「按用例切换的夹具」，不是真连面板。
 #    故本脚本验的是"调了什么、生成了什么"，**不是**"nginx 真的能转发、ufw 真的放行"。
 #    （真机验收见 docs/deployment.md 2.5 的清单。）
 #  - 自签证书用的是**真 openssl**（不 shim），所以那条路径是真跑的。
@@ -115,12 +116,28 @@ case "$1" in
 esac
 exit 0
 SH
-chmod +x /tmp/e2e-shim/systemctl /tmp/e2e-shim/nginx /tmp/e2e-shim/ss /tmp/e2e-shim/ufw
+cat > /tmp/e2e-shim/curl <<'SH'
+#!/bin/bash
+echo "curl $*" >> /tmp/e2e-shim/calls.log
+[ "${CURL_FAIL:-0}" = "1" ] && exit 1
+cat "${STATUS_FILE:-/dev/null}"
+exit 0
+SH
+chmod +x /tmp/e2e-shim/systemctl /tmp/e2e-shim/nginx /tmp/e2e-shim/ss /tmp/e2e-shim/ufw /tmp/e2e-shim/curl
 export PATH=/tmp/e2e-shim:$PATH
 
 # ss 输出按用例切换：$1=状态名，其后是 ss 的真实输出行
 setss() { local name="$1"; shift; printf '%s\n' "$@" > "$SS_OUT"; }
 reset_log() { : > /tmp/e2e-shim/calls.log; }
+
+# 首启状态夹具：默认「已初始化」；setstatus 切到 true / 空响应，CURL_FAIL=1 模拟探测失败。
+# ⚠ 夹具必须能区分两种实现：只给 true→false 是不够的，还得验「响应里压根没有
+#   needs_bootstrap:false」和「curl 非 0」也都判红，否则守卫删掉判据仍可能恒绿。
+STATUS_FILE=/tmp/e2e-shim/status.json
+CURL_FAIL=0
+export STATUS_FILE CURL_FAIL
+setstatus() { printf '%s\n' "$1" > "$STATUS_FILE"; }
+setstatus '{"code":0,"data":{"needs_bootstrap":false,"token_active":false}}'
 
 # ── 3. 参数校验都必须拒绝（fail-closed）────────────────────────────────
 say '== 3. 参数不合法时一律拒绝（不接受“先装上再说”）=='
@@ -208,6 +225,30 @@ out=$(bash "$SCRIPT" -d panel.example.com -a 203.0.113.0/24 2>&1); rc=$?
 chk "面板已监听 0.0.0.0 必须拒绝" "$rc" "1"
 chk_has "指出已经暴露在外" "$out" "已经自己暴露"
 
+# ── 4.5 首启引导窗口：未初始化 / 判据不可信一律拒绝（fail-closed 第 4 条）──
+say "== 4.5 首启引导窗口必须封死 =="
+setss normal "State   Recv-Q  Send-Q  Local Address:Port  Peer Address:Port" \
+             "LISTEN  0       128     127.0.0.1:$PORT    0.0.0.0:*"
+
+setstatus '{"code":0,"data":{"needs_bootstrap":true,"token_active":true}}'
+out=$(bash "$SCRIPT" -d panel.example.com -a 203.0.113.0/24 2>&1); rc=$?
+chk "needs_bootstrap=true 必须拒绝" "$rc" "1"
+chk_has "拒绝原因要点明是首启窗口" "$out" "拒绝开放公网反代"
+
+setstatus '{"code":0,"data":{}}'
+out=$(bash "$SCRIPT" -d panel.example.com -a 203.0.113.0/24 2>&1); rc=$?
+chk "响应里没有明确的 needs_bootstrap:false 必须拒绝" "$rc" "1"
+
+CURL_FAIL=1
+out=$(bash "$SCRIPT" -d panel.example.com -a 203.0.113.0/24 2>&1); rc=$?
+chk "状态探测失败（curl 非 0）必须拒绝" "$rc" "1"
+CURL_FAIL=0
+
+setstatus '{"code":0,"data":{"needs_bootstrap":false,"token_active":false}}'
+out=$(bash "$SCRIPT" -d panel.example.com -a 203.0.113.0/24 2>&1); rc=$?
+chk "已初始化时放行（前置检查不误伤正常路径）" "$rc" "0"
+if [ "$rc" -ne 0 ]; then say "--------- 输出 ---------"; say "$out"; say "------------------------"; fi
+
 # ── 5. 正常路径：生成什么必须逐条核对 ──────────────────────────────────
 say "== 5. 正常路径生成的 nginx 配置 =="
 setss normal "State   Recv-Q  Send-Q  Local Address:Port  Peer Address:Port" \
@@ -222,6 +263,21 @@ if [ -f "$NGINX_CONF" ]; then
   conf=$(cat "$NGINX_CONF")
   # ⚠ 没有 deny all 就意味着"名单内放行、名单外也放行"——这条是整个脚本的安全底线
   chk_has "配置含 deny all（fail-closed 底线）" "$conf" "deny all;"
+  # 引导端点必须在 nginx 层封死，且判据要指向**该 location 块内**：
+  # 只搜整份文件的 "deny all;" 会命中 server 级白名单那条 ⇒ 恒绿。
+  # ⚠ 刻意不用 awk：/etc 被 tmpfs 盖空后 /usr/bin/awk -> /etc/alternatives/awk
+  #   软链断裂，awk 会「凭空消失」，命令替换静默返回空串 ⇒ 下面两条断言恒红
+  #   （本仓 install.sh / expose-public.sh 都踩过）。纯 bash 内建提取该块。
+  boot_block=""; in_block=0
+  while IFS= read -r line; do
+    case "$line" in *"location ^~ /api/v1/auth/bootstrap"*) in_block=1 ;; esac
+    if [ "$in_block" -eq 1 ]; then
+      boot_block+="$line"$'\n'
+      case "$line" in "    }") break ;; esac
+    fi
+  done < "$NGINX_CONF"
+  chk_has "配置含引导端点 ^~ location" "$boot_block" "location ^~ /api/v1/auth/bootstrap"
+  chk_has "引导端点块内必须 deny all" "$boot_block" "deny all;"
   chk_has "allow 网段 1"  "$conf" "allow 203.0.113.0/24;"
   chk_has "allow 网段 2"  "$conf" "allow 198.51.100.7/32;"
   chk_has "反代指向面板回环端口" "$conf" "proxy_pass http://127.0.0.1:$PORT;"
@@ -418,6 +474,6 @@ rc=$?
 
 if [ "$rc" -eq 0 ]; then
   say ""
-  say "PASS：公网暴露脚本的三条 fail-closed、坏配置回滚与卸载均已钉住"
+  say "PASS：公网暴露脚本的四条 fail-closed、坏配置回滚与卸载均已钉住"
 fi
 exit "$rc"

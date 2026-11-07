@@ -59,6 +59,9 @@ guards:
 	# release panic 策略必须与 CatchPanicLayer 兼容：panic="abort" 下兜底层整体失效，
 	# 而 panic_guard 的单测跑在 dev(unwind) 下恒绿 ⇒ 只能源码级守卫钉住（本轮 P0）。
 	bash ci/check-release-panic.sh
+	# 首启引导窗口：expose 脚本必须先确认 needs_bootstrap=false，且生成的 nginx
+	# 配置对 /api/v1/auth/bootstrap* 加 deny（同机反代会让端点误判为 loopback）。
+	python3 ci/check_expose_bootstrap.py
 
 # 内嵌前端新鲜度：改完前端只 cargo build **不会**重新 embed，必须
 # ① vite build → ② rm -rf web/dist/* → ③ cp -a → ④ touch embed.rs → ⑤ cargo build。
@@ -207,7 +210,7 @@ e2e-upgrade:
 
 # 公网暴露脚本 E2E（deploy/expose-public.sh，在 user namespace 里真跑）。
 # 和 e2e-install 同一路数：不碰 HTTP、不需要运行中的后端，用 tmpfs + systemctl /
-# nginx / ss / ufw 的 shim 在隔离环境里把脚本真跑一遍，逐条核对三条 fail-closed
+# nginx / ss / ufw / curl 的 shim 在隔离环境里把脚本真跑一遍，逐条核对四条 fail-closed
 # （不给 allow 就拒 / 面板已裸奔就拒 / 端口探测不可信就拒）、生成的 nginx 配置、
 # 坏配置必须回滚上一份、以及卸载必须撤干净。
 # 这是"把 root 面板放到公网边缘"的脚本，守卫必须能自证有效：改动脚本 / 断言后，
