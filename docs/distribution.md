@@ -58,7 +58,7 @@ PANEL_CACHE_DIR=/data/forkpanel-cache sudo -E sh get-panel.sh
 默认源是 GitHub Releases。若想走自建源（如 `releases.forkpanel.dev`）或镜像：
 
 ```bash
-# 两步法：先下载脚本（入口用 main 分支源码版或 releases 版均可），执行时切到自建/镜像源
+# 两步法：先下载**固定 tag** 的脚本（不要用 main 分支实时版），执行时切到自建/镜像源
 wget -O get-panel.sh https://raw.githubusercontent.com/crudguy/forkpanel-backend/main/deploy/get-panel.sh
 PANEL_RELEASE_BASE=https://releases.forkpanel.dev sudo -E sh get-panel.sh
 ```
@@ -108,20 +108,37 @@ sudo panel uninstall        # 等价于 /usr/local/bin/panel --config /etc/forkp
 4. 私钥 `release.key` 的**全部内容**（含 `-----BEGIN/END-----` 与换行）原样粘贴为
    GitHub repo secret **`PANEL_RELEASE_KEY`**（GitHub secret 支持多行；release.yml 会还原成文件）。
 
-### 演示密钥的用途
+### 仓库内公钥的身份：由发版流水线证明，不靠文档断言
 
-- 仓库里现存的 `RELEASE_PUBKEY` + `build-static.sh` 默认读的 `$HOME/.forkpanel-release.key`
-  是**一对演示密钥**，专供你**本地联调**整条「签名→下载→验签→安装」链路
-  （用演示私钥签的包，演示公钥能验过）。**正式发版前必须换成你自己的正式密钥对**，
-  否则任何人拿演示私钥都能伪造签名。
+> 本节取代此前「演示密钥的用途」的说法。历史文档曾把仓库内现存的
+> `RELEASE_PUBKEY` 描述为「演示密钥」，而安装器注释又称它「并非占位演示密钥」，
+> 两处自相矛盾 —— 靠人判断密钥身份本身就是风险。
+
+- **四处公钥是同一把**：`deploy/get-panel.sh` 内嵌 PEM、`deploy/release-pubkey.pub`
+  （`panel upgrade` 用 `include_str!` 引用）、`deploy/mirror-sync.sh` 内嵌 PEM，
+  由 `ci/check-docs-consistency.sh` 与 `ci/verify-release-assets.sh` 双重比对。
+- **唯一信任根是 GitHub repo secret `PANEL_RELEASE_KEY`**（ed25519 私钥）。
+- **每次发版自动证明匹配**：`release.yml` 在上传 Release **之前**调用
+  `ci/verify-release-assets.sh`，用**安装器内嵌的那把公钥**（不是从私钥导出的公钥）
+  对双架构 tarball 逐份跑与用户侧完全相同的 `openssl dgst -verify`，并校验
+  `SHA256SUMS`。若 secret 私钥与内嵌公钥不匹配、产物被篡改、架构缺失或摘要不符，
+  发版**当场失败**，不会把用户验不过的资产发出去。
+- ⚠ 但流水线回验**不能证明私钥从未外泄**。若维护者无法确认当前 secret 对应私钥
+  的保管历史（例如曾在本机明文留存、经协作环节传递），仍必须按上一节
+  「首次发布前：生成并配置正式密钥」重新生成并轮换：四处同步公钥、重新发版、
+  替换历史 Release 资产、对外公布公钥指纹。这一步需要维护者本人执行，
+  AI / 脚本不代生成私钥。
 
 ### 密钥分配模型（用户视角）：用户不需要、也不应该生成任何密钥
 
 - **私钥只在你（发布者）手里**：存于 GitHub secret `PANEL_RELEASE_KEY`，仅用于给每次
   发布的 tarball 签名。**用户永远拿不到、也不需要这个私钥**。
 - **公钥对所有用户公开且共享**：已内嵌进 `get-panel.sh`，随安装器分发给每一个下载者。
-  用户机器跑 `curl | sh` 时，脚本自动用内嵌公钥验证下载的 tarball 是否由你的私钥签出。
-- **用户不生成任何密钥**：安装全程只是 `curl | sh`，验签对用户透明、无需任何操作。
+  用户按两步法（先把脚本下载到本地、确认完整，再本地执行）运行安装器时，
+  脚本自动用内嵌公钥验证下载的 tarball 是否由你的私钥签出。
+- **用户不生成任何密钥**：安装全程只跑本地那份脚本，验签对用户透明、无需任何操作。
+  ⚠ 不要从 `main` 分支实时 `curl | sh`：验签公钥就内嵌在被取回的脚本里，
+  脚本被替换即可连公钥一起替换，验签的信任起点会被绕过；请钉死版本 URL。
 - ⚠ 这与「用户登录面板的账号」是两回事：
   - ed25519 密钥 = **发布者签名 / 用户验源**，解决「软件是不是你发的、有没有被改」；
   - 面板 owner/admin 账号 = **用户身份认证**，是面板启动后由首启向导/引导令牌创建的，

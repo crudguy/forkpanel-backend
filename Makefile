@@ -65,6 +65,9 @@ guards:
 	# 零 root E2E 必须真的接进 CI：此前 18 个 e2e-*.sh + run-e2e-ci.sh 全在门禁外，
 	# 「脚本已为 CI 准备好」和「CI 会跑」是两回事；顺带钉住 [skip] 不得冒充通过。
 	python3 ci/check_e2e_wired.py
+	# 发版签名回验必须真的接在 release.yml 且排在上传 Release 之前：
+	# 密钥错配 / 篡改 / 资产缺失要当场判红，不能等用户侧验签失败才发现（B3）。
+	python3 ci/check_release_verify_wired.py
 
 # 内嵌前端新鲜度：改完前端只 cargo build **不会**重新 embed，必须
 # ① vite build → ② rm -rf web/dist/* → ③ cp -a → ④ touch embed.rs → ⑤ cargo build。

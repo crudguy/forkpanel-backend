@@ -57,9 +57,11 @@
 #        ② 把 PANEL_MIRRORS / PANEL_RELEASE_BASE 指到国内可达镜像；
 #        ③ 手动下载后本地装（见下方失败提示）。
 #
-# 注意：下方 RELEASE_PUBKEY 即为发布私钥 /home/a/release.key 对应的 ed25519 公钥
-#       （base64 已与 release.key 对齐，并非占位演示密钥）。若将来更换签名密钥，
-#       须用新私钥重签，并用 `openssl pkey -in <新私钥> -pubout` 同步更新此处（或改用 PANEL_PUBKEY_FILE）。
+# 注意：下方 RELEASE_PUBKEY 是随安装器分发的 ed25519 公钥，必须与 GitHub repo
+#       secret PANEL_RELEASE_KEY（发布私钥）对应；release.yml 在上传 Release 前
+#       用本段 PEM 回验签名，不匹配即中止发版（见 ci/verify-release-assets.sh）。
+#       更换签名密钥时须四处同步：本段 PEM、deploy/release-pubkey.pub、
+#       deploy/mirror-sync.sh 内嵌 PEM、PANEL_RELEASE_KEY secret，并重签全部资产。
 set -euo pipefail
 
 # 目标版本

@@ -5,7 +5,12 @@ name: Release
 #   - 手动 workflow_dispatch（可选填 version 覆盖）
 #
 # 产物：dist/panel-linux-{amd64,arm64}.tar.gz(+.sig) + SHA256SUMS，上传到 GitHub Release。
-# 用户侧安装：curl -fsSL https://raw.githubusercontent.com/crudguy/forkpanel-backend/main/deploy/get-panel.sh | sh
+# 用户侧安装（两步法 + 固定版本 URL；不要从 main 分支实时 curl | sh —— 验签公钥
+# 内嵌在被取回的脚本里，脚本被替换即可连公钥一起换掉，验签信任起点会被绕过）：
+#   TAG=v0.1.0
+#   wget -O get-panel.sh https://raw.githubusercontent.com/crudguy/forkpanel-backend/$TAG/deploy/get-panel.sh
+#   sh get-panel.sh                 # 先读一遍再本地执行；PANEL_VERSION 可钉版本
+# 详见 docs/distribution.md 的「两步法」。
 on:
   push:
     tags: ['v*']
@@ -127,6 +132,13 @@ jobs:
 
       - name: 生成 SHA256SUMS
         run: ( cd dist && sha256sum panel-linux-*.tar.gz > SHA256SUMS )
+
+      # ⚠ 必须在上传 Release **之前**。用安装器内嵌的那把公钥回验，而不是用私钥
+      #   导出公钥自验（自己跟自己比恒绿）：secret 私钥与仓库内嵌公钥不匹配、
+      #   产物被篡改、双架构缺一、SHA256SUMS 不符 ⇒ 当场中止发版，不再等用户侧
+      #   get-panel.sh 验签失败才发现。判据与用户侧同源（同一条 dgst -verify）。
+      - name: 回验发布产物（安装器内嵌公钥 + 双架构 + SHA256SUMS）
+        run: bash ci/verify-release-assets.sh . dist
 
       - name: 发布到 GitHub Releases
         uses: softprops/action-gh-release@v2

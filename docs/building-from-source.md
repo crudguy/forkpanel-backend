@@ -90,7 +90,8 @@ make check
 cargo install cargo-zigbuild
 rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 
-# 签名私钥（自己生成；想用本地联调的演示密钥也行，但对外分发必须换成自己的）
+# 签名私钥（自己生成并妥善保管；必须与 PANEL_RELEASE_KEY secret 及仓库内嵌公钥
+#   对应，否则 ci/verify-release-assets.sh 会在发版前判红）
 openssl genpkey -algorithm ed25519 -out release.key && chmod 600 release.key
 
 ./deploy/build-static.sh 1.0.0 ./release.key   # 产出 dist/panel-linux-{amd64,arm64}.tar.gz(.sig)
