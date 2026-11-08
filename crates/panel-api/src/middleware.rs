@@ -68,7 +68,7 @@ pub async fn guard_write(req: Request, next: Next) -> Response {
     next.run(req).await
 }
 
-/// 安全响应头（设计方案 §1.3）。CSP 使用 nonce，禁止 inline script。
+/// 安全响应头（设计方案 §1.3）。CSP 为静态 `script-src 'self'`（不使用 nonce）。
 pub async fn security_headers(req: Request, next: Next) -> Response {
     let mut res = next.run(req).await;
     let h = res.headers_mut();
@@ -76,7 +76,8 @@ pub async fn security_headers(req: Request, next: Next) -> Response {
     h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
     h.insert("Permissions-Policy", HeaderValue::from_static("geolocation=(), microphone=(), camera=()"));
-    // nonce 在渲染 index.html 时注入；API 响应不需要脚本执行
+    // 静态 CSP：index.html 只有外链 module script，不含 inline script / nonce；
+    // API 响应同样下发（不执行脚本，但保持全站策略一致）。
     h.insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(

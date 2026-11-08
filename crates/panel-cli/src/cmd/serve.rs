@@ -158,6 +158,14 @@ pub(crate) fn run(cli: &Cli, os: Arc<dyn panel_os::OsAdapter>) -> Result<()> {
         let app = panel_api::routes::build_router(state.clone())
             .route("/healthz", axum::routing::get(embed::healthz))
             .fallback(embed::static_handler)
+            // 安全响应头：必须挂在 build_router **之外**且 `.fallback()` 之后 ——
+            // build_router 内的 layer 不包裹之后新增的 /healthz 与替换后的 SPA fallback，
+            // 曾导致登录页、静态资源、404、healthz 全部无 X-Frame-Options / CSP。
+            // 放在 request_log 之内层：request_log 仍是最外层（其唯一挂点守卫不变），
+            // 而本层覆盖所有响应分支（含 CatchPanic 转出的 500）。
+            .layer(axum::middleware::from_fn(
+                panel_api::middleware::security_headers,
+            ))
             // 请求级结构化日志：**最后加 = 最外层**。必须加在 `.fallback()`
             // 之后——axum 的 `.fallback()` 会整体替换既有 fallback 路由，且
             // 新 fallback 不被此前任何 `.layer()` 包裹；本层若加在它之前

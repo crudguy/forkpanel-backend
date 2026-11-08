@@ -89,7 +89,8 @@ impl FromRequestParts<Shared> for MaybeAuth {
 /// 构造完整路由。
 ///
 /// 中间件顺序（**顺序即语义，不要改**）：
-/// `security_headers` → `require_auth` → `guard_write`(仅写) → `read_only_guard`(仅写) → handler
+/// `require_auth` → `guard_write`(仅写) → `read_only_guard`(仅写) → handler
+/// 安全响应头 `security_headers` 不挂在本函数内，见下方说明与 `cmd/serve.rs` 的生产链。
 pub fn build_router(state: Shared) -> Router {
     // ── 公开路由（无需登录） ──
     let public = Router::new()
@@ -449,7 +450,14 @@ pub fn build_router(state: Shared) -> Router {
         .merge(authed)
         .merge(terminal_r)
         .merge(asst_r)
-        .layer(middleware::from_fn(crate::middleware::security_headers))
+        // ⚠ security_headers **刻意不挂在这里**：生产链在 build_router 之后还会
+        //   `.route("/healthz")` 与 `.fallback(embed::static_handler)`，而 axum 的
+        //   layer 只包裹调用时已存在的路由 / fallback —— 之后新增的 /healthz 与
+        //   替换后的 SPA fallback 会整条绕过本层，导致登录页 / JS / 404 / healthz
+        //   一个安全头都没有（接口有防护、页面没防护）。
+        //   故统一挂到 cmd/serve.rs 的 `.fallback()` 之后，与 request_log 同层链，
+        //   一次覆盖 API / SPA / 静态资源 / healthz / CatchPanic 转出的 500。
+        //   全链只许一个挂点，双挂会重复执行；由 ci/check_security_headers.py 钉住。
         // 兜底：未匹配路由返回结构化 404（不暴露路由表）
         .fallback(handler_404)
         // panic 兜底：**最后加 = 最外层**，才能盖住内层中间件与所有 handler（含 fallback）。

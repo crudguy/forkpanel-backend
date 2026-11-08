@@ -68,6 +68,9 @@ guards:
 	# 发版签名回验必须真的接在 release.yml 且排在上传 Release 之前：
 	# 密钥错配 / 篡改 / 资产缺失要当场判红，不能等用户侧验签失败才发现（B3）。
 	python3 ci/check_release_verify_wired.py
+	# 安全响应头必须挂在 serve 链的 .fallback() 之后（build_router 内挂了 SPA/静态/
+	# healthz/404 会整条绕过），且全链唯一。判据剔注释，防说明文字冒充挂点。
+	python3 ci/check_security_headers.py
 
 # 内嵌前端新鲜度：改完前端只 cargo build **不会**重新 embed，必须
 # ① vite build → ② rm -rf web/dist/* → ③ cp -a → ④ touch embed.rs → ⑤ cargo build。
