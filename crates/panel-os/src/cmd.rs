@@ -408,9 +408,26 @@ pub async fn run_checked(bin: Bin, args: &[&str], opt: CmdOpt) -> Result<CmdOutp
 /// （Bin 白名单 + 安全 PATH + 不解释 shell），出口仍只落在 cmd.rs 内——
 /// 业务层不得直接 spawn 子进程（CI 门禁 [1]）。
 ///
-/// 与 [`run`] 的差异：同步、不收集逐行回调、不做超时（运维动作瞬时确定）。
+/// 与 [`run`] 的差异：同步、不收集逐行回调；**超时靠 `try_wait` 轮询实现**
+/// （见 `run_sync_with_timeout`）。不做超时是历史欠账：孙进程继承 stdout 时
+/// `read_to_string` 永远等不到 EOF，会把 spawn_blocking 线程永久钉住。
+/// `run_sync` 的默认超时。比异步 `run()` 的 10s 宽松（运维脚本可能跑 nginx -t /
+/// 自签证书），但足以挡住「孙进程继承 stdout ⇒ 永远等不到 EOF」这类挂死。
+pub const RUN_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 同步执行一次性运维动作（默认超时 [`RUN_SYNC_TIMEOUT`]）。
 pub fn run_sync(bin: Bin, args: &[&str]) -> Result<CmdOutput> {
+    run_sync_with_timeout(bin, args, RUN_SYNC_TIMEOUT)
+}
+
+/// 带超时的同步出口：标准库没有 `wait_timeout`，用 `try_wait` 轮询 + kill 进程组实现。
+///
+/// 主线程的职责是「按上限决定何时收」，管道读取交给独立线程；这样既不会因
+/// 管道缓冲满而让子进程写阻塞，也不会被 `read_to_string` 卡死。超时后 kill
+/// 负 pgid（`setsid` 已让子进程成为组长）连同孙进程一起收，再回收避免僵尸。
+pub fn run_sync_with_timeout(bin: Bin, args: &[&str], limit: Duration) -> Result<CmdOutput> {
     let program = bin.resolved()?;
+    let start = std::time::Instant::now();
     let mut cmd = std::process::Command::new(program);
     cmd.args(args);
     cmd.stdin(Stdio::null());
@@ -421,32 +438,70 @@ pub fn run_sync(bin: Bin, args: &[&str]) -> Result<CmdOutput> {
     cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
     cmd.env("LANG", "C");
     cmd.env("LC_ALL", "C");
-    // 独立进程组，避免孙进程泄漏成为孤儿
+    // 独立进程组，超时可整组 kill（防孙进程泄漏）
     unsafe { cmd.pre_exec(|| { libc::setsid(); Ok(()) }); }
 
     let mut child = cmd.spawn().map_err(|e| PanelError::Command {
         bin: bin.as_str().into(), detail: format!("spawn failed: {e}")
     })?;
 
-    // 先取管道读到 EOF（子进程关闭 stdout/stderr 后），再回收，避免管道缓冲死锁。
-    let mut stdout = String::new();
-    let mut stderr = String::new();
+    // ⚠ 用 channel + recv_timeout 而不是 JoinHandle::join()：万一孙进程脱离进程组
+    //   没被 kill 到，读线程仍挂着，主线程也只多等 1s，不会二次挂死。
+    let (tx_out, rx_out) = std::sync::mpsc::channel::<String>();
+    let (tx_err, rx_err) = std::sync::mpsc::channel::<String>();
     if let Some(mut o) = child.stdout.take() {
-        let _ = std::io::Read::read_to_string(&mut o, &mut stdout);
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = std::io::Read::read_to_string(&mut o, &mut s);
+            let _ = tx_out.send(s);
+        });
+    } else {
+        drop(tx_out);
     }
     if let Some(mut e) = child.stderr.take() {
-        let _ = std::io::Read::read_to_string(&mut e, &mut stderr);
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = std::io::Read::read_to_string(&mut e, &mut s);
+            let _ = tx_err.send(s);
+        });
+    } else {
+        drop(tx_err);
     }
-    let status = child.wait().map_err(|e| PanelError::Command {
-        bin: bin.as_str().into(), detail: format!("wait failed: {e}")
-    })?;
 
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) => {
+                if start.elapsed() >= limit {
+                    timed_out = true;
+                    unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL); }
+                    let _ = child.wait(); // 回收，避免僵尸
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => return Err(PanelError::Command {
+                bin: bin.as_str().into(), detail: format!("try_wait failed: {e}")
+            }),
+        }
+    };
+
+    let stdout = rx_out.recv_timeout(Duration::from_secs(1)).unwrap_or_default();
+    let stderr = rx_err.recv_timeout(Duration::from_secs(1)).unwrap_or_default();
+
+    if timed_out || status.is_none() {
+        return Err(PanelError::Command {
+            bin: bin.as_str().into(),
+            detail: format!("run_sync timed out after {:?}（已 kill 进程组）", limit),
+        });
+    }
     Ok(CmdOutput {
-        code: exit_code(&status),
+        code: exit_code(&status.expect("status 非 None 已由上面保证")),
         stdout,
         stderr,
         truncated: false,
-        elapsed: Duration::ZERO,
+        elapsed: start.elapsed(),
     })
 }
 
@@ -702,6 +757,33 @@ mod tests {
         assert_eq!(Bin::Nft.as_str(), "nft");
         assert_eq!(Bin::Systemctl.as_str(), "systemctl");
         assert_eq!(Bin::Bash.as_str(), "bash");
+    }
+
+    #[test]
+    fn run_sync_returns_stdout_and_exit_code() {
+        let out = run_sync(Bin::Bash, &["-c", "printf ok"]).expect("瞬时命令应成功");
+        assert_eq!(out.code, Some(0));
+        assert_eq!(out.stdout.trim(), "ok");
+        assert!(out.elapsed < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn run_sync_times_out_instead_of_hanging() {
+        let start = std::time::Instant::now();
+        let r = run_sync_with_timeout(
+            Bin::Bash, &["-c", "sleep 30"], std::time::Duration::from_millis(300));
+        assert!(r.is_err(), "超时必须返回 Err，不能把空 stdout 当成功");
+        assert!(start.elapsed() < std::time::Duration::from_secs(5), "超时后不得继续挂住");
+    }
+
+    #[test]
+    fn run_sync_kills_grandchild_holding_stdout() {
+        // 孙进程继承 stdout 且长期存活：旧实现的 read_to_string 永远等不到 EOF。
+        let start = std::time::Instant::now();
+        let r = run_sync_with_timeout(
+            Bin::Bash, &["-c", "sleep 30 & wait"], std::time::Duration::from_millis(300));
+        assert!(r.is_err(), "孙进程持有管道也必须在上限内被打断");
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]

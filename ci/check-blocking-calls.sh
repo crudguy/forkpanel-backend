@@ -77,9 +77,30 @@ else
   pass "除唯一出口外无直接 run_sync 调用"
 fi
 
+# ④ 出口自己必须带超时（Q-01 的第二半）
+#    只保证「走唯一出口」不够：出口若先 read_to_string 等 EOF 再 wait()，
+#    孙进程继承 stdout 就会永久钉住 spawn_blocking 线程。判据指向 cmd.rs
+#    生产段（剔 cfg(test) 之后的测试字符串），不靠别处转述。
+echo
+echo "== [Q-01b] 同步出口必须自带超时与进程组回收 =="
+CMD_SRC="crates/panel-os/src/cmd.rs"
+if [ ! -s "$CMD_SRC" ]; then
+  fail "$CMD_SRC 不存在——超时判据前提不成立"
+else
+  CMD_PROD=$(awk '/#\[cfg\(test\)\]/{exit} {print}' "$CMD_SRC" 2>/dev/null || true)
+  MISS=0
+  for needle in 'RUN_SYNC_TIMEOUT' 'run_sync_with_timeout' 'try_wait()' 'libc::SIGKILL' 'recv_timeout'; do
+    if ! printf '%s\n' "$CMD_PROD" | grep -q "$needle"; then
+      fail "cmd.rs 生产段缺 $needle（同步出口没有超时 / 进程组 kill / 读线程上限）"
+      MISS=1
+    fi
+  done
+  [ "$MISS" -eq 0 ] && pass "同步出口含超时、进程组 kill 与读线程上限"
+fi
+
 echo
 if [ "$FAIL" -eq 0 ]; then
-  echo "PASS：阻塞调用出口唯一"
+  echo "PASS：阻塞调用出口唯一且自带超时"
   exit 0
 else
   echo "FAIL：存在裸调"
