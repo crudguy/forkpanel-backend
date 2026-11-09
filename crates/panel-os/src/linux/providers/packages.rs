@@ -323,7 +323,7 @@ impl PackageProvider for LinuxPackages {
                     let detail = match version {
                         Some(v) if o.stderr.contains("was not found") || o.stderr.contains("has no candidate") =>
                             format!("指定版本 {v} 在软件源中不可用（可能未收录或需启用 backports/security 源）"),
-                        _ => truncate_err(&o.stderr),
+                        _ => panel_core::sanitize::stderr(&o.stderr),
                     };
                     return Err(PanelError::Command { bin: "apt-get".into(), detail });
                 }
@@ -585,7 +585,7 @@ pub(super) async fn pkg_run_streamed(bin: Bin, args: &[&str], on_line: std::sync
         timeout: Duration::from_secs(1800), on_line: Some(on_line), ..Default::default()
     }).await?;
     if o.code != Some(0) {
-        return Err(PanelError::Command { bin: bin.as_str().into(), detail: truncate_err(&o.stderr) });
+        return Err(PanelError::Command { bin: bin.as_str().into(), detail: panel_core::sanitize::stderr(&o.stderr) });
     }
     Ok(())
 }
@@ -594,12 +594,9 @@ pub(super) async fn pkg_run_streamed(bin: Bin, args: &[&str], on_line: std::sync
 pub(super) async fn pkg_run(bin: Bin, args: &[&str]) -> Result<()> {
     let o = crate::cmd::run(bin, args, CmdOpt { timeout: Duration::from_secs(1800), ..Default::default() }).await?;
     if o.code != Some(0) {
-        return Err(PanelError::Command { bin: bin.as_str().into(), detail: truncate_err(&o.stderr) });
+        return Err(PanelError::Command { bin: bin.as_str().into(), detail: panel_core::sanitize::stderr(&o.stderr) });
     }
     Ok(())
 }
 
-pub(super) fn truncate_err(s: &str) -> String {
-    if s.len() <= 2000 { s.to_string() } else { format!("{}…(truncated)", &s[..2000]) }
-}
 

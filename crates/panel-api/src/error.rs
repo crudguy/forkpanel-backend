@@ -99,7 +99,8 @@ impl From<PanelError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        // 安全：不回显内部堆栈；detail 已在构造侧做过裁剪
+        // 安全：不回显内部堆栈；外部命令输出已在构造侧过 panel_core::sanitize
+        // （临时目录/ACME 账户/邮箱脱敏 + 限长，见 ci/check-error-sanitize.py）
         let body = json!({
             "code": self.code,
             "message": self.message,

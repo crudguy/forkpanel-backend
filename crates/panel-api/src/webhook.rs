@@ -71,15 +71,12 @@ pub async fn fire(url: &str, payload: &Value) -> Result<(), PanelError> {
     if out.code != Some(0) {
         return Err(PanelError::Command {
             bin: "curl".into(),
-            detail: format!("webhook exit={:?} {}", out.code, truncate(&out.stderr, 500)),
+            detail: format!("webhook exit={:?} {}", out.code, panel_core::sanitize::stderr(&out.stderr)),
         });
     }
     Ok(())
 }
 
-fn truncate(s: &str, n: usize) -> String {
-    if s.len() > n { format!("{}…", &s[..n]) } else { s.to_string() }
-}
 
 // ─────────────── 端点：测试 Webhook（向给定 URL 发一条测试事件） ───────────────
 

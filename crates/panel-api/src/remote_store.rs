@@ -159,7 +159,7 @@ impl RemoteTarget {
         if out.code != Some(0) {
             return Err(PanelError::Command {
                 bin: "curl".into(),
-                detail: out.stderr.trim().to_string(),
+                detail: panel_core::sanitize::stderr(&out.stderr),
             });
         }
         Ok(())
@@ -180,7 +180,7 @@ impl RemoteTarget {
         if out.code != Some(0) {
             return Err(PanelError::Command {
                 bin: "curl".into(),
-                detail: out.stderr.trim().to_string(),
+                detail: panel_core::sanitize::stderr(&out.stderr),
             });
         }
         Ok(out.stdout)

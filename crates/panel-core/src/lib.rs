@@ -13,6 +13,9 @@ use std::fmt;
 pub mod crypto; // 应用层密钥加密（AES-256-GCM，关闭 M0 阻塞项）
 pub mod sync;   // 互斥锁中毒恢复（禁止裸 lock().unwrap()，见 ci/check_lock_unwrap.py）
 pub mod clock;  // 全仓唯一的 now_unix()（禁止各 crate 再自带一份）
+// 外部命令输出回显前的脱敏唯一收口（Command/ConfigInvalid 构造侧必过，
+// 见 ci/check-error-sanitize.py）
+pub mod sanitize;
 // 提到 crate 根，调用方统一写 `panel_core::now_unix()`——不必记住它在哪个子模块。
 pub use clock::now_unix;
 // 公网暴露参数校验（域名 / CIDR）：CLI 的 `panel expose` 与 Web 向导共用同一份规则，

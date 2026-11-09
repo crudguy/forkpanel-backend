@@ -395,7 +395,7 @@ pub async fn run_checked(bin: Bin, args: &[&str], opt: CmdOpt) -> Result<CmdOutp
         Some(0) => Ok(out),
         other => Err(PanelError::Command {
             bin: bin.as_str().into(),
-            detail: format!("exit={other:?} stderr={}", truncate(&out.stderr, 2000)),
+            detail: format!("exit={other:?} stderr={}", panel_core::sanitize::stderr(&out.stderr)),
         }),
     }
 }
@@ -505,9 +505,6 @@ pub fn run_sync_with_timeout(bin: Bin, args: &[&str], limit: Duration) -> Result
     })
 }
 
-fn truncate(s: &str, n: usize) -> String {
-    if s.len() <= n { s.to_string() } else { format!("{}…(truncated)", &s[..n]) }
-}
 
 // ═══════════════════════ 交互式 PTY（Web 终端） ═══════════════════════
 //
@@ -765,6 +762,33 @@ mod tests {
         assert_eq!(out.code, Some(0));
         assert_eq!(out.stdout.trim(), "ok");
         assert!(out.elapsed < std::time::Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn run_checked_sanitizes_stderr_before_echoing() {
+        // 回显前必须脱敏（P1：nginx -t / certbot stderr 原样回显会泄露内部
+        // 临时路径与 ACME 信息）。夹具必须是真命令真 stderr——假夹具会让
+        // 「删掉 sanitize 调用」这个负向不转红。
+        if !Bin::Sh.available() {
+            eprintln!("[skip] 无 sh，跳过 run_checked 脱敏行为测试");
+            return;
+        }
+        let r = run_checked(
+            Bin::Sh,
+            &["-c", "echo 'bad /tmp/x/panel-validate-4242-7/conf/site.conf:3 mail ops@example.com' >&2; exit 1"],
+            CmdOpt::default(),
+        )
+        .await;
+        let Err(PanelError::Command { detail, .. }) = r else {
+            panic!("非 0 退出码必须返回 Command 错误");
+        };
+        assert!(!detail.contains("4242"), "校验临时目录未脱敏：{detail}");
+        assert!(!detail.contains("ops@example.com"), "邮箱未脱敏：{detail}");
+        assert!(
+            detail.contains("<validate-workdir>/conf/site.conf:3"),
+            "文件名+行号是排障关键，必须保留：{detail}"
+        );
+        assert!(detail.contains("<email>"), "{detail}");
     }
 
     #[test]

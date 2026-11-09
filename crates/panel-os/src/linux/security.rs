@@ -309,7 +309,7 @@ pub(crate) async fn apply_ssh_item(key: &str) -> Result<SecurityApplyResult> {
             );
         }
         let why = match out {
-            Ok(o) => o.stderr,
+            Ok(o) => panel_core::sanitize::stderr(&o.stderr),
             Err(e) => e.to_string(),
         };
         return Err(PanelError::Command {

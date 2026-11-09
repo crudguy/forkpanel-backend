@@ -99,7 +99,7 @@ impl LinuxContainers {
         if out.code == Some(0) {
             return Ok(());
         }
-        let detail = if out.stderr.trim().is_empty() { out.stdout.trim() } else { out.stderr.trim() };
+        let detail = panel_core::sanitize::stderr(if out.stderr.trim().is_empty() { &out.stdout } else { &out.stderr });
         Err(PanelError::Command {
             bin: "docker".into(),
             detail: format!("{what}: {detail}"),

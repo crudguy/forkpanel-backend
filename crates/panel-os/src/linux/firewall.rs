@@ -120,7 +120,7 @@ async fn delete_number(fw: &LinuxFirewall, n: u32) -> Result<()> {
     let num = n.to_string();
     let out = fw.ufw(&["--force", "delete", &num], Duration::from_secs(15)).await?;
     if out.code != Some(0) {
-        return Err(PanelError::Command { bin: "ufw".into(), detail: out.stderr.trim().to_string() });
+        return Err(PanelError::Command { bin: "ufw".into(), detail: panel_core::sanitize::stderr(&out.stderr) });
     }
     Ok(())
 }
@@ -217,7 +217,7 @@ impl FirewallProvider for LinuxFirewall {
         let args: &[&str] = if active { &["--force", "enable"] } else { &["disable"] };
         let out = self.ufw(args, Duration::from_secs(20)).await?;
         if out.code != Some(0) {
-            return Err(PanelError::Command { bin: "ufw".into(), detail: out.stderr.trim().to_string() });
+            return Err(PanelError::Command { bin: "ufw".into(), detail: panel_core::sanitize::stderr(&out.stderr) });
         }
         Ok(())
     }
@@ -292,7 +292,7 @@ impl FirewallProvider for LinuxFirewall {
                 // API 路由已对 Err 做回滚 + 返回错误（见 panel-api firewall.rs）。
                 return Err(PanelError::Command {
                     bin: "ufw".into(),
-                    detail: format!("add {} 失败: {}", rule.id, out.stderr.trim()),
+                    detail: format!("add {} 失败: {}", rule.id, panel_core::sanitize::stderr(&out.stderr)),
                 });
             }
         }

@@ -218,10 +218,6 @@ pub async fn current_codename() -> Result<String> {
     parse_codename(&content).ok_or(PanelError::Unsupported("os.codename"))
 }
 
-fn trunc(s: &str) -> String {
-    let s = s.trim();
-    if s.len() <= 2000 { s.to_string() } else { format!("{}…(已截断)", &s[..2000]) }
-}
 
 /// 确保第三方 apt 源就绪：下载并校验 GPG 密钥指纹 → 写隔离 keyring → 写 sources.list.d → apt-get update。
 ///
@@ -270,7 +266,7 @@ async fn ensure_repo_inner(repo: &ThirdPartyRepo, sources_content: &str, on_line
         Ok(o) if o.code == Some(0) => {}
         Ok(o) => return Err(PanelError::Command {
             bin: "curl".into(),
-            detail: format!("下载 {} 密钥失败：{}", repo.logical, trunc(&o.stderr)),
+            detail: format!("下载 {} 密钥失败：{}", repo.logical, panel_core::sanitize::stderr(&o.stderr)),
         }),
         Err(e) => return Err(e),
     }

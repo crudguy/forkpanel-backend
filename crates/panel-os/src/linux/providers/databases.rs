@@ -100,7 +100,7 @@ impl LinuxDatabases {
         if out.code != Some(0) {
             return Err(panel_core::PanelError::Command {
                 bin: "mysql/psql".into(),
-                detail: out.stderr,
+                detail: panel_core::sanitize::stderr(&out.stderr),
             });
         }
         Ok(out
@@ -162,7 +162,7 @@ impl LinuxDatabases {
         )
         .await?;
         if out.code != Some(0) {
-            return Err(panel_core::PanelError::Command { bin: "psql".into(), detail: out.stderr });
+            return Err(panel_core::PanelError::Command { bin: "psql".into(), detail: panel_core::sanitize::stderr(&out.stderr) });
         }
         if out.truncated {
             return Err(panel_core::PanelError::Command {

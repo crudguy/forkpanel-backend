@@ -38,7 +38,7 @@ pub async fn tar_gz(src_dir: &Path, dest: &Path) -> Result<()> {
         crate::fs::set_mode(dest, 0o600)?;
         Ok(())
     } else {
-        Err(PanelError::Command { bin: "tar".into(), detail: out.stderr })
+        Err(PanelError::Command { bin: "tar".into(), detail: panel_core::sanitize::stderr(&out.stderr) })
     }
 }
 
@@ -52,7 +52,7 @@ pub async fn list_tar_entries(archive: &Path) -> Result<Vec<String>> {
     )
     .await?;
     if out.code != Some(0) {
-        return Err(PanelError::Command { bin: "tar".into(), detail: out.stderr });
+        return Err(PanelError::Command { bin: "tar".into(), detail: panel_core::sanitize::stderr(&out.stderr) });
     }
     Ok(out
         .stdout
@@ -90,7 +90,7 @@ pub async fn untar_gz(archive: &Path, dest_parent: &Path) -> Result<()> {
     if out.code == Some(0) {
         Ok(())
     } else {
-        Err(PanelError::Command { bin: "tar".into(), detail: out.stderr })
+        Err(PanelError::Command { bin: "tar".into(), detail: panel_core::sanitize::stderr(&out.stderr) })
     }
 }
 

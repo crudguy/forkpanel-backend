@@ -52,7 +52,7 @@ fn cmd_err(label: &str, out: &CmdOutput) -> PanelError {
     let detail = if out.stderr.trim().is_empty() {
         format!("exit={:?}", out.code)
     } else {
-        out.stderr.trim().chars().take(300).collect::<String>()
+        panel_core::sanitize::stderr(&out.stderr)
     };
     PanelError::Command { bin: label.to_string(), detail }
 }
@@ -268,7 +268,7 @@ async fn run_async(opts: Opts) -> Result<()> {
     let install_ok = matches!(&out, Ok(o) if o.code == Some(0));
     if !install_ok {
         let detail = match &out {
-            Ok(o) => o.stderr.trim().chars().take(300).collect::<String>(),
+            Ok(o) => panel_core::sanitize::stderr(&o.stderr),
             Err(e) => e.to_string(),
         };
         eprintln!("  ✗ install.sh 失败：{detail}");

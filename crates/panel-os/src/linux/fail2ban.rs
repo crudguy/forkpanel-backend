@@ -73,7 +73,7 @@ impl Fail2ban {
             CmdOpt { timeout: Duration::from_secs(15), ..Default::default() },
         ).await?;
         if out.code != Some(0) {
-            return Err(PanelError::Command { bin: "fail2ban-client".into(), detail: out.stderr.trim().to_string() });
+            return Err(PanelError::Command { bin: "fail2ban-client".into(), detail: panel_core::sanitize::stderr(&out.stderr) });
         }
         Ok(())
     }

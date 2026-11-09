@@ -98,9 +98,25 @@ for needle, desc in [
         bad(f"scheduler.rs 缺 {desc}（{needle}）")
 
 print("== [4] 同步出口自带超时、进程组 kill 与读线程上限 ==")
+# 函数体提取用括号配对，不用「下一个函数名」当锚点——后者是巧合锚点：
+# 锚点函数被删/改名/挪位时判据塌成空（truncate 被删时真实塌过一次）。
 i = cmd_code.find("pub fn run_sync_with_timeout(")
-j = cmd_code.find("\nfn truncate(", i)
-body = cmd_code[i:j] if i >= 0 and j > i else ""
+if i < 0:
+    body = ""
+else:
+    brace = cmd_code.find("{", i)
+    depth = 0
+    j = brace
+    while j < len(cmd_code):
+        if cmd_code[j] == "{":
+            depth += 1
+        elif cmd_code[j] == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        j += 1
+    # 注释已剥离；format! 的 {:?} 花括号成对，不干扰配对
+    body = cmd_code[i:j + 1] if depth == 0 else ""
 if not body.strip():
     bad("提取不到 run_sync_with_timeout 函数体（判据塌成空）")
 else:

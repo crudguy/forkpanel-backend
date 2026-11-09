@@ -300,7 +300,7 @@ impl FirewallProvider for NftFirewall {
         if check.code != Some(0) {
             return Err(PanelError::Command {
                 bin: "nft".into(),
-                detail: format!("持久化文件 {} 校验失败: {}", path.display(), check.stderr.trim()),
+                detail: format!("持久化文件 {} 校验失败: {}", path.display(), panel_core::sanitize::stderr(&check.stderr)),
             });
         }
         self.nft_checked(&["-f", &p], Duration::from_secs(20)).await.map_err(|e| {

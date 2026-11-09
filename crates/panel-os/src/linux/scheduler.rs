@@ -172,7 +172,7 @@ async fn read_crontab() -> Result<Vec<String>> {
         Some(1) if out.stderr.contains("no crontab") => Ok(Vec::new()),
         _ => Err(PanelError::Command {
             bin: "crontab".into(),
-            detail: format!("crontab -l failed: code={:?} {}", out.code, out.stderr.trim()),
+            detail: format!("crontab -l failed: code={:?} {}", out.code, panel_core::sanitize::stderr(&out.stderr)),
         }),
     }
 }
@@ -198,7 +198,7 @@ async fn write_crontab(text: &str) -> Result<()> {
     if out.code != Some(0) {
         return Err(PanelError::Command {
             bin: "crontab".into(),
-            detail: format!("crontab install failed: {}", out.stderr.trim()),
+            detail: format!("crontab install failed: {}", panel_core::sanitize::stderr(&out.stderr)),
         });
     }
     Ok(())

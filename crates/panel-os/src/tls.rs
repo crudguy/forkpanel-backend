@@ -42,7 +42,7 @@ pub async fn htpasswd_line(user: &str, pass: &str) -> Result<String> {
             }
             Ok(format!("{user}:{h}"))
         }
-        Ok(o) => Err(PanelError::Command { bin: "openssl".into(), detail: truncate(&o.stderr, 500) }),
+        Ok(o) => Err(PanelError::Command { bin: "openssl".into(), detail: panel_core::sanitize::stderr(&o.stderr) }),
         Err(e) => Err(e),
     }
 }
@@ -70,7 +70,7 @@ pub async fn issue_acme(
     )
     .await?;
     if out.code != Some(0) {
-        return Err(panel_core::PanelError::Command { bin: "certbot".into(), detail: out.stderr });
+        return Err(panel_core::PanelError::Command { bin: "certbot".into(), detail: panel_core::sanitize::external_output(&out.stderr, &[email], panel_core::sanitize::EXTERNAL_OUTPUT_MAX) });
     }
     read_acme_pair(domain)
 }
@@ -85,7 +85,7 @@ pub async fn renew_acme(domain: &str) -> Result<(String, String)> {
     )
     .await?;
     if out.code != Some(0) {
-        return Err(panel_core::PanelError::Command { bin: "certbot".into(), detail: out.stderr });
+        return Err(panel_core::PanelError::Command { bin: "certbot".into(), detail: panel_core::sanitize::stderr(&out.stderr) });
     }
     read_acme_pair(domain)
 }
@@ -157,7 +157,7 @@ pub async fn generate_self_signed(
         Ok(o) if o.code == Some(0) => {}
         Ok(o) => {
             cleanup(&dir);
-            return Err(PanelError::Command { bin: "openssl".into(), detail: truncate(&o.stderr, 2000) });
+            return Err(PanelError::Command { bin: "openssl".into(), detail: panel_core::sanitize::stderr(&o.stderr) });
         }
         Err(e) => { cleanup(&dir); return Err(e); }
     }
@@ -262,7 +262,7 @@ pub async fn ensure_root_ca(ca_dir: &Path, tmp_dir: &Path) -> Result<()> {
     let cleanup = |dir: &Path| { let _ = std::fs::remove_dir_all(dir); };
     match r {
         Ok(o) if o.code == Some(0) => {}
-        Ok(o) => { cleanup(&work); return Err(PanelError::Command { bin: "openssl".into(), detail: truncate(&o.stderr, 2000) }); }
+        Ok(o) => { cleanup(&work); return Err(PanelError::Command { bin: "openssl".into(), detail: panel_core::sanitize::stderr(&o.stderr) }); }
         Err(e) => { cleanup(&work); return Err(e); }
     }
 
@@ -366,8 +366,8 @@ pub async fn issue_leaf_signed_by_ca(
             let k = std::fs::read_to_string(&leaf_key).map_err(|e| PanelError::Internal(e.to_string()))?;
             (c, k)
         }
-        (Ok(o1), _) if o1.code != Some(0) => { cleanup(&work); return Err(PanelError::Command { bin: "openssl".into(), detail: truncate(&o1.stderr, 2000) }); }
-        (_, Ok(o2)) if o2.code != Some(0) => { cleanup(&work); return Err(PanelError::Command { bin: "openssl".into(), detail: truncate(&o2.stderr, 2000) }); }
+        (Ok(o1), _) if o1.code != Some(0) => { cleanup(&work); return Err(PanelError::Command { bin: "openssl".into(), detail: panel_core::sanitize::stderr(&o1.stderr) }); }
+        (_, Ok(o2)) if o2.code != Some(0) => { cleanup(&work); return Err(PanelError::Command { bin: "openssl".into(), detail: panel_core::sanitize::stderr(&o2.stderr) }); }
         (_, Err(e)) => { cleanup(&work); return Err(e.clone()); }
         _ => { cleanup(&work); return Err(PanelError::Internal("unexpected openssl state".into())); }
     };

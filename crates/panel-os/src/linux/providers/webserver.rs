@@ -1357,7 +1357,8 @@ impl WebServerProvider for LinuxWebServer {
         match r {
             Ok(o) if o.code == Some(0) => Ok(()),
             Ok(o) => Err(PanelError::ConfigInvalid {
-                detail: if o.stderr.trim().is_empty() { o.stdout } else { o.stderr },
+                detail: panel_core::sanitize::stderr(
+                    if o.stderr.trim().is_empty() { &o.stdout } else { &o.stderr }),
             }),
             Err(e) => Err(e),
         }
@@ -1398,7 +1399,7 @@ impl WebServerProvider for LinuxWebServer {
                     CmdOpt { timeout: Duration::from_secs(15), ..Default::default() },
                 ).await?;
                 if o.code == Some(0) { Ok(()) }
-                else { Err(PanelError::Command { bin: "nginx".into(), detail: truncate_err(&o.stderr) }) }
+                else { Err(PanelError::Command { bin: "nginx".into(), detail: panel_core::sanitize::stderr(&o.stderr) }) }
             }
             Some("caddy") => {
                 // caddy reload 必须指向**主配置**（含 `import sites/*`），与 nginx 的
@@ -1416,7 +1417,7 @@ impl WebServerProvider for LinuxWebServer {
                     CmdOpt { timeout: Duration::from_secs(15), ..Default::default() },
                 ).await?;
                 if o.code == Some(0) { Ok(()) }
-                else { Err(PanelError::Command { bin: "caddy".into(), detail: truncate_err(&o.stderr) }) }
+                else { Err(PanelError::Command { bin: "caddy".into(), detail: panel_core::sanitize::stderr(&o.stderr) }) }
             }
             _ => unsupported!("webserver.reload: 未检测到 nginx/caddy"),
         }
