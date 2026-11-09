@@ -332,26 +332,35 @@ pub async fn conf_put(
         audit(&state, &s, "site.conf.edit", &id.to_string(), "fail").await;
         return Err(ApiError::from(PanelError::ConfigInvalid { detail: e.to_string() }));
     }
-    // 原子替换 + reload；reload 失败时配置已写入（语法已验过，可恢复）——与 apply 同口径
-    state.os.webserver().deploy(&target, &req.content).await?;
-    finish_deploy(&state, id, false).await?;
-
+    // ⚠ 下发前抓快照：deploy / finish_deploy / 落库任一失败都要恢复磁盘，
+    //   否则「文件已改但库还是旧值」，与 apply 的三方分叉同型（G7）。
+    let snapshot = super::rollback::DeploySnapshot::capture(&target, None).await;
     let path_str = target.display().to_string();
     let path_db = path_str.clone();
     // 指纹 = 当前表单值：此刻「文件已对齐表单」（文件=用户文本 + 表单=库值）。
     // 未来表单再改时，与这份文件分叉 → 未同步提示由此成立（017 迁移）。
     let snap_db = fingerprint_of(&row);
-    state
-        .db
-        .exec(move |conn| {
-            conn.execute(
-                "UPDATE sites SET manual_conf = 1, conf_path = ?1, conf_snapshot = ?3 WHERE id = ?2",
-                rusqlite::params![path_db, id, snap_db],
-            )
-            .map(|n| panel_db::WriteAck { rows_changed: n })
-            .map_err(|e| PanelError::Database(e.to_string()))
-        })
-        .await?;
+    let outcome: std::result::Result<(), ApiError> = async {
+        state.os.webserver().deploy(&target, &req.content).await?;
+        finish_deploy(&state, id, false).await?;
+        state
+            .db
+            .exec(move |conn| {
+                conn.execute(
+                    "UPDATE sites SET manual_conf = 1, conf_path = ?1, conf_snapshot = ?3 WHERE id = ?2",
+                    rusqlite::params![path_db, id, snap_db],
+                )
+                .map(|n| panel_db::WriteAck { rows_changed: n })
+                .map_err(|e| PanelError::Database(e.to_string()))
+            })
+            .await?;
+        Ok(())
+    }.await;
+    if let Err(e) = outcome {
+        super::rollback::rollback_after_failure(&state, &snapshot).await;
+        audit(&state, &s, "site.conf.edit", &id.to_string(), "fail").await;
+        return Err(e);
+    }
 
     audit(&state, &s, "site.conf.edit", &id.to_string(), "ok").await;
     // 版本留档（018）：手动保存 = 一条新的「已生效历史」（source=manual）。

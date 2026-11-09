@@ -750,6 +750,9 @@ pub async fn apply(
     // 版本留档（018）：真正落盘的内容在下面留存，落库成功后再进版本链
     // （落库失败不留档——版本链记录的必须是「已生效」的历史）。
     let mut archived_render: Option<String> = None;
+    // 下发失败时要恢复的文件状态（仅在 deploy 分支里 capture；落库失败也用得到，
+    // 故提到 if 外面）。
+    let mut rollback_snapshot: Option<super::rollback::DeploySnapshot> = None;
     let conf = if manual_skip {
         cur_row.as_ref().and_then(|r| r.conf_path.clone()).unwrap_or_default()
     } else {
@@ -766,25 +769,33 @@ pub async fn apply(
         // 5) 部署（仅启用态）。停用态：上面已渲染+校验通过配置，但**不**下发到 Web 服务器，
         //    配置不会进 nginx，与「真停用」一致；用户启用站点后再应用才会真正生效。
         if deploy {
-            state.os.webserver().deploy(&target, &rendered).await?;
-            // 文件已真实落盘 → 留存待版本链（落库成功后入库；见下方 archive 调用）
-            archived_render = Some(rendered.clone());
-
-            // 5.5) 域名改过则旧文件名成了孤儿：新配置已就位，**此刻**才轮到删旧配置。
-            //      `remove` 自带 reload —— 删过就等于重载过了，不再重复 reload。
-            let stale_conf = cur_row.as_ref().and_then(|r| r.conf_path.as_deref());
-            let pruned = prune_stale_conf(&state, stale_conf, &target).await?;
-            // 6) reload。失败时配置已写入但服务未加载 —— 这是可恢复的（配置语法已校验过）。
-            //    apply 按 name upsert：新建站点的 id 要等下面落库才生成，故时间戳在
-            //    upsert 后补记（其余四条入口在 finish_deploy 里落）。
-            if !pruned {
-                if let Err(e) = state.os.webserver().reload().await {
-                    return Err(ApiError::from(PanelError::Command {
-                        bin: "reload".to_string(),
-                        detail: format!("配置已写入但 reload 失败：{e}"),
-                    }));
+            // ⚠ 下发前无条件抓快照：deploy / prune / reload / 落库任一失败都要把磁盘
+            //   恢复到调用前状态，否则磁盘、nginx 内存、DB 三方分叉。
+            let stale_path = cur_row.as_ref().and_then(|r| r.conf_path.as_deref())
+                .map(std::path::Path::new);
+            let snap = super::rollback::DeploySnapshot::capture(&target, stale_path).await;
+            rollback_snapshot = Some(snap.clone());
+            let outcome: std::result::Result<(), ApiError> = async {
+                state.os.webserver().deploy(&target, &rendered).await?;
+                // 5.5) 域名改过则旧文件名成了孤儿：新配置已就位，**此刻**才轮到删旧配置。
+                let stale_conf = cur_row.as_ref().and_then(|r| r.conf_path.as_deref());
+                let pruned = prune_stale_conf(&state, stale_conf, &target).await?;
+                if !pruned {
+                    state.os.webserver().reload().await.map_err(|e| {
+                        ApiError::from(PanelError::Command {
+                            bin: "reload".to_string(),
+                            detail: format!("配置已写入但 reload 失败：{e}"),
+                        })
+                    })?;
                 }
+                Ok(())
+            }.await;
+            if let Err(e) = outcome {
+                super::rollback::rollback_after_failure(&state, &snap).await;
+                return Err(e);
             }
+            // 文件已真实落盘且 reload 成功 → 留存待版本链（落库成功后入库）
+            archived_render = Some(rendered.clone());
         }
         target.display().to_string()
     };
@@ -832,7 +843,7 @@ pub async fn apply(
     // 只有「重新生成」才结束手动维护；普通 apply 对手动站点是整段跳过（manual 保持 1）。
     let clear_manual: Option<i32> = if !manual_skip && was_manual { Some(0) } else { None };
 
-    state
+    let db_result = state
         .db
         .exec(move |conn| {
             // ?5 = enabled, ?6 = conf_path；deploy=false 时两者分别为 0 / 空串。
@@ -885,7 +896,16 @@ pub async fn apply(
             .map(|_| panel_db::WriteAck { rows_changed: 1 })
             .map_err(|e| PanelError::Database(e.to_string()))
         })
-        .await?;
+        .await;
+
+    // 落库失败同样回滚：此时文件已生效、reload 已成功，但库里还是旧记录，
+    // 不回滚就会让 UI 永远提示「未同步」，且下次重启加载的是这次的配置。
+    if let Err(e) = db_result {
+        if let Some(snap) = rollback_snapshot.as_ref() {
+            super::rollback::rollback_after_failure(&state, snap).await;
+        }
+        return Err(ApiError::from(e));
+    }
 
     // 上次下发时间（023）：apply 按 name upsert，新建站点的 id 由本次落库才生成，
     // 只能在此刻补记（其余四条入口在 finish_deploy 里落）。deploy=false 的停用态

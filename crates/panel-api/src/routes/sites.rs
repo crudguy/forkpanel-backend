@@ -47,6 +47,8 @@ mod model;
 pub use model::*;
 
 // ─── 站点 CRUD（列表/创建/详情/更新/删除，拆至 sites/crud.rs；pub use 重导出端点） ───
+// 下发回滚快照：apply / conf_put 共用，避免「磁盘改了、reload 或落库失败」三方分叉。
+mod rollback;
 mod crud;
 pub use crud::*;
 

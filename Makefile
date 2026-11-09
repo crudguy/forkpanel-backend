@@ -80,6 +80,9 @@ guards:
 	# 日志真实去向（journald + 保留上限）、崩溃告警 OnFailure 与不实注释修正
 	# 必须一起接线：只改注释不改安装器 = 又一轮「文档承诺但代码没有」。
 	python3 ci/check_logging.py
+	# 站点下发 deploy→reload→落库 任一失败都要回滚磁盘（apply 两条路径 / conf_put 一条），
+	# 少一条就是「配置已写但库还是旧值」，下次 nginx 重启才爆。
+	python3 ci/check_site_rollback.py
 
 # 内嵌前端新鲜度：改完前端只 cargo build **不会**重新 embed，必须
 # ① vite build → ② rm -rf web/dist/* → ③ cp -a → ④ touch embed.rs → ⑤ cargo build。
