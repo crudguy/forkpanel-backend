@@ -76,7 +76,23 @@ stop_own_server() {
   local pid; pid=$(port_pid)
   if [ -z "$pid" ]; then return 0; fi
   echo 'a' | sudo -S -p '' kill "$pid" 2>/dev/null
+  # ⚠ 端口先释放 **不等于** 进程已退出：优雅关闭会先摘 listener、再走完收尾，而实例锁
+  #   按「pid 是否存活」判定。只等端口就重启会撞锁：
+  #   「已有 panel 实例持有 data/panel.lock（锁文件记录 pid=…）」（实测踩过）。
+  #   等 /proc/<pid> 消失——对属主/权限不敏感，僵尸被回收后也会消失。
+  for _ in $(seq 1 40); do
+    [ -d "/proc/$pid" ] || break
+    sleep 0.2
+  done
   wait_port_free || return 1
+}
+# 等端口就绪（最多 ~6s）：固定 sleep 在慢机器/大二进制上会偶发假红
+wait_serving() {
+  for _ in $(seq 1 20); do
+    ss -tln 2>/dev/null | grep -q ":$PORT " && return 0
+    sleep 0.3
+  done
+  return 1
 }
 
 cleanup() {
@@ -124,7 +140,11 @@ DB="$ROOT/data/panel.db"
 [ -f "$DB" ] && ok "panel.db 已创建" || bad "panel.db 不存在"
 
 say "== 1. 造一份真产物 =="
-out=$("$BIN" backup --config "$CFG" 2>&1)
+# 这里刻意用 --no-encrypt：本脚本验的是**恢复机制**（停服闸门 / 先验产物 / 留快照 /
+# 原子替换），明文产物能把这条链路单独钉住。加密产物那条链（含丢密钥、换密钥）由
+# `ci/e2e-key-drill.sh` 覆盖；两条都跑，才不至于"加密封装坏了但恢复逻辑是好的"
+# 或反过来。G12 起 `panel backup` 默认加密，故必须显式关掉。
+out=$("$BIN" backup --config "$CFG" --no-encrypt 2>&1)
 chk_rc "backup 成功" "$?" "0"
 ART=$(ls "$ROOT"/data/backups/panel-*.db 2>/dev/null | head -1)
 if [ -n "$ART" ] && [ -s "$ART" ]; then ok "产物存在且非空：$(basename "$ART")"
@@ -145,9 +165,9 @@ chk_has "坏产物失败原因是 db 解析而非参数错误" "$out" "not a dat
 say "== 4. restore-db 负向：服务在线必须拒绝 =="
 echo 'a' | sudo -S -p '' setsid nohup "$BIN" serve --config "$CFG" \
   > "$ROOT/serve.log" 2>&1 < /dev/null &
-sleep 3
-if ! ss -tln 2>/dev/null | grep -q ":$PORT "; then
+if ! wait_serving; then
   bad "隔离实例未能启动，后续在线闸门无法验证（见 $ROOT/serve.log）"
+  tail -8 "$ROOT/serve.log" 2>/dev/null | sed 's/^/    /'
 else
   ok "隔离实例已起（:$PORT）"
   out=$("$BIN" restore-db --config "$CFG" "$ART" 2>&1); rc=$?
@@ -197,9 +217,9 @@ else ok "旧库 -wal/-shm 已清理"; fi
 say "== 9. 恢复后的库必须真的能用：起服务 + 登录 =="
 echo 'a' | sudo -S -p '' setsid nohup "$BIN" serve --config "$CFG" \
   > "$ROOT/serve2.log" 2>&1 < /dev/null &
-sleep 3
-if ! ss -tln 2>/dev/null | grep -q ":$PORT "; then
+if ! wait_serving; then
   bad "恢复后实例起不来（恢复出来的库可能不可用）"
+  tail -8 "$ROOT/serve2.log" 2>/dev/null | sed 's/^/    /'
 else
   ok "恢复后实例已起"
   code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/v1/auth/login" \

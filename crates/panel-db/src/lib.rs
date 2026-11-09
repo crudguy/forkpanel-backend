@@ -17,6 +17,7 @@
 pub mod aggregator;
 pub mod cleanup;
 pub mod migrate;
+pub mod rekey;
 pub mod ring;
 
 use panel_core::{PanelError, Result, Tier};
@@ -464,6 +465,18 @@ pub fn backup_to(conn: &Connection, dest: &Path) -> Result<()> {
     let mut stmt = conn.prepare(sql).map_err(|e| PanelError::Database(e.to_string()))?;
     stmt.execute(rusqlite::params![dest_str])
         .map_err(|e| PanelError::Database(format!("vacuum into: {e}")))?;
+    // 产物权限 0600：面板库里有口令密文、SSL 私钥密文与审计明细，0644 等于
+    // 同机任何用户都能拷走整库（再离线爆破主密钥）。目录虽是 0700，但产物常被
+    // 拷到别处（用户 `--out` 到 /tmp 或家目录），所以权限必须跟着文件本身。
+    //
+    // ⚠ 只能建完之后收紧：`VACUUM INTO` 拒绝写**已存在**的文件，无法像 tar 那样
+    //   「先建 0600 空文件再覆盖」。窗口期内文件在 0700 目录里，其他本地用户
+    //   进不来，故此处接受这个极短窗口。
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| PanelError::Io(format!("chmod {}: {e}", dest.display())))?;
+    }
     Ok(())
 }
 

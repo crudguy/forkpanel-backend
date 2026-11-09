@@ -87,6 +87,27 @@ fn load_master_key(data_dir: &std::path::Path) -> Option<MasterKey> {
     }
 }
 
+/// 只在主密钥**已存在**时读取；不存在返回 `None`，**绝不生成**。
+///
+/// 恢复 / 校验 / 取远端产物这类"读既有数据"的路径必须用这个，不能用
+/// [`load_master_key`]：后者在文件缺失时会顺手生成一把新钥匙，于是「密钥丢了」
+/// 被伪装成「密钥不对」（报的是 `aes-gcm decrypt` 失败，看起来像产物损坏）。
+/// 更糟的是**明文产物**会恢复成功，而库里所有密文从此永久打不开——现场一切正常，
+/// 直到某天要读 SSL 私钥。丢密钥必须是一次显式失败，不是一次静默自愈。
+fn load_existing_master_key(data_dir: &std::path::Path) -> Option<MasterKey> {
+    let p = bootstrap::master_key_path(data_dir);
+    if !p.is_file() {
+        return None;
+    }
+    match std::fs::read(&p) {
+        Ok(b) => match MasterKey::from_bytes(&b) {
+            Ok(k) => Some(k),
+            Err(e) => { tracing::warn!("主密钥长度非法: {e}"); None }
+        },
+        Err(e) => { tracing::warn!("读取主密钥失败: {e}"); None }
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "panel", version, about = "轻量 Linux 服务器管理面板")]
 struct Cli {
@@ -122,8 +143,13 @@ enum Cmd {
     Migrate,
     /// 启动服务
     Serve,
-    /// 在线备份数据库
-    Backup { #[arg(long)] out: Option<PathBuf> },
+    /// 在线备份数据库（**默认加密**，产物 `<名称>.db.enc`，0600）
+    Backup {
+        #[arg(long)] out: Option<PathBuf>,
+        /// 出**明文** `.db` 产物。仅用于「本机临时看一眼」，别交给外部介质
+        #[arg(long)]
+        no_encrypt: bool,
+    },
     /// 重建数据库（回收空间）
     Vacuum,
     /// 修改用户口令（仅改已存在用户；建号只能走 init / 首启引导令牌）
@@ -155,6 +181,15 @@ enum Cmd {
         /// 跳过"服务仍在监听"的检查（容器里进程名不同 / 已确认停机时用）
         #[arg(long)]
         force: bool,
+    },
+    /// 主密钥运维：查看指纹 / 导出离线副本 / 校验副本 / 轮换密钥
+    ///
+    /// 这一组动的是**唯一能解开全库密文**的钥匙（MFA 密钥 / SSL 私钥 / 数据库口令 /
+    /// 远端备份凭据 / LLM API Key）。`rotate` 会改库，故与 `restore-db` 一样
+    /// 要求服务先停——运行中的进程内存里还是旧密钥。
+    Key {
+        #[command(subcommand)]
+        action: KeyAction,
     },
     /// 安装/卸载外部探活（覆盖 Restart=on-failure 管不了的"活着但不服务"）
     Healthcheck {
@@ -278,6 +313,33 @@ enum Cmd {
         },
     }
 
+    /// `panel key` 的子命令。四条都作用于 `<data_dir>/master.key`。
+    #[derive(Clone, Subcommand)]
+    enum KeyAction {
+        /// 打印路径、权限位与指纹（**不打印密钥本体**）
+        Show,
+        /// 导出一份 0600 离线副本；拒绝写进数据目录（同盘等于没备份）
+        Export {
+            /// 目标路径（异地介质上，如 /mnt/usb/master.key）
+            #[arg(long)]
+            out: PathBuf,
+        },
+        /// 校验一份副本：指纹比对 + 真拿它解一条库里的密文
+        Check {
+            /// 副本路径
+            path: PathBuf,
+        },
+        /// 轮换主密钥：用新密钥重加密全库密文（**必须先停服务**）
+        Rotate {
+            /// 跳过「服务仍在监听」的检查（容器里进程名不同 / 已确认停机时用）
+            #[arg(long)]
+            force: bool,
+            /// 确认执行；不给只打印将要发生什么（换钥不可逆）
+            #[arg(long)]
+            yes: bool,
+        },
+    }
+
 fn main() {
     let cli = Cli::parse();
     if let Err(e) = run(cli) {
@@ -320,7 +382,8 @@ fn run(cli: Cli) -> Result<()> {
         // `[paths]` 覆盖重建适配器，原先那个只在读到配置前用于定位配置文件。
         Cmd::Serve => cmd::serve::run(&cli, os),
 
-        Cmd::Backup { ref out } => cmd::db::backup(&cli, os.clone(), out.as_deref()),
+        Cmd::Backup { ref out, no_encrypt } =>
+            cmd::db::backup(&cli, os.clone(), out.as_deref(), !no_encrypt),
 
         Cmd::Vacuum => cmd::db::vacuum(&cli, os.clone()),
 
@@ -333,6 +396,15 @@ fn run(cli: Cli) -> Result<()> {
         // 面板自身库的五条运维命令搬进 `cmd/db.rs`（同域：都动同一份 panel.db）。
         Cmd::RestoreDb { ref path, remote, ref artifact, force } => cmd::db::restore(
             &cli, os.clone(), path.as_deref(), remote, artifact.as_deref(), force),
+
+        // 主密钥这一组与 `db` 分开：动的是"唯一能解开全库密文"的钥匙，
+        // 出错的后果不是"某个功能坏了"，而是"全部密文永久打不开"。
+        Cmd::Key { action } => match action {
+            KeyAction::Show => cmd::key::show(&cli, os),
+            KeyAction::Export { ref out } => cmd::key::export(&cli, os, out),
+            KeyAction::Check { ref path } => cmd::key::check(&cli, os, path),
+            KeyAction::Rotate { force, yes } => cmd::key::rotate(&cli, os, force, yes),
+        },
 
         Cmd::Healthcheck { install, uninstall } =>
             cmd::system::healthcheck(&cli, os.clone(), install, uninstall),

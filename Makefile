@@ -8,7 +8,7 @@
 # （恒绿比没门禁更危险）。故 audit 单独成一个目标，CI 里单独一个 job——
 # advisory-db 托管在 GitHub，网络抖动时不该连带拖红主门禁。
 
-.PHONY: check guards audit test embed-fresh e2e-files e2e-backups e2e-containers e2e-cron e2e-databases e2e-sites e2e-firewall e2e-rbac e2e-security e2e-all e2e-ui e2e-observe e2e-restore e2e-install e2e-upgrade e2e-expose e2e-get-panel e2e-mirror mirror-sync
+.PHONY: check guards audit test embed-fresh e2e-files e2e-backups e2e-containers e2e-cron e2e-databases e2e-sites e2e-firewall e2e-rbac e2e-security e2e-all e2e-ui e2e-observe e2e-restore e2e-key-drill e2e-install e2e-upgrade e2e-expose e2e-get-panel e2e-mirror mirror-sync
 
 # E2E 用的后端地址与二进制路径（可按需覆盖：make e2e-files BASE=http://127.0.0.1:2084）
 BASE ?= http://127.0.0.1:2083
@@ -96,6 +96,10 @@ guards:
 	# 发布产物完整性：dist/ 里一出现 panel-linux-*.tar.gz 就必须双架构 + .sig +
 	# SHA256SUMS 逐行可验（一个都没有＝未构建，跳过；做了一半＝判红）。
 	bash ci/check_release_artifacts.sh
+	# G12：密钥与备份的接线——encrypt 默认开启且后端/openapi×2/前端四处一致、
+	# 产物一律 0600、rekey 覆盖面与 schema 的 *_enc 列集合相等、恢复路径不得
+	# 自动生成主密钥（否则「丢密钥」被伪装成「产物损坏」）。
+	python3 ci/check_key_hygiene.py
 
 # 内嵌前端新鲜度：改完前端只 cargo build **不会**重新 embed，必须
 # ① vite build → ② rm -rf web/dist/* → ③ cp -a → ④ touch embed.rs → ⑤ cargo build。
@@ -224,6 +228,11 @@ e2e-observe:
 #   make e2e-restore
 e2e-restore:
 	bash ci/e2e-restore.sh "$(BIN)"
+
+# 主密钥三方恢复演练（G12）：`panel.db` + `master.key` + 备份同时删掉再拉回来。
+# 与 e2e-restore 一样要自建实例 + 停服，故不进 `make check`（CI 的 E2E job 跑它）。
+e2e-key-drill:
+	bash ci/e2e-key-drill.sh "$(BIN)"
 
 # 安装脚本 E2E（deploy/install.sh + uninstall.sh，**在 user namespace 里真跑**）。
 # 又一次不同于前面所有 e2e-*：它不碰 HTTP、不碰运行中的后端，而是在 `unshare -rmn`

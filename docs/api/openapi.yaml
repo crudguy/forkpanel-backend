@@ -998,7 +998,7 @@ components:
         enabled:     { type: boolean, default: true }
         last_run_at: { type: [integer, "null"] }
         last_result: { type: [string, "null"] }
-        encrypt:     { type: boolean, default: false, description: "产物静态加密（AES-256-GCM 分块容器，见 panel-os/backup.rs）；主密钥来自 /var/lib/forkpanel/master.key 且不落库。加密会抬高恢复门槛——主密钥丢失等于备份全废，故默认关闭，由用户显式选择" }
+        encrypt:     { type: boolean, default: true, description: "产物静态加密（AES-256-GCM 分块容器，见 panel-os/backup.rs）；主密钥来自 /var/lib/forkpanel/master.key 且不落库。**默认开启**：产物一旦离机（U 盘 / 对象存储 / 换机器），未加密等于交出整站配置与审计明细。代价是「主密钥丢失 = 备份全废」，所以必须同时做异地离线副本（docs/deployment.md §4.1）并用 `panel key check` 验证；确实不需要加密时显式传 false" }
         remote_kind:  { type: [string, "null"], enum: [webdav, s3, null], description: "远端副本类型；null=仅本地。本地备份挡不住整机故障（磁盘坏、误删、机房事故），异地那份才是真兜底" }
         remote_url:   { type: [string, "null"], description: "webdav: 目标目录 URL；s3: endpoint（如 https://s3.example.com）。仅 http/https" }
         remote_bucket: { type: [string, "null"], description: "s3: bucket 名（s3 必填）" }
@@ -3210,7 +3210,7 @@ paths:
                 cron_expr:  { type: [string, "null"] }
                 keep_count: { type: integer, default: 7 }
                 enabled:    { type: boolean, default: true }
-                encrypt:    { type: boolean, default: false }
+                encrypt:    { type: boolean, default: true }
                 remote:     { $ref: '#/components/schemas/RemoteConfig' }
       responses: { '201': { description: 已创建 } }
   /api/v1/backups/test-remote:

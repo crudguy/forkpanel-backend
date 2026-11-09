@@ -23,6 +23,9 @@ tracing    = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 rand       = "0.8"
 rusqlite   = { workspace = true }
+# 主密钥指纹（`panel key show/export/check`）：只导出 SHA-256 的前 8 字节，
+# 让人能比对「是不是同一把」而无需看到密钥本身。
+sha2       = "0.10"
 
 # 静态资源内嵌：运行期零 Node、零外部文件依赖
 rust-embed = { version = "8", features = ["mime-guess", "compression"] }

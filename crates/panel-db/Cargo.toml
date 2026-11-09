@@ -12,6 +12,8 @@ panel-core = { path = "../panel-core" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 tokio    = { workspace = true }
 arc-swap = "1"
+# 仅 rekey 用：settings.value_json 是 JSON 字符串，`enc:<hex>` 藏在里面
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

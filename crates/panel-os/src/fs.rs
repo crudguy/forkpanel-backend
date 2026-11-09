@@ -41,6 +41,29 @@ pub fn write_private(p: &Path, data: &[u8], mode: u32) -> Result<()> {
     set_mode(p, mode)
 }
 
+/// **以给定权限创建**文件并返回句柄（备份产物、解密明文等用 0600）。
+///
+/// 为什么不直接用 `write_private`：它是「先 `fs::write` 再 `chmod`」，两次 syscall
+/// 之间文件已存在且权限是 `0666 & ~umask`（典型 0644）——同机任何用户都能在这个
+/// 窗口里打开它。对写一次就完事的小文件窗口极短，但备份产物与**解密出来的明文库**
+/// 是几百 MB 的量级，写入期长达数秒，窗口不是理论问题。
+///
+/// `OpenOptions::mode` 只在 `O_CREAT` 真正建文件时生效；对**已存在**的目标内核
+/// 会忽略它，所以补一次 `set_mode` 让「旧文件 0644 + 本次复用」也收敛到目标权限。
+pub fn create_private(p: &Path, mode: u32) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(parent) = p.parent() { std::fs::create_dir_all(parent).ok(); }
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(mode)
+        .open(p)
+        .map_err(|e| PanelError::Internal(format!("create {}: {e}", p.display())))?;
+    set_mode(p, mode)?;
+    Ok(f)
+}
+
 /// 检查数据目录所在文件系统，返回 `(文件系统名, 是否为网络文件系统)`。
 ///
 /// 为什么必须走这里：SQLite 的 WAL 依赖共享内存与可靠的 fsync 语义，

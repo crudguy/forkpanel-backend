@@ -377,7 +377,14 @@ pub async fn create(
     let keep = req.keep_count.unwrap_or(7).clamp(1, 365);
     let enabled = req.enabled.unwrap_or(true) as i32;
     let cron = req.cron_expr.clone();
-    let encrypt = req.encrypt.unwrap_or(false) as i32;
+    // **默认加密**（G12）：省略 `encrypt` 时按 true 处理。产物一旦离机
+    // （U 盘 / 对象存储 / 同事的机器），未加密就等于交出整站配置与审计明细；
+    // 代价是「主密钥丢失 = 备份全废」，由 `docs/deployment.md` §4.1 的异地离线
+    // 副本 + `panel key check` 兜住。不想加密必须**显式**传 false。
+    //
+    // ⚠ 与 PATCH 的语义不同（那里省略 = 保持原值，不是改回 true）：
+    //   创建是定初值，更新是「没说就别动」——两者混用会让一次改名悄悄重新加密。
+    let encrypt = req.encrypt.unwrap_or(true) as i32;
     // 开启加密前先确认主密钥可用：否则计划创建成功、**执行时**才失败，
     // 用户会以为"已经在备份了"，实际每天在报错——这是最坏的失败方式。
     if encrypt != 0 {

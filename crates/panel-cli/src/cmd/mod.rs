@@ -10,7 +10,9 @@
 //! `db`（migrate/backup/vacuum/verify-backup/restore-db，五个都动同一份 panel.db）。
 //! `system`（systemd-unit/healthcheck/capabilities/uninstall/upgrade，
 //! 都改这台机器的面板安装）、`security`（passwd/expose，都改变"谁能访问面板"）、
-//! `init`（init/doctor，装完立刻用的一对：建出来的东西正是自检的对象）。
+//! `init`（init/doctor，装完立刻用的一对：建出来的东西正是自检的对象）、
+//! `key`（show/export/check/rotate，四条都动同一份 `master.key`——唯一能解开
+//! 全库密文的钥匙，故与 `db` 分开：这里出错的后果是"全部密文永久打不开"）。
 //!
 //! ⚠️ 迁移时有一条固定动作：`main.rs` 的 `wiring_guard_tests` 里有几条守卫靠
 //! `include_str!` 扫被搬走的代码（"这条调用必须挂在 serve 启动链上"这类）。
@@ -20,6 +22,7 @@
 
 pub(crate) mod db;
 pub(crate) mod init;
+pub(crate) mod key;
 pub(crate) mod security;
 pub(crate) mod serve;
 pub(crate) mod system;

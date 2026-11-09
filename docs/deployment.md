@@ -361,10 +361,10 @@ sudo panel --config /etc/forkpanel/config.toml passwd admin --pass '<新口令>'
 
 ---
 
-### 4.1 主密钥必须单独备份（最容易被漏的一步）
+### 4.1 主密钥：异地副本 / 丢失 / 轮换
 
-`<data_dir>/master.key`（0600）加密着 **SSL 私钥、数据库口令、远端备份凭据**。
-它**不在任何备份里**——这是刻意的（密钥跟密文放一起，加密就白做了）。
+`<data_dir>/master.key`（0600，32 字节）加密着 **SSL 私钥、数据库口令、远端备份凭据、
+MFA 密钥、LLM API Key**。它**不在任何备份里**——这是刻意的（密钥跟密文放一起，加密就白做了）。
 
 于是有一条必须写进运维清单的结论：
 
@@ -372,12 +372,120 @@ sudo panel --config /etc/forkpanel/config.toml passwd admin --pass '<新口令>'
 > 但所有证书私钥解不开、所有数据库连不上、远端备份也传不出去。
 > 外观上"恢复成功了"，实际是个残废的面板。
 
+从 G12 起，**备份产物默认加密**（`panel backup` 出 `.db.enc`，备份计划不传 `encrypt`
+即按 `true` 处理），所以这条从"建议"升级成"没做就不能开工"。
+
+#### 4.1.1 做一份异地离线副本
+
+不需要 `tar`/`chmod` 手工拼命令，用面板自己的命令（它顺带拒绝两个错：写进数据目录、
+覆盖已有副本）：
+
 ```bash
-# 初始化后立刻做一次，并存到与备份**不同**的地方（同盘等于没备份）
-sudo tar czf /root/forkpanel-master-$(date +%F).tar.gz -C /var/lib/forkpanel master.key
-sudo chmod 600 /root/forkpanel-master-*.tar.gz
-# 建议：再抄一份到密码管理器或异地；换机器时它是第一个要搬的东西
+# 1) 看一眼当前密钥的指纹（16 位十六进制）。指纹是哈希，贴进工单/聊天不泄露密钥。
+sudo panel key show
+#   主密钥：/var/lib/forkpanel/master.key
+#   权限：0600
+#   大小：32 字节
+#   指纹：bcd198f68ebc8e88
+
+# 2) 导出到**异地介质**（U 盘 / 另一台机器 / 密码管理器附件）。
+#    目标在数据目录内会被直接拒绝——同盘等于没备份。
+sudo panel key export --out /mnt/usb/forkpanel-master.key
+
+# 3) 立刻验证它真能开锁：指纹比对 + 拿副本真解一条库里的密文
+sudo panel key check /mnt/usb/forkpanel-master.key
+#   ✅ 已用副本解开一条真实密文（db_connections.password_enc id=1（数据库连接口令））
+#      ——这份副本确实能开这把锁
 ```
+
+三件事必须一起做，缺一条这份副本就只是"看着像备份"：
+
+1. **存到与备份不同的介质**（同盘、同机、同机房都不算）；
+2. **记下指纹**（写进密码管理器条目或运维台账，换钥后要能分辨"这是哪一代"）；
+3. **定期复核**：换机器、换密钥、恢复演练之前，先跑一次 `panel key check`。
+   指纹一致但解不开的唯一原因，就是这把钥匙不是那批密文的那把。
+
+> `panel key check` 与 `panel verify-backup` 的区别：前者验"钥匙对不对"，
+> 后者验"产物能不能恢复"。恢复出事故时两个都要跑，顺序是先钥匙后产物。
+
+#### 4.1.2 丢密钥了怎么办
+
+**先别做任何写操作。** 按顺序试三条出路，前一条不成立再走下一条：
+
+| # | 处境 | 处置 |
+|---|---|---|
+| ① | 有异地副本 | 把它放回 `<data_dir>/master.key`（`chmod 600`），`panel key check` 确认能开锁，再走 §5.3 恢复库 |
+| ② | 换过密钥 | 目录里会有 `master.key.bak-<时间戳>`；用它去解**那个年代**加密的产物。用错代次报的是 `aes-gcm decrypt` 失败，不是"文件损坏" |
+| ③ | 真的全丢了 | **加密产物无救**（AES-256-GCM 无密钥即无解）。只能改用未加密的 `.db` 产物恢复，并接受库里所有密文失效：重新签发证书、重设数据库口令与远端凭据、重新绑定 MFA |
+
+第 ③ 条的代价要提前讲清楚：恢复出来的库**能登录**，`has_password` 还是 `true`，
+但每一次真正去读秘密都会失败。所以丢密钥时的正确动作是"找密钥"，不是"重装一遍"。
+
+⚠ **不要用一把新生成的密钥顶替。** 新密钥解不开旧产物，只会让现场看起来像"产物损坏"，
+把排查引到完全错误的方向。为此 `panel restore-db` / `verify-backup` 在密钥缺失时
+**显式失败**并列出上面三条出路，而不是自动生成一把新的（这条有源码守卫
+`ci/check_key_hygiene.py` [6] 钉着）。
+
+#### 4.1.3 换密钥（`panel key rotate`）
+
+需要换钥的典型场景：密钥曾随备份一起外泄、交接换人、合规要求定期轮换。
+
+```bash
+sudo systemctl stop panel                  # ① 必须先停：运行中的进程内存里还是旧密钥
+sudo panel key rotate                      # ② 先干跑：只打印将发生什么
+sudo panel key rotate --yes                # ③ 真换
+```
+
+它会做四件事，顺序是安全性的一部分：
+
+1. **单事务**重加密 5 个作用域的密文（MFA 密钥 / SSL 私钥 / 数据库口令 / 远端备份凭据 /
+   LLM API Key）。任何一行解不开就整体回滚——绝不留"半新半旧"的库；
+2. 新密钥**先落盘**（`master.key.new`，0600）再改库：反过来的话，一旦写钥匙失败，
+   库里已是新密文而盘上没有对应钥匙 = 数据当场全废；
+3. 原子换名：旧 → `master.key.bak-<时间戳>`，新 → `master.key`；
+4. 打印各作用域行数与新指纹。
+
+两条硬前提（都会被命令本身拦下，不用记）：
+
+- **服务在跑就拒绝**——否则运行中的进程会继续用旧密钥加密新秘密，库里新旧混装；
+- **`backup_dir` 里还有 `.enc` 产物就拒绝**（`--force` 才继续）——那些产物换钥后永久不可解。
+  先恢复到新库、或用旧密钥解一份明文 `--no-encrypt` 备份，再换。
+
+换完立刻做的事：
+
+```bash
+sudo systemctl start panel && sudo panel doctor
+sudo panel key export --out /mnt/usb/forkpanel-master-new.key   # 副本同步更新
+sudo panel key check  /mnt/usb/forkpanel-master-new.key
+# 确认服务与各功能都正常后，才删除 master.key.bak-<ts>
+```
+
+> 旧密钥不要急着删：它是换钥后**唯一**还能解开旧产物与旧副本的东西。
+> 保留到下一次备份周期结束、并确认新副本可用之后再删。
+
+#### 4.1.4 三方恢复演练（`panel.db` + `master.key` + 备份）
+
+三个部件少一个都恢复不了，所以演练必须**同时**覆盖"删库"和"删密钥"：
+
+```bash
+ci/e2e-key-drill.sh            # 隔离实例 + 独立端口，不碰正在用的实例
+```
+
+它按顺序验 10 组、74 条断言（2026-11-09 实跑 `PASS=74 FAIL=0 SKIP=1`）：
+
+| 组 | 验什么 |
+|---|---|
+| 1 | `panel backup` 默认出 `.db.enc` 且 0600；同目录不留明文；`--no-encrypt` 仍可用 |
+| 2–3 | API 侧省略 `encrypt` ⇒ 落库 `true`；显式 `false` **必须被尊重**（默认开启 ≠ 无法关闭） |
+| 4–5 | `key show/export/check` 正向；写到数据目录、覆盖已有副本、16 字节文件、另一把 32 字节密钥，四个负向全部被拒 |
+| 6 | `key rotate` 三道闸门：服务在跑 / 有旧 `.enc` 产物 / 缺 `--yes` |
+| 7–8 | 真换钥后：旧副本失效、新钥能开库、旧产物解不开且报"上一代密钥" |
+| 9 | 删库 + 删钥后 `restore-db` 被拒、**不新建密钥**、**不创建空库** |
+| 10 | 副本放回 → 恢复库 → 起服务 → 登录 → 数据在 → 密文仍能解开（三方闭环） |
+
+> 「只演练过明文产物」等于没演练：G12 之前 `restore-db` 在密钥缺失时会**静默生成**
+> 一把新密钥，于是"丢密钥"被伪装成"产物损坏"，而明文产物那条路会一路成功——
+> 现场看起来一切正常，直到某天要读 SSL 私钥。这条是 2026-11-09 真跑时抓出来的。
 
 前端备份页对加密产物已有同义的红字警告（「主密钥一旦丢失无法恢复」），
 但那是**用户勾选加密时**才看得见——而密钥丢失影响的是全部备份，故在此再立一条。
@@ -513,15 +621,23 @@ journalctl -u panel-healthcheck.service -n 20 --no-pager
 > 恢复前先确认：**主密钥 `<data_dir>/master.key` 还在**。它不在备份里（那是它
 > 该在的地方），但 SSL 私钥、数据库口令、远端凭据全都靠它解密——丢了它，备份
 > 恢复回来也是一堆解不开的密文。
+>
+> 从 G12 起默认产物是 `.db.enc`（加密容器），**没有主密钥连恢复都开始不了**：
+> `restore-db` 会明确告诉你"没有它无法恢复"并列出三条出路，而不是给你一个
+> `aes-gcm decrypt` 失败。顺序永远是 **先钥匙，后库**——详见 §4.1.2。
 
 ```bash
 CFG=/etc/forkpanel/config.toml
+
+# ⓪ 先确认钥匙这一半：副本与在用密钥指纹一致，且真能开锁
+panel --config "$CFG" key show
+panel --config "$CFG" key check /mnt/usb/forkpanel-master.key
 
 # ① 停服务（systemd 环境下探活 timer 会连着报失败，属预期，恢复后自愈）
 systemctl stop panel
 
 # ② 一条命令完成：验产物 → 给当前库留快照 → 原子替换 → 清掉旧 WAL/SHM
-panel --config "$CFG" restore-db /path/to/plan1-1234567890.db
+panel --config "$CFG" restore-db /path/to/panel-1234567890.db.enc
 #    ✅ 产物可恢复：… integrity_check=ok，含 users 表
 #    当前库已留快照：/var/lib/forkpanel/backups/pre-restore-<ts>.db
 #    ✅ 已恢复：/var/lib/forkpanel/panel.db
@@ -530,6 +646,8 @@ panel --config "$CFG" restore-db /path/to/plan1-1234567890.db
 systemctl start panel
 curl -fsS http://127.0.0.1:2083/api/v1/version
 # 登录进面板，核对站点数 / 用户数 / 最近备份时间与备份时刻一致
+# 密文这一半也要验：库里"有口令"不等于"口令解得开"
+panel --config "$CFG" key check /mnt/usb/forkpanel-master.key
 ```
 
 `restore-db` 的四道保护（缺一条都可能把"恢复"变成"二次事故"）：

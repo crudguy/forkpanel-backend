@@ -40,14 +40,15 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # e2e-restore 放最后：它是唯一**不起 HTTP**的域（自己在隔离目录 init/backup/restore），
 # 参数是 panel 二进制而非 base_url，且会临时独占一个端口。放在末尾既不影响前置域，
 # 也保证它失败时前面的结论仍然可信。
-SCRIPTS=(e2e-files e2e-backups e2e-containers e2e-cron e2e-databases e2e-sites e2e-firewall e2e-rbac e2e-security e2e-observe e2e-restore)
+SCRIPTS=(e2e-files e2e-backups e2e-containers e2e-cron e2e-databases e2e-sites e2e-firewall e2e-rbac e2e-security e2e-observe e2e-restore e2e-key-drill)
 declare -A LABEL=(
   [e2e-files]="文件" [e2e-backups]="备份" [e2e-containers]="容器"
   [e2e-cron]="计划任务" [e2e-databases]="数据库" [e2e-sites]="站点"
   [e2e-firewall]="防火墙" [e2e-rbac]="权限与设置" [e2e-security]="WAF 与安全" [e2e-observe]="可观测"
-  [e2e-restore]="恢复链路(CLI)"
+  [e2e-restore]="恢复链路(CLI)" [e2e-key-drill]="主密钥三方恢复(CLI)"
 )
-# 参数形态：绝大多数域吃 base_url，e2e-restore 吃 panel 二进制路径（缺省 debug 产物）。
+# 参数形态：绝大多数域吃 base_url；e2e-restore 与 e2e-key-drill 吃 panel 二进制路径
+# （两者都要自己拉/停实例：恢复要覆盖库，换钥要停服，都不能跑在共享实例上）。
 RESTORE_BIN="${PANEL_E2E_BIN:-./target/debug/panel}"
 
 say() { printf '%s\n' "$*"; }
@@ -58,7 +59,7 @@ DEGRADED=0; DEG_LIST=""   # 降级域：能力位缺失，只验了诚实 501，
 for s in "${SCRIPTS[@]}"; do
   say ""
   say "════════ [$s] ${LABEL[$s]} ════════"
-  if [ "$s" = "e2e-restore" ]; then
+  if [ "$s" = "e2e-restore" ] || [ "$s" = "e2e-key-drill" ]; then
     out=$(bash "$HERE/$s.sh" "$RESTORE_BIN" 2>&1); rc=$?
   else
     out=$(bash "$HERE/$s.sh" "$B" 2>&1); rc=$?

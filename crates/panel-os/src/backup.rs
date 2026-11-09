@@ -7,7 +7,11 @@ use std::time::Duration;
 
 /// 把 `src_dir` 打包为 `dest`（`.tar.gz`）。`dest` 的父目录必须已存在。
 ///
-/// 用法：`tar -czf <dest> -C <parent> <dirname>` —— 归档内保留目录名，恢复时可直接解包。
+/// ⚠ **产物权限 0600**：`tar -czf` 打开目标用的是 `O_CREAT|O_TRUNC, 0666`，
+/// 新建时权限 = `0666 & ~umask`（典型 0644）；而目标**已存在**时内核忽略 mode、
+/// 原权限不变。所以这里先以 0600 建一个空文件，再让 tar 覆盖它——
+/// 产物从第一字节起就只有属主可读，不必「先裸写几百 MB 再 chmod」。
+/// 站点归档里有用户上传与站点配置，0644 等于同机任何用户都能整站拷走。
 pub async fn tar_gz(src_dir: &Path, dest: &Path) -> Result<()> {
     let parent = src_dir
         .parent()
@@ -20,6 +24,9 @@ pub async fn tar_gz(src_dir: &Path, dest: &Path) -> Result<()> {
     let dest_s = dest.to_str().ok_or_else(|| PanelError::Internal("备份目标非 UTF-8".into()))?;
     let parent_s = parent.to_str().ok_or_else(|| PanelError::Internal("备份父目录非 UTF-8".into()))?;
 
+    // 预创建 0600（见函数注释）；随后 tar 截断写入，不改权限。
+    crate::fs::create_private(dest, 0o600)?;
+
     let out = crate::cmd::run(
         Bin::Tar,
         &["-czf", dest_s, "-C", parent_s, name.as_str()],
@@ -27,6 +34,8 @@ pub async fn tar_gz(src_dir: &Path, dest: &Path) -> Result<()> {
     )
     .await?;
     if out.code == Some(0) {
+        // 兜一道：tar 若因实现差异重建了文件，这里把权限拉回 0600。
+        crate::fs::set_mode(dest, 0o600)?;
         Ok(())
     } else {
         Err(PanelError::Command { bin: "tar".into(), detail: out.stderr })
@@ -133,35 +142,65 @@ pub async fn encrypt_file(src: &Path, dst: &Path, key: &MasterKey) -> Result<()>
     let dst = dst.to_path_buf();
     let key = *key; // MasterKey 是 Copy
     tokio::task::spawn_blocking(move || -> Result<()> {
-        use std::io::Write;
-        let mut r = std::fs::File::open(&src)
-            .map_err(|e| ioe(e, &format!("打开 {} 失败", src.display())))?;
         // 先写临时文件再改名：中途失败不会留下"看起来完整"的半截密文
         let tmp = dst.with_extension("enc.part");
-        let mut w = std::fs::File::create(&tmp)
-            .map_err(|e| ioe(e, &format!("创建 {} 失败", tmp.display())))?;
-        w.write_all(ENC_MAGIC).map_err(|e| ioe(e, "写入容器头失败"))?;
-
-        let mut buf = vec![0u8; ENC_CHUNK];
-        loop {
-            let n = read_full(&mut r, &mut buf)?;
-            if n == 0 {
-                break;
-            }
-            let ct = key.encrypt(&buf[..n])?;
-            let len = u32::try_from(ct.len())
-                .map_err(|_| PanelError::Internal("分块密文长度溢出 u32".into()))?;
-            w.write_all(&len.to_be_bytes()).map_err(|e| ioe(e, "写入块长失败"))?;
-            w.write_all(&ct).map_err(|e| ioe(e, "写入密文块失败"))?;
+        // ⚠ 源与目标（或与临时文件）撞名 = 一边读一边写同一个文件：
+        //   打开 src 之后又 truncate 同一个路径，读到的永远是"刚写进去的那几个字节"，
+        //   循环不会到 EOF，产物无限增长（实测一次跑出 438MB 的 .part 才停手）。
+        //   真实调用方完全可能传入这种组合（把明文临时文件放在 `<dest>.part`），
+        //   所以在原语这一层直接拒绝，而不是指望每个调用方都想清楚命名。
+        if src == dst || src == tmp {
+            return Err(PanelError::Validation {
+                field: "src",
+                reason: format!(
+                    "源与目标/临时文件是同一个路径（{}）：加密会边读边写同一个文件，\
+                     产物无限增长。请给源与目标不同的文件名",
+                    src.display()
+                ),
+            });
         }
-        w.sync_all().map_err(|e| ioe(e, "落盘失败"))?;
-        drop(w);
-        std::fs::rename(&tmp, &dst)
-            .map_err(|e| ioe(e, &format!("重命名到 {} 失败", dst.display())))?;
-        Ok(())
+        let mut r = std::fs::File::open(&src)
+            .map_err(|e| ioe(e, &format!("打开 {} 失败", src.display())))?;
+        // 0600：权限在 open(2) 建文件时生效，不存在「先 0644 写满再 chmod」的窗口
+        let mut w = crate::fs::create_private(&tmp, 0o600)?;
+
+        let res = encrypt_stream(&mut r, &mut w, &key).and_then(|()| {
+            w.sync_all().map_err(|e| ioe(e, "落盘失败"))?;
+            std::fs::rename(&tmp, &dst)
+                .map_err(|e| ioe(e, &format!("重命名到 {} 失败", dst.display())))
+        });
+        if res.is_err() {
+            // 半截密文/垃圾临时文件不能留在盘上：它和真产物只差一个后缀
+            drop(w);
+            let _ = std::fs::remove_file(&tmp);
+        }
+        res
     })
     .await
     .map_err(|e| PanelError::Internal(format!("加密任务 join 失败: {e}")))?
+}
+
+/// 把 `r` 的全部内容按分块容器格式写进 `w`。
+fn encrypt_stream(
+    r: &mut std::fs::File,
+    w: &mut std::fs::File,
+    key: &MasterKey,
+) -> Result<()> {
+    use std::io::Write;
+    w.write_all(ENC_MAGIC).map_err(|e| ioe(e, "写入容器头失败"))?;
+    let mut buf = vec![0u8; ENC_CHUNK];
+    loop {
+        let n = read_full(r, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let ct = key.encrypt(&buf[..n])?;
+        let len = u32::try_from(ct.len())
+            .map_err(|_| PanelError::Internal("分块密文长度溢出 u32".into()))?;
+        w.write_all(&len.to_be_bytes()).map_err(|e| ioe(e, "写入块长失败"))?;
+        w.write_all(&ct).map_err(|e| ioe(e, "写入密文块失败"))?;
+    }
+    Ok(())
 }
 
 /// 解密 [`encrypt_file`] 的产物。
@@ -186,8 +225,9 @@ pub async fn decrypt_file(src: &Path, dst: &Path, key: &MasterKey) -> Result<()>
             });
         }
         let tmp = dst.with_extension("dec.part");
-        let mut w = std::fs::File::create(&tmp)
-            .map_err(|e| ioe(e, &format!("创建 {} 失败", tmp.display())))?;
+        // ⚠ 这里写的是**明文**（解密出来的备份/库），比密文更该收紧：
+        //   0600 在创建时就生效，不会出现「明文已落盘但还是 0644」的瞬间。
+        let mut w = crate::fs::create_private(&tmp, 0o600)?;
 
         loop {
             let mut lenb = [0u8; 4];

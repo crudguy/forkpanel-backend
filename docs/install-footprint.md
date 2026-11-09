@@ -62,8 +62,10 @@
 
 ```
 panel.db            SQLite 主库（WAL 模式，伴生 panel.db-wal / panel.db-shm）
-master.key          主密钥：加密 SSL 私钥 / 数据库口令 / 远端备份凭据。
-                    刻意不进任何备份（丢了只能重新签发证书、重设凭据）。
+master.key          主密钥：加密 SSL 私钥 / 数据库口令 / 远端备份凭据 / MFA / LLM Key。
+                    刻意不进任何备份（和密文放一起等于没加密）。异地副本走
+                    `panel key export --out <介质路径>` + `panel key check` 验证；
+                    丢了就按 deployment.md §4.1.2 处置，别新建一把顶替。
 ssl/
   ca/ca.crt  ca.key 本地根 CA（自签证书的信任根）
   <域名>.crt <域名>.key  站点证书（私钥落库前用 master.key 加密）
