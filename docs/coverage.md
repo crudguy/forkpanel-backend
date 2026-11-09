@@ -7,6 +7,11 @@
 >
 > **本版为 2026-09-30 刷新**：P0（站点/SSL、数据库、用户）与 P1（容器、安全基线、备份、日志 SSE）、
 > P2（终端、AI 助手）已落地；本机不可验项（ACME/caddy/mysql-pg/ufw 真机）如实标注。
+>
+> **2026-11-09 追加「行覆盖率基线」（G10）**。本文档由此含**两类不同的覆盖**，百分比
+> 不可互相比较：①**接口契约覆盖**（§1–16 的矩阵，口径＝设计文档所列接口是否已接线）；
+> ②**行覆盖率**（代码行是否被测试进程执行过）。前者的「100%」与后者的 51.68%/26.39%
+> 描述的是两件事，混读会同时低估测试、高估接线质量——详见该节开头的提示。
 
 ## 图例
 
@@ -152,6 +157,61 @@
 | `sessions` 表落库（001 已定义、此前零引用） | 会话持久化 | ✅ | **只存 sid 哈希**；中间件 `get_or_restore` 惰性重建 → 重启不再全员登出；DB 写入 spawn 到 runtime，绝不持 MutexGuard 跨 await |
 | `/auth/mfa/{enroll,verify,disable}` + 登录第二因子 | MFA（TOTP） | ✅ | RFC 6238 HMAC-SHA1（验证器兼容档）+ 10 个恢复码（只存哈希，一次性消费）；**关闭 MFA 必须出示第二因子** |
 
+## 行覆盖率基线（2026-11-09 首次度量）
+
+> ⚠ 本节与前文的「契约完整度 100%」是**两个不同的指标**，不可互相替代或推导：
+> 前者说「设计文档所列接口有多少已经接线」，后者说「代码有多少行被测试进程执行过」。
+> 「接口全接线 + 行覆盖率不高」是完全正常的组合——大量路由与 OS 适配层由
+> `ci/e2e-*.sh` 打真机 HTTP 覆盖，**那些执行不进 llvm-cov / v8 的统计**（见下文「怎么读」）。
+> 上线评审请勿把本节的数字与前文的 100% 对比，也不要反过来用覆盖率倒推「没验证过」。
+
+| 侧 | 工具 / 版本 | 复现命令 | 行 | 函数 | 区域 / 语句 |
+|---|---|---|---|---|---|
+| 后端（Rust workspace） | `cargo-llvm-cov` 0.9.1 + `llvm-tools-preview`（rustc 1.98.1） | `cargo llvm-cov --workspace --summary-only` | **51.68%**（17351/33574） | 46.30%（2374/5127） | 53.66%（33956/63276） |
+| 前端（Vue3 + TS） | `@vitest/coverage-v8`（v8 provider，与 vitest 同 `^5.0.5`） | `make coverage`（= `vitest run --coverage`） | **26.39%**（2024/7667） | 20.05%（479/2389） | 语句 24.78%；分支 20.76% |
+
+- 耗时：后端约 4m40s（含全量测试），前端约 74s（59 个测试文件 / 677 用例）。
+- 后端分支覆盖为 `-`：本次只开行/函数/区域，未启用 `--branch`（LLVM 的分支计数在
+  Rust 上噪声较大，且当前没有阈值判据，开了也没人读）。
+- 前端的 `include` 在 `vitest.config.ts` 里**显式钉住 `src/**/*.{ts,vue}`**。缺省时 v8
+  provider 只统计「被测试 import 到的文件」，从未被引用的模块**根本不进分母**，覆盖率
+  会虚高到没有意义（本项目「空集恒真」的同族问题）。排除项只有测试文件、`src/test/**`
+  测试基建、`src/api/types.ts` 契约生成物。
+
+### 怎么读这两个数
+
+**51.68% 不代表「一半代码没测」，26.39% 也不代表「界面没测过」**——两侧的分母都包含
+大量「只能靠真机验证」的代码：
+
+- 覆盖率高的一侧正好是纯逻辑层：`panel-core/src/sensitive.rs` 100%（敏感路径黑名单）、
+  `clock.rs` / `sync.rs` 100%、`lib.rs` 98.34%、`panel-db/src/ring.rs` 98.41%、
+  `panel-core/src/expose.rs` 96.95%、`panel-api/src/totp.rs` 93.92%、
+  `panel-cli/src/config.rs` 94.51%。这类代码**本来就应该**被测到接近满。
+- 覆盖率接近 0 的是**进程入口与真机适配层**，它们的主要验证手段不是单测：
+  - `panel-cli/src/cmd/serve.rs` 0.00%（385 行）—— 进程启动链（单实例锁、迁移快照、
+    router 装配、优雅关闭）。由 `ci/verify-instance-lock.sh`、`ci/verify-healthz.sh`、
+    `ci/verify-graceful-shutdown.sh`、`ci/e2e-install.sh` **真拉起进程**验证。
+  - `panel-cli/src/cmd/{db,init,security,system}.rs`、`upgrade.rs` 均 0.00% —— CLI 子命令，
+    由 `ci/e2e-restore.sh` / `e2e-upgrade.sh` / `e2e-get-panel.sh` 在 userns 里真跑。
+  - `panel-api/src/routes/sites/{crud,ssl}.rs`、`users.rs` 0.00%，`system.rs` 2.27% ——
+    路由层，由 `ci/e2e-sites.sh` / `e2e-rbac.sh` / `e2e-observe.sh` 覆盖。
+  - `panel-os/src/linux/providers/databases.rs` 25.98% —— mysql/pg 需远端实例，
+    本机只验 SQLite 全链路（`ci/e2e-databases.sh`）。
+- 前端 26.39% 的分母含 **78 个顶层 `.vue`**（34 views + 44 components，模板与样式占大头），
+  其中 **14 个**有真挂载测试、**20 个**测试文件跑在 jsdom 下；纯逻辑（composables /
+  utils / api client）的覆盖显著高于平均值。用「组件数 vs 覆盖率」直接判「界面没测」
+  会得到相反结论——界面层的兜底是 `ci/e2e-ui.sh` 的浏览器 DOM 断言。
+
+### 刻意不做的事
+
+- **不设阈值门禁**（不加 `--fail-under`）。基线一接就设线，只会逼人抬阈值或排除文件，
+  重演 `ci/budgets.json` 里「贴近现状的硬门禁＝逼人改数字」的老路。本轮目标是把数
+  **第一次量出来并写清口径**，不是造一条会莫名其妙变红的线。
+- **不用覆盖率替代 E2E，也不让 E2E 进覆盖率**。`cargo llvm-cov` 与 `vitest --coverage`
+  都只统计「测试进程执行过哪些行」；`ci/e2e-*.sh` 打的是**另一个进程**（运行中的后端），
+  `ci/verify-*.sh` 拉起的是**真二进制**。把 E2E 算进覆盖率需要进程级 merge，收益远小于
+  维护成本，故不做——但这也意味着**「覆盖率低」不能反推「没验证过」**，判据要看两套。
+
 ## 覆盖结论（2026-09-30 三次刷新：P2 批次 + T1~T5）
 
 - **契约完整度：100%**，且新增端点全部**先写契约再实现**（前端副本按事实源同步）。
@@ -204,7 +264,7 @@
   校验，见 `panel-os` 的 `rendered_config_passes_real_nginx_syntax_check`）。
 - **能力驱动 UI**：未支持能力一律 EmptyState/置灰 + 原因，绝不假装可用。
 
-## 真机 E2E 脚本（十一域，`ci/e2e-*.sh`）
+## 真机 E2E 脚本（17 个域，`ci/e2e-*.sh`）
 
 对**运行中的真实后端**打请求的脚本化验收，弥补"单测只覆盖纯逻辑、覆盖不到
 路由注册 + 能力位门禁 + OS provider 真实落盘"的空白。最后一域 `e2e-restore`
@@ -227,7 +287,21 @@
 
 | `e2e-upgrade` | **升级链路（离线；user namespace 内真跑）**：本地 http 源 + 测试 ed25519 密钥签名的 tarball → `panel upgrade --dry-run`（下载/验签/解包）→ 篡改 tarball 必须验签失败且**不执行包内 install.sh** → 正常升级（备份 `panel.bak`、install.sh 拉起服务）→ install.sh 失败必须回滚到失败前二进制 | **不动本机**：`/usr/local`、`/etc`、`/var` 全 tmpfs；systemctl/ss 用 shim（`Bin::resolved` 不读 PATH，故 shim 需 bind-mount 到真实路径） | 19 |
 
-合计 **476 条断言**。运行方式：
+合计 **293 处断言调用**（2026-11-09 重数）。口径必须说清，否则数字只是摆设：
+
+- **上表只列 13 个域脚本**；另 4 个是 `e2e-expose-public`（公网暴露/撤销）、
+  `e2e-get-panel`（安装器下载回退，9 处）、`e2e-mirror`（镜像同步，6 处）、
+  `e2e-ui`（浏览器 DOM 冒烟，20 处）。加上表格这 13 个＝**17 个域脚本**，
+  另有 `e2e-all.sh` 聚合器（自身不含断言）。
+- 计数口径＝**脚本里断言函数的调用行数**（`chk` / `chk_has` / `chk_ne` / `chk_bool` /
+  `chk_ge` / `ok` / `check`）。运行时输出的 ✓ 条数会**多于**它——循环里对每个样本各断
+  言一次，所以「静态调用数」是下界而非总数。
+- 旧版此处写「476 条断言」，既未注明口径也无法复现（是 §3.9 点名的文档数字问题之一）。
+  本次按静态调用行重数：`e2e-get-panel` / `e2e-mirror` 的断言函数叫 `check`、用的是
+  `pass` 而不是 `PASS`，用 `PASS++` 作判据会**整段漏掉**这两个脚本——这类「计数判据
+  只认一种写法」正是本项目反复踩的坑。
+
+运行方式：
 
 ```bash
 make e2e-all                                    # 全部域串行跑完并聚合（上线前整机自检）
@@ -251,11 +325,17 @@ make e2e-install                                # 安装脚本（吃 release pan
 
 ### 浏览器级 UI 冒烟（`ci/e2e-ui.sh`，20 条断言）
 
-十一域中前十域全部打在 **API** 上（`e2e-restore` 是 CLI 级，见上）；前端 74 个 UI 文件（32 views + 42 components）此前
-**没有任何渲染测试**（vitest 只收 `src/**/*.test.ts` 且无 vue 插件）。而本项目踩过的
-最深一坑正是这一类——**新增子组件忘了 import ⇒ 静默不渲染**（Vue 把未知标签当普通
-元素渲染出空内容，仅 console warning；vue-tsc / build / 单测全绿），后端 E2E 永远
-抓不到，只有拿浏览器看 DOM 才能发现。
+上表 13 个域中的 12 个全部打在 **API** 上（`e2e-restore` 是 CLI 级，见上）；前端 **78 个
+顶层 `.vue`**（34 views + 44 components）**在本轮之前**没有任何渲染测试——当时
+`vitest.config.ts` 没启用 vue 插件、只收 `src/**/*.test.ts`。
+
+**现状已不同（2026-11-09 校正）**：该配置已启用 `@vitejs/plugin-vue`，59 个测试文件里
+**20 个**跑在 jsdom 下、**14 个**通过 `src/test/mount.ts` **真挂载**组件。但渲染测试仍
+覆盖不到「页面上到底有没有那个 DOM」——它只证明组件能挂载、props 能透传，不证明视图被
+正确 import 且出现在路由里。而本项目踩过的最深一坑正是这一类——**新增子组件忘了 import
+⇒ 静默不渲染**（Vue 把未知标签当普通元素渲染出空内容，仅 console warning；
+vue-tsc / build / 单测全绿），后端 E2E 永远抓不到，只有拿浏览器看 DOM 才能发现。
+所以浏览器级冒烟这一层不能省。
 
 `ci/e2e-ui.sh` 用 agent-browser 驱动真实浏览器：登录 → 概览（标题 + **数据驱动**卡片
 「共 N 个」+ 顶栏 CPU 实时值）→ 容器页 6 个 Tab 逐一断言**边界引导 banner 真实在 DOM

@@ -21,11 +21,24 @@ BE_DIST="$HERE/web/dist"
 
 fail() { echo "check-embed-fresh: $1" >&2; exit 1; }
 
-# ── 环境判定：CI 只 checkout 后端，没有前端仓库 ──
-# 前端产物缺失时**显式跳过并喊出来**，不判失败：CI 上没有 forkpanel-frontend/，
-# 判失败等于恒红（比没门禁更糟——会淹没真失败）。本地两个仓库都在，才是真检查。
+# ── 环境判定：CI 必须真检查，缺产物＝判红 ──
+# 报告 §3.9 P1：此前无论在哪都 `[skip] exit 0`，而 CI 的 check job 从不构建
+# 前端、`FE_DIST` 又指向被 .gitignore 的目录 ⇒ 这条门禁在 CI 上**从未执行过**，
+# 注释写着「跳过（非通过）」而退出码是 0，等于自欺。
+# 现在 ci.yml 的 check job 会 checkout 前端 + `pnpm build` + 同步 web/dist，
+# 所以 CI 下 `FE_DIST` 缺失只可能是**接线断了**（构建步骤被删/改名/失败），
+# 此时判红——不能把「这一层没有覆盖」算成通过。
+# 本地仍允许跳过：只 clone 后端、没构建过前端是常见状态，硬判红会逼人加
+# `|| true`（那才是真正的恒绿）。
 if [ ! -d "$FE_DIST" ]; then
-  echo "[skip] check-embed-fresh：找不到 $FE_DIST（CI 环境未 checkout 前端仓库，跳过）" >&2
+  if [ -n "${CI:-}" ]; then
+    echo "✗ check-embed-fresh：CI 下找不到 $FE_DIST" >&2
+    echo "  ci.yml 的 check job 应已构建前端并同步 web/dist（步骤名：「构建前端并同步内嵌产物」）。" >&2
+    echo "  缺失说明该步骤被删除 / 改名 / 失败 —— 内嵌新鲜度将完全没有覆盖，故判红。" >&2
+    exit 1
+  fi
+  echo "[skip] check-embed-fresh：本地未构建前端（$FE_DIST 不存在），本门禁未执行（非通过）" >&2
+  echo "  构建后重跑：cd ../forkpanel-frontend && corepack pnpm@9 build" >&2
   exit 0
 fi
 [ -d "$BE_DIST" ] || fail "找不到内嵌目录 $BE_DIST"

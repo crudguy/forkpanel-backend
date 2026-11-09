@@ -86,6 +86,10 @@ guards:
 	# 单实例锁（flock）+ 升级前一致快照必须三条入口都接线：漏一路就是
 	# 并发 DDL 或「升级后没有回退锚点」（025/029 是破坏性变更）。
 	python3 ci/check_migrate_safety.py
+	# G10：3 个「守卫存在但不在跑」的洞必须钉住接线——embed-fresh 在 CI 里
+	# 必然 [skip]（ci.yml 不构建前端）、check-frontend-loc 两处 CI 分支 exit 0、
+	# 前端 check:contract 是孤儿。判据一律剔注释（注释里就写着 exit 0 / [skip]）。
+	python3 ci/check_gate_holes.py
 
 # 内嵌前端新鲜度：改完前端只 cargo build **不会**重新 embed，必须
 # ① vite build → ② rm -rf web/dist/* → ③ cp -a → ④ touch embed.rs → ⑤ cargo build。

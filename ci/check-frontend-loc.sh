@@ -28,12 +28,15 @@ for cand in "$FE_ROOT/src" "$ROOT/web/src"; do
   if [ -d "$cand" ]; then FE_SRC="$cand"; break; fi
 done
 if [ -z "$FE_SRC" ]; then
-  if [ -n "${CI:-}" ]; then
-    echo "[skip] $(basename "$0")：找不到前端源码（试过 $FE_ROOT/src 与 $ROOT/web/src）——本轮跳过（非通过）" >&2
-    exit 0
-  fi
+  # ⚠ 报告 §3.9 P1 的另一半：此前 CI 下这里 `exit 0`「跳过（非通过）」。
+  #   但 CI 里 `PANEL_FRONTEND_ROOT` 未被检出时**必然**命中本分支，于是整条
+  #   门禁在 CI 上从未执行过——只改下面「扫到 0 个文件」那处（报告点的 :89）
+  #   是修不到的，因为根本走不到那里。注释写着「非通过」而退出码是 0＝自欺。
+  #   ci.yml 的 check job 会检出前端仓（且 check-ui-guards.sh 缺失即判红），
+  #   故这里同口径判红：缺前端＝这一层没验，不能算通过。
   echo "✗ $(basename "$0")：找不到前端源码（试过 $FE_ROOT/src 与 $ROOT/web/src）" >&2
   echo "  本地两仓应并列存放；也可设 PANEL_FRONTEND_ROOT 指定。" >&2
+  echo "  CI：check job 应已 checkout 前端仓，缺失说明该步骤被删除或失败。" >&2
   exit 1
 fi
 
@@ -82,12 +85,9 @@ fi
 
 cnt=$(list_files | grep -c .)
 if [ "$cnt" -eq 0 ]; then
-  # ⚠ P1-8：本轮新加门禁自带洞——扫到 0 个文件仍报「0 个文件均在限额内」PASS。
-  #   目录结构一变 / list_files 异常 ⇒ 恒绿。门禁无法得出结论时绝不能算通过。
-  if [ -n "${CI:-}" ]; then
-    echo "[skip] $(basename "$0")：扫描到 0 个前端文件，门禁无法得出结论（非通过）" >&2
-    exit 0
-  fi
+  # ⚠ 报告 §3.9 P1 点名的就是这里（原 :89）：注释写着「门禁无法得出结论时绝不能
+  #   算通过」，CI 分支却 `exit 0` —— 注释改了、退出码没改，等于恒绿。
+  #   目录结构一变 / list_files 异常就会走到这里，必须判红。
   echo "✗ $(basename "$0")：扫描到 0 个前端文件——路径探测或 list_files 异常，门禁不能当作通过" >&2
   echo "   FE_SRC=$FE_SRC；检查前端仓是否并列存放或设 PANEL_FRONTEND_ROOT" >&2
   exit 1

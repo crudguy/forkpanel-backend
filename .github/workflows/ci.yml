@@ -20,10 +20,12 @@ jobs:
           toolchain: "1.98.1"
       - uses: Swatinem/rust-cache@v2
 
-      # 契约 / 权限点 / 包白名单三个门禁需要前端源码。前端是**私有**独立仓：
-      # 配了 secrets.FRONTEND_REPO_TOKEN 才拉得下来；未配时本步失败但
-      # continue-on-error 不拖红 job，三个脚本会各自显式 [skip]（非通过）。
+      # 契约 / 权限点 / 包白名单 / UI 守卫 / 内嵌新鲜度五个门禁都需要前端。
+      # 前端是**私有**独立仓：配了 secrets.FRONTEND_REPO_TOKEN 才拉得下来。
+      # ⚠ `check-ui-guards.sh` 在前端入口缺失时**硬判红**（不是 [skip]），
+      #   所以「CI 要求前端仓必须检出」是既有约束，不是本 job 新增的。
       - name: 检出前端仓（私有仓需 secrets.FRONTEND_REPO_TOKEN）
+        id: frontend
         uses: actions/checkout@v4
         continue-on-error: true
         with:
@@ -31,11 +33,35 @@ jobs:
           path: forkpanel-frontend
           token: ${{ secrets.FRONTEND_REPO_TOKEN }}
 
-      # CI 只跑后端逻辑测试，不需要真实前端产物；但 embed.rs 的
-      # #[folder="../../web/dist"] 在**编译期**要求目录存在（web/dist 被 gitignore，
-      # 由前端仓构建后拷入）。生成一个占位 index.html 让 cargo test 可编译。
-      # ⚠ 发布构建仍必须拷真实前端 dist（占位仅用于 CI 测试编译）。
-      - name: 生成占位 web/dist（仅 CI，供 RustEmbed 编译）
+      # ⭐ 内嵌新鲜度（ci/check-embed-fresh.sh）在 CI 的**唯一**覆盖来源。
+      #   该门禁比对 `web/dist` 与前端 `dist`。此前 CI 从不构建前端、`FE_DIST`
+      #   又指向被 .gitignore 的目录 ⇒ 它**必然 [skip] exit 0**，于是
+      #   「改了前端却发出旧前端、编译/类型/测试全绿」这条唯一防线在 CI 上是空的
+      #   （报告 §3.9 P1，仅靠 release.yml 单点兜底）。这里补上构建+同步，
+      #   步骤与 release.yml 逐字对齐，保证「CI / 发版 / 本地」同一套口径。
+      - name: 构建前端并同步内嵌产物（embed-fresh 真检查的前提）
+        if: steps.frontend.outcome == 'success'
+        run: |
+          cd forkpanel-frontend
+          corepack enable
+          corepack pnpm@9 install --frozen-lockfile
+          corepack pnpm@9 build
+          cd ..
+          # 必须 rm -rf 再 cp：只 cp 只增不删，会留下旧 hash 的僵尸 chunk，
+          # 既撑大二进制又让 embed-fresh 的僵尸检查失去意义
+          rm -rf web/dist
+          mkdir -p web/dist
+          cp -a forkpanel-frontend/dist/. web/dist/
+          # touch 让 cargo 重新执行 RustEmbed（否则 rust-cache 命中时仍嵌旧产物）
+          touch crates/panel-cli/src/embed.rs
+          echo "内嵌产物：$(find web/dist -type f | wc -l) 个文件"
+
+      # 兜底：前端仓拉不下来时仍要能编译——embed.rs 的
+      # #[folder="../../web/dist"] 在**编译期**要求目录存在（web/dist 被 gitignore）。
+      # ⚠ `if` 不能省：无条件执行会用占位覆盖上面已同步的真产物，
+      #   让 embed-fresh 静默退回「内容不一致」的假红或直接失配。
+      - name: 占位 web/dist（仅前端仓不可用时，供 RustEmbed 编译）
+        if: steps.frontend.outcome != 'success'
         run: |
           mkdir -p web/dist
           if [ ! -f web/dist/index.html ]; then
