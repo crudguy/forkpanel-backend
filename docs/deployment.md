@@ -522,9 +522,15 @@ sudo chmod 600 /root/forkpanel-ca-*.tar.gz
 `panel systemd-unit --install` 生成的单元已含：
 
 - `NoNewPrivileges / ProtectSystem=strict / ProtectHome / ProtectKernelTunables / ProtectControlGroups / RestrictSUIDSGID`
-- `ReadWritePaths` 开放数据、日志、站点、配置四个**必填**目录（由 `PathLayout` 提供，非硬编码），外加 nginx `conf.d` / caddy `sites` 两个**可选**目录（`-` 前缀：不存在时 systemd 忽略而非拒绝启动）——站点部署要直写这两个 /etc 落点
+- `CapabilityBoundingSet`（§8-12）：只保留有真实消费者的 10 个 cap——`CHOWN / DAC_OVERRIDE / DAC_READ_SEARCH / FOWNER / FSETID`（文件与站点目录管理）、`KILL`（进程信号）、`SETUID / SETGID`（cron「立即执行」的 run_as 降权）、`NET_BIND_SERVICE`（可配置直绑 80/443）、`NET_ADMIN`（nft/iptables 防火墙）。明确不含 `SYS_ADMIN`（god cap）等其余 31 个。**改这行前必须想清消费者**：砍掉 `SETUID` 会让 run_as 降权 spawn 失败，砍掉 `NET_ADMIN` 会让防火墙读写全灭（实测：`nft list` 直接 EPERM）
+- `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK`：UNIX（docker/systemctl socket）、INET/INET6（HTTP/ACME）、NETLINK（nftables 命根）
+- `MemoryDenyWriteExecute=yes`：内存页不得同时可写可执行（Rust/SQLite/各子进程均不需 W^X 豁免）
+- `SystemCallFilter=@system-service` + `SystemCallErrorNumber=EPERM`：收敛到服务常用 syscall 集（含 set*id 降权与 netlink），越权调用响亮失败
+- `ReadWritePaths` 开放数据、日志、站点、配置四个**必填**目录（由 `PathLayout` 提供，非硬编码），外加 nginx `conf.d` / caddy `sites` 两个**可选**目录（`-` 前缀：不存在时 systemd 忽略而非拒绝启动）——站点部署要直写这两个 /etc 落点。⚠ 自定义 [paths] 时目录**不能放 /tmp 或 /var/tmp**：`PrivateTmp=yes` 会给服务一个私有的 /tmp 与 /var/tmp，单元会以 226/NAMESPACE 起不来
 - `MemoryMax` 按档位（96M / 192M / 384M）、`CPUQuota=20%`、`TasksMax=256`
 - `Restart=on-failure` + `RestartSec=3`：**进程崩溃 / 非零退出会自愈**
+
+以上收敛集经真机验收（Debian 13 / systemd 254 划痕实例，2026-11-09）：启动 active、HTTP 200、登录/cron/docker/nft/systemctl/进程/总览各链路全通、journal 零 SIGSYS、`CapBnd=0x14ff` 精确等于保留集；负向（临时砍掉 NET_ADMIN）证实限制真实生效且探针可分辨。
 
 ### 5.1 崩溃自愈的边界（如实说明）
 

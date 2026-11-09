@@ -87,6 +87,24 @@ ProtectHome=yes
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
+# capability 收敛（§8-12）：面板以 root 运行不等于需要全部 capability。
+# 保留集的每一项都有真实消费者：CHOWN/FOWNER/FSETID/DAC_*（文件与站点目录管理）、
+# KILL（信号任意进程）、SETUID/SETGID（cmd.rs run_as 降权三件套——砍掉它们，
+# cron「立即执行」非 root 任务会 spawn 失败）、NET_BIND_SERVICE（面板可被配置
+# 直绑 80/443）、NET_ADMIN（nft/iptables 防火墙）。明确不给：SYS_ADMIN（挂载/
+# 命名空间，面板自身不碰）、SYS_MODULE/SYS_BOOT/SYS_RAWIO/BPF/PERFMON/MKNOD。
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_FSETID CAP_KILL CAP_SETGID CAP_SETUID CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+# 地址族收敛：UNIX（docker/systemctl socket）、INET/INET6（HTTP/ACME）、
+# NETLINK（nftables 内核接口）。AF_PACKET 等一律拒绝。
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# 内存页不得「可写且可执行」同时成立：Rust/SQLite/nginx/docker 客户端均不需要
+# W^X 豁免，挡住的是漏洞利用的 shellcode 落地路径。
+MemoryDenyWriteExecute=yes
+# 系统调用收敛到「服务常用集」：@system-service 已含 set*id（降权）、netlink
+# （防火墙）、进程/网络/文件常规面；排除 @mount/@raw-io/@reboot/@swap/@obsolete
+# 这类面板永远用不到的特权组。越权调用返回 EPERM 而非静默成功。
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 # 数据/日志/站点目录需要可写，其余只读（由 PathLayout 提供，非硬编码）
 # 可选档（web 服务器 conf drop-in）带 - 前缀：不存在时 systemd 忽略而非拒绝启动
 ReadWritePaths={writable}
@@ -308,6 +326,17 @@ mod tests {
         assert!(u.contains("NoNewPrivileges=yes"));
         assert!(u.contains("ProtectSystem=strict"));
         assert!(u.contains("CPUQuota=20%"));
+        // §8-12 capability/syscall/地址族/内存四件套（每项的保留理由见模板注释）：
+        // 回归方向是「被删掉」而不是「值变了」——值变了要真机验收，删掉是静默降防。
+        assert!(u.contains("CapabilityBoundingSet="), "capability 收敛被删");
+        assert!(u.contains("CAP_SETUID"), "砍掉 CAP_SETUID 会让 run_as 降权 spawn 失败");
+        assert!(u.contains("CAP_NET_ADMIN"), "砍掉 CAP_NET_ADMIN 会让 nft/iptables 失效");
+        assert!(!u.contains("CAP_SYS_ADMIN"), "god capability 不得进保留集");
+        assert!(u.contains("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK"),
+                "地址族收敛被改（NETLINK 是 nft 的命根）");
+        assert!(u.contains("MemoryDenyWriteExecute=yes"));
+        assert!(u.contains("SystemCallFilter=@system-service"));
+        assert!(u.contains("SystemCallErrorNumber=EPERM"), "越权 syscall 必须 EPERM 而非静默");
         // 单元内容本身不应包含服务目录路径（那是安装位置，由 PathLayout 决定）
         assert!(!u.contains("systemd/system"), "安装位置应由 PathLayout 决定，不得写死在单元内容里");
     }

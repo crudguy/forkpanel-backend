@@ -189,6 +189,18 @@ if [ -f "$UNIT" ]; then
   ok "panel.service 已落盘"
   grep -q 'ProtectSystem=strict' "$UNIT" && ok "单元启用 ProtectSystem=strict" \
     || bad "单元缺少 ProtectSystem=strict（面板可写全盘）"
+  # §8-12 capability/syscall/地址族/内存收敛四件套（每项的保留理由见
+  # bootstrap.rs 模板注释；砍掉 SETUID 会让 run_as 降权 spawn 失败）
+  grep -q '^CapabilityBoundingSet=.*CAP_SETUID.*CAP_NET_ADMIN' "$UNIT" \
+    && ok "单元 capability 收敛含 SETUID/NET_ADMIN" \
+    || bad "单元缺 CapabilityBoundingSet 或砍掉了 SETUID/NET_ADMIN"
+  grep -q '^RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK' "$UNIT" \
+    && ok "单元地址族收敛（含 NETLINK=nft 命根）" \
+    || bad "单元缺 RestrictAddressFamilies 或丢了 NETLINK"
+  grep -q '^MemoryDenyWriteExecute=yes' "$UNIT" && ok "单元 W^X" \
+    || bad "单元缺 MemoryDenyWriteExecute"
+  grep -q '^SystemCallFilter=@system-service' "$UNIT" && ok "单元 syscall 收敛" \
+    || bad "单元缺 SystemCallFilter=@system-service"
   rwp=$(grep -oE '^ReadWritePaths=.*' "$UNIT" | head -1)
   if [ -n "$rwp" ]; then
     ok "单元声明了 ReadWritePaths"
