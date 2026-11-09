@@ -115,6 +115,8 @@ pub struct InternalScheduler {
     token: CancellationToken,
     /// 记录上次执行的 Unix 秒，用于"启动后补跑"
     last_run: Arc<Mutex<HashMap<&'static str, i64>>>,
+    /// 周期任务的 JoinHandle：优雅关闭时等待它们退出（见 drain）。
+    handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl InternalScheduler {
@@ -123,6 +125,7 @@ impl InternalScheduler {
             jobs: Arc::new(Mutex::new(HashMap::new())),
             token: CancellationToken::new(),
             last_run: Arc::new(Mutex::new(HashMap::new())),
+            handles: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -147,7 +150,7 @@ impl InternalScheduler {
             let kind = s.kind;
             let name = s.name;
 
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 // 错峰：避免所有任务在同一秒触发
                 if jitter > 0 {
                     tokio::time::sleep(Duration::from_secs(jitter)).await;
@@ -177,10 +180,32 @@ impl InternalScheduler {
                     }
                 }
             });
+            self.handles.lock().await.push(handle);
         }
     }
 
     pub fn shutdown(&self) { self.token.cancel(); }
+
+    /// 优雅关闭：等待已启动的周期任务收尾，**带上限**。
+    ///
+    /// 取消后每个 loop 会在下一轮 `token.cancelled()` 处 break；但正在
+    /// `run_job_with_timeout` 里的任务最长可跑 600s（INTERNAL_JOB_TIMEOUT），
+    /// 不能无限等。超时即记 warning 返回，剩余任务随 runtime 退出 —— 如实
+    /// 说明边界，不假装全部 drain 完。
+    pub async fn drain(&self, limit: Duration) {
+        let handles: Vec<_> = self.handles.lock().await.drain(..).collect();
+        let join = async {
+            for h in handles {
+                let _ = h.await;
+            }
+        };
+        if tokio::time::timeout(limit, join).await.is_err() {
+            tracing::warn!(
+                limit_secs = limit.as_secs(),
+                "优雅关闭等待周期任务超时，剩余任务随 runtime 退出"
+            );
+        }
+    }
 
     /// 上次成功执行的时间（供运维排查）
     pub async fn last_run_of(&self, name: &str) -> Option<i64> {

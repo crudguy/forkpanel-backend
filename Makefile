@@ -71,6 +71,9 @@ guards:
 	# 安全响应头必须挂在 serve 链的 .fallback() 之后（build_router 内挂了 SPA/静态/
 	# healthz/404 会整条绕过），且全链唯一。判据剔注释，防说明文字冒充挂点。
 	python3 ci/check_security_headers.py
+	# SIGTERM 优雅关闭（含调度器 drain）与 run_sync 超时必须真的接线：
+	# 前者曾让 sched.shutdown() 永远执行不到，后者会永久钉住 spawn_blocking 线程。
+	python3 ci/check_graceful_shutdown.py
 
 # 内嵌前端新鲜度：改完前端只 cargo build **不会**重新 embed，必须
 # ① vite build → ② rm -rf web/dist/* → ③ cp -a → ④ touch embed.rs → ⑤ cargo build。

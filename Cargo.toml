@@ -21,7 +21,7 @@ panel-cli  = { path = "crates/panel-cli" }
 panel-testutil = { path = "crates/panel-testutil" }
 
 # 依赖预算（直接依赖）：本骨架 6 个；完整项目目标 30~38 个
-tokio       = { version = "1", features = ["rt-multi-thread", "net", "time", "fs", "process", "sync", "macros", "io-util"] }
+tokio       = { version = "1", features = ["rt-multi-thread", "net", "time", "fs", "process", "sync", "macros", "io-util", "signal"] }
 async-trait = "0.1"
 thiserror   = "1"
 serde       = { version = "1", features = ["derive"] }

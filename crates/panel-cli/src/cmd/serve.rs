@@ -231,11 +231,41 @@ pub(crate) fn run(cli: &Cli, os: Arc<dyn panel_os::OsAdapter>) -> Result<()> {
             .map_err(|e| PanelError::Internal(format!("bind {addr}: {e}")))?;
         // 接线 ConnectInfo：引导令牌端点据此判定请求是否来自回环地址，
         // 拒绝非 localhost 取令牌（远程攻击者即使能访问端口也拿不到）。
-        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await
-            .map_err(|e| PanelError::Internal(format!("serve: {e}")))
+        let serve_result = axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .map_err(|e| PanelError::Internal(format!("serve: {e}")));
+        // HTTP 连接已排空 ⇒ 停调度器，并给在跑的周期任务一个有限收尾窗口。
+        // 这两行以前**永远不会执行**（axum::serve 正常运行时不返回），
+        // 现在由 SIGTERM/SIGINT 触发 graceful shutdown 后才会走到。
+        sched_in.shutdown();
+        sched_in.drain(std::time::Duration::from_secs(5)).await;
+        serve_result
     });
+    // 兜底：async 块若在 serve 之前就 `?` 返回，仍要取消调度器，别留孤儿循环。
     sched.shutdown();
     r
+}
+
+/// 等待 SIGTERM（systemd / 编排）或 SIGINT（前台 Ctrl-C），交给 axum 排空在途连接。
+///
+/// 没有这层时，SIGTERM 会直接终止进程：正在落盘的备份、站点配置下发、SSE / Web
+/// 终端连接全部硬断，且 `sched.shutdown()` 永远执行不到。项目只支持 Linux，
+/// 故直接用 unix signal，不做 cfg 分支。
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[panel] ⚠ 安装 SIGTERM handler 失败（{e}），仅保留 Ctrl-C");
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        }
+    };
+    tokio::select! {
+        _ = term.recv() => tracing::info!("收到 SIGTERM，开始优雅关闭（排空在途连接）"),
+        _ = tokio::signal::ctrl_c() => tracing::info!("收到 SIGINT，开始优雅关闭（排空在途连接）"),
+    }
 }
 
 /// 注册内部周期任务的实现。
