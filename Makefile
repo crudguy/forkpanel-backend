@@ -33,6 +33,10 @@ lint:
 guards:
 	bash ci/check-layering.sh
 	bash ci/check-api-contract.sh
+	# 前端调用方法与契约一致：`/files/write` 只注册 PUT，前端写 api.post ⇒ 浏览器 405、
+	# 「在线编辑并保存」整版不可用。路径集合门禁（上面那条只比路径）与后端 e2e-files.sh
+	# （用 `put` 直接打接口）都看不见「路径对、方法错」这一类，只能单独钉。
+	python3 ci/check-api-method.py
 	bash ci/check-permissions.sh
 	bash ci/check-docs-consistency.sh
 	bash ci/check-pkg-whitelist.sh
