@@ -83,6 +83,9 @@ guards:
 	# 站点下发 deploy→reload→落库 任一失败都要回滚磁盘（apply 两条路径 / conf_put 一条），
 	# 少一条就是「配置已写但库还是旧值」，下次 nginx 重启才爆。
 	python3 ci/check_site_rollback.py
+	# 单实例锁（flock）+ 升级前一致快照必须三条入口都接线：漏一路就是
+	# 并发 DDL 或「升级后没有回退锚点」（025/029 是破坏性变更）。
+	python3 ci/check_migrate_safety.py
 
 # 内嵌前端新鲜度：改完前端只 cargo build **不会**重新 embed，必须
 # ① vite build → ② rm -rf web/dist/* → ③ cp -a → ④ touch embed.rs → ⑤ cargo build。

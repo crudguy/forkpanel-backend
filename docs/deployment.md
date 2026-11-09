@@ -636,7 +636,61 @@ sudo panel uninstall
 
 ---
 
-## 7. 故障排查
+## 7. schema 升级与回滚（单实例约束）
+
+### 7.1 只有前向迁移，**没有 down migration**
+
+`panel-db/migrate.rs` 的 `MIGRATIONS` 是纯前向数组（当前 `LATEST = 29`），
+`schema_migrations` 只记录已应用版本与校验和。两个破坏性变更使旧二进制无法
+在同一库上工作：
+
+| 版本 | 动作 | 后果 |
+|---|---|---|
+| `025_server_notes.sql` | 建 `server_notes` 后 `DROP TABLE server_note` | 旧码仍按 `server_note` 查，表已不存在 |
+| `029_drop_api_tokens.sql` | `DROP TABLE IF EXISTS api_tokens` | 零引用的表被删除，旧码若有引用即失败 |
+
+因此**回滚 = 整库还原 + 换回旧二进制**，不是「跑一条 down SQL」。项目不为已删数据
+硬写反向脚本（那会造出「表结构回来了、数据没了」的假回退）。
+
+### 7.2 升级前自动一致快照
+
+`serve` / `panel migrate` / `panel init` 在 `migrate::apply` 之前调用
+`snapshot_before_migrate`：仅当 `0 < current < LATEST` 时用 `VACUUM INTO`
+写一份升级前的一致快照到 `<data_dir>/backups/pre-migrate-v<旧>-to-v29-<ts>.db`，
+保留最近 5 份。全新库与版本已最新时零额外 IO（冷启动预算不受影响）。
+快照失败会**阻断升级**——没有回退锚点就不把 schema 推到不可回退的位置。
+
+### 7.3 回滚 runbook
+
+```bash
+# 1) 停服（务必先停：否则旧二进制与新库仍在互相写）
+sudo systemctl stop panel
+# 2) 找到升级前快照（按时间选升级那一刻的那份）
+ls -lt /var/lib/forkpanel/backups/pre-migrate-*.db
+# 3) 还原（会先验产物、给当前库留 pre-restore 快照、原子替换、清 WAL/SHM）
+sudo panel restore-db /var/lib/forkpanel/backups/pre-migrate-v28-to-v29-<ts>.db
+# 4) 换回旧版本二进制，再起服务
+sudo cp /path/to/old/panel /usr/local/bin/panel && sudo systemctl start panel
+# 5) 验收：能登录 + 站点/用户数量与升级前一致 + panel doctor 的 integrity_check=ok
+```
+
+> ⚠ 回滚演练需两个真实不同版本的二进制才能完整验证「旧码 + 旧库」。当前仓库
+> 只保留一个版本产物，该组合的端到端演练仍列在上线验收清单（见
+> `high-risk-acceptance-runbook.md`）。已有 `panel restore-db` 的真机恢复演练可证明
+> 「库能被完整换回」，但不能替代「旧二进制能读它」的验证。
+
+### 7.4 单实例与并发迁移硬护栏
+
+`serve` / `panel migrate` / `panel init` 启动即抢 `<data_dir>/panel.lock` 的
+`flock(LOCK_EX | LOCK_NB)`，持有到进程退出；抢不到会带持有者 PID 明确报错退出。
+这同时挡住三类事故：并发跑 DDL（`table already exists` / `database is locked`）、
+双实例各跑一遍备份 / 证书续期 / 清理、以及内存状态各持一份。
+flock 由内核持有，进程被 SIGKILL 后自动释放，不留陈旧 pid 文件。
+
+单实例是**已知设计限制**（`docs/design-multi-node.md` 标注设计稿未实施）；
+多节点方案需先引入 leader 选举与共享存储，不能靠放宽这把锁实现。
+
+## 8. 故障排查
 
 | 现象 | 原因与处理 |
 |---|---|

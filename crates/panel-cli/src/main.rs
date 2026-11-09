@@ -5,6 +5,8 @@ mod cmd;
 mod config;
 mod doctor;
 mod embed;
+/// 升级前一致快照：老库回滚的唯一锚点（项目无 down migration）。
+mod migrate_snapshot;
 mod upgrade;
 
 use clap::{CommandFactory, Parser, Subcommand};

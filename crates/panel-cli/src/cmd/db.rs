@@ -28,7 +28,10 @@ pub(crate) fn migrate(cli: &Cli, os: Arc<dyn panel_os::OsAdapter>) -> Result<()>
     let layout0 = build_layout(&os, None);
     let cfg = load_cfg(cli, &layout0)?;
     let layout = build_layout(&os, Some(&cfg));
-    let mut conn = panel_db::open(&layout.sqlite_path(), detect_tier(&*os, &cfg), &cfg.db.synchronous)?;
+    let _instance_lock = panel_os::instance_lock::acquire(&layout.data_dir())?;
+    let db_path = layout.sqlite_path();
+    let mut conn = panel_db::open(&db_path, detect_tier(&*os, &cfg), &cfg.db.synchronous)?;
+    crate::migrate_snapshot::snapshot_before_migrate(&conn, &db_path, &layout.backup_dir())?;
     let v = panel_db::migrate::apply(&mut conn)?;
     println!("schema 版本 {v}");
     Ok(())

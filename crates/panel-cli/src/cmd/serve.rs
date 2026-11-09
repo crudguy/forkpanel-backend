@@ -40,6 +40,9 @@ pub(crate) fn run(cli: &Cli, os: Arc<dyn panel_os::OsAdapter>) -> Result<()> {
     // 放在任何副作用（建库 / 起调度器 / bind）之前——失败时机器状态零改动。
     cfg.validate_implemented()?;
     let layout = build_layout(&os, Some(&cfg));
+    // 单实例锁必须在**任何副作用之前**（含 migrate / 起调度器）：第二个进程
+    // 会在这一步被硬拒，而不是等到两个进程各自跑 DDL 才报 table already exists。
+    let _instance_lock = panel_os::instance_lock::acquire(&layout.data_dir())?;
     // 关键修复：把配置感知的路径布局注入适配器。否则运行期
     // `site_root()` 等 [paths] 覆盖不生效（adapter 仍用默认 /var/www），
     // 导致建站等依赖 site_root 的能力在非 root 环境下必然失败。
@@ -64,6 +67,9 @@ pub(crate) fn run(cli: &Cli, os: Arc<dyn panel_os::OsAdapter>) -> Result<()> {
 
     let db_path = layout.sqlite_path();
     let mut conn = panel_db::open(&db_path, tier, &cfg.db.synchronous)?;
+    // 真实升级前留一致快照：025/029 是破坏性变更，旧二进制读不了新库，
+    // 没有锚点就只能靠运气恢复。全新库 / 版本已最新时零额外 IO。
+    crate::migrate_snapshot::snapshot_before_migrate(&conn, &db_path, &layout.backup_dir())?;
     panel_db::migrate::apply(&mut conn)?;
     drop(conn);
 

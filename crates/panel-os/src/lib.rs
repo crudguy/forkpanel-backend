@@ -9,6 +9,8 @@
 pub mod backup;
 pub mod cmd;
 pub mod fs;
+/// 单实例排他锁（flock）：serve / migrate / init 共用，防并发迁移与双实例调度。
+pub mod instance_lock;
 pub mod linux;
 pub mod mock_files;
 pub mod mock;

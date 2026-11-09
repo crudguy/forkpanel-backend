@@ -58,10 +58,13 @@ pub(crate) fn init(
     // 目录与主密钥以最终 layout（含配置中的 [paths] 覆盖）为准
     let layout = build_layout(&os, Some(&cfg));
     bootstrap::ensure_dirs(&layout)?;
+    // 与 serve / panel migrate 共用实例锁，避免 init 与正在跑的实例并发改库。
+    let _instance_lock = panel_os::instance_lock::acquire(&layout.data_dir())?;
     let _key = bootstrap::ensure_master_key(&layout.data_dir())?;
     let tier = detect_tier(&*os, &cfg);
     let db_path = layout.sqlite_path();
     let mut conn = panel_db::open(&db_path, tier, &cfg.db.synchronous)?;
+    crate::migrate_snapshot::snapshot_before_migrate(&conn, &db_path, &layout.backup_dir())?;
     panel_db::migrate::apply(&mut conn)?;
     // 幂等：已有 owner 则跳过
     let owner_count: i64 = conn.query_row(
