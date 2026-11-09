@@ -108,6 +108,7 @@ for needle, desc in [
     ("没有 down migration", "前向迁移事实"),
     ("025_server_notes.sql", "破坏性变更 025"),
     ("029_drop_api_tokens.sql", "破坏性变更 029"),
+    ("030_audit_append_only.sql", "后向不兼容变更 030（旧码 prune_audit 无令牌会被触发器拒）"),
     ("panel restore-db", "整库还原步骤"),
     ("旧二进制", "旧码不能读新库"),
 ]:

@@ -49,12 +49,45 @@ pub fn prune_metrics(conn: &Connection, r: crate::aggregator::Retention) -> Resu
     Ok(WriteAck { rows_changed: changed })
 }
 
+/// 审计修剪令牌（030 迁移的 append-only 触发器的唯一合法 DELETE 通道）。
+///
+/// 触发器只放行「单行令牌表 `_audit_permit` 里有行」的 DELETE。生产路径上
+/// 本函数跑在 writer.exec 的事务里：令牌的 INSERT 与回收 DELETE 同事务提交，
+/// 任何已提交状态都不存在游离令牌，其他连接（读池）在 WAL 快照里也永远
+/// 看不到它。RAII 保证任何退出路径（含中途失败）都回收——令牌残留等于
+/// 审计删除被静默放行。
+struct PrunePermit<'c>(&'c Connection);
+
+impl<'c> PrunePermit<'c> {
+    fn acquire(conn: &'c Connection) -> Result<Self> {
+        // 不靠 IF NOT EXISTS 式兜底：令牌已有行说明重入/嵌套修剪（或上次
+        // 回收失败），那是 bug，必须当场报错而不是静默共用令牌
+        conn.execute("INSERT INTO _audit_permit(permit) VALUES (1)", [])
+            .map_err(|e| PanelError::Database(format!("acquire audit prune permit: {e}")))?;
+        Ok(Self(conn))
+    }
+}
+
+impl Drop for PrunePermit<'_> {
+    fn drop(&mut self) {
+        if let Err(e) = self.0.execute("DELETE FROM _audit_permit WHERE permit = 1", []) {
+            // Drop 不能传播错误；令牌残留 = 审计删除放行窗口，必须留痕
+            eprintln!("[error] audit prune permit 回收失败：{e}（审计删除令牌残留）");
+        }
+    }
+}
+
 /// 清理审计日志。
 ///
 /// # 为什么默认是 90 天而不是 180 天（实测修正）
 /// 180 天 × 200 条/天 = 36,000 行 = **4.12 MB**（含 ts 索引），是分层后指标体积（668KB）的 **6 倍**。
 /// 90 天 × 50 条/天 = 360 KB。故默认收紧为 90 天 + 5 万行上限。
+///
+/// # append-only（030）
+/// 本函数是 audit_log 的**唯一**合法 DELETE 通道（持 [`PrunePermit`]）。
+/// 其余任何 UPDATE/DELETE 都被触发器拦下（`audit_log is append-only`）。
 pub fn prune_audit(conn: &Connection, retention_days: u32, max_rows: u64) -> Result<WriteAck> {
+    let _permit = PrunePermit::acquire(conn)?;
     let mut changed = 0usize;
     let cutoff = now_unix() - (retention_days as i64) * 86_400;
     changed += conn.execute("DELETE FROM audit_log WHERE ts < ?1", rusqlite::params![cutoff])
@@ -188,7 +221,14 @@ mod tests {
     #[test]
     fn prune_runs_on_real_db() {
         let c = Connection::open_in_memory().unwrap();
-        c.execute_batch("CREATE TABLE audit_log(id INTEGER PRIMARY KEY, ts INTEGER)").unwrap();
+        // 030 起 prune_audit 必须先持 `_audit_permit` 令牌（append-only 触发器的
+        // 唯一合法 DELETE 通道）——夹具少了这张表，acquire 会以 no such table 失败。
+        // 本测试量的是修剪数学（批次/收敛），故只建最小表结构、不建触发器；
+        // 触发器行为由下方 migrated_db() 系列测试覆盖。
+        c.execute_batch(
+            "CREATE TABLE audit_log(id INTEGER PRIMARY KEY, ts INTEGER);
+             CREATE TABLE _audit_permit(permit INTEGER PRIMARY KEY)",
+        ).unwrap();
         let now = now_unix();
         // 插入 1~100 天前的 100 条（刻意不含"今天"，这样保留 90 天时被删的正好是
         // 91~100 天前那 10 条；若从 0 开始则只有 9 条，与保留语义对不上）
@@ -256,5 +296,86 @@ mod tests {
         assert_eq!(ack.rows_changed, 0, "未超期未超限时不得删除任何行");
         let left: u64 = c.query_row("SELECT count(*) FROM notifications", [], |r| r.get(0)).unwrap();
         assert_eq!(left, 5);
+    }
+
+    // ── 030：审计 append-only 触发器（夹具必须跑真迁移，否则触发器根本不存在、
+    //    「被拦」断言恒绿——夹具不真实则负向不转红）──
+
+    fn migrated_db() -> Connection {
+        let mut c = Connection::open_in_memory().unwrap();
+        crate::migrate::apply(&mut c).unwrap();
+        c
+    }
+
+    fn insert_audit(c: &Connection, ts: i64) {
+        c.execute(
+            "INSERT INTO audit_log(ts, actor, action, result) VALUES(?1, 't', 't.op', 'ok')",
+            rusqlite::params![ts],
+        ).unwrap();
+    }
+
+    #[test]
+    fn migrated_db_has_append_only_triggers() {
+        // 夹具自检：触发器不在位，后续所有「被拦」断言都是假绿
+        let c = migrated_db();
+        let n: u64 = c.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='trigger'
+             AND name IN ('audit_append_only_no_update','audit_append_only_no_delete')",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(n, 2, "030 迁移必须创建两个 append-only 触发器");
+    }
+
+    #[test]
+    fn audit_update_is_blocked() {
+        let c = migrated_db();
+        insert_audit(&c, now_unix());
+        let msg = c.execute("UPDATE audit_log SET result='error'", []).unwrap_err().to_string();
+        assert!(msg.contains("append-only"), "UPDATE 必须被拦下：{msg}");
+    }
+
+    #[test]
+    fn audit_delete_without_permit_is_blocked() {
+        let c = migrated_db();
+        insert_audit(&c, now_unix());
+        let msg = c.execute("DELETE FROM audit_log", []).unwrap_err().to_string();
+        assert!(msg.contains("append-only"), "无令牌 DELETE 必须被拦下：{msg}");
+        let n: u64 = c.query_row("SELECT count(*) FROM audit_log", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1, "被拦的 DELETE 不得删掉任何行");
+    }
+
+    #[test]
+    fn prune_audit_holds_permit_and_releases_it() {
+        let c = migrated_db();
+        let now = now_unix();
+        for i in 1..=100u32 {
+            insert_audit(&c, ts_days_ago(now, i as i64));
+        }
+        let ack = prune_audit(&c, 90, 50_000).unwrap();
+        assert_eq!(ack.rows_changed, 10, "持令牌的保留期修剪必须照常工作");
+        // 令牌已回收：修剪结束后裸 DELETE 仍要被拦
+        let msg = c.execute("DELETE FROM audit_log", []).unwrap_err().to_string();
+        assert!(msg.contains("append-only"), "修剪结束令牌必须已回收：{msg}");
+    }
+
+    #[test]
+    fn prune_permit_rejects_reentry_and_recovers_after_drop() {
+        let c = migrated_db();
+        let p1 = PrunePermit::acquire(&c).unwrap();
+        assert!(PrunePermit::acquire(&c).is_err(), "同连接重入必须报错（嵌套修剪是 bug）");
+        drop(p1);
+        PrunePermit::acquire(&c).unwrap(); // 回收后可再获取
+    }
+
+    #[test]
+    fn prune_permit_released_on_early_exit() {
+        let c = migrated_db();
+        insert_audit(&c, now_unix());
+        {
+            let _p = PrunePermit::acquire(&c).unwrap();
+            // 模拟修剪中途失败：提前离开作用域
+        }
+        let msg = c.execute("DELETE FROM audit_log", []).unwrap_err().to_string();
+        assert!(msg.contains("append-only"), "错误路径也必须回收令牌：{msg}");
     }
 }

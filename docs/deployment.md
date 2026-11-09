@@ -795,7 +795,7 @@ sudo panel uninstall
 
 ### 7.1 只有前向迁移，**没有 down migration**
 
-`panel-db/migrate.rs` 的 `MIGRATIONS` 是纯前向数组（当前 `LATEST = 29`），
+`panel-db/migrate.rs` 的 `MIGRATIONS` 是纯前向数组（当前 `LATEST = 30`），
 `schema_migrations` 只记录已应用版本与校验和。两个破坏性变更使旧二进制无法
 在同一库上工作：
 
@@ -804,6 +804,12 @@ sudo panel uninstall
 | `025_server_notes.sql` | 建 `server_notes` 后 `DROP TABLE server_note` | 旧码仍按 `server_note` 查，表已不存在 |
 | `029_drop_api_tokens.sql` | `DROP TABLE IF EXISTS api_tokens` | 零引用的表被删除，旧码若有引用即失败 |
 
+另有一个**非破坏性但后向不兼容**的变更（不丢数据，但旧码的某条路径会失败）：
+
+| 版本 | 动作 | 后果 |
+|---|---|---|
+| `030_audit_append_only.sql` | 建 `_audit_permit` 令牌表 + `audit_log` append-only 触发器（UPDATE 全禁，DELETE 须持令牌） | 旧二进制的 `prune_audit` 没有令牌逻辑，清理任务每次执行报 `audit_log is append-only`；其余读写正常 |
+
 因此**回滚 = 整库还原 + 换回旧二进制**，不是「跑一条 down SQL」。项目不为已删数据
 硬写反向脚本（那会造出「表结构回来了、数据没了」的假回退）。
 
@@ -811,7 +817,7 @@ sudo panel uninstall
 
 `serve` / `panel migrate` / `panel init` 在 `migrate::apply` 之前调用
 `snapshot_before_migrate`：仅当 `0 < current < LATEST` 时用 `VACUUM INTO`
-写一份升级前的一致快照到 `<data_dir>/backups/pre-migrate-v<旧>-to-v29-<ts>.db`，
+写一份升级前的一致快照到 `<data_dir>/backups/pre-migrate-v<旧>-to-v<新>-<ts>.db`（版本号取自 `migrate::LATEST`，不硬编码），
 保留最近 5 份。全新库与版本已最新时零额外 IO（冷启动预算不受影响）。
 快照失败会**阻断升级**——没有回退锚点就不把 schema 推到不可回退的位置。
 

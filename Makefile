@@ -47,6 +47,9 @@ guards:
 	# 原样回显会泄露校验临时目录与 ACME 账户信息；message 在构造侧已拼好，
 	# API 边界再裁 detail 字段没用，只能钉构造点）
 	python3 ci/check-error-sanitize.py
+	# 审计 append-only：030 触发器 + prune 令牌 + doctor 留痕四环接线
+	# （此前 append-only 只是注释自称，任何代码路径都能无痕删改）
+	python3 ci/check_audit_append_only.py
 	# 前端单文件行数上限：挡住 .vue/.ts 无限膨胀（大视图的直接后果是"纯逻辑没法单测"）
 	bash ci/check-frontend-loc.sh
 	# 前端 UI 守卫（清单以 run-ui-guards.mjs 的 UI_GUARDS 为准，不在此写死数量）：

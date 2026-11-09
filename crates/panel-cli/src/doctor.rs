@@ -100,15 +100,40 @@ pub fn run(os: &dyn OsAdapter, layout: &dyn PathLayout, db_path: &Path, tier: Ti
     // 6. 数据库完整性
     if db_path.exists() {
         match panel_db::open(db_path, tier, synchronous) {
-            Ok(c) => match panel_db::integrity_check(&c) {
-                Ok(s) if s == "ok" => v.push(Check { name: "db_integrity", level: Level::Ok,
-                    message: "数据库完整性检查通过".into(), fix: None }),
-                Ok(s) => v.push(Check { name: "db_integrity", level: Level::Fail,
-                    message: format!("完整性检查未通过：{s}"),
-                    fix: Some("从最近的备份恢复：panel restore <file>".into()) }),
-                Err(e) => v.push(Check { name: "db_integrity", level: Level::Warn,
-                    message: format!("完整性检查失败：{e}"), fix: None }),
-            },
+            Ok(c) => {
+                match panel_db::integrity_check(&c) {
+                    Ok(s) if s == "ok" => v.push(Check { name: "db_integrity", level: Level::Ok,
+                        message: "数据库完整性检查通过".into(), fix: None }),
+                    Ok(s) => v.push(Check { name: "db_integrity", level: Level::Fail,
+                        message: format!("完整性检查未通过：{s}"),
+                        fix: Some("从最近的备份恢复：panel restore <file>".into()) }),
+                    Err(e) => v.push(Check { name: "db_integrity", level: Level::Warn,
+                        message: format!("完整性检查失败：{e}"), fix: None }),
+                }
+                // 6b. 审计 append-only 触发器在位（030 迁移）：触发器被 DROP/改名
+                // 是「审计防线被绕过」的唯一留痕点——root 层篡改挡不住，但必须可查。
+                // 库版本 < 30 属「未迁移」，Warn 提示跑迁移即可，不判 Fail。
+                let ver: u32 = c.query_row(
+                    "SELECT COALESCE(MAX(version),0) FROM schema_migrations", [], |r| r.get(0),
+                ).unwrap_or(0);
+                let triggers: u32 = c.query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='trigger'
+                     AND name IN ('audit_append_only_no_update','audit_append_only_no_delete')",
+                    [], |r| r.get(0),
+                ).unwrap_or(0);
+                v.push(if ver >= 30 && triggers != 2 {
+                    Check { name: "audit_append_only", level: Level::Fail,
+                        message: format!("审计 append-only 触发器缺失（{triggers}/2，库已 v{ver}）——可能被人工 DROP"),
+                        fix: Some("核对是否有人直接改过库；重跑 `panel migrate` 不会重建被 DROP 的触发器（迁移已标记应用），需从备份恢复或手工重建（见 migrations/030_audit_append_only.sql）".into()) }
+                } else if triggers != 2 {
+                    Check { name: "audit_append_only", level: Level::Warn,
+                        message: format!("审计 append-only 触发器未就位（库 v{ver} < 30）"),
+                        fix: Some("启动一次 panel serve（或 panel migrate）应用 030 迁移".into()) }
+                } else {
+                    Check { name: "audit_append_only", level: Level::Ok,
+                        message: "审计 append-only 触发器在位".into(), fix: None }
+                });
+            }
             Err(e) => v.push(Check { name: "db_integrity", level: Level::Fail,
                 message: format!("无法打开数据库：{e}"), fix: None }),
         }

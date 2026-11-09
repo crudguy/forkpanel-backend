@@ -45,10 +45,13 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (28, include_str!("../../../migrations/028_waf_alert_cfg.sql")),
     // 029：删除零引用的 api_tokens（P2-2）——留着等于宣称支持 API 令牌
     (29, include_str!("../../../migrations/029_drop_api_tokens.sql")),
+    // 030：审计表 append-only 触发器（§3.5 P1）——UPDATE 全禁，DELETE 须持
+    // cleanup::prune_audit 的 temp 表令牌（保留期修剪是唯一合法删除通道）
+    (30, include_str!("../../../migrations/030_audit_append_only.sql")),
 ];
 
 /// 当前 schema 版本
-pub const LATEST: u32 = 29;
+pub const LATEST: u32 = 30;
 
 pub fn apply(conn: &mut Connection) -> Result<u32> {
     conn.execute_batch(
