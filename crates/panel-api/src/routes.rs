@@ -493,8 +493,9 @@ pub async fn audit(state: &AppState, s: &Session, action: &'static str,
     let ip = if s.ip.is_empty() { "unknown".to_string() } else { s.ip.clone() };
     let target = target.to_string();
     // 审计写失败必须留痕：静默丢弃会让"操作已生效但无记录"，事后无法发现。
-    // 用 eprintln! 而非 tracing：panel-api 未引入日志设施（依赖预算纪律：零新依赖），
-    // serve 启动时 stderr 已重定向进日志文件，不会打到终端。
+    // 用 eprintln! 而非 tracing：panel-api 未引入日志设施（依赖预算纪律：零新依赖）。
+    // stderr 在 systemd 部署下进 journald（journalctl -u panel），非 systemd 部署
+    // 打到启动终端；**不会**重定向进 /var/log/forkpanel 下的文件。
     if let Err(e) = state.db.exec(move |conn| {
         conn.execute(
             "INSERT INTO audit_log(ts, actor, actor_ip, action, target, result, detail_json)

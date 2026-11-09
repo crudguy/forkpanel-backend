@@ -102,6 +102,66 @@ install -d -m 0750 "$LOG_DIR"
 install -d -m 0755 "$SITE_ROOT"
 echo "· 目录已就绪（数据 0700 / 配置·日志 0750）"
 
+# ── 日志去向与保留（systemd 部署：stderr → journald，不落 /var/log 文件）──
+# 此前 install-footprint.md 与 Rust 注释声称「stderr 已重定向进日志文件」，实际
+# 从未实现：/var/log/forkpanel 一直是空目录。这里如实保留 journald 作为唯一
+# 日志去向，并给它加保留上限，避免无人值守机器上 journal 无限膨胀撑爆磁盘。
+JOURNALD_DROPIN=/etc/systemd/journald.conf.d/forkpanel.conf
+install -d -m 0755 "$(dirname "$JOURNALD_DROPIN")"
+cat > "$JOURNALD_DROPIN" <<'EOF'
+# 由 ForkPanel 安装器生成。面板日志走 journald（journalctl -u panel），
+# 不写 /var/log/forkpanel 下的文件；这里只限制 journal 的磁盘占用与保留期。
+[Journal]
+SystemMaxUse=200M
+MaxRetentionSec=14day
+EOF
+chmod 0644 "$JOURNALD_DROPIN"
+echo "· journald 保留策略 → $JOURNALD_DROPIN（SystemMaxUse=200M / 14 天）"
+
+# 崩溃告警：Restart=on-failure 会先把进程拉起，但没人知道它挂过。
+# OnFailure 指向一个 oneshot 单元：默认写一条高优先级 journal；若运维在
+# /etc/forkpanel/alert-webhook 配了 URL，则同时 POST 一条 JSON 到外部渠道。
+NOTIFY_SCRIPT="$SHARE_DIR/notify-failure.sh"
+install -d -m 0755 "$SHARE_DIR"
+cat > "$NOTIFY_SCRIPT" <<'EOF'
+#!/bin/sh
+# ForkPanel 崩溃通知：由 panel-failure-notify.service (OnFailure=) 调用。
+# 没配 webhook 时只写 journal；投递失败也绝不影响服务恢复。
+set -u
+TS=$(date -Is)
+HOST=$(hostname 2>/dev/null || echo unknown)
+MSG="forkpanel panel.service entered failed state on $HOST at $TS"
+echo "$MSG" >&2
+logger -t forkpanel -p daemon.err "$MSG" 2>/dev/null || true
+WH=/etc/forkpanel/alert-webhook
+if [ -f "$WH" ] && [ -s "$WH" ]; then
+  URL=$(head -1 "$WH" | tr -d '\r\n')
+  [ -n "$URL" ] || exit 0
+  curl -fsS --max-time 5 -H 'Content-Type: application/json' \
+    -d "{\"host\":\"$HOST\",\"time\":\"$TS\",\"unit\":\"panel.service\",\"event\":\"crash\"}" \
+    "$URL" >/dev/null 2>&1 || echo "forkpanel: alert webhook 投递失败（不影响服务恢复）" >&2
+fi
+exit 0
+EOF
+chmod 0755 "$NOTIFY_SCRIPT"
+UNIT_DIR=/etc/systemd/system
+# /etc 被 tmpfs 覆盖的极简环境（容器 / userns E2E）里这个目录可能不存在；
+# 直接 cat > 会「没有那个文件或目录」而中断整个安装（真机同样可能踩）。
+install -d -m 0755 "$UNIT_DIR"
+cat > "$UNIT_DIR/panel-failure-notify.service" <<EOF
+[Unit]
+Description=ForkPanel crash notifier (journal + optional webhook)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$NOTIFY_SCRIPT
+EOF
+chmod 0644 "$UNIT_DIR/panel-failure-notify.service"
+echo "· 崩溃告警单元 → panel-failure-notify.service（可选 webhook：/etc/forkpanel/alert-webhook）"
+# journald.conf.d 改动需重启 journald 才生效；失败不阻断安装（配置已落盘）。
+systemctl restart systemd-journald >/dev/null 2>&1 || true
+
 if [ -f "$CONF_FILE" ]; then
   echo "· 配置已存在，保留 $CONF_FILE（升级不覆盖）"
   PORT=$(grep -oE '^port = [0-9]+' "$CONF_FILE" | grep -oE '[0-9]+' || echo 2083)

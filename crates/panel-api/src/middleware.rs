@@ -136,8 +136,10 @@ pub type SharedSessions = Arc<SessionCache>;
 
 // ═══════════════════════ 请求级结构化日志 ═══════════════════════
 
-/// 请求级结构化日志（复盘 🟡 项）。每条请求一行，落 stderr（serve 启动时
-/// stderr 已重定向进日志文件；systemd 部署下进 journald）：
+/// 请求级结构化日志（复盘 🟡 项）。每条请求一行，落 stderr；systemd 部署下
+/// 由 journald 收集（`journalctl -u panel`），非 systemd 部署则打到启动终端。
+/// **不写 /var/log/forkpanel 下的文件**——安装器已给 journald 配保留上限，
+/// 详见 `deploy/install.sh` 与 `docs/deployment.md`「日志去向与保留」。
 ///
 /// ```text
 /// [panel] [http] method=GET path=/api/v1/version status=200 dur_ms=3 user=admin rid=-

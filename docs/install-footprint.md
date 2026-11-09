@@ -36,6 +36,9 @@
 | `/etc/systemd/system/panel-healthcheck.timer` | 文件 | — | 探活定时器（每分钟一次，连续两次失败才重启） |
 | `/var/lib/forkpanel/scripts/healthcheck.sh` | 文件 | — | 探活脚本（写进数据目录内的受限脚本目录） |
 | `/usr/local/share/forkpanel/expose-public.sh` | 文件 | 0755 | 公网暴露脚本（`panel expose` 调用它做 nginx 反代 + 防火墙白名单，面板仍只绑回环） |
+| `/etc/systemd/journald.conf.d/forkpanel.conf` | 文件 | 0644 | journald 保留上限（`SystemMaxUse=200M` / `MaxRetentionSec=14day`），面板日志唯一去向是 journald |
+| `/etc/systemd/system/panel-failure-notify.service` | 文件 | 0644 | 崩溃通知单元，由 `panel.service` 的 `OnFailure=` 触发 |
+| `/usr/local/share/forkpanel/notify-failure.sh` | 文件 | 0755 | 崩溃通知脚本：默认写 `daemon.err` journal；仅当 `/etc/forkpanel/alert-webhook` 存在且非空才外发 JSON |
 
 > 安装完成后会执行 `systemctl daemon-reload && systemctl enable panel`、随即
 > `systemctl start panel` **把服务直接拉起来**，以及
@@ -118,8 +121,12 @@ tmp/  cache/  log/  临时 / 缓存 / 内部日志
 
 - **集中式面板**：一棵树看得见摸得着，`tar czf www.tgz /www` 一次全搬；但用户数据、
   面板自身、各种服务软件混居同树，备份难只挑站点不挑软件。
-- **ForkPanel**：每类数据各在标准位置。`logrotate` 认 `/var/log`、备份工具认
-  `/var/lib`、打成 deb 也顺理成章；代价是路径分散，新人需查本文。
+- **ForkPanel**：每类数据各在标准位置。日志走 journald（`journalctl -u panel`，
+  安装器已配保留上限）、备份工具认 `/var/lib`、打成 deb 也顺理成章；代价是路径分散，
+  新人需查本文。
+  ⚠ `/var/log/forkpanel` 目前**不落文件日志**（该目录保留给任务输出等）。历史文档
+  「`logrotate` 认 `/var/log`」与代码注释「stderr 已重定向进日志文件」都是不实描述，
+  已废止；若确需文件日志 + logrotate，见 `docs/deployment.md` §5.2.2 的取舍说明。
 
 ### 安全性（差距最大的一项）
 

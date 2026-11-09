@@ -77,6 +77,9 @@ guards:
 	# /healthz 必须是依赖型就绪探针（DB 可读 / 磁盘余量），且 systemd 探活
 	# 仍打 /api/v1/version（盘满重启无用，改用就绪探针会造成重启循环）。
 	python3 ci/check_healthz.py
+	# 日志真实去向（journald + 保留上限）、崩溃告警 OnFailure 与不实注释修正
+	# 必须一起接线：只改注释不改安装器 = 又一轮「文档承诺但代码没有」。
+	python3 ci/check_logging.py
 
 # 内嵌前端新鲜度：改完前端只 cargo build **不会**重新 embed，必须
 # ① vite build → ② rm -rf web/dist/* → ③ cp -a → ④ touch embed.rs → ⑤ cargo build。

@@ -207,6 +207,23 @@ for f in panel-healthcheck.service panel-healthcheck.timer; do
   [ -f "/etc/systemd/system/$f" ] && ok "探活单元已落盘：$f" || bad "缺少探活单元：$f"
 done
 
+# ── 6b. 日志保留 / 崩溃告警必须真的落盘 ─────────────────────────────────
+say "== 6b. journald 保留策略与崩溃告警 =="
+JD=/etc/systemd/journald.conf.d/forkpanel.conf
+if [ -f "$JD" ]; then
+  ok "journald 保留配置已落盘：$JD"
+  chk_has "含 SystemMaxUse"    "$(cat "$JD")" "SystemMaxUse=200M"
+  chk_has "含 MaxRetentionSec" "$(cat "$JD")" "MaxRetentionSec=14day"
+else
+  bad "缺 $JD（journal 会无限膨胀撑爆磁盘）"
+fi
+grep -q '^OnFailure=panel-failure-notify.service' "$UNIT"   && ok "panel.service 触发崩溃通知单元"   || bad "panel.service 缺 OnFailure=panel-failure-notify.service"
+for f in /etc/systemd/system/panel-failure-notify.service          /usr/local/share/forkpanel/notify-failure.sh; do
+  [ -f "$f" ] && ok "崩溃告警文件已落盘：$f" || bad "缺崩溃告警文件：$f"
+done
+NS=/usr/local/share/forkpanel/notify-failure.sh
+[ -f "$NS" ] && chk_has "通知脚本含 webhook 钩子" "$(cat "$NS")" "alert-webhook"
+
 # ── 7. install.sh 调用了哪些 systemctl（shim 记录） ──────────────────────
 say "== 7. 安装过程调用了哪些 systemctl =="
 calls=$(cat /tmp/e2e-install-shim/calls.log 2>/dev/null)

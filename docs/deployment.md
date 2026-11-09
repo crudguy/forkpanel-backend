@@ -479,6 +479,28 @@ journalctl -u panel-healthcheck.service -n 20 --no-pager
 
 ---
 
+### 5.2.2 日志去向与保留
+
+| 项 | 说明 |
+|---|---|
+| 唯一去向 | `journalctl -u panel`（systemd 部署）；非 systemd 部署打到启动终端 |
+| 无文件日志 | `/var/log/forkpanel` **不落文件**（该目录保留给任务输出等） |
+| 保留上限 | 安装器写 `/etc/systemd/journald.conf.d/forkpanel.conf`：`SystemMaxUse=200M`、`MaxRetentionSec=14day` |
+| 生效 | `install.sh` 会 `systemctl restart systemd-journald`；手工改配置后同样需要重启 |
+
+> 历史文档曾声称「serve 启动时 stderr 已重定向进日志文件」，实际从未实现，已修正代码注释与 `install-footprint.md`。若确需文件日志 + logrotate（例如采集 agent 只认文件），需把 `StandardOutput/StandardError` 改成 `append:` 并**接受 `journalctl -u panel` 不再可用**；这是另一套方案，当前未采用。
+
+### 5.2.3 崩溃告警
+
+`panel.service` 带 `OnFailure=panel-failure-notify.service`。服务进入 failed 时：
+
+1. 默认写一条 `daemon.err` 级 journal（`logger -t forkpanel`），`journalctl -t forkpanel` 可查；
+2. 若在 `/etc/forkpanel/alert-webhook` 写入一行 URL（该文件不入库，权限建议 0600），通知脚本会 POST 一条 JSON（`host` / `time` / `unit` / `event=crash`）到该地址。
+
+投递失败只写告警，不影响 `Restart=on-failure` 恢复服务；没配 webhook 时纯本地留痕，不会向外发任何请求。
+
+> 业务事件（备份失败 / 证书续期失败 / 磁盘写满 / 审计写失败）的**外部告警尚未接线**，仍只有站内通知与 stderr；见生产就绪度复盘 §3.5，属 P1 待办。
+
 ### 5.3 停机恢复面板库（runbook，已真机演练）
 
 **适用范围**：`kind=panel` 的备份（面板自身数据库）。

@@ -69,6 +69,9 @@ pub fn systemd_unit(bin: &str, config: &str, tier: Tier, writable: &[std::path::
 Description=Lightweight server management panel
 After=network-online.target
 Wants=network-online.target
+# 崩溃时除 Restart=on-failure 拉起外，还要留一条外部可见的记录 / 告警；
+# 通知单元与脚本由 deploy/install.sh 生成，通知失败不影响服务恢复。
+OnFailure=panel-failure-notify.service
 
 [Service]
 Type=simple
