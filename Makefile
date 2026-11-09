@@ -90,6 +90,12 @@ guards:
 	# 必然 [skip]（ci.yml 不构建前端）、check-frontend-loc 两处 CI 分支 exit 0、
 	# 前端 check:contract 是孤儿。判据一律剔注释（注释里就写着 exit 0 / [skip]）。
 	python3 ci/check_gate_holes.py
+	# G11：发布流水线必须是「draft 上传 → 发布后冒烟 → 转正 → 失败回滚」，
+	# 且冒烟验的是**下载回来的资产**（拿本地 dist 自验等于没验发布结果）。
+	python3 ci/check_release_pipeline.py
+	# 发布产物完整性：dist/ 里一出现 panel-linux-*.tar.gz 就必须双架构 + .sig +
+	# SHA256SUMS 逐行可验（一个都没有＝未构建，跳过；做了一半＝判红）。
+	bash ci/check_release_artifacts.sh
 
 # 内嵌前端新鲜度：改完前端只 cargo build **不会**重新 embed，必须
 # ① vite build → ② rm -rf web/dist/* → ③ cp -a → ④ touch embed.rs → ⑤ cargo build。

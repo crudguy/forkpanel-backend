@@ -104,15 +104,36 @@ jobs:
           PANEL_FRONTEND_OPENAPI: ${{ github.workspace }}/forkpanel-frontend/src/api/openapi.yaml
           FE_DIST: ${{ github.workspace }}/forkpanel-frontend/dist
 
+      # 统一解析 TAG / VER 写进 $GITHUB_ENV，后续步骤（版本对齐 / build-static / 冒烟 /
+      # 转正 / 回滚）共用同一份。此前每处各写一遍 `inputs.version || ref_name`，那种
+      # 写法在 workflow_dispatch 填 `0.2.0` 时得到**不带 v 的版本号**，拿去
+      # `gh release edit` 会找不到 tag（发布后冒烟与回滚都依赖准确的 tag）。
+      - name: 解析发布 tag 与版本号
+        id: meta
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            V="${{ github.event.inputs.version }}"
+          else
+            V="${GITHUB_REF_NAME}"
+          fi
+          V="${V#v}"                       # v0.2.0 → 0.2.0
+          # 双写是刻意的：`$GITHUB_OUTPUT` 供 `with:` 里的表达式用（steps 上下文一定
+          # 可用），`$GITHUB_ENV` 供后续 `run:` 的 shell 变量用。
+          # ⚠ 只写 GITHUB_ENV 不够——它注入的是 runner 进程环境，**不保证**出现在后续
+          #   步骤的 `env` 上下文（`${{ env.TAG }}` 可能取到空串），那个坑会让
+          #   `tag_name:` 变成空值而静默用默认 tag。
+          echo "tag=v$V"  >> "$GITHUB_OUTPUT"
+          echo "ver=$V"   >> "$GITHUB_OUTPUT"
+          echo "TAG=v$V"  >> "$GITHUB_ENV"
+          echo "VER=$V"   >> "$GITHUB_ENV"
+          echo "发布版本：$V（tag：v$V）"
+
       # 把 tag 版本写进 Cargo.toml，否则二进制自报的版本恒为源码里的旧值
       # （panel 的 /api/v1/version 取 env!("CARGO_PKG_VERSION")），
       # 导致 v0.2.0 的面板「关于」显示 0.1.0。改法只动工作区、不提交。
       - name: 版本号对齐 tag
         run: |
-          V="${{ github.event.inputs.version || github.ref_name }}"
-          V="${V#v}"                       # v0.1.0 → 0.1.0
-          echo "发布版本：$V"
-          sed -i -E "s/^version = \"[^\"]*\"/version = \"$V\"/" Cargo.toml
+          sed -i -E "s/^version = \"[^\"]*\"/version = \"$VER\"/" Cargo.toml
           grep -n '^version' Cargo.toml | head -2
 
       - name: 写入 ed25519 签名私钥（来自 secret，绝不入库）
@@ -121,9 +142,15 @@ jobs:
           printf '%s\n' "${{ secrets.PANEL_RELEASE_KEY }}" > "$HOME/.forkpanel-release.key"
           chmod 600 "$HOME/.forkpanel-release.key"
 
+      # 产物新鲜度的基准：构建**之前**打时间戳，构建之后再比对每个产物的 mtime。
+      # 防的是「本次 arm64 构建失败但 dist/ 里躺着上一轮的 arm64 包」——那种情况下
+      # 后面每一步都会绿，发出去的是旧架构的二进制（报告 §3.10 P2 要求 newest 进门禁）。
+      - name: 记录构建开始时间（产物新鲜度基准）
+        run: date +%s > "$RUNNER_TEMP/build-started-at"
+
       # 复用 deploy/build-static.sh（打包 + 签名的单一事实源），避免两处漂移
       - name: 静态构建 + 签名 tarball
-        run: ./deploy/build-static.sh "${{ github.event.inputs.version || github.ref_name }}"
+        run: ./deploy/build-static.sh "$VER"
         # 注入构建标识：/api/v1/version 的 build 字段取 option_env!("PANEL_BUILD")，
         # 不注入则恒为 "dev"（此前发行版一直显示 dev，与 docs/env.md「CI 可注入」不符）。
         # 用 commit SHA 作构建号，便于从「关于/版本徽标」反查来源。
@@ -140,9 +167,32 @@ jobs:
       - name: 回验发布产物（安装器内嵌公钥 + 双架构 + SHA256SUMS）
         run: bash ci/verify-release-assets.sh . dist
 
-      - name: 发布到 GitHub Releases
+      # 结构完整之外再判「新鲜度」：产物必须晚于本次构建开始时间。缺这条时，
+      # `cargo zigbuild` 若因缓存跳过 arm64、而 dist/ 里又躺着上一轮的 arm64 包，
+      # 回验照样全绿——发出去的是旧架构二进制（报告 §3.10 P2「产物比源码旧 5 天」）。
+      - name: 产物新鲜度（mtime ≥ 本次构建开始）
+        run: |
+          base="$(cat "$RUNNER_TEMP/build-started-at")"
+          bad=0
+          for f in dist/panel-linux-amd64.tar.gz dist/panel-linux-arm64.tar.gz dist/SHA256SUMS; do
+            [ -f "$f" ] || { echo "✗ 缺少 $f" >&2; bad=1; continue; }
+            m="$(stat -c %Y "$f")"
+            if [ "$m" -lt "$base" ]; then
+              echo "✗ $f 比本次构建开始早 $((base - m))s —— 上一轮残留，不是本次产物" >&2
+              bad=1
+            else
+              echo "  ✓ $f 新鲜（+$((m - base))s）"
+            fi
+          done
+          [ "$bad" -eq 0 ] || exit 1
+
+      # ⚠ 先传成 **draft**：此刻用户看不到这个 Release。见文件末尾的「自动回滚」。
+      - name: 上传为草稿 Release（用户不可见）
+        id: publish
         uses: softprops/action-gh-release@v2
         with:
+          draft: true
+          tag_name: ${{ steps.meta.outputs.tag }}
           files: |
             dist/panel-linux-amd64.tar.gz
             dist/panel-linux-amd64.tar.gz.sig
@@ -150,5 +200,30 @@ jobs:
             dist/panel-linux-arm64.tar.gz.sig
             dist/SHA256SUMS
           # tag 名含 "-"（如 v0.1.0-rc1）视为预发布
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(steps.meta.outputs.tag, '-') }}
           generate_release_notes: true
+
+      # 发布后冒烟：把**刚上传的资产下载回来**再验一遍。上面那轮验的是「准备发的」，
+      # 这轮验「用户真能下到的」——漏传 / 上传损坏 / 资产改名只有这轮看得见。
+      - name: 发布后冒烟（下载资产 + 验签 + 跑二进制 + 判架构）
+        run: bash ci/release-smoke.sh "${{ github.repository }}" "$TAG"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 冒烟通过才转正：这是整个流程里唯一的「发布可见」动作。
+      - name: 冒烟通过 → 转为正式发布
+        run: gh release edit "$TAG" --draft=false
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ★ 自动回滚路径：任何后续失败都把 Release 按回 draft。
+      # 为什么是 draft 而不是「删除 Release」：草稿用户不可见，等价于撤销发布，但
+      #   ① 不丢已上传资产（便于人工排查）② 不需要第二次网络写操作（删除失败会留窗口期）
+      #   ③ 重跑 workflow 时 softprops 更新同一 Release，幂等。
+      - name: 失败 → 撤销发布可见性（保持草稿）
+        if: failure()
+        run: |
+          echo "::error::发布流程失败，Release $TAG 保持 draft（用户不可见）；修好后重跑本 workflow。"
+          gh release edit "$TAG" --draft=true || echo "（Release 可能尚未创建，忽略）"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

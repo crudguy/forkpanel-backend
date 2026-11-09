@@ -38,4 +38,9 @@ ci/.cache/
 .dev-backend.log
 
 # 部署打包产物（build output，不入库）
+# ⚠ build-static.sh 的 `OUT="dist"` 是**仓库根下的 dist/**，不是 deploy/dist/
+#   （deploy/dist 是更早的输出位置，现已废弃）。两条都要留：
+#   此前只写了 /deploy/dist/，于是 `git status` 一直显示 `?? dist/`，
+#   一次 `git add -A` 就会把 5.8MB 的二进制包提交进仓库。
+/dist/
 /deploy/dist/

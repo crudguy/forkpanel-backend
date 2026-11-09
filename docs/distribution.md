@@ -152,8 +152,38 @@ sudo panel uninstall        # 等价于 /usr/local/bin/panel --config /etc/forkp
 2. 确保 `get-panel.sh` 已是正式公钥（见上）。
 3. 打 tag 触发发版：`git tag v0.1.0 && git push origin v0.1.0`
    ⚠ 打 tag 的 push **不会**触发 `ci.yml`（`ci.yml` 只绑 `main` 分支）。所以发版前的质量兜底完全由 `release.yml` 内置的 `make check` 承担——它必须留在发布链最前面，不能省。
-4. GitHub Actions `Release` workflow 自动：先跑 **`make check`（门禁 + 全量测试）作为发布门槛** → 构建（前端 + 后端 musl 静态）→ 签名 → 上传到 `v0.1.0` Release 资产。门禁不过则中止，不会把坏代码签名发出去。
+4. GitHub Actions `Release` workflow 自动跑完整条链：**`make check`（门禁 + 全量测试）**
+   → 构建（前端 + 后端 musl 静态）→ 签名 → 生成 `SHA256SUMS` → **用安装器内嵌公钥回验**
+   → **产物新鲜度**（mtime ≥ 本次构建开始）→ **上传为草稿 Release** → **发布后冒烟**
+   → **冒烟通过才转正**。任何一步失败都不会让坏包对用户可见。
 5. 在 GitHub Releases 页面复核资产（`*.tar.gz` / `*.tar.gz.sig` / `SHA256SUMS`），必要时编辑发布说明。
+
+### 发布后冒烟与自动回滚
+
+上传是**先落草稿**（`draft: true`）——此刻用户看不到这个 Release。之后
+`ci/release-smoke.sh` 把刚上传的资产**下载回来**再验一遍：
+
+| 判据 | 为什么「上传前那一轮」看不见 |
+|---|---|
+| Release 上恰好 5 个资产 | `files:` 列表漏写某项时，本地 `dist/` 仍然齐全 |
+| `sha256sum -c` 通过 | 上传中断会产生 0 字节资产 |
+| 两个 `.sig` 用**仓库内嵌公钥**验过 | 上传损坏，或资产被替换 |
+| `panel --version` 输出 == tag 版本 | `Cargo.toml` 版本对齐失败，用户看到的版本号是旧的 |
+| 双架构正确 + 静态链接 | amd64 包冒充 arm64（构建缓存跳过了某个 target） |
+
+- **冒烟通过** → `gh release edit --draft=false` 转正。这是整条链里**唯一**让用户可见的动作。
+- **冒烟失败** → Release 停在草稿（job 红），修好后重跑 workflow 即可（幂等）。
+
+为什么回滚是「按回 draft」而不是「删除 Release」：草稿用户不可见，等价于撤销发布，但
+① 不丢已上传资产（便于人工排查）② 不需要第二次网络写操作（删除失败会留可见窗口期）
+③ 重跑时 `softprops/action-gh-release` 更新同一 Release，不会产生孤儿资产。
+
+**本地 `dist/` 不是发布来源。** `build-static.sh` 的 `OUT="dist"` 让它落在仓库根下的
+`dist/`（更早的 `deploy/dist/` 已废弃，那里的残留包正是评审看到的「比源码旧 5 天」）。
+两个位置都进 `.gitignore`，只用于本地安装测试。`ci/check_release_artifacts.sh`
+（已接 `make guards`）在目录里出现任何 `panel-linux-*.tar.gz` 时校验「双架构 + `.sig`
+非空 + `SHA256SUMS` 逐行可验」——**「一个包都没有」视为未构建而跳过，「做了一半」判红**，
+防止有人拿半个月前的残缺产物去装。正式产物一律由 tag 触发的 CI 产出。
 
 ### 需要的 Secrets
 
