@@ -126,12 +126,75 @@ pub async fn static_handler(uri: Uri) -> Response {
     }
 }
 
-/// 健康检查：不做鉴权、不查库，供 systemd / 反代探活
-pub async fn healthz() -> &'static str { "ok" }
+/// 健康检查所需的只读依赖（由 serve 链注入，不写库、不改状态）。
+#[derive(Clone)]
+pub struct HealthState {
+    pub pool: std::sync::Arc<panel_db::ReadPool>,
+    pub data_dir: std::path::PathBuf,
+}
+
+/// 数据目录至少保留 32 MiB 可用才算健康：盘满时 SQLite 写会失败，
+/// 而「进程还活着」不等于「还能服务」。
+pub const MIN_FREE_BYTES: u64 = 32 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthVerdict { Healthy, DbUnavailable, DiskLow, DiskUnknown }
+
+/// 纯判定：抽成函数才能用单测覆盖全部四态，不依赖真机把盘写满。
+pub fn evaluate_health(db_ok: bool, available: Option<u64>) -> HealthVerdict {
+    if !db_ok { return HealthVerdict::DbUnavailable; }
+    match available {
+        None => HealthVerdict::DiskUnknown,
+        Some(n) if n < MIN_FREE_BYTES => HealthVerdict::DiskLow,
+        Some(_) => HealthVerdict::Healthy,
+    }
+}
+
+/// 健康检查：免登录、只读，供**前置 LB / 编排系统**摘流量。
+///
+/// 200 = DB 可读且数据目录有余量；503 = 依赖异常。响应只回原因码，
+/// **不回内部路径、错误详情或堆栈**（避免给攻击者提供地图）。
+/// ⚠ 刻意**不**作为 systemd 探活判据：盘满 / 库挂这类依赖故障重启解决不了，
+///   连续两次失败就重启会退化成无意义的重启循环；systemd 侧继续打
+///   `/api/v1/version` 判「HTTP 是否还能回话」，见 bootstrap.rs 的探活脚本。
+pub async fn healthz(hs: HealthState) -> Response {
+    let db_ok = hs.pool.with(|conn| {
+        conn.query_row("SELECT 1", [], |r| r.get::<_, i32>(0))
+            .map_err(|e| panel_core::PanelError::Database(e.to_string()))
+    }).await.is_ok();
+    let available = panel_os::paths::available_bytes(&hs.data_dir);
+    let (status, reason) = match evaluate_health(db_ok, available) {
+        HealthVerdict::Healthy => (StatusCode::OK, "ok"),
+        HealthVerdict::DbUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "db_unavailable"),
+        HealthVerdict::DiskLow => (StatusCode::SERVICE_UNAVAILABLE, "disk_low"),
+        HealthVerdict::DiskUnknown => (StatusCode::SERVICE_UNAVAILABLE, "disk_unknown"),
+    };
+    let body = if status.is_success() {
+        serde_json::json!({ "status": "ok" })
+    } else {
+        serde_json::json!({ "status": "degraded", "reason": reason })
+    };
+    let mut res = (status, Json(body)).into_response();
+    res.headers_mut().insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    res
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn health_verdict_covers_all_four_branches() {
+        assert_eq!(evaluate_health(true, Some(MIN_FREE_BYTES)), HealthVerdict::Healthy);
+        assert_eq!(evaluate_health(true, Some(MIN_FREE_BYTES - 1)), HealthVerdict::DiskLow);
+        assert_eq!(evaluate_health(true, None), HealthVerdict::DiskUnknown);
+        assert_eq!(evaluate_health(false, Some(MIN_FREE_BYTES)), HealthVerdict::DbUnavailable);
+        // DB 挂了优先于磁盘状态：避免同时异常时给出误导性的 disk_low
+        assert_eq!(evaluate_health(false, None), HealthVerdict::DbUnavailable);
+    }
 
     #[test]
     fn hashed_detection() {

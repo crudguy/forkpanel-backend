@@ -155,8 +155,16 @@ pub(crate) fn run(cli: &Cli, os: Arc<dyn panel_os::OsAdapter>) -> Result<()> {
         sched_in.start(schedules).await;
         tracing::info!("内部调度器已启动（{} 个周期任务）", n_sched);
 
+        // /healthz 是依赖型就绪探针（DB 可读 + 数据目录余量），只注入只读依赖。
+        let health_data_dir = layout.data_dir().to_path_buf();
         let app = panel_api::routes::build_router(state.clone())
-            .route("/healthz", axum::routing::get(embed::healthz))
+            .route("/healthz", axum::routing::get({
+                let hs = embed::HealthState {
+                    pool: state.pool.clone(),
+                    data_dir: health_data_dir,
+                };
+                move || async move { embed::healthz(hs.clone()).await }
+            }))
             .fallback(embed::static_handler)
             // 安全响应头：必须挂在 build_router **之外**且 `.fallback()` 之后 ——
             // build_router 内的 layer 不包裹之后新增的 /healthz 与替换后的 SPA fallback，

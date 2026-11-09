@@ -138,8 +138,10 @@ pub fn writable_dirs(layout: &dyn panel_os::PathLayout)
 /// 这类故障 systemd 从外部看不出来，服务会一直挂着直到有人登上服务器才发现。
 ///
 /// 判定用 `/api/v1/version`（免登录 GET，语义 = "服务还能不能回话"）。
-/// 刻意**不用** `/healthz`：那个在 embed 层，进程活着就一定 200，探不到
-/// "HTTP 服务已死但主线程还在"——正是要抓的那类故障。
+/// 刻意**不用** `/healthz`：它现在会检查 DB 可读与数据目录余量（供前置 LB /
+/// 编排摘流量），但盘满、库挂这类依赖故障**重启解决不了**，连续两次失败就
+/// 重启会退化成无意义的重启循环。systemd 层只判「HTTP 是否还能回话」；
+/// 依赖型故障交给 `/healthz` 的 503 让上层摘流量与告警。
 ///
 /// **连续两次失败才重启**（用 marker 文件记状态）：单次失败多为瞬时抖动
 /// （重启窗口、CPU 饱和、探活自身超时），误把好服务重启掉的代价高于漏一次报。
@@ -264,10 +266,10 @@ mod tests {
     #[test]
     fn healthcheck_script_probes_version_not_healthz() {
         let sh = healthcheck_script("panel", 2083);
-        // 判定必须打 /api/v1/version：/healthz 在 embed 层，进程活着就恒 200，
-        // 探不到"HTTP 服务已死但主线程还在"——那正是要抓的故障。
-        assert!(sh.contains("/api/v1/version"), "必须探 API 而非 embed 静态路由：{sh}");
-        assert!(!sh.contains("/healthz"), "/healthz 探不到要抓的故障，不应作为判据：{sh}");
+        // 判定必须打 /api/v1/version：/healthz 现在是依赖型就绪探针（DB/磁盘），
+        // 用它做 systemd 探活会在盘满时触发无意义的重启循环。
+        assert!(sh.contains("/api/v1/version"), "systemd 探活只判 HTTP 是否还能回话：{sh}");
+        assert!(!sh.contains("/healthz"), "依赖型探针不该用于触发重启（盘满重启无用）：{sh}");
         // 端口来自 Config，不硬编码
         assert!(sh.contains("127.0.0.1:2083"), "端口应来自调用方：{sh}");
     }

@@ -74,6 +74,9 @@ guards:
 	# SIGTERM 优雅关闭（含调度器 drain）与 run_sync 超时必须真的接线：
 	# 前者曾让 sched.shutdown() 永远执行不到，后者会永久钉住 spawn_blocking 线程。
 	python3 ci/check_graceful_shutdown.py
+	# /healthz 必须是依赖型就绪探针（DB 可读 / 磁盘余量），且 systemd 探活
+	# 仍打 /api/v1/version（盘满重启无用，改用就绪探针会造成重启循环）。
+	python3 ci/check_healthz.py
 
 # 内嵌前端新鲜度：改完前端只 cargo build **不会**重新 embed，必须
 # ① vite build → ② rm -rf web/dist/* → ③ cp -a → ④ touch embed.rs → ⑤ cargo build。

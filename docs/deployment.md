@@ -448,8 +448,7 @@ panel healthcheck --uninstall           # 移除
 
 两个刻意的设计选择：
 
-- **判定打 `/api/v1/version` 而非 `/healthz`**。后者在 embed 层，进程活着就
-  恒返 200，探不到「HTTP 服务已死但主线程还在」——那正是要抓的故障。
+- **判定打 `/api/v1/version` 而非 `/healthz`**。`GET /healthz` 现在是**依赖型就绪探针**（检查 DB 可读 + 数据目录可用余量，异常返回 503），供前置 LB / 编排摘流量；但盘满、库挂这类故障**重启解决不了**，拿它做 systemd 探活会让「连续两次失败」退化成无意义的重启循环。systemd 层只判「HTTP 是否还能回话」，依赖故障交给 `/healthz` 的 503 + 外部告警。
 - **探活 service 自身 `Restart=no`**。「两次才重启」由脚本实现，systemd 若再叠
   一层 `Restart=on-failure`，会把策略变得更激进（一次失败就反复重跑）。
 
@@ -460,6 +459,19 @@ journalctl -u panel-healthcheck.service -n 20 --no-pager
 # 手动跑一次自检（不等 timer）
 /var/lib/forkpanel/scripts/healthcheck.sh
 ```
+
+### 5.2.1 就绪探针 `/healthz`
+
+| 项 | 说明 |
+|---|---|
+| 路径 | `GET /healthz`（免登录、只读、不写库） |
+| 200 | `{"status":"ok"}` — DB 可读且数据目录可用空间 ≥ 32 MiB |
+| 503 | `{"status":"degraded","reason":"db_unavailable"｜"disk_low"｜"disk_unknown"}` — 只回原因码，**不回内部路径 / 错误详情** |
+| 缓存 | `Cache-Control: no-store`，避免 LB 缓存旧健康状态 |
+| 用途 | 前置 LB / 编排系统的**就绪探针**：异常时摘流量并触发告警 |
+| 不用于 | systemd 探活（见上：盘满重启无用，会形成重启循环） |
+
+> 当前探针覆盖 DB 可读与磁盘余量；**调度器停摆尚未纳入**。外部告警渠道与日志轮转仍在 P1 待办（见 `production-readiness-2026-11-07.md` §3.5）。
 
 > 脚本路径取自 `PathLayout::script_dir()`、端口取自 `Config`，均不硬编码。
 > 该脚本的逻辑已真机四态验证（活着 / 挂一次 / 连续挂两次 / 恢复），
