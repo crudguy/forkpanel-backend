@@ -90,10 +90,17 @@ else
   CMD_PROD=$(awk '/#\[cfg\(test\)\]/{exit} {print}' "$CMD_SRC" 2>/dev/null || true)
   MISS=0
   for needle in 'RUN_SYNC_TIMEOUT' 'run_sync_with_timeout' 'try_wait()' 'libc::SIGKILL' 'recv_timeout'; do
-    if ! printf '%s\n' "$CMD_PROD" | grep -q "$needle"; then
-      fail "cmd.rs 生产段缺 $needle（同步出口没有超时 / 进程组 kill / 读线程上限）"
-      MISS=1
-    fi
+    # ⚠ 用 `case` 而不是 `printf | grep -q`：`grep -q` 命中即退出，printf 随即收到
+    # SIGPIPE，在 `set -o pipefail` 下整条管道返回 141 ⇒ **偶发假失败**
+    # （实测连跑 5 次红 2 次，而手动 `grep -c` 每次都过）。假失败的守卫比没有守卫
+    # 更糟：它会训练所有人"红了就重跑"，真失败迟早被一起忽略。
+    case "$CMD_PROD" in
+      *"$needle"*) ;;
+      *)
+        fail "cmd.rs 生产段缺 $needle（同步出口没有超时 / 进程组 kill / 读线程上限）"
+        MISS=1
+        ;;
+    esac
   done
   [ "$MISS" -eq 0 ] && pass "同步出口含超时、进程组 kill 与读线程上限"
 fi

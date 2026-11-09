@@ -859,7 +859,7 @@ mod tests {
         let state = std::sync::Arc::new(crate::AppState::new(
             os, writer, pool, tasks, metrics, tier, Some(master), false, 5,
             std::time::Duration::from_secs(1800), std::time::Duration::from_secs(43_200),
-            90, 50_000, true, true, "NORMAL".to_string(), 7, false));
+            90, 50_000, true, true, "NORMAL".to_string(), 7, false, None));
 
         // 三键齐配（api_key 走后门：主密钥加密 + enc: 前缀，与 PATCH 落库格式一致）
         let blob = master.encrypt(b"sk-test").unwrap();

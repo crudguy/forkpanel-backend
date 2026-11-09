@@ -191,6 +191,14 @@ enum Cmd {
         #[command(subcommand)]
         action: KeyAction,
     },
+    /// 外部告警通道：查看是否已接、发一条测试告警
+    ///
+    /// 配置来源是 `/etc/forkpanel/alert-webhook`（单行 URL），与崩溃告警
+    /// （systemd `OnFailure=` → `notify-failure.sh`）**共用同一个文件**。
+    Alert {
+        #[command(subcommand)]
+        action: AlertAction,
+    },
     /// 安装/卸载外部探活（覆盖 Restart=on-failure 管不了的"活着但不服务"）
     Healthcheck {
         /// 安装探活脚本与 systemd service/timer
@@ -340,6 +348,15 @@ enum Cmd {
         },
     }
 
+    /// `panel alert` 的子命令。两条都只读或只发一条测试包，不动任何状态。
+    #[derive(Clone, Subcommand)]
+    enum AlertAction {
+        /// 打印告警通道是否已接、节流口径、配置文件名（**不回显 URL**，它常带 token）
+        Status,
+        /// 真发一条测试告警：走与业务告警完全相同的发送路径
+        Test,
+    }
+
 fn main() {
     let cli = Cli::parse();
     if let Err(e) = run(cli) {
@@ -404,6 +421,13 @@ fn run(cli: Cli) -> Result<()> {
             KeyAction::Export { ref out } => cmd::key::export(&cli, os, out),
             KeyAction::Check { ref path } => cmd::key::check(&cli, os, path),
             KeyAction::Rotate { force, yes } => cmd::key::rotate(&cli, os, force, yes),
+        },
+
+        // 告警通道是「配了但从不验证」的重灾区：status 回答"会不会发"，
+        // test 把"配了"变成"通了"。
+        Cmd::Alert { action } => match action {
+            AlertAction::Status => cmd::alert::status(&cli, os),
+            AlertAction::Test => cmd::alert::test(&cli, os),
         },
 
         Cmd::Healthcheck { install, uninstall } =>

@@ -122,7 +122,11 @@ else:
 print("== [5] 部署文档与安装 E2E 同步 ==")
 for needle, desc in [
     ("### 5.2.2 日志去向与保留", "日志章节"),
-    ("### 5.2.3 崩溃告警", "告警章节"),
+    ("### 5.2.3 外部告警通道", "告警章节"),
+    # 标题之外再钉两个**只可能来自真实实现**的锚点：`panel alert test` 是 CLI
+    # 真命令，`backup.failed` 是代码里的事件名。只判标题的话，正文删空仍然绿。
+    ("panel alert test", "告警自检命令"),
+    ("backup.failed", "业务失败事件名"),
 ]:
     if needle in dep:
         ok(f"deployment.md 含 {desc}")

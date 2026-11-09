@@ -598,16 +598,53 @@ journalctl -u panel-healthcheck.service -n 20 --no-pager
 
 > 历史文档曾声称「serve 启动时 stderr 已重定向进日志文件」，实际从未实现，已修正代码注释与 `install-footprint.md`。若确需文件日志 + logrotate（例如采集 agent 只认文件），需把 `StandardOutput/StandardError` 改成 `append:` 并**接受 `journalctl -u panel` 不再可用**；这是另一套方案，当前未采用。
 
-### 5.2.3 崩溃告警
+### 5.2.3 外部告警通道（崩溃 + 业务失败，共用一份配置）
 
-`panel.service` 带 `OnFailure=panel-failure-notify.service`。服务进入 failed 时：
+告警只有一个配置点：**`/etc/forkpanel/alert-webhook`**，内容是**一行** URL（仅 `http(s)`）。
+崩溃与业务失败读的是同一个文件——运维不需要在设置页再配第二个地址。
 
-1. 默认写一条 `daemon.err` 级 journal（`logger -t forkpanel`），`journalctl -t forkpanel` 可查；
-2. 若在 `/etc/forkpanel/alert-webhook` 写入一行 URL（该文件不入库，权限建议 0600），通知脚本会 POST 一条 JSON（`host` / `time` / `unit` / `event=crash`）到该地址。
+```bash
+sudo sh -c 'echo "https://hooks.example.com/services/XXX" > /etc/forkpanel/alert-webhook'
+sudo chmod 600 /etc/forkpanel/alert-webhook   # 该 URL 通常自带 token
+sudo panel alert test                         # 立刻验证通不通，别等真出事
+panel alert status                            # 是否已接 + 节流口径
+```
 
-投递失败只写告警，不影响 `Restart=on-failure` 恢复服务；没配 webhook 时纯本地留痕，不会向外发任何请求。
+#### 会触发什么
 
-> 业务事件（备份失败 / 证书续期失败 / 磁盘写满 / 审计写失败）的**外部告警尚未接线**，仍只有站内通知与 stderr；见生产就绪度复盘 §3.5，属 P1 待办。
+| 事件 | `event` 字段 | 触发点 |
+|---|---|---|
+| 进程崩溃 | `crash` | `panel.service` 的 `OnFailure=` → `notify-failure.sh`（不依赖面板进程还活着） |
+| 备份失败 | `backup.failed` | 任务终态 `failed` 且 `kind=backup`（手动 / 计划 / 上传远端任一步） |
+| 证书签发或续期失败 | `cert.failed` | 任务终态 `failed` 且 `kind=cert_issue` |
+| 其它任务失败 | `job.failed` | 任务终态 `failed`（含超时） |
+| 内部周期任务失败 | `job.failed` | `InternalScheduler` 任一 job 返回 Err 或超时（清理 / 采样 / 备份扫描…） |
+| 通道自检 | `test` | `panel alert test` |
+
+包体形状（shell 侧与 Rust 侧**字段一致**，接收方一套解析即可）：
+
+```json
+{"panel":"forkpanel","event":"backup.failed","host":"web-1","ts":1762000000,"unit":"panel.service","detail":"任务 #7（backup）失败：…"}
+```
+
+`ts` 是**纪元秒**（数值，不是字符串）；人类可读时间在 `detail` 里。
+
+#### 节流（以及为什么不会把运维逼到关掉告警）
+
+同一 `event` 在 **300 秒**内只外发一条，每小时总量上限 **30 条**。被节流的只记 journald，
+外发侧静默。投递失败会**回滚**该事件的节流记录——否则「这次没送到」会占掉整个窗口，
+之后 5 分钟内的真实故障全被吞掉。
+
+#### 三条硬约束
+
+1. **配置不存数据库**。库挂了（损坏 / 磁盘满 / 迁移卡死）恰恰是最该告警的时刻，
+   把 URL 放进 `settings` 表等于「最需要它的时候读不出来」。
+2. **告警失败绝不影响业务**。备份失败的原因是「磁盘满」，不该被「告警发不出去」覆盖掉；
+   投递错误只记日志，业务结果不变。
+3. **未配置时完全静默**：不报错、不重试、不假装发出。`panel alert status` 会明说「未配置」。
+
+> 排查顺序（`panel alert test` 失败时）：① `curl -v -X POST -d '{}' <URL>` 看对端是否收 POST；
+> ② 出站防火墙 / nft 是否放行；③ `which curl` —— 面板经 `curl` 投递，未装则必然失败。
 
 ### 5.3 停机恢复面板库（runbook，已真机演练）
 

@@ -39,6 +39,7 @@
 | `/etc/systemd/journald.conf.d/forkpanel.conf` | 文件 | 0644 | journald 保留上限（`SystemMaxUse=200M` / `MaxRetentionSec=14day`），面板日志唯一去向是 journald |
 | `/etc/systemd/system/panel-failure-notify.service` | 文件 | 0644 | 崩溃通知单元，由 `panel.service` 的 `OnFailure=` 触发 |
 | `/usr/local/share/forkpanel/notify-failure.sh` | 文件 | 0755 | 崩溃通知脚本：默认写 `daemon.err` journal；仅当 `/etc/forkpanel/alert-webhook` 存在且非空才外发 JSON |
+| `/etc/forkpanel/alert-webhook` | 文件（**运维手动创建，非安装产物**） | 建议 0600 | 可选：一行 `http(s)` URL。**崩溃告警与业务失败（备份 / 证书 / 任务）共用这一个地址**；不存在则完全静默、不发任何外部请求。Rust 侧读它的代码见 `panel-api/src/alert.rs` |
 
 > 安装完成后会执行 `systemctl daemon-reload && systemctl enable panel`、随即
 > `systemctl start panel` **把服务直接拉起来**，以及
@@ -50,7 +51,8 @@
 > 启动失败**不会**让 `install.sh` 判失败（此刻二进制/目录/配置/单元都已落盘），
 > 它仍以 0 退出并给出 `journalctl -u panel` 诊断，真实状态是"已安装、这次没起来"。
 
-**`config.toml` 是唯一需要你关心的配置文件**，其 `[paths]` 节可覆盖上面 4 个根
+**`config.toml` 是唯一需要你关心的配置文件**（另一个可选项是 `/etc/forkpanel/alert-webhook`，
+只影响是否外发告警，不影响面板功能），其 `[paths]` 节可覆盖上面 4 个根
 （config / data / log / site_root），但业务代码禁止直接拼路径——一律走
 `PathLayout`，CI 门禁会 grep `/etc`、`/var`、`/www` 字面量。
 

@@ -129,6 +129,7 @@ cat > "$NOTIFY_SCRIPT" <<'EOF'
 # 没配 webhook 时只写 journal；投递失败也绝不影响服务恢复。
 set -u
 TS=$(date -Is)
+TS_EPOCH=$(date +%s)
 HOST=$(hostname 2>/dev/null || echo unknown)
 MSG="forkpanel panel.service entered failed state on $HOST at $TS"
 echo "$MSG" >&2
@@ -137,8 +138,11 @@ WH=/etc/forkpanel/alert-webhook
 if [ -f "$WH" ] && [ -s "$WH" ]; then
   URL=$(head -1 "$WH" | tr -d '\r\n')
   [ -n "$URL" ] || exit 0
+  # 包形状必须与 Rust 侧 `panel_api::alert::payload()` 一致（panel/event/host/ts/
+  # unit/detail）：同一个接收方要能处理崩溃与业务失败，两种格式就得是同一套字段。
+  # `ts` 用纪元秒（与 Rust 侧同口径），人类可读时间放 detail。
   curl -fsS --max-time 5 -H 'Content-Type: application/json' \
-    -d "{\"host\":\"$HOST\",\"time\":\"$TS\",\"unit\":\"panel.service\",\"event\":\"crash\"}" \
+    -d "{\"panel\":\"forkpanel\",\"event\":\"crash\",\"host\":\"$HOST\",\"ts\":$TS_EPOCH,\"unit\":\"panel.service\",\"detail\":\"panel.service 进入 failed 状态（$TS）\"}" \
     "$URL" >/dev/null 2>&1 || echo "forkpanel: alert webhook 投递失败（不影响服务恢复）" >&2
 fi
 exit 0

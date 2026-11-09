@@ -39,6 +39,7 @@ pub mod routes;
 pub mod sse;
 pub mod totp;
 pub mod webhook;
+pub mod alert;
 
 use error::{ApiError, ApiResult};
 use panel_core::{crypto::MasterKey, CapabilityMap, Tier};
@@ -103,6 +104,12 @@ pub struct AppState {
     /// 采集循环最近一次采样结果的缓存。**HTTP 接口一律读它，不要自己调
     /// `os.metrics().snapshot()`**——原因见 `cached_snapshot()` 的注释。
     pub last_snapshot: tokio::sync::RwLock<Option<Arc<panel_os::traits::SystemSnapshot>>>,
+    /// 外部告警通道（G8）。`None` = 运维没配 `/etc/forkpanel/alert-webhook`，
+    /// 所有告警静默跳过（不报错、不假装发出）。
+    ///
+    /// **为什么不放进 settings 表**：告警要能报「库挂了」，配置就不能存在库里。
+    /// 与崩溃告警（systemd `OnFailure=` → `notify-failure.sh`）共用同一份文件配置。
+    pub alert: Option<Arc<crate::alert::AlertSink>>,
 }
 
 /// 只读模式是否生效：**config 基线或环境变量**，任一为真即开。
@@ -131,7 +138,8 @@ impl AppState {
                session_idle: std::time::Duration, session_absolute: std::time::Duration,
                audit_retention_days: u32, audit_max_rows: u64,
                localhost_only: bool, daily_backup: bool, db_synchronous: String,
-               backup_keep: i64, allow_web_upgrade: bool) -> Self {
+               backup_keep: i64, allow_web_upgrade: bool,
+               alert: Option<Arc<crate::alert::AlertSink>>) -> Self {
         let capabilities = os.capabilities();
         // 会话持久化：把写者交给 SessionCache（`sessions` 表 001 已定义、此前无人使用）。
         // 先 clone——下方 struct 字面量会把 db move 进字段。
@@ -153,6 +161,7 @@ impl AppState {
             master_key,
             started_at: now_unix(),
             last_snapshot: tokio::sync::RwLock::new(None),
+            alert,
         }
     }
 
@@ -273,7 +282,7 @@ pub(crate) mod test_support {
         crate::AppState::new(
             os, writer, pool, tasks, metrics, tier, None, false, 5,
             std::time::Duration::from_secs(1800), std::time::Duration::from_secs(43_200),
-            90, 50_000, true, true, "NORMAL".to_string(), 7, false)
+            90, 50_000, true, true, "NORMAL".to_string(), 7, false, None)
     }
 
     /// 源码守卫取「**生产段**」：剔注释行 + 剔 `#[cfg(test)]` 包裹的块。

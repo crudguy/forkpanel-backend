@@ -41,6 +41,14 @@ pub enum ScheduleKind {
 
 pub type JobFn = Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> + Send + Sync>;
 
+/// 任务失败时的告警钩子（G8）：`(任务名, 错误文本)`。
+///
+/// **同步签名是刻意的**：调度循环在 `run_job_with_timeout` 之后立刻继续下一轮，
+/// 而告警投递最长要 10 秒（curl `--max-time`）。钩子里若直接 `.await` 一个 HTTP
+/// POST，等于让 `backup.sweep` 这种每分钟任务把整个调度循环拖慢十倍。
+/// 实现方须自己 `tokio::spawn` 出去发。
+pub type FailureHook = Arc<dyn Fn(&'static str, String) + Send + Sync>;
+
 /// 内置任务注册表。**新增内部周期任务就在这里加一行**，不要散落到各模块。
 pub fn builtin_schedules(tier: panel_core::Tier) -> Vec<Schedule> {
     let mut v = vec![
@@ -117,6 +125,10 @@ pub struct InternalScheduler {
     last_run: Arc<Mutex<HashMap<&'static str, i64>>>,
     /// 周期任务的 JoinHandle：优雅关闭时等待它们退出（见 drain）。
     handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// 任务失败时的外部告警钩子（G8），`None` = 未接线。
+    /// 锁保护的只是「配置好的一个回调」，中毒后取到 None 退化成不告警，
+    /// 属于可重建状态 ⇒ 用 `lock_recover`。
+    failure_hook: std::sync::Mutex<Option<FailureHook>>,
 }
 
 impl InternalScheduler {
@@ -126,7 +138,14 @@ impl InternalScheduler {
             token: CancellationToken::new(),
             last_run: Arc::new(Mutex::new(HashMap::new())),
             handles: Arc::new(Mutex::new(Vec::new())),
+            failure_hook: std::sync::Mutex::new(None),
         }
+    }
+
+    /// 接线失败告警（G8）。须在 `start` 之前调用——`start` 只取一次快照，
+    /// 之后替换不影响已在跑的循环（避免运行期换钩子带来的语义歧义）。
+    pub fn set_failure_hook(&self, hook: FailureHook) {
+        *panel_core::sync::lock_recover(&self.failure_hook) = Some(hook);
     }
 
     /// 注册任务实现。名字必须与 `builtin_schedules` 中的一致。
@@ -141,9 +160,12 @@ impl InternalScheduler {
 
     /// 启动全部任务。每个任务一个独立 tokio 任务，互不阻塞。
     pub async fn start(&self, schedules: Vec<Schedule>) {
+        // 钩子在启动时取一次快照，之后每个 schedule 各持一份（Arc）。
+        let failure_hook = panel_core::sync::lock_recover(&self.failure_hook).clone();
         for s in schedules {
             let jobs = self.jobs.clone();
             let token = self.token.clone();
+            let hook = failure_hook.clone();
 
             let last_run = self.last_run.clone();
             let jitter = s.jitter_sec;
@@ -175,6 +197,11 @@ impl InternalScheduler {
                         // 同时用超时包裹，避免任一 job 挂住导致该 schedule 永久停摆（P1-10）。
                         if let Err(e) = run_job_with_timeout(name, &f, INTERNAL_JOB_TIMEOUT).await {
                             tracing::warn!(task = name, "内部任务失败: {e}");
+                            // G8：把「进程活着但任务坏了」告诉运维。钩子同步返回，
+                            // 真正的外发由实现方 spawn，不阻塞本调度循环。
+                            if let Some(h) = &hook {
+                                h(name, e.to_string());
+                            }
                         }
                         last_run.lock().await.insert(name, now_unix());
                     }

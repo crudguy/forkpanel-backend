@@ -23,7 +23,7 @@ pub mod traits;
 
 pub use cmd::{run, run_checked, run_shell, run_sync, spawn_stream, Bin, CmdOpt, CmdOutput};
 pub use fs::{
-    create_private, elf_arch_of, ensure_dir, exec_arch_mismatch, host_machine, is_root, mode_of,
+    create_private, elf_arch_of, ensure_dir, exec_arch_mismatch, host_machine, hostname, is_root, mode_of,
     port_in_use, prune_keep_newest, read_password, set_mode, write_private, ElfArch, PortInUse,
 };
 pub use linux::scheduler::local_utc_offset_secs_at;

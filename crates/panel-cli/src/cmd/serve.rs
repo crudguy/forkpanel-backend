@@ -76,10 +76,45 @@ pub(crate) fn run(cli: &Cli, os: Arc<dyn panel_os::OsAdapter>) -> Result<()> {
     let writer = Arc::new(panel_db::WriterActor::spawn(db_path.clone(), tier, &cfg.db.synchronous)?);
     let pool = Arc::new(panel_db::ReadPool::new(&db_path, tier)?);
 
+    // 外部告警通道（G8）：读 `<config_dir>/alert-webhook`——与崩溃告警
+    // （systemd `OnFailure=` → `notify-failure.sh`）**同一个文件、同一份配置**，
+    // 运维只需维护一个 webhook 地址。未配置则为 None：所有告警静默跳过。
+    //
+    // 必须在 `TaskRunner` 之前构造：任务失败告警要挂在 runner 上，而 runner
+    // 又要 move 进下面的 async block。
+    let alert = panel_api::alert::AlertSink::load(&layout.config_dir()).map(Arc::new);
+    match &alert {
+        Some(_) => tracing::info!(
+            "外部告警通道已启用（{}）",
+            layout.config_dir().join(panel_api::alert::WEBHOOK_FILE).display()
+        ),
+        None => tracing::info!("未配置外部告警通道：备份/证书/任务失败只记 journald"),
+    }
+
     // 任务中心：输出落文件而非入库（实测：stdout 塞进 DB 会让体积失控）
     let task_out = layout.log_dir().join("tasks");
     std::fs::create_dir_all(&task_out).ok();
     let tasks = Arc::new(panel_task::TaskRunner::new(writer.clone(), tier, task_out, db_path.clone(), cfg.db.synchronous.clone()));
+    // 任务失败 → 外部告警（G8）。接在 runner 的**终态处置点**，一次覆盖所有任务
+    // 类型：备份（`Ok(Failed)`）、ACME 证书（`Err`）、站点下发、容器等。若改成在
+    // 各 TaskBody 里逐处调用，三条失败出口（Err / 超时 / Ok(Failed)）必漏其一。
+    if let Some(sink) = alert.clone() {
+        tasks.set_failure_hook(Arc::new(move |_id, kind, detail| {
+            // 事件名按任务种类映射：运维在告警里看到 `backup.failed` 与
+            // `cert.failed` 才能一眼分辨是哪条链路坏了，全部塞进 `job.failed`
+            // 等于只告诉他"有东西失败了"。
+            let event = match kind {
+                "backup" => panel_api::alert::events::BACKUP_FAILED,
+                "cert_issue" => panel_api::alert::events::CERT_FAILED,
+                _ => panel_api::alert::events::JOB_FAILED,
+            };
+            let sink = sink.clone();
+            // 钩子是同步的：spawn 出去投递，别让 curl 的 10s 超时拖住任务终态。
+            tokio::spawn(async move {
+                sink.notify_failure(event, detail).await;
+            });
+        }));
+    }
 
     // run() 是同步函数，所有 .await 都必须发生在 runtime 的 block_on 之内，
     // 因此 runtime 要在异步初始化之前就构建好。
@@ -152,10 +187,26 @@ pub(crate) fn run(cli: &Cli, os: Arc<dyn panel_os::OsAdapter>) -> Result<()> {
             os.clone(), writer.clone(), pool, tasks.clone(), metrics.clone(), tier,
             master_key, read_only, max_login_attempts, session_idle, session_absolute,
             audit_retention_days, audit_max_rows, localhost_only, daily_backup,
-            db_synchronous, backup_keep, cfg.danger.allow_web_upgrade));
+            db_synchronous, backup_keep, cfg.danger.allow_web_upgrade, alert.clone()));
 
         // ── 内部周期任务 ──
         register_internal_jobs(&sched_in, &os, writer.clone(), metrics.clone(), &layout, &cfg, tier, state.clone()).await;
+        // 内部任务失败 → 外部告警（G8）。`cert.renew_check` / `db.backup` /
+        // `backup.sweep` 等**所有**周期任务的失败都从调度器的统一处置点流出，
+        // 这里接一次即可，无需在每个 job 里各写一遍（那必然会漏）。
+        if let Some(sink) = alert.clone() {
+            sched_in.set_failure_hook(Arc::new(move |name, err| {
+                let sink = sink.clone();
+                // 钩子是同步的：spawn 出去投递，绝不让 curl 的 10 秒超时
+                // 拖住每分钟一次的调度循环。
+                tokio::spawn(async move {
+                    sink.notify_failure(
+                        panel_api::alert::events::JOB_FAILED,
+                        format!("内部任务 {name} 失败: {err}"),
+                    ).await;
+                });
+            }));
+        }
         let schedules = panel_task::builtin_schedules(tier);
         let n_sched = schedules.len();
         sched_in.start(schedules).await;
@@ -531,11 +582,20 @@ async fn register_internal_jobs(
             let state = state.clone();
             async move {
                 match panel_api::routes::backups::sweep_due(&state).await {
-                    Ok(0) => {}
-                    Ok(n) => tracing::info!("定时备份：本轮提交 {n} 个计划"),
-                    Err(e) => tracing::warn!("定时备份扫描失败: {e}"),
+                    Ok(0) => Ok(()),
+                    Ok(n) => {
+                        tracing::info!("定时备份：本轮提交 {n} 个计划");
+                        Ok(())
+                    }
+                    Err(e) => {
+                        tracing::warn!("定时备份扫描失败: {e}");
+                        // **不再吞掉**：返回 Err 才能进调度器的统一告警（G8）。
+                        // 此前这里 `Ok(())` 让「每分钟扫描一直失败」完全静默——
+                        // 页面上的定时备份永远不触发，却没有任何信号，只有翻
+                        // journald 才看得到一行 warn。
+                        Err(e)
+                    }
                 }
-                Ok(())
             }
         }).await;
     }

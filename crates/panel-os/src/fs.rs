@@ -21,14 +21,27 @@ pub fn set_mode(p: &Path, mode: u32) -> Result<()> {
 }
 
 /// 读取权限位（POSIX）。
+/// 本机主机名：读 `/etc/hostname` 的第一行，失败回退 `"unknown"`。
+///
+/// 为什么必须放在 OS 层：它读的是一个 **OS 路径**，而 `ci/check-layering.sh` [3]
+/// 禁止业务层硬编码路径（实测这条守卫抓到了本函数最初的实现位置）。
+/// 消费方是外部告警包——同一个 webhook 收多台机器的告警时，没有 host
+/// 就分不清是哪一台出的问题。
+pub fn hostname() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .and_then(|s| s.lines().next().map(|l| l.trim().to_string()))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 pub fn mode_of(p: &Path) -> Option<u32> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(p).ok().map(|m| m.permissions().mode())
 }
 
 /// 创建目录（递归）并设置权限
-pub fn ensure_dir(p: &Path, mode: u32) -> Result<()> {
-    std::fs::create_dir_all(p)
+pub fn ensure_dir(p: &Path, mode: u32) -> Result<()> {    std::fs::create_dir_all(p)
         .map_err(|e| PanelError::Internal(format!("mkdir {}: {e}", p.display())))?;
     set_mode(p, mode)
 }

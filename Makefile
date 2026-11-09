@@ -100,6 +100,10 @@ guards:
 	# 产物一律 0600、rekey 覆盖面与 schema 的 *_enc 列集合相等、恢复路径不得
 	# 自动生成主密钥（否则「丢密钥」被伪装成「产物损坏」）。
 	python3 ci/check_key_hygiene.py
+	# G8：外部告警接线——serve 必须读 alert-webhook 并给任务/调度器两条主干接钩子、
+	# 事件按 kind 分类、钩子必须真被调用（不是只存着）、backup.sweep 不得吞 Err、
+	# shell 与 Rust 指向同一个文件名（改名只改一处＝崩溃告警静默失效）。
+	python3 ci/check_alert_wiring.py
 
 # 内嵌前端新鲜度：改完前端只 cargo build **不会**重新 embed，必须
 # ① vite build → ② rm -rf web/dist/* → ③ cp -a → ④ touch embed.rs → ⑤ cargo build。

@@ -232,7 +232,19 @@ pub struct TaskRunner {
     /// 两个请求都失败且无法回退合并。故 submit 用此路径独立开连接单事务写入，
     /// 确保"先到者提交、后到者唯一冲突后回退复用既有 id"。
     db_path: PathBuf,
+    /// 任务失败时的外部告警钩子（G8）：`(任务 id, kind, 原因)`。
+    ///
+    /// **同步签名**：钩子在 `tokio::spawn` 出的任务体尾部调用，实现方须自己
+    /// 再 spawn 出去发（`curl` 最长 10s，不能拖住任务终态落库与 `Finished` 事件）。
+    ///
+    /// 为什么接在这里而不是各 TaskBody 里：任务失败有**三条**出口（`Err`、
+    /// 超时、`Ok(TaskOutcome{Failed})`），逐个体接线必然漏——备份走的是第三条，
+    /// ACME 证书走第一条。统一在终态处判 `state == Failed` 才能一次覆盖全部任务类型。
+    failure_hook: std::sync::Mutex<Option<TaskFailureHook>>,
 }
+
+/// 任务失败告警钩子，见 [`TaskRunner::set_failure_hook`]。
+pub type TaskFailureHook = Arc<dyn Fn(i64, &'static str, String) + Send + Sync>;
 
 impl TaskRunner {
     pub fn new(writer: Arc<WriterActor>, tier: Tier, output_dir: PathBuf, db_path: PathBuf, synchronous: String) -> Self {
@@ -246,7 +258,14 @@ impl TaskRunner {
             output_dir,
             db_path,
             synchronous,
+            failure_hook: std::sync::Mutex::new(None),
         }
+    }
+
+    /// 接线失败告警（G8）。须在提交任务前调用；`submit` 每次取一次快照，
+    /// 运行期替换不影响已派发的任务（避免"半个任务用新钩子"的语义歧义）。
+    pub fn set_failure_hook(&self, hook: TaskFailureHook) {
+        *panel_core::sync::lock_recover(&self.failure_hook) = Some(hook);
     }
 
     /// 取（或建）任务组的互斥闸门。容量恒为 1 → 同组串行。
@@ -370,6 +389,8 @@ impl TaskRunner {
         let rkind = req.kind;
         // 组闸门在 spawn **之前**取好：group_gate 用 std Mutex，guard 不能跨 await。
         let gate = rkind.exclusive_group().map(|g| self.group_gate(g));
+        // 失败告警钩子同样在 spawn 前取快照（钩子是 Arc，克隆代价可忽略）
+        let hook = panel_core::sync::lock_recover(&self.failure_hook).clone();
 
         tokio::spawn(async move {
             // 先占**组闸门**再占全局 slot，顺序不可反：若反序，一串同组任务会把全局
@@ -396,14 +417,20 @@ impl TaskRunner {
                 tracing::error!("任务 {id} 置 running 写库失败（前端可能一直显示排队中）: {e}");
             }
 
+            // 失败原因只在这里拿得到（outcome 是 Failed 但 `Ok(Err)` 与超时两种
+            // 分支的文本不会进 TaskOutcome）。G8 的告警要带上它，否则运维只能
+            // 看到「任务 #7 失败」然后自己去翻输出。
+            let mut failure_reason: Option<String> = None;
             let outcome = match tokio::time::timeout(timeout, body.run(progress.clone())).await {
                 Ok(Ok(o)) => o,
                 Ok(Err(e)) => {
                     progress.log(&format!("任务失败：{e}")).await;
+                    failure_reason = Some(e.to_string());
                     TaskOutcome { state: TaskState::Failed, exit_code: None, output_path: None }
                 }
                 Err(_) => {
                     progress.log(&format!("任务超时（{}s）", timeout.as_secs())).await;
+                    failure_reason = Some(format!("超时（{}s 未完成）", timeout.as_secs()));
                     TaskOutcome { state: TaskState::Failed, exit_code: None, output_path: None }
                 }
             };
@@ -423,6 +450,20 @@ impl TaskRunner {
             }
 
             bus.publish(TaskEvent::Finished { id, state: outcome.state, kind: rkind });
+
+            // G8：任务终态是失败 → 外部告警。**放在终态落库与事件广播之后**：
+            // 面板内的状态必须先正确（用户刷新就能看到 failed），外部通知才谈得上
+            // 「晚几秒」。`Ok(TaskOutcome{Failed})` 是备份这类任务主动上报失败的方式，
+            // 它不带 reason ⇒ 给一句如实的兜底文案，不编造原因。
+            if outcome.state == TaskState::Failed {
+                if let Some(h) = &hook {
+                    let detail = match failure_reason {
+                        Some(r) => format!("任务 #{id}（{}）失败：{r}", rkind.as_str()),
+                        None => format!("任务 #{id}（{}）报告失败，详情见任务输出", rkind.as_str()),
+                    };
+                    h(id, rkind.as_str(), detail);
+                }
+            }
         });
 
         Ok((id, true))
@@ -854,6 +895,70 @@ mod tests {
 
         let p = peak.load(Ordering::SeqCst);
         assert_eq!(p, 2, "无互斥组的任务被意外串行化了（峰值 {p}）：组闸门不该影响它们");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// G8：任务终态失败必须把「谁失败了、为什么」交给告警钩子。
+    ///
+    /// 覆盖**两条**失败出口：`Err(...)`（ACME 证书续期走这条）与
+    /// `Ok(TaskOutcome{Failed})`（备份走这条——它要把失败日志路径带回任务页，
+    /// 所以不能用 Err）。只测 Err 的实现会在真机上漏掉「备份失败」，
+    /// 而那恰恰是最要紧的一类：备份静默失败等于没有备份。
+    struct ErrBody;
+    #[async_trait::async_trait]
+    impl TaskBody for ErrBody {
+        async fn run(&self, _p: Progress) -> Result<TaskOutcome> {
+            Err(panel_core::PanelError::Internal("certbot 退出码 1".into()))
+        }
+    }
+    struct ReportFailBody;
+    #[async_trait::async_trait]
+    impl TaskBody for ReportFailBody {
+        async fn run(&self, _p: Progress) -> Result<TaskOutcome> {
+            Ok(TaskOutcome { state: TaskState::Failed, exit_code: Some(1), output_path: None })
+        }
+    }
+
+    #[tokio::test]
+    async fn failure_hook_fires_for_both_failure_paths() {
+        let (runner, dir) = runner_for("hook-both", Tier::Nano);
+        let seen: Arc<std::sync::Mutex<Vec<(i64, String, String)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let seen = seen.clone();
+            runner.set_failure_hook(Arc::new(move |id, kind, detail| {
+                panel_core::sync::lock_recover(&seen).push((id, kind.to_string(), detail));
+            }));
+        }
+        let req = |k: &str, kind: TaskKind| TaskRequest {
+            idempotency_key: k.to_string(),
+            kind,
+            label: k.to_string(),
+            timeout: Duration::from_secs(10),
+        };
+
+        let (err_id, _) = runner.submit(req("h-err", TaskKind::CertIssue), ErrBody).await.unwrap();
+        let (rep_id, _) = runner.submit(req("h-rep", TaskKind::Backup), ReportFailBody).await.unwrap();
+        let (ok_id, _) = runner.submit(req("h-ok", TaskKind::Internal), NoopBody).await.unwrap();
+        wait_all(&runner, &[err_id, rep_id, ok_id]).await;
+
+        let got = panel_core::sync::lock_recover(&seen).clone();
+        assert_eq!(got.len(), 2, "只有失败的任务应触发告警，实际 {}", got.len());
+
+        // Err 路径：原因文本必须带出来（否则运维只知道"坏了"）
+        let e = got.iter().find(|(id, _, _)| *id == err_id)
+            .expect("Err 失败没有触发告警：ACME 证书续期失败会彻底静默");
+        assert_eq!(e.1, "cert_issue", "kind 传错会让告警分不清是哪条链路");
+        assert!(e.2.contains("certbot"), "原因文本丢了：{}", e.2);
+
+        // Ok(Failed) 路径：没有原因可带，但**必须**仍触发（备份走这条）
+        let r = got.iter().find(|(id, _, _)| *id == rep_id)
+            .expect("Ok(TaskOutcome{Failed}) 没有触发告警：备份失败会彻底静默");
+        assert_eq!(r.1, "backup");
+
+        // 成功的任务不该告警（否则告警会变成噪音，运维就会关掉它）
+        assert!(got.iter().all(|(id, _, _)| *id != ok_id), "成功的任务也发了告警");
 
         std::fs::remove_dir_all(&dir).ok();
     }
