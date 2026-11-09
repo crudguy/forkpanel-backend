@@ -234,6 +234,54 @@ pub struct CmdOutput {
     pub elapsed: Duration,
 }
 
+/// run_as 降权的解析结果。数值在 spawn 前算好：pre_exec 运行在 fork 与 exec
+/// 之间，分配内存/读 /etc/passwd 都不是 async-signal-safe 的。
+#[derive(Debug)]
+struct ResolvedUser {
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    groups: Vec<libc::gid_t>,
+}
+
+/// 解析系统用户的 uid/gid/附加组。用户不存在/为 root/为空都**响亮报错**——
+/// 降权是安全语义，任何「查不到就按原样跑」都是假控制（以 root 顶替目标用户）。
+fn resolve_run_as(user: &str) -> Result<ResolvedUser> {
+    if user.is_empty() || user == "root" {
+        return Err(PanelError::Validation {
+            field: "run_as",
+            reason: format!("run_as 必须是非 root 的系统用户，收到 {user:?}"),
+        });
+    }
+    let cname = std::ffi::CString::new(user).map_err(|_| PanelError::Validation {
+        field: "run_as",
+        reason: "用户名含 NUL 字符".into(),
+    })?;
+    // SAFETY: getpwnam 返回静态缓冲区；这里单次调用、立即拷出数值，
+    // 不持有指针跨调用（后续 getpwnam 会覆写该缓冲区）。
+    let pw = unsafe { libc::getpwnam(cname.as_ptr()) };
+    if pw.is_null() {
+        return Err(PanelError::Validation {
+            field: "run_as",
+            reason: format!("系统用户不存在：{user}"),
+        });
+    }
+    let (uid, gid) = unsafe { ((*pw).pw_uid, (*pw).pw_gid) };
+    // 附加组：先按 64 个试，不够时 getgrouplist 返回 -1 并把实际数量写回 n
+    let mut groups = vec![0 as libc::gid_t; 64];
+    let mut n: libc::c_int = 64;
+    // SAFETY: groups 缓冲与 n 描述的长度一致；失败路径按 n 扩容后重试一次。
+    let rc = unsafe { libc::getgrouplist(cname.as_ptr(), gid, groups.as_mut_ptr(), &mut n) };
+    if rc < 0 {
+        groups.resize(n as usize, 0);
+        let rc2 = unsafe { libc::getgrouplist(cname.as_ptr(), gid, groups.as_mut_ptr(), &mut n) };
+        if rc2 < 0 {
+            return Err(PanelError::Internal(format!("读取 {user} 的附加组失败")));
+        }
+    }
+    groups.truncate(n as usize);
+    Ok(ResolvedUser { uid, gid, groups })
+}
+
 /// 执行命令。**唯一出口。**
 pub async fn run(bin: Bin, args: &[&str], opt: CmdOpt) -> Result<CmdOutput> {
     let program = bin.resolved()?;
@@ -255,13 +303,42 @@ pub async fn run(bin: Bin, args: &[&str], opt: CmdOpt) -> Result<CmdOutput> {
         cmd.env(k, v);
     }
     if let Some(dir) = &opt.working_dir { cmd.current_dir(dir); }
-    if let Some(user) = &opt.run_as {
-        // 降权：由 pre_exec 或外部 sudo 包装实现，此处以参数形式记录，
-        // 具体实现见 linux::privileges（避免在此处引入 setuid 的 unsafe 细节）
-        let _ = user;
-    }
+    // run_as 降权（设计方案 §1.1-1）：解析在 spawn 前完成（pre_exec 里分配内存
+    // 不是 async-signal-safe），执行在 pre_exec（fork 后 exec 前）。
+    // 任何一步失败都必须让 spawn 整体失败——「降不了权就以 root 跑」是比
+    // 拒绝执行更坏的安全语义（假控制：调用方以为降权了）。
+    let resolved = match &opt.run_as {
+        Some(user) => {
+            if !crate::is_root() {
+                return Err(PanelError::Validation {
+                    field: "run_as",
+                    reason: "非 root 无法降权，拒绝执行（不得以当前身份静默顶替）".into(),
+                });
+            }
+            Some(resolve_run_as(user)?)
+        }
+        None => None,
+    };
     // 独立进程组，便于超时时整组 kill（防止孙进程泄漏）
-    unsafe { cmd.pre_exec(|| { libc::setsid(); Ok(()) }); }
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::setsid();
+            if let Some(ru) = &resolved {
+                // 顺序不可换：先附加组、再 gid、最后 uid——反过来会在中途
+                // 丢掉完成后续步骤所需的 root 身份
+                if libc::setgroups(ru.groups.len(), ru.groups.as_ptr()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::setgid(ru.gid) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::setuid(ru.uid) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
 
     let mut child = cmd.spawn().map_err(|e| PanelError::Command {
         bin: bin.as_str().into(), detail: format!("spawn failed: {e}")
@@ -762,6 +839,60 @@ mod tests {
         assert_eq!(out.code, Some(0));
         assert_eq!(out.stdout.trim(), "ok");
         assert!(out.elapsed < std::time::Duration::from_secs(5));
+    }
+
+    // ── run_as 降权：防「记录参数但静默忽略」的假控制（本项目高发 bug 类）──
+
+    #[test]
+    fn run_as_unknown_user_is_rejected_loudly() {
+        let e = resolve_run_as("panel-no-such-user-9f8d").unwrap_err();
+        assert!(e.to_string().contains("不存在"), "用户不存在必须报错：{e}");
+    }
+
+    #[test]
+    fn run_as_root_or_empty_is_rejected_as_meaningless() {
+        // 降权到 root 没有语义；空串是调用方 bug。都不得静默放行
+        assert!(resolve_run_as("root").is_err(), "run_as=root 是调用方 bug");
+        assert!(resolve_run_as("").is_err(), "run_as 空串是调用方 bug");
+    }
+
+    #[tokio::test]
+    async fn run_as_requires_root_and_refuses_otherwise() {
+        if crate::is_root() {
+            eprintln!("[skip] root 环境测不了「非 root 拒绝降权」分支");
+            return;
+        }
+        let r = run(
+            Bin::Sh, &["-c", "id -u"],
+            CmdOpt { run_as: Some("nobody".into()), ..Default::default() },
+        ).await;
+        assert!(r.is_err(), "非 root 携带 run_as 必须被拒绝，不得以当前身份静默顶替");
+    }
+
+    #[tokio::test]
+    async fn run_as_actually_drops_privileges_when_root() {
+        if !crate::is_root() {
+            eprintln!("[skip] 非 root，跳过降权真机行为测试");
+            return;
+        }
+        let out = run(
+            Bin::Sh, &["-c", "id -u; id -g"],
+            CmdOpt { run_as: Some("nobody".into()), ..Default::default() },
+        ).await.expect("root 下降权执行 nobody 应成功");
+        let mut lines = out.stdout.trim().lines();
+        assert_eq!(lines.next(), Some("65534"), "必须以 nobody 的 uid 运行");
+        assert_eq!(lines.next(), Some("65534"), "必须以 nobody 的 gid 运行");
+    }
+
+    #[test]
+    fn run_as_wiring_is_real_in_production_source() {
+        // 接线守卫：pre_exec 里必须真的调 set*id 三件套 + 有非 root 拒绝门；
+        // 判据盯本文件生产段（剔注释剥测试），防「改回记录参数但不执行」的回退。
+        let prod = panel_testutil::production_source(include_str!("cmd.rs"));
+        assert!(!prod.contains("let _ = user;"), "run_as 又回到静默忽略（假控制）");
+        for needle in ["libc::setgroups(", "libc::setgid(", "libc::setuid(", "crate::is_root()"] {
+            assert!(prod.contains(needle), "cmd.rs 生产段缺 {needle}——run_as 降权接线被拆");
+        }
     }
 
     #[tokio::test]
