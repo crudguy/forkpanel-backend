@@ -56,6 +56,9 @@ guards:
 	# SSE 任务流 Lagged 不关流：分类 / 循环 continue / task_stream 接线 /
 	# 真行为测试四层（只测纯分类函数挡不住 loop 里写 break 的回归）
 	python3 ci/check_sse_lagged.py
+	# 依赖审计 CI 接线：前后端 audit job 必须真跑 make audit、不得
+	# continue-on-error / needs / --ignore，工具缺失必须 exit 1
+	python3 ci/check_audit_wired.py
 	# 前端单文件行数上限：挡住 .vue/.ts 无限膨胀（大视图的直接后果是"纯逻辑没法单测"）
 	bash ci/check-frontend-loc.sh
 	# 前端 UI 守卫（清单以 run-ui-guards.mjs 的 UI_GUARDS 为准，不在此写死数量）：
