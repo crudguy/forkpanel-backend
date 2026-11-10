@@ -28,6 +28,10 @@ pub struct Config {
     #[serde(default)]
     pub audit: Audit,
 
+    /// Prometheus 抓取端点（默认关闭）
+    #[serde(default)]
+    pub metrics: Metrics,
+
     /// 高危操作开关（默认全关）。改后重启生效。
     #[serde(default)]
     pub danger: Danger,
@@ -109,6 +113,16 @@ pub struct Audit {
     pub max_rows: u64,
 }
 
+/// Prometheus 抓取端点。**默认关闭**：`scrape_token` 缺省/留白 ⇒
+/// serve.rs 不注册 /metrics（彻底不占面，而不是注册了回 404）。
+/// token 是唯一鉴权（`Authorization: Bearer`，与登录会话/CSRF 完全独立——
+/// Prometheus 抓取器不支持 cookie 流）。消费链见 cmd/serve.rs 与 ci/check_prom_metrics.py。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Metrics {
+    pub scrape_token: Option<String>,
+}
+
 /// 高危操作开关。**默认全部关闭**：这些操作会动到面板自身或 root 产物，
 /// 必须由部署者在 config.toml 里显式打开，而不是靠 UI 上一个按钮。
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -159,7 +173,7 @@ impl Default for Config {
         Self { server: Server::default(), paths: PathsOverride::default(),
                db: Db::default(), security: Security::default(),
                audit: Audit::default(), danger: Danger::default(),
-               tier: default_tier() }
+               metrics: Metrics::default(), tier: default_tier() }
     }
 }
 

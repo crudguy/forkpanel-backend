@@ -34,6 +34,8 @@ pub mod extract;
 pub mod error;
 pub mod middleware;
 pub mod panic_guard;
+// Prometheus 抓取端点（/metrics，配置项开启 + Bearer token；挂载在 serve.rs）
+pub mod prom;
 pub mod remote_store;
 pub mod routes;
 pub mod sse;

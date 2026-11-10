@@ -652,6 +652,62 @@ panel alert status                            # 是否已接 + 节流口径
 > 排查顺序（`panel alert test` 失败时）：① `curl -v -X POST -d '{}' <URL>` 看对端是否收 POST；
 > ② 出站防火墙 / nft 是否放行；③ `which curl` —— 面板经 `curl` 投递，未装则必然失败。
 
+### 5.2.4 Prometheus 抓取端点 `/metrics`
+
+**默认关闭**：config.toml 里 `[metrics] scrape_token` 缺省或留白时，
+`/metrics` **根本不注册**（请求落到 SPA 回退返回页面 HTML，不是注册了回 404）。
+配置了 token 才挂载，鉴权是独立的 Bearer token——与登录会话 / CSRF 完全分离，
+因为 Prometheus 抓取器不支持 cookie 登录流。
+
+```toml
+# /etc/forkpanel/config.toml
+[metrics]
+# openssl rand -hex 24 生成；写完 systemctl restart panel
+scrape_token = "<随机长串>"
+```
+
+验证（三态，已真机跑通）：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:2083/metrics                     # 401
+curl -s -o /dev/null -w '%{http_code}\n' -H 'Authorization: Bearer 错的' \
+  http://127.0.0.1:2083/metrics                                                             # 401
+curl -s -H 'Authorization: Bearer <token>' http://127.0.0.1:2083/metrics | head            # 200 + 指标
+```
+
+| 指标 | 含义 |
+|---|---|
+| `forkpanel_up` | 恒 1（抓得到就是活着；进程级活性用 `up == 0` 告警） |
+| `forkpanel_uptime_seconds` | 进程运行时长（首次抓取后起算，误差为抓取间隔级） |
+| `forkpanel_build_info{version}` | 版本号标签 |
+| `forkpanel_sse_connections` | 当前 SSE 流连接数 |
+| `forkpanel_db_size_bytes` | SQLite 库文件大小（未知 = -1） |
+| `forkpanel_audit_log_rows` | 审计日志行数（未知 = -1） |
+| `forkpanel_disk_available_bytes` | 数据目录所在文件系统余量（未知 = -1） |
+| `forkpanel_backup_last_success_age_seconds` | 距上次成功备份的秒数；**从未成功 = -1**，告警规则写 `> 86400` 即可同时覆盖「从未备份」 |
+| `forkpanel_cert_days_to_expiry{domains}` | 每组证书距到期天数（无证书时无样本） |
+
+Prometheus 侧参考（scrape 配置走反代或 SSH 隧道，不要为此把面板 bind 改成 0.0.0.0）：
+
+```yaml
+scrape_configs:
+  - job_name: forkpanel
+    scheme: https                # 经反代终结 TLS 时
+    authorization:
+      credentials: "<同 scrape_token>"
+    static_configs:
+      - targets: ["panel.example.internal:443"]
+```
+
+三条边界如实说明：
+
+1. **token 猜解不做独立限流**（面板默认只绑回环；公网暴露按 §2.5 走反代，限速加在反代层）。
+   token 比较是常数时间的，不泄露前缀匹配度；请用 ≥ 24 字节随机串。
+2. **单项采集失败不报 500**：对应指标降级为 -1（或无样本），由 Prometheus 侧
+   `absent()` / 阈值规则兜底——抓取端点自身不能因为 DB 出问题而消失。
+3. **与 `/healthz` 分工**：`/healthz` 给 LB / 编排做就绪探针（无鉴权、只回原因码）；
+   `/metrics` 给监控系统做持续采集（带鉴权、全量指标）。别混用。
+
 ### 5.3 停机恢复面板库（runbook，已真机演练）
 
 **适用范围**：`kind=panel` 的备份（面板自身数据库）。

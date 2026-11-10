@@ -218,10 +218,28 @@ pub(crate) fn run(cli: &Cli, os: Arc<dyn panel_os::OsAdapter>) -> Result<()> {
             .route("/healthz", axum::routing::get({
                 let hs = embed::HealthState {
                     pool: state.pool.clone(),
-                    data_dir: health_data_dir,
+                    data_dir: health_data_dir.clone(),
                 };
                 move || async move { embed::healthz(hs.clone()).await }
-            }))
+            }));
+        // /metrics（Prometheus 抓取）：token 留白 ⇒ 完全不注册（不是注册了回 404）。
+        // 与 /healthz 同属运维面：挂 build_router 之外，避开 authed 会话分层，
+        // 鉴权由 handler 自带的 Bearer token 完成（Prometheus 不走 cookie+CSRF）。
+        let app = match cfg.metrics.scrape_token.as_deref().map(str::trim) {
+            Some(t) if !t.is_empty() => app.route(
+                "/metrics",
+                axum::routing::get({
+                    let ps = panel_api::prom::PromState {
+                        pool: state.pool.clone(),
+                        data_dir: health_data_dir,
+                        token: t.to_string(),
+                    };
+                    move |h: axum::http::HeaderMap| panel_api::prom::metrics(ps.clone(), h)
+                }),
+            ),
+            _ => app,
+        };
+        let app = app
             .fallback(embed::static_handler)
             // 安全响应头：必须挂在 build_router **之外**且 `.fallback()` 之后 ——
             // build_router 内的 layer 不包裹之后新增的 /healthz 与替换后的 SPA fallback，
