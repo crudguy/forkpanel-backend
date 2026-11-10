@@ -819,7 +819,11 @@ impl DatabaseProvider for LinuxDatabases {
                 }
                 // 在线文件复制：SQLite 文件在面板自身库上就是直接 cp（与 DbRestoreTask 同源口径）。
                 // 大库一致性由备份任务在库空闲期执行保证，这里不引入 rusqlite 在线热备依赖。
-                std::fs::copy(src, o.as_path()).map_err(|e| PanelError::Io(e.to_string()))?;
+                // 整个 SQLite 库可能上 GB：必须放 blocking 池，否则钉住 tokio worker
+                let (s, d) = (src.to_string(), o.as_path().to_path_buf());
+                crate::fs::blocking(move || std::fs::copy(&s, &d))
+                    .await?
+                    .map_err(|e| panel_core::PanelError::Io(e.to_string()))?;
                 on_line("SQLite 文件已复制".into());
                 Ok(())
             }
@@ -889,9 +893,15 @@ impl DatabaseProvider for LinuxDatabases {
                             .map(|d| d.as_secs())
                             .unwrap_or(0),
                     );
-                    std::fs::copy(dst, &bak).map_err(|e| PanelError::Io(e.to_string()))?;
+                    let (s, d) = (dst.to_string(), bak.clone());
+                    crate::fs::blocking(move || std::fs::copy(&s, &d))
+                        .await?
+                        .map_err(|e| panel_core::PanelError::Io(e.to_string()))?;
                 }
-                std::fs::copy(from.as_path(), dst).map_err(|e| PanelError::Io(e.to_string()))?;
+                let (s, d) = (from.as_path().to_path_buf(), dst.to_string());
+                crate::fs::blocking(move || std::fs::copy(&s, &d))
+                    .await?
+                    .map_err(|e| panel_core::PanelError::Io(e.to_string()))?;
                 Ok(())
             }
             DbEngine::MySql => {

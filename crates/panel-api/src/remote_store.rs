@@ -390,8 +390,13 @@ impl RemoteTarget {
         let url = self.object_url(PROBE_OBJECT)?;
         validate_remote_url(&url)?;
         let tmp = std::env::temp_dir().join(format!("panel-probe-{}", std::process::id()));
-        std::fs::write(&tmp, b"panel-connection-probe")
-            .map_err(|e| PanelError::Io(e.to_string()))?;
+        // 内容类 IO 一律走统一出口（门禁按方法名判，不靠人估文件大小）
+        panel_os::fs::blocking({
+            let tmp = tmp.clone();
+            move || std::fs::write(&tmp, b"panel-connection-probe")
+        })
+        .await?
+        .map_err(|e| PanelError::Io(e.to_string()))?;
         let up = self.upload(&tmp, PROBE_OBJECT).await;
         let _ = std::fs::remove_file(&tmp);
         up?;

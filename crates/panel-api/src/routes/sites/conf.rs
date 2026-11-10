@@ -226,12 +226,18 @@ pub async fn log_clear(
     let kind = req.kind.clone().unwrap_or_else(|| "access".to_string());
     let p = site_log_file(&row, &state, &kind)
         .ok_or_else(|| ApiError::bad_request("kind", "该站点未开启独立日志（先在编辑弹窗里开启）"))?;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&p)
-        .map_err(|e| ApiError::from(PanelError::Io(e.to_string())))?;
+    let clear_target = p.clone();
+    panel_os::fs::blocking(move || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&clear_target)
+            .map(|_| ())
+    })
+    .await
+    .map_err(ApiError::from)?
+    .map_err(|e| ApiError::from(PanelError::Io(e.to_string())))?;
     let kref: &'static str = if kind == "error" { "error" } else { "access" };
     audit(&state, &s, "site.log.clear", &id.to_string(), kref).await;
     Ok(ok(serde_json::json!({ "path": p.display().to_string() })))

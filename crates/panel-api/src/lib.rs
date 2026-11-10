@@ -12,18 +12,28 @@
 //!   `system::restart` 十年没人补审计——照着注释以为中间件已经记了。
 //!   新增写 handler 时把 audit 调用当作必填项，而不是可选装饰。
 //!
-//! ## 同步 IO 约定（P1-1 / P2-3）
+//! ## 同步 IO 约定（P1-1 / P2-3；#10 已上机器判据）
 //!
-//! 本 crate 里有约 30 处 `std::fs::`，**绝大多数是刻意不包 `spawn_blocking` 的**——
-//! 它们是元数据级快操作（`create_dir_all` / `remove_file` / `read_dir` /
-//! `set_permissions` / `canonicalize` / 读几十字节的配置文件），耗时在微秒到毫秒级，
-//! 包一层 blocking 只会多一次线程切换。⚠ `remove_file` 删几个 GB 的文件也很快：
-//! unlink 只摘目录项、不擦内容，别被文件大小吓到。
+//! **判据是「耗时随数据量增长」，不是「调了 std::fs」**（报告 §3.7 / §8-10）。
+//! 2026-11-10 起由 `ci/check_sync_io.py` 强制执行，接在 `make guards` 里：
 //!
-//! **需要包 `spawn_blocking` 的是另一类**：整库 VACUUM INTO、tar 打包、AES 加密
-//! 大文件、递归删大目录树——判据是「耗时随数据量增长」，而不是「调用了 std::fs」。
-//! 反例与正确写法见 `routes/backups.rs` 的 `backup_file`（P1-1 的修复现场）。
-//! 新增同步调用时按这条判据自判，别照着邻近代码抄。
+//! | 类别 | 方法 | 要求 |
+//! |---|---|---|
+//! | 重 IO | `read` / `read_to_string` / `write` / `copy` / `OpenOptions` / `remove_dir_all` / `rename` / `canonicalize` | async fn 里**必须**包进 `panel_os::fs::blocking(...)` 或 `tokio::task::spawn_blocking(...)` |
+//! | 微 IO | `create_dir_all` / `remove_file` / `metadata` / `read_dir` / `set_permissions` / `Permissions` | 元数据级快操作，允许直调；**总数钉死**，新增一处必须复审并更新守卫的 `MICRO_PIN` |
+//!
+//! `remove_file` 删几个 GB 的文件也很快（unlink 只摘目录项、不擦内容），别被
+//! 文件大小吓到；反过来 `copy` 一个整库、递归遍历/删解压目录，必须进阻塞池：
+//! 否则 tokio worker 被钉住，`tokio::time::timeout` 对不 yield 的 future 也不会
+//! 触发，`panel-task` 的任务超时就成了假象（见 `panel-task` 的超时行为测试）。
+//!
+//! 小文件也统一进阻塞池，是刻意用「一次线程切换」换「判据只看方法名、
+//! 机器可判、不会误绿」——比靠人判断「这个配置文件会不会变大」可靠。
+//!
+//! 豁免面写死在守卫里：`crates/panel-cli/**`（CLI 与 `panel upgrade` 自带
+//! runtime；Web 升级经 `systemd-run` 拉独立进程）、`*/tests.rs` 与
+//! `#[cfg(test)]` 模块。反例与正确写法见 `routes/backups.rs` 的 `backup_file`
+//! （P1-1 修复现场）与 `verify_artifact`（#10 修复现场）。
 
 // 阻塞子进程调用的唯一出口（Q-01）：`panel_os::run_sync` 只许出现在这里，
 // 由 ci/check-blocking-calls.sh 钉住。见该文件的模块文档。

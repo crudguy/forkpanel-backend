@@ -11,6 +11,18 @@ use panel_core::{PanelError, Result};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// 递归删临时目录（耗时随条目数增长）⇒ 统一放 blocking 池。
+/// 失败只留痕、不改变主结果：清理失败不该把一次成功的签发翻成失败，
+/// 但明文私钥残留必须看得到（原来 `let _ =` 是彻底静默）。
+async fn cleanup_work(dir: &Path) {
+    let d = dir.to_path_buf();
+    if let Err(e) = crate::fs::blocking(move || {
+        let _ = std::fs::remove_dir_all(&d);
+    }).await {
+        eprintln!("[warn] 清理临时证书目录失败（可能残留明文私钥）: {e}");
+    }
+}
+
 /// openssl 是否可用（供能力位 `ssl.selfsigned` 判定）。只做存在性检查。
 pub fn available() -> bool { Bin::OpenSsl.available() }
 
@@ -151,21 +163,25 @@ pub async fn generate_self_signed(
     ).await;
 
     // 无论成败都清掉临时目录（私钥不留痕）
-    let cleanup = |dir: &Path| { let _ = std::fs::remove_dir_all(dir); };
 
     match r {
         Ok(o) if o.code == Some(0) => {}
         Ok(o) => {
-            cleanup(&dir);
+            cleanup_work(&dir).await;
             return Err(PanelError::Command { bin: "openssl".into(), detail: panel_core::sanitize::stderr(&o.stderr) });
         }
-        Err(e) => { cleanup(&dir); return Err(e); }
+        Err(e) => { cleanup_work(&dir).await; return Err(e); }
     }
 
-    let cert = std::fs::read_to_string(&crt_p).map_err(|e| PanelError::Internal(e.to_string()));
-    let key = std::fs::read_to_string(&key_p).map_err(|e| PanelError::Internal(e.to_string()));
-    cleanup(&dir);
-    Ok((cert?, key?))
+    let (cert, key) = crate::fs::blocking({
+        let (c, k) = (crt_p.clone(), key_p.clone());
+        move || (std::fs::read_to_string(&c), std::fs::read_to_string(&k))
+    }).await?;
+    cleanup_work(&dir).await;
+    Ok((
+        cert.map_err(|e| PanelError::Internal(e.to_string()))?,
+        key.map_err(|e| PanelError::Internal(e.to_string()))?,
+    ))
 }
 
 fn unique() -> u64 {
@@ -259,26 +275,31 @@ pub async fn ensure_root_ca(ca_dir: &Path, tmp_dir: &Path) -> Result<()> {
         Bin::OpenSsl, &a,
         CmdOpt { timeout: Duration::from_secs(60), ..Default::default() },
     ).await;
-    let cleanup = |dir: &Path| { let _ = std::fs::remove_dir_all(dir); };
     match r {
         Ok(o) if o.code == Some(0) => {}
-        Ok(o) => { cleanup(&work); return Err(PanelError::Command { bin: "openssl".into(), detail: panel_core::sanitize::stderr(&o.stderr) }); }
-        Err(e) => { cleanup(&work); return Err(e); }
+        Ok(o) => { cleanup_work(&work).await; return Err(PanelError::Command { bin: "openssl".into(), detail: panel_core::sanitize::stderr(&o.stderr) }); }
+        Err(e) => { cleanup_work(&work).await; return Err(e); }
     }
 
     // 落盘前再判一次：若已被并发请求创建，则丢弃本次生成，沿用既有根 CA
     if ca_cert_path(ca_dir).is_file() && ca_key_path(ca_dir).is_file() {
-        cleanup(&work);
+        cleanup_work(&work).await;
         return Ok(());
     }
-    std::fs::copy(&crt, ca_cert_path(ca_dir)).map_err(|e| PanelError::Internal(e.to_string()))?;
-    std::fs::copy(&key, ca_key_path(ca_dir)).map_err(|e| PanelError::Internal(e.to_string()))?;
+    {
+        let (c, k, d) = (crt.clone(), key.clone(), ca_dir.to_path_buf());
+        crate::fs::blocking(move || -> Result<()> {
+            std::fs::copy(&c, ca_cert_path(&d)).map_err(|e| PanelError::Internal(e.to_string()))?;
+            std::fs::copy(&k, ca_key_path(&d)).map_err(|e| PanelError::Internal(e.to_string()))?;
+            Ok(())
+        }).await??;
+    }
     #[cfg(unix)]
     let _ = std::fs::set_permissions(
         ca_key_path(ca_dir),
         std::os::unix::fs::PermissionsExt::from_mode(0o600),
     );
-    cleanup(&work);
+    cleanup_work(&work).await;
     Ok(())
 }
 
@@ -358,20 +379,24 @@ pub async fn issue_leaf_signed_by_ca(
         CmdOpt { timeout: Duration::from_secs(60), ..Default::default() },
     ).await;
 
-    let cleanup = |dir: &Path| { let _ = std::fs::remove_dir_all(dir); };
-    if let Err(e) = &r1 { cleanup(&work); return Err(PanelError::Command { bin: "openssl".into(), detail: truncate(&e.to_string(), 2000) }); }
+    if let Err(e) = &r1 { cleanup_work(&work).await; return Err(PanelError::Command { bin: "openssl".into(), detail: truncate(&e.to_string(), 2000) }); }
     let (crt, key) = match (&r1, &r2) {
         (Ok(o1), Ok(o2)) if o1.code == Some(0) && o2.code == Some(0) => {
-            let c = std::fs::read_to_string(&leaf_crt).map_err(|e| PanelError::Internal(e.to_string()))?;
-            let k = std::fs::read_to_string(&leaf_key).map_err(|e| PanelError::Internal(e.to_string()))?;
-            (c, k)
+            let (rc, rk) = crate::fs::blocking({
+                let (c, k) = (leaf_crt.clone(), leaf_key.clone());
+                move || (std::fs::read_to_string(&c), std::fs::read_to_string(&k))
+            }).await?;
+            (
+                rc.map_err(|e| PanelError::Internal(e.to_string()))?,
+                rk.map_err(|e| PanelError::Internal(e.to_string()))?,
+            )
         }
-        (Ok(o1), _) if o1.code != Some(0) => { cleanup(&work); return Err(PanelError::Command { bin: "openssl".into(), detail: panel_core::sanitize::stderr(&o1.stderr) }); }
-        (_, Ok(o2)) if o2.code != Some(0) => { cleanup(&work); return Err(PanelError::Command { bin: "openssl".into(), detail: panel_core::sanitize::stderr(&o2.stderr) }); }
-        (_, Err(e)) => { cleanup(&work); return Err(e.clone()); }
-        _ => { cleanup(&work); return Err(PanelError::Internal("unexpected openssl state".into())); }
+        (Ok(o1), _) if o1.code != Some(0) => { cleanup_work(&work).await; return Err(PanelError::Command { bin: "openssl".into(), detail: panel_core::sanitize::stderr(&o1.stderr) }); }
+        (_, Ok(o2)) if o2.code != Some(0) => { cleanup_work(&work).await; return Err(PanelError::Command { bin: "openssl".into(), detail: panel_core::sanitize::stderr(&o2.stderr) }); }
+        (_, Err(e)) => { cleanup_work(&work).await; return Err(e.clone()); }
+        _ => { cleanup_work(&work).await; return Err(PanelError::Internal("unexpected openssl state".into())); }
     };
-    cleanup(&work);
+    cleanup_work(&work).await;
     Ok((crt, key))
 }
 

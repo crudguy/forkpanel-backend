@@ -421,6 +421,13 @@ impl TaskRunner {
             // 分支的文本不会进 TaskOutcome）。G8 的告警要带上它，否则运维只能
             // 看到「任务 #7 失败」然后自己去翻输出。
             let mut failure_reason: Option<String> = None;
+            // ⚠ `tokio::time::timeout` 是**合作式**的：它只能在 future 让出执行权
+            //   时触发。任务体里若有不 yield 的同步重 IO（整库 copy / 递归目录树），
+            //   worker 被钉住 ⇒ 计时器也跑不起来 ⇒ 超时保护是假象（报告 §3.7）。
+            //   因此 #10 把这类 IO 全部收进 `panel_os::fs::blocking` / spawn_blocking，
+            //   由 `ci/check_sync_io.py` 机器钉死「async fn 里不得直调重 IO」。
+            //   下面这条测试（timeout_fires_when_heavy_io_is_offloaded）真跑一遍
+            //   验证：重 IO 已卸载时，超时确实能把任务判成 failed。
             let outcome = match tokio::time::timeout(timeout, body.run(progress.clone())).await {
                 Ok(Ok(o)) => o,
                 Ok(Err(e)) => {
@@ -683,6 +690,52 @@ mod tests {
             [], |r| r.get(0)).unwrap();
         assert_eq!(active, 1, "同 key 非终态行应为 1，实为 {active}");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #10 真行为判据：重 IO 卸载到 blocking 池后，`tokio::time::timeout` 必须
+    /// 真的能触发。负向语义是：若把 sleep 改回「在 async fn 里直接 std::thread::sleep」
+    /// （等价于同步重 IO 不 yield），计时器根本不会跑，任务会一路跑到 ok —— 那种
+    /// 形态由 `ci/check_sync_io.py` 在生产段拦下，不让本测试退化成永绿。
+    struct OffloadedSlowBody;
+    #[async_trait::async_trait]
+    impl TaskBody for OffloadedSlowBody {
+        async fn run(&self, _p: Progress) -> Result<TaskOutcome> {
+            tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(600)))
+                .await
+                .map_err(|e| PanelError::Internal(e.to_string()))?;
+            Ok(TaskOutcome { state: TaskState::Ok, exit_code: Some(0), output_path: None })
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_fires_when_heavy_io_is_offloaded() {
+        let dir = std::env::temp_dir().join(format!("panel-task-timeout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("panel.db");
+        {
+            let mut c = rusqlite::Connection::open(&db).unwrap();
+            panel_db::migrate::apply(&mut c).unwrap();
+        }
+        let writer = std::sync::Arc::new(panel_db::WriterActor::spawn(db.clone(), Tier::Nano, "NORMAL").unwrap());
+        let runner = TaskRunner::new(writer, Tier::Nano, dir.clone(), db.clone(), "NORMAL".to_string());
+        let (id, _) = runner.submit(TaskRequest {
+            idempotency_key: "timeout-offloaded".into(),
+            kind: TaskKind::Service,
+            label: "timeout offloaded".into(),
+            timeout: Duration::from_millis(120),
+        }, OffloadedSlowBody).await.expect("提交失败");
+
+        let mut terminal = false;
+        for _ in 0..60 {
+            if runner.is_terminal(id).await.unwrap_or(false) { terminal = true; break; }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(terminal, "超时后任务必须进入终态（计时器没触发＝超时保护是假象）");
+        let c = rusqlite::Connection::open(dir.join("panel.db")).unwrap();
+        let st: String = c.query_row("SELECT state FROM task_runs WHERE id=?1", [id], |r| r.get(0)).unwrap();
+        assert_eq!(st, "failed", "重 IO 已让出 worker ⇒ timeout 必须把任务判失败");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -222,6 +222,58 @@ fn decode_proc_addr(hex: &str) -> String {
     }
 }
 
+/// async 上下文里**重文件 IO 的唯一异步出口**（P1 §8-10）。
+///
+/// 判据不是「调了 std::fs」，而是「耗时随数据量增长」：整文件 read/write/copy、
+/// 递归删目录树、递归遍历。这类操作直接写在 `async fn` 里会把 tokio worker
+/// 钉住到 IO 结束——前端轮询被放大时整个 API 短时无响应，而且
+/// `tokio::time::timeout` 对一个不 yield 的 future **根本不会触发**（任务超时
+/// 会变成假象）。元数据级快操作（`metadata` / `create_dir_all` / `remove_file`
+/// / 单层 `read_dir` / `set_permissions` / `rename`）按 crate 根约定不必包。
+///
+/// 由 `ci/check_sync_io.py` 机器钉死：生产段 async fn 里的重 IO 只允许出现在
+/// `spawn_blocking(...)` 或本函数（`fs::blocking(...)`）的闭包内。
+pub async fn blocking<F, T>(f: F) -> Result<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| PanelError::Internal(format!("阻塞 IO 任务异常: {e}")))
+}
+
+#[cfg(test)]
+mod blocking_pool_tests {
+    use super::*;
+
+    /// 真行为判据：闭包必须跑在**另一个线程**上，而不是当前 async worker。
+    /// ⚠ 不能用线程名判：tokio 的 blocking 池线程也叫 `tokio-rt-worker`
+    /// （实测踩过），判线程 id 才不会被同名骗过去。
+    #[tokio::test]
+    async fn blocking_really_uses_blocking_pool() {
+        let caller = std::thread::current().id();
+        let (name, id) = blocking(|| {
+            (std::thread::current().name().unwrap_or("").to_string(),
+             std::thread::current().id())
+        })
+        .await
+        .expect("blocking 不应失败");
+        assert_ne!(id, caller, "阻塞闭包仍在调用方线程上（实际线程名：{name}）");
+    }
+
+    /// 闭包返回值原样透出（IO 错误由调用点按各自语义映射，不在这里强转）
+    #[tokio::test]
+    async fn blocking_returns_closure_value_unchanged() {
+        let v: std::io::Result<usize> = blocking(|| Ok::<usize, std::io::Error>(42)).await.unwrap();
+        assert_eq!(v.unwrap(), 42);
+        let bad: std::io::Result<()> = blocking(|| Err::<(), std::io::Error>(std::io::Error::other("boom")))
+            .await
+            .unwrap();
+        assert!(bad.is_err(), "闭包里的 IO 错误必须原样交给调用点");
+    }
+}
+
 #[cfg(test)]
 mod port_tests {
     use super::*;

@@ -181,16 +181,18 @@ async fn write_crontab(text: &str) -> Result<()> {
     // 写临时文件（0600）再 `crontab <file>`：避免 stdin 注入，且保留用户其他内容
     let dir = std::env::temp_dir();
     let path = dir.join(format!("panel-crontab-{}.tmp", std::process::id()));
-    {
+    let (text_owned, p) = (text.to_string(), path.clone());
+    crate::fs::blocking(move || -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         let mut f = std::fs::OpenOptions::new()
             .write(true).create(true).truncate(true)
             .mode(0o600)
-            .open(&path)
-            .map_err(|e| PanelError::Io(format!("open {path:?}: {e}")))?;
+            .open(&p)
+            .map_err(|e| PanelError::Io(format!("open {p:?}: {e}")))?;
         use std::io::Write;
-        f.write_all(text.as_bytes()).map_err(|e| PanelError::Io(format!("write {path:?}: {e}")))?;
-    }
+        f.write_all(text_owned.as_bytes()).map_err(|e| PanelError::Io(format!("write {p:?}: {e}")))?;
+        Ok(())
+    }).await??;
     let res = crate::cmd::run(Bin::Crontab, &[path.to_str().unwrap_or("/dev/null")],
         CmdOpt { timeout: Duration::from_secs(15), ..Default::default() }).await;
     let _ = std::fs::remove_file(&path);

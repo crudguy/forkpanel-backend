@@ -433,8 +433,13 @@ pub async fn bootstrap_token(
     }
     // ③ 取文件内容（== 内存令牌明文；文件不存在 = 不该发生，仍按 404 处理）。
     let path = state.os.paths().data_dir().join("bootstrap.token");
-    let tok = std::fs::read_to_string(&path)
-        .map_err(|_| ApiError::not_found("bootstrap token unavailable"))?;
+    let tok = panel_os::fs::blocking({
+        let path = path.clone();
+        move || std::fs::read_to_string(&path)
+    })
+    .await
+    .map_err(|_| ApiError::not_found("bootstrap token unavailable"))?
+    .map_err(|_| ApiError::not_found("bootstrap token unavailable"))?;
     let tok = tok.trim();
     if tok.is_empty() {
         return Err(ApiError::not_found("bootstrap token unavailable"));

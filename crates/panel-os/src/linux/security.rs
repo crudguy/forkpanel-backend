@@ -166,7 +166,8 @@ impl SecurityProvider for LinuxSecurity {
         }
 
         // ── 空口令账户（读 /etc/shadow 需 root）──
-        match std::fs::read_to_string("/etc/shadow") {
+        let shadow = crate::fs::blocking(|| std::fs::read_to_string("/etc/shadow")).await?;
+        match shadow {
             Ok(txt) => {
                 let empties: Vec<String> = txt
                     .lines()
@@ -261,7 +262,10 @@ pub(crate) async fn apply_ssh_item(key: &str) -> Result<SecurityApplyResult> {
     if !path.exists() {
         return Err(PanelError::NotFound(format!("sshd 配置不存在：{}", path.display())));
     }
-    let orig = std::fs::read_to_string(&path).map_err(|e| PanelError::Io(e.to_string()))?;
+    let orig = crate::fs::blocking({
+        let p = path.clone();
+        move || std::fs::read_to_string(&p)
+    }).await?.map_err(|e| PanelError::Io(e.to_string()))?;
     let next = apply_ssh_directive(&orig, directive, value);
     if next == orig {
         // 已符合预期：不写盘、不备份
@@ -270,7 +274,12 @@ pub(crate) async fn apply_ssh_item(key: &str) -> Result<SecurityApplyResult> {
 
     // ① 先备份
     let backup = path.with_extension(format!("conf.panel.bak-{}", now_secs()));
-    std::fs::copy(&path, &backup).map_err(|e| PanelError::Io(e.to_string()))?;
+    {
+        let (a, b) = (path.clone(), backup.clone());
+        crate::fs::blocking(move || std::fs::copy(&a, &b))
+            .await?
+            .map_err(|e| PanelError::Io(e.to_string()))?;
+    }
 
     // 备份文件名带秒级时间戳，每次改配置都是**新文件**、永不复用也从不清理，
     // 目录会随改配置次数无限膨胀。只保留最近几份（回滚用得上最近的那次就够）：
@@ -282,7 +291,11 @@ pub(crate) async fn apply_ssh_item(key: &str) -> Result<SecurityApplyResult> {
     }
 
     // ② 写（失败则备份仍在、原文件未变）
-    if let Err(e) = std::fs::write(&path, &next) {
+    let write_res = crate::fs::blocking({
+        let (p, n) = (path.clone(), next.clone());
+        move || std::fs::write(&p, &n)
+    }).await?;
+    if let Err(e) = write_res {
         return Err(PanelError::Io(format!(
             "写入失败，原配置未改动（备份 {}）：{e}",
             backup.display()
@@ -301,7 +314,10 @@ pub(crate) async fn apply_ssh_item(key: &str) -> Result<SecurityApplyResult> {
         // ⚠ 回滚**可能失败**（备份被删、权限变化、磁盘满）。此前用 `let _ =` 吞掉结果，
         // 而文案却无条件宣称「已自动回滚」——用户据此重启 sshd，就会在磁盘上仍是坏
         // 配置的情况下把自己锁在门外（二轮审计 P0-9）。
-        let rolled_back = std::fs::copy(&backup, &path).is_ok();
+        let rolled_back = crate::fs::blocking({
+            let (a, b) = (backup.clone(), path.clone());
+            move || std::fs::copy(&a, &b).is_ok()
+        }).await.unwrap_or(false);
         if !rolled_back {
             eprintln!(
                 "[panel] ⚠ [security] sshd 配置校验未通过且**回滚失败**：目标 {} 上仍是未通过校验的配置（备份留在 {}）",

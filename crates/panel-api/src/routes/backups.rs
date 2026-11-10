@@ -606,16 +606,30 @@ async fn verify_artifact(
         }
         "gz" => {
             let out = tmp_dir.join(format!("verify-untar-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&out);
+            // 递归删目录树耗时随条目数增长 ⇒ 与「必须重建」一起放 blocking 池。
             // **必须重建**：`untar_gz` 走 `tar -C <dir>`，目录不存在时 tar 直接
             // 报 "Cannot open: No such file or directory"。此前只删不建，导致
             // **所有站点备份（tar.gz）在校验阶段必然失败并删掉产物**——面板库
             // 备份走 `.db` 分支，所以这个 bug 一直没被日常使用暴露。
-            std::fs::create_dir_all(&out)
-                .map_err(|e| PanelError::Internal(format!("create verify dir: {e}")))?;
+            panel_os::fs::blocking({
+                let out = out.clone();
+                move || -> Result<()> {
+                    let _ = std::fs::remove_dir_all(&out);
+                    std::fs::create_dir_all(&out)
+                        .map_err(|e| PanelError::Internal(format!("create verify dir: {e}")))?;
+                    Ok(())
+                }
+            }).await??;
             panel_os::backup::untar_gz(&plain, &out).await?;
-            let n = walkdir_count(&out);
-            let _ = std::fs::remove_dir_all(&out);
+            // 递归遍历整棵解压目录 + 递归删除，都随数据量增长 ⇒ 合到一个阻塞任务
+            let n = panel_os::fs::blocking({
+                let out = out.clone();
+                move || {
+                    let n = walkdir_count(&out);
+                    let _ = std::fs::remove_dir_all(&out);
+                    n
+                }
+            }).await?;
             if n == 0 {
                 return Err(PanelError::Internal("归档解出来是空的".into()));
             }
