@@ -59,6 +59,9 @@ guards:
 	# 依赖审计 CI 接线：前后端 audit job 必须真跑 make audit、不得
 	# continue-on-error / needs / --ignore，工具缺失必须 exit 1
 	python3 ci/check_audit_wired.py
+	# 同步重 IO 不得留在 async 上下文：内容类/递归类必须在 blocking 池、
+	# 微 IO 白名单+计数钉死；顺带保住 panel-task 超时不是假象
+	python3 ci/check_sync_io.py
 	# 前端单文件行数上限：挡住 .vue/.ts 无限膨胀（大视图的直接后果是"纯逻辑没法单测"）
 	bash ci/check-frontend-loc.sh
 	# 前端 UI 守卫（清单以 run-ui-guards.mjs 的 UI_GUARDS 为准，不在此写死数量）：
