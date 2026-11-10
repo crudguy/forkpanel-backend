@@ -718,7 +718,7 @@ impl DatabaseProvider for LinuxDatabases {
             let mut st = conn
                 .prepare(&format!("SELECT * FROM {} LIMIT ?1 OFFSET ?2", quote_ident(&table)))
                 .map_err(db_err)?;
-            let columns: Vec<String> = st.column_names().iter().map(|s| s.to_string()).collect();
+            let columns: Vec<String> = st.column_names().map(|s| s.to_string()).collect();
             let ncol = columns.len();
             let mut out = Vec::new();
             let mut qr = st
@@ -784,7 +784,7 @@ impl DatabaseProvider for LinuxDatabases {
             // 写语句在这里也会**物理失败**（纵深防御，不依赖单点校验）。
             let conn = LinuxDatabases::open_sqlite(&t)?;
             let mut st = conn.prepare(&sql).map_err(db_err)?;
-            let columns: Vec<String> = st.column_names().iter().map(|s| s.to_string()).collect();
+            let columns: Vec<String> = st.column_names().map(|s| s.to_string()).collect();
             let ncol = columns.len();
             let mut out: Vec<Vec<Option<String>>> = Vec::new();
             let mut truncated = false;

@@ -9,7 +9,7 @@ description = "SQLite 数据层：单写 actor、分层指标存储、迁移、�
 [dependencies]
 panel-core = { path = "../panel-core" }
 # bundled：静态编译 sqlite3 C 源码，目标机无需 libsqlite3
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41", default-features = false, features = ["bundled", "fallible_uint"] }
 tokio    = { workspace = true }
 arc-swap = "1"
 # 仅 rekey 用：settings.value_json 是 JSON 字符串，`enc:<hex>` 藏在里面

@@ -708,6 +708,37 @@ scrape_configs:
 3. **与 `/healthz` 分工**：`/healthz` 给 LB / 编排做就绪探针（无鉴权、只回原因码）；
    `/metrics` 给监控系统做持续采集（带鉴权、全量指标）。别混用。
 
+### 5.2.5 依赖安全审计（两端各一个 CI job）
+
+| 端 | 本地命令 | CI | 数据源 |
+|---|---|---|---|
+| 后端 | `make audit`（需 `cargo install cargo-audit`） | `ci.yml` 独立 `audit` job → `make audit` | RustSec advisory-db（扫 `Cargo.lock`） |
+| 前端 | `make audit`（corepack 提供 pnpm 10，本机 pnpm 不在 PATH 也能跑） | `ci.yml` 独立 `audit` job → `make audit` | npm registry audit 端点（扫 `pnpm-lock.yaml`） |
+
+两条纪律：
+
+1. **不进主门禁**：advisory-db 在 GitHub、npm audit 端点也要联网，网络抖动会连带
+   拖红 `make check`。两端都拆成独立 job，红了只红这一条，且**不允许**
+   `continue-on-error` / `needs: check` / `--ignore*` / `--audit-level` / `--prod` /
+   `-D` —— 由后端 `ci/check_audit_wired.py` 钉死（接在 `make guards` 里）。
+2. **工具缺失判红，不判跳过**：`ci/check-audit.sh` 找不到 `cargo-audit` 直接
+   `exit 1`。仅当联网刷新 advisory-db 失败且错误属网络类时，才回退本地缓存
+   `--no-fetch` 重判（本地库由首次 `cargo audit` 生成；cargo-audit 0.22 没有
+   `fetch` 子命令）。**缓存要定期联网刷新**，否则新公布的 advisory 不会自动进来。
+
+`.cargo/audit.toml` 里现有 14 条 zstd 豁免是**带理由的例外**（`rust-embed →
+include-flate → zstd 0.13`，只解压编译期嵌入的自有前端资源，不接触外部数据流；
+上游 `include-flate` 尚无适配 zstd 0.14 的版本）。每条都写明复审条件，按季度复查；
+新增豁免必须写清「为什么可忽略 + 何时必须复审」，否则等于关掉门禁。
+
+**2026-11-10 首次真扫结果**：`libsqlite3-sys 0.30.1` 命中
+`RUSTSEC-2026-0459`（CVE-2026-119375，SQLite < 3.54.0 在打开「库文件 + 页大小
+不同的 sibling `-wal`」时可能返回未初始化的页缓存内存）。该场景与 §5.3 的停机
+恢复面板库（可能导入外部 `.db`）相关，故**不用 ignore 放过**，直接把
+`rusqlite` 升到 0.41.1 / `libsqlite3-sys` 0.39.1（内嵌 SQLite 3.54.1）修掉。
+前端同批修掉 7 条 advisory（vite 6.4.3 → 6.4.6、source-map-js 1.2.1 → 1.2.2、
+minimatch 9.0.9 → 11.0.1）。当前两端扫描均 0 漏洞。
+
 ### 5.3 停机恢复面板库（runbook，已真机演练）
 
 **适用范围**：`kind=panel` 的备份（面板自身数据库）。

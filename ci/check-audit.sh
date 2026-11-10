@@ -10,7 +10,8 @@
 #
 # 网络鲁棒性：advisory-db 托管在 github，本机网络会抖动。故**先试联网拉新库拿最新事实，
 # 仅当失败是网络类（fetch/IO/git/dns/tcp）时回退本地缓存 --no-fetch 重判**——绝不因
-# 网络抖动把结果判错。本地缓存由首次 `cargo audit`（或 `cargo audit fetch`）生成，
+# 网络抖动把结果判错。本地缓存由首次 `cargo audit` 生成（0.22 无 `fetch` 子命令，
+# 直接跑即自动 fetch；手动刷新也可在 ~/.cargo/advisory-db 里 `git pull`），
 # 建议定期联网刷新以纳入新公布 advisory。
 #
 # 退出语义：发现**漏洞**→ 非零（门禁红）；仅有 unmaintained 等 warning 不拦（cargo audit
@@ -49,6 +50,6 @@ if [ $rc -eq 0 ]; then
   echo "PASS：Cargo.lock 无已知漏洞"
   exit 0
 else
-  echo "FAIL：cargo audit 退出码 $rc——可能有漏洞，或无本地 advisory-db（先联网跑一次 cargo audit fetch），详见上方"
+  echo "FAIL：cargo audit 退出码 $rc——可能有漏洞，或无本地 advisory-db（先联网跑一次 cargo audit 以生成缓存），详见上方"
   exit 1
 fi
