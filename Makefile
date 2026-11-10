@@ -53,6 +53,9 @@ guards:
 	# Prometheus /metrics：条件注册（留白不占面）+ Bearer 鉴权先于采集
 	# + scrape_token 消费链（防「config 有字段、serve 没人读」的假控制）
 	python3 ci/check_prom_metrics.py
+	# SSE 任务流 Lagged 不关流：分类 / 循环 continue / task_stream 接线 /
+	# 真行为测试四层（只测纯分类函数挡不住 loop 里写 break 的回归）
+	python3 ci/check_sse_lagged.py
 	# 前端单文件行数上限：挡住 .vue/.ts 无限膨胀（大视图的直接后果是"纯逻辑没法单测"）
 	bash ci/check-frontend-loc.sh
 	# 前端 UI 守卫（清单以 run-ui-guards.mjs 的 UI_GUARDS 为准，不在此写死数量）：

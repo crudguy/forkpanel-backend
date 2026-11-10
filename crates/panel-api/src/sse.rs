@@ -23,6 +23,8 @@ use std::{
     },
     time::Duration,
 };
+use futures_util::StreamExt;
+use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::sync::mpsc;
 
 /// 当前 SSE 连接数（进程内原子计数，用于档位上限判定）
@@ -123,6 +125,74 @@ pub async fn metrics_stream(
         .into_response()
 }
 
+/// 把一次 `broadcast::Receiver::recv` 的结果分类，区分三种情况：
+/// - `Event`：正常事件，转交 SSE 流推送；
+/// - `Lagged(n)`：慢消费者落后 n 条——**必须继续接收**，SSE 流保持存活；
+/// - `Closed`：总线关闭（服务停机），正常结束流。
+///
+/// 纯函数（不打日志、不碰 IO），便于单测直接验证分类；日志与「继续」动作
+/// 在 `task_event_stream` 的 Lagged 分支里。`task_stream` 不得再回到
+/// `while let Ok(..) = bus_rx.recv()` 的旧写法——那会把 `Lagged` 误判为流结束，
+/// 导致客户端静默失联、只能靠 EventSource 自动重连。
+enum TaskRecvStep {
+    Event(panel_task::TaskEvent),
+    Lagged(u64),
+    Closed,
+}
+
+fn classify_task_recv(res: Result<panel_task::TaskEvent, RecvError>) -> TaskRecvStep {
+    match res {
+        Ok(ev) => TaskRecvStep::Event(ev),
+        Err(RecvError::Lagged(n)) => TaskRecvStep::Lagged(n),
+        Err(RecvError::Closed) => TaskRecvStep::Closed,
+    }
+}
+
+/// 任务事件 → SSE 帧的接收循环。**抽成独立函数是为了能真跑行为测试**：
+/// 传一个容量很小的真实 `broadcast::Receiver`，制造 tokio 自己发出的
+/// `Lagged`，断言流不结束、后续事件仍能送达（单测 `task_event_stream_*`）。
+/// 只测 `classify_task_recv` 挡不住「loop 里把 Lagged 写成 break」——那是
+/// 恒绿判据，接线由 `ci/check_sse_lagged.py` 钉死。
+fn task_event_stream(
+    mut bus_rx: broadcast::Receiver<panel_task::TaskEvent>,
+) -> impl futures_util::Stream<Item = Result<Event, Infallible>> {
+    async_stream::stream! {
+        loop {
+            match classify_task_recv(bus_rx.recv().await) {
+                TaskRecvStep::Event(ev) => {
+                    let (name, data) = match ev {
+                        panel_task::TaskEvent::Progress { id, percent, message } => (
+                            "progress",
+                            serde_json::json!({ "id": id, "percent": percent, "message": message }),
+                        ),
+                        panel_task::TaskEvent::Log { id, line } => (
+                            "log",
+                            serde_json::json!({ "id": id, "line": line }),
+                        ),
+                        panel_task::TaskEvent::Finished { id, state, kind } => (
+                            "finished",
+                            serde_json::json!({ "id": id, "state": state.as_str(), "kind": kind.as_str() }),
+                        ),
+                        panel_task::TaskEvent::CancelRequested { id } => (
+                            "cancel",
+                            serde_json::json!({ "id": id }),
+                        ),
+                    };
+                    yield Ok::<_, Infallible>(Event::default().event(name).data(data.to_string()));
+                }
+                // 慢消费者落后：响亮记日志后继续接收，**不关闭 SSE 流**（修复 #6）。
+                // 落后条数 n 来自 tokio 的真实 Lagged，绝不静默吞掉。
+                TaskRecvStep::Lagged(n) => {
+                    eprintln!("[warn] sse task stream lagged by {n} events; client connection kept alive");
+                    continue;
+                }
+                // 总线关闭（服务停机）：正常结束流。
+                TaskRecvStep::Closed => break,
+            }
+        }
+    }
+}
+
 /// 任务进度频道：订阅需 `task.view`
 pub async fn task_stream(
     State(state): State<Arc<AppState>>,
@@ -148,27 +218,15 @@ pub async fn task_stream(
     // 守卫在计数 +1 之后立刻持有（同 metrics_stream）
     let conn = SseConnGuard;
     // 订阅全局任务总线：所有任务事件都从这里广播
-    let mut bus_rx = state.tasks.bus().subscribe();
+    let bus_rx = state.tasks.bus().subscribe();
+    // conn 守卫必须随 SSE body 流转移（见 SseConnGuard 注释）：客户端断开时
+    // axum 直接 drop 整个流，包一层生成器持有它才能两路都恰好 -1 一次。
+    let inner = task_event_stream(bus_rx);
     let stream = async_stream::stream! {
         let _guard = conn;
-        while let Ok(ev) = bus_rx.recv().await {
-            let (name, data) = match ev {
-                panel_task::TaskEvent::Progress { id, percent, message } => (
-                    "progress",
-                    serde_json::json!({ "id": id, "percent": percent, "message": message }),
-                ),
-                panel_task::TaskEvent::Log { id, line } => (
-                    "log", serde_json::json!({ "id": id, "line": line }),
-                ),
-                panel_task::TaskEvent::Finished { id, state, kind } => (
-                    "finished",
-                    serde_json::json!({ "id": id, "state": state.as_str(), "kind": kind.as_str() }),
-                ),
-                panel_task::TaskEvent::CancelRequested { id } => (
-                    "cancel", serde_json::json!({ "id": id }),
-                ),
-            };
-            yield Ok::<_, Infallible>(Event::default().event(name).data(data.to_string()));
+        let mut inner = Box::pin(inner);
+        while let Some(item) = inner.next().await {
+            yield item;
         }
     };
     Sse::new(stream)
@@ -351,6 +409,70 @@ mod tests {
     fn backlog_is_small() {
         // 低配机器上缓冲区必须小：64 条 × 事件大小，避免慢客户端拖垮内存
         assert!(BACKLOG <= 128);
+    }
+
+    /// ⭐ 分类判据（#6）：`classify_task_recv` 必须把 `Lagged(n)` 判为继续接收、
+    /// 把 `Closed` 判为结束流、把 `Ok` 判为推送事件；落后条数必须原样传递。
+    /// 但这**不是** #6 的主判据——loop 里改成 break 它照样绿，真判据见下。
+    #[test]
+    fn classify_task_recv_keeps_stream_alive_on_lagged() {
+        use tokio::sync::broadcast::error::RecvError;
+        assert!(
+            matches!(classify_task_recv(Err(RecvError::Lagged(7))), TaskRecvStep::Lagged(7)),
+            "Lagged 必须判为继续接收（不关 SSE 流），且落后条数原样传递"
+        );
+        assert!(matches!(classify_task_recv(Err(RecvError::Closed)), TaskRecvStep::Closed));
+        let ev = panel_task::TaskEvent::CancelRequested { id: 1 };
+        assert!(matches!(classify_task_recv(Ok(ev)), TaskRecvStep::Event(_)));
+        // 旧 `while let Ok` 的等价行为：Lagged 被当成流结束，必须不成立
+        assert!(!matches!(
+            classify_task_recv(Err(RecvError::Lagged(3))),
+            TaskRecvStep::Closed
+        ));
+    }
+
+    /// ⭐⭐ #6 的**真行为判据**：容量 2 的真实 broadcast 通道，订阅后连发
+    /// 3 条 ⇒ tokio 自己发出 `Lagged(1)`。把 loop 改回 `while let Ok(..)` 或
+    /// 把 Lagged 分支写成 `break`，第一次 poll 就拿到 None ⇒ 此测试必红。
+    #[tokio::test]
+    async fn task_event_stream_survives_lagged() {
+        let (tx, rx) = broadcast::channel::<panel_task::TaskEvent>(2);
+        for id in 1..=3 {
+            tx.send(panel_task::TaskEvent::Progress { id, percent: 0, message: None })
+                .expect("订阅者存在，send 必成功");
+        }
+        let mut s = Box::pin(task_event_stream(rx));
+        // Lagged 之后必须仍收到 SSE 帧（旧写法这里直接 None = 客户端静默失联）
+        let first = tokio::time::timeout(std::time::Duration::from_millis(500), s.next())
+            .await
+            .expect("Lagged 之后不得卡住")
+            .expect("Lagged 之后流不得关闭");
+        assert!(first.is_ok(), "SSE 帧必须是 Ok(Infallible)");
+        // 再补一条后发事件：证明流没半关闭，循环仍在继续接收
+        tx.send(panel_task::TaskEvent::CancelRequested { id: 99 })
+            .expect("send");
+        let second = tokio::time::timeout(std::time::Duration::from_millis(500), s.next())
+            .await
+            .expect("补发事件后不得卡住")
+            .expect("补发事件后流不得关闭");
+        assert!(second.is_ok());
+        // 总线关闭仍要正常结束，不能变成无限循环。tokio 语义：drop(tx) 后
+        // 接收者会先排空环形缓冲里剩余的事件，之后才收到 Closed——所以先排空。
+        drop(tx);
+        let mut drained = 0;
+        let mut ended = false;
+        for _ in 0..8 {
+            match tokio::time::timeout(std::time::Duration::from_millis(500), s.next())
+                .await
+                .expect("总线关闭后必须结束，不能卡住")
+            {
+                None => { ended = true; break; }
+                Some(Ok(_)) => drained += 1,
+                Some(Err(_)) => unreachable!("Infallible"),
+            }
+        }
+        assert!(drained >= 1, "Lagged 之后补发的事件必须仍被送达");
+        assert!(ended, "排空缓冲后 Closed 必须结束流（不能无限循环）");
     }
 
     /// ⭐ **单源守卫**（P2-6）：SSE 档位上限的唯一真值是 `Tier::max_sse_clients()`
