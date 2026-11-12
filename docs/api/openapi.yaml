@@ -1324,6 +1324,8 @@ components:
             api_key_set:  { type: boolean, description: assistant.llm_api_key 是否已设置（永不明文） }
             narrative:     { type: boolean, description: assistant.llm_narrative 开关；false（缺省）时后端不外发任何诊断数据，diagnose 回退纯规则报告 }
             narrative_note: { type: string, description: 开启后会外发什么的披露文案（后端单一维护，前端原样展示，不得自行改写） }
+            chat_context: { type: boolean, description: assistant.llm_chat_context 开关；false（缺省）时 chat 模式不附带任何系统数据，自由对话只转发用户文字；开启后 chat 也外发一份脱敏系统概要 }
+            chat_context_note: { type: string, description: 开启 chat 系统上下文后会外发什么的披露文案（后端单一维护，前端原样展示，不得自行改写） }
         deployment:
           type: object
           description: 部署级只读展示（改 config.toml 并重启）

@@ -39,13 +39,27 @@ const K_LLM_API_KEY: &str = "assistant.llm_api_key";
 /// 不搞「配齐三键即自动外发」——那等于把隐私决定藏在连接参数里。
 const K_LLM_NARRATIVE: &str = "assistant.llm_narrative";
 
-/// runtime 白名单：PATCH 只接受这四个键。
-const RUNTIME_KEYS: [&str; 4] = [K_LLM_ENDPOINT, K_LLM_MODEL, K_LLM_API_KEY, K_LLM_NARRATIVE];
+/// chat 模式是否附带脱敏后的系统概要（布尔）。**缺省 = 关**：自由对话默认不把
+/// 任何系统数据带出本机；开启后，chat 通道也会外发一份（受同一叙事开关 +
+/// `redact_for_llm` 约束）。仅当叙事开关已开（LLM 实际被调用）时才有意义。
+const K_LLM_CHAT_CONTEXT: &str = "assistant.llm_chat_context";
+
+/// runtime 白名单：PATCH 只接受这五个键。
+const RUNTIME_KEYS: [&str; 5] = [
+    K_LLM_ENDPOINT,
+    K_LLM_MODEL,
+    K_LLM_API_KEY,
+    K_LLM_NARRATIVE,
+    K_LLM_CHAT_CONTEXT,
+];
 
 /// 开启叙事后**会外发什么**的披露文案。由后端单一维护、前端原样展示——
 /// 文案与 `assistant::redact_for_llm` 的实际覆盖范围一一对应，杜绝
 /// 「文档说已脱敏、代码没脱敏」的漂移。
 pub const NARRATIVE_NOTE: &str = "开启后，每次诊断会把以下内容发送到上方配置的 Endpoint：CPU/内存/磁盘等指标摘要、规则诊断结论，以及最近 20 条 error 级系统日志原文（发送前脱敏 IP 地址、邮箱与密钥样式文本；路径与主机名不脱敏——它们是诊断的核心证据）。数据离开本机后不再受面板控制。关闭时仅使用内置规则诊断，不外发任何数据。";
+
+/// 开启 chat 系统上下文后会外发什么的披露文案。同样单一维护、前端原样渲染。
+pub const CHAT_CONTEXT_NOTE: &str = "开启后，自由对话（非快捷体检）也会把一份脱敏后的系统概要（CPU/内存/负载/磁盘最高占用/Top CPU 进程，不含 IP、密钥等敏感信息）随你的提问一起发给模型，使通用提问也能结合本机实况作答。默认关闭：自由对话只转发你的文字，不附带任何系统数据。";
 
 /// 部署级键：在 settings 表里只有死种子，实际生效值来自 config.toml/env。
 const DEPLOYMENT_KEYS: [&str; 12] = [
@@ -78,6 +92,10 @@ pub struct LlmRuntime {
     narrative: bool,
     /// 开启后会外发什么的披露文案（单一事实源，前端原样渲染）
     narrative_note: &'static str,
+    /// chat 模式是否附带脱敏系统概要（缺省 false）。true 时自由对话也外发一份系统快照。
+    chat_context: bool,
+    /// 开启后会外发什么的披露文案（单一事实源，前端原样渲染）
+    chat_context_note: &'static str,
 }
 
 /// 叙事开关读取：表内值为 JSON 字符串 "true" 才算开；缺省/其余一律关。
@@ -85,6 +103,17 @@ pub struct LlmRuntime {
 fn narrative_on(table: &std::collections::BTreeMap<String, String>) -> bool {
     table
         .get(K_LLM_NARRATIVE)
+        .and_then(|j| serde_json::from_str::<Value>(j).ok())
+        .and_then(|v| v.as_str().map(str::to_string))
+        .as_deref()
+        == Some("true")
+}
+
+/// chat 上下文开关读取：与 `narrative_on` 同款语义，缺省/坏值/false 一律关，
+/// 只有显式 "true" 开。纯函数（不吃 state）——开关语义必须有单测盯着。
+fn chat_context_on(table: &std::collections::BTreeMap<String, String>) -> bool {
+    table
+        .get(K_LLM_CHAT_CONTEXT)
         .and_then(|j| serde_json::from_str::<Value>(j).ok())
         .and_then(|v| v.as_str().map(str::to_string))
         .as_deref()
@@ -107,6 +136,8 @@ pub struct LlmConfig {
     pub model: String,
     /// 已解密的明文密钥（仅内存使用，绝不落日志/回显）
     pub api_key: String,
+    /// chat 模式是否附带脱敏系统概要（仅当叙事开关已开时读取）
+    pub chat_context: bool,
 }
 
 /// 读取已保存的 LLM 配置；三键任一缺失、api_key 解密失败、**或叙事开关未开启**
@@ -140,7 +171,8 @@ pub async fn llm_config(state: &Shared) -> ApiResult<Option<LlmConfig>> {
         Some(k) => k,
         None => return Ok(None), // 密钥存储损坏（主密钥轮换等）→ 视作未配置
     };
-    Ok(Some(LlmConfig { endpoint, model, api_key }))
+    let chat_context = chat_context_on(&table);
+    Ok(Some(LlmConfig { endpoint, model, api_key, chat_context }))
 }
 
 // ───────────────────────── GET ─────────────────────────
@@ -166,6 +198,8 @@ pub async fn get(
         api_key_set: table.contains_key(K_LLM_API_KEY),
         narrative: narrative_on(&table),
         narrative_note: NARRATIVE_NOTE,
+        chat_context: chat_context_on(&table),
+        chat_context_note: CHAT_CONTEXT_NOTE,
     };
 
     // deployment：只读展示实际生效值（不取自 settings 表）
@@ -299,7 +333,8 @@ pub async fn patch(
             (K_LLM_ENDPOINT, Value::Null)
             | (K_LLM_MODEL, Value::Null)
             | (K_LLM_API_KEY, Value::Null)
-            | (K_LLM_NARRATIVE, Value::Null) => ops.push((k.as_str(), None)), // null = 清除
+            | (K_LLM_NARRATIVE, Value::Null)
+            | (K_LLM_CHAT_CONTEXT, Value::Null) => ops.push((k.as_str(), None)), // null = 清除
             (K_LLM_ENDPOINT, Value::String(url)) => {
                 let url = url.trim();
                 // 与「测试连接」共用同一条约束（valid_endpoint），避免两条路径漂移
@@ -332,6 +367,8 @@ pub async fn patch(
             // 叙事开关：布尔原样落库（"true"/"false" JSON 字符串）。
             // null = 清除 ⇒ 回落缺省（关）——隐私开关不允许有第三种残留状态。
             (K_LLM_NARRATIVE, Value::Bool(b)) => ops.push((k.as_str(), Some(b.to_string()))),
+            // chat 上下文开关：与叙事开关同款布尔语义。
+            (K_LLM_CHAT_CONTEXT, Value::Bool(b)) => ops.push((k.as_str(), Some(b.to_string()))),
             (_, other) => {
                 return Err(ApiError::bad_request("settings", format!("`{k}` 期望 string 或 null，得到 {other}")));
             }
@@ -809,6 +846,22 @@ mod tests {
         assert!(!narrative_on(&t), "坏值不得当成开");
         t.insert(K_LLM_NARRATIVE.to_string(), "\"TRUE\"".into());
         assert!(!narrative_on(&t), "大小写不将就：只认小写 true");
+    }
+
+    /// chat 上下文开关与叙事开关同款纯函数语义：缺省/坏值/false 一律关，只认 "true"。
+    /// 负向对照：把 `chat_context_on` 改成「缺省开」或「大小写不敏感」这条即红。
+    #[test]
+    fn chat_context_switch_defaults_off_and_only_true_opens() {
+        let mut t = std::collections::BTreeMap::new();
+        assert!(!chat_context_on(&t), "缺省必须关：自由对话默认不外发系统数据");
+        t.insert(K_LLM_CHAT_CONTEXT.to_string(), "\"false\"".into());
+        assert!(!chat_context_on(&t));
+        t.insert(K_LLM_CHAT_CONTEXT.to_string(), "\"true\"".into());
+        assert!(chat_context_on(&t));
+        t.insert(K_LLM_CHAT_CONTEXT.to_string(), "not-json".into());
+        assert!(!chat_context_on(&t), "坏值不得当成开");
+        t.insert(K_LLM_CHAT_CONTEXT.to_string(), "\"TRUE\"".into());
+        assert!(!chat_context_on(&t), "大小写不将就：只认小写 true");
     }
 
     /// 往 settings 表写一行（测试辅助）。

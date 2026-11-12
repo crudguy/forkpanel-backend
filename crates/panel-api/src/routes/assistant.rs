@@ -18,8 +18,10 @@
 //! ③ **披露**：会外发什么由 `settings::NARRATIVE_NOTE` 单一维护并原样展示。
 //!
 //! **两种意图（显式 mode，不靠猜关键词）**：
-//! - `mode=chat`（自由输入）：**原样转发用户消息**到 LLM，返回 `answer` 作为主响应；
-//!   不采集系统数据、不外发诊断上下文，因此普通对话不会再被当成体检。
+//! - `mode=chat`（自由输入）：**原样转发用户消息**到 LLM，返回 `answer` 作为主响应。
+//!   默认不采集、不外发任何系统数据（普通对话不会再被当成体检）；若设置里开启了
+//!   `assistant.llm_chat_context`，则额外附带一份**脱敏后的系统概要**（CPU/内存/负载/
+//!   磁盘/Top 进程），让自由输入也能结合本机实况作答。
 //! - `mode=diagnose`（快捷提问 / 页面解释）：保留规则诊断引擎，`question` 同时
 //!   进入 LLM 提示词，`narrative` 围绕问题作答；`findings/ctx` 只在此模式有实值。
 //!
@@ -789,14 +791,29 @@ fn build_chat_user(question: &str) -> String {
     redact_for_llm(question.trim())
 }
 
+/// chat 带系统上下文时的 user 消息：问题（脱敏）+ 脱敏后的系统概要，明确标注仅供参考。
+/// 让自由输入也能结合本机实况作答，同时把「这是面板给的背景、不是用户原话」讲清楚，
+/// 避免模型把系统快照当成用户自述。
+fn build_chat_user_with_context(question: &str, system_ctx: &str) -> String {
+    let q = redact_for_llm(question.trim());
+    format!(
+        "用户问题：{q}\n\n当前服务器概要（已脱敏，仅供回答参考，不要当作已由用户提供的原始数据）：\n{system_ctx}"
+    )
+}
+
 async fn generate_answer(
     cfg: &crate::routes::settings::LlmConfig,
     question: &str,
+    system_ctx: Option<&str>,
 ) -> Result<String, LlmFailure> {
+    let user = match system_ctx {
+        Some(ctx) => build_chat_user_with_context(question, ctx),
+        None => build_chat_user(question),
+    };
     call_llm(
         cfg,
         "你是服务器运维助手，用简体中文简洁、准确地回答用户的问题；不要编造未提供的系统数据。",
-        &build_chat_user(question),
+        &user,
         800,
     )
     .await
@@ -819,6 +836,54 @@ fn empty_brief() -> ContextBrief {
     }
 }
 
+/// chat 模式（开启 chat_context 时）附带给模型的脱敏系统概要：把面板独有的数据面
+/// 汇成一段人话，让自由输入也能结合本机实况作答。出盒前经 `redact_for_llm` 脱敏
+/// （IP/邮箱/密钥/Bearer 一律清，路径与主机名按设计保留——它们是诊断核心证据）。
+fn build_chat_context(ctx: &Ctx) -> String {
+    let m = &ctx.snap.mem;
+    let avail_pct = if m.total_kib > 0 {
+        m.available_kib as f64 * 100.0 / m.total_kib as f64
+    } else { 0.0 };
+    let mut s = format!(
+        "CPU 使用率 {:.0}%（load1/5/15 = {:.2}/{:.2}/{:.2}）；内存 已用 {} / 总量 {}（可用 {:.0}%）；进程数 {}；运行时长 {}；",
+        ctx.snap.cpu.total_pct,
+        ctx.snap.cpu.load1, ctx.snap.cpu.load5, ctx.snap.cpu.load15,
+        human_kib(m.used_kib), human_kib(m.total_kib), avail_pct,
+        ctx.snap.proc_count, fmt_uptime(ctx.snap.uptime_sec),
+    );
+    if let Some(d) = ctx.snap.disks.iter()
+        .filter(|d| d.total_bytes > 0)
+        .max_by(|a, b| {
+            let ra = a.used_bytes as f64 / a.total_bytes as f64;
+            let rb = b.used_bytes as f64 / b.total_bytes as f64;
+            ra.partial_cmp(&rb).unwrap_or(std::cmp::Ordering::Equal)
+        })
+    {
+        s.push_str(&format!(
+            "磁盘最高占用：{} {}%（已用 {} / 总量 {}）；",
+            d.mount_point.display(),
+            (d.used_bytes as f64 * 100.0 / d.total_bytes as f64) as u32,
+            human_bytes(d.used_bytes), human_bytes(d.total_bytes),
+        ));
+    }
+    if !ctx.top_cpu.is_empty() {
+        let top = ctx.top_cpu.iter().take(3)
+            .map(|p| format!("{} (pid {}) {:.0}%", p.name, p.pid, p.cpu_pct))
+            .collect::<Vec<_>>()
+            .join("、");
+        s.push_str(&format!("Top CPU 进程：{top}；"));
+    }
+    redact_for_llm(&s)
+}
+
+/// 把秒数渲染成中文时长（chat 概要展示用）。
+fn fmt_uptime(sec: u64) -> String {
+    if sec >= 86_400 { format!("{} 天", sec / 86_400) }
+    else if sec >= 3600 { format!("{} 小时", sec / 3600) }
+    else if sec >= 60 { format!("{} 分钟", sec / 60) }
+    else { format!("{sec} 秒") }
+}
+
 // ───────────────────────── 端点 ─────────────────────────
 
 /// POST /api/v1/assistant/diagnose
@@ -838,18 +903,8 @@ pub async fn diagnose(
     // 关键词路由只在诊断模式内选域，绝不用来判定「用户是不是想体检」。
     let scope = route_scope(&question);
 
-    // chat 不采集系统数据：普通对话不该被拖进全量体检，也不产生可外发的诊断上下文。
-    let (summary, findings, ctx_brief) = if mode == "chat" {
-        (String::new(), Vec::new(), empty_brief())
-    } else {
-        let ctx = collect(&state).await;
-        let findings = run_diagnosis(&ctx, scope);
-        let summary = build_summary(&ctx, &findings);
-        (summary, findings, brief(&ctx))
-    };
-
-    // 门控三类分开：只读停用 / 未配置 / 可用。失败绝不静默降级成"看起来成功"。
-    // 只读模式不外发：出站请求是副作用，且持有最低读权限的人可反复触发。
+    // 先算门控：chat 模式是否带系统上下文，取决于叙事开关已开 + chat_context 已开。
+    // cfg 为 Err（只读 / 未配置）时 chat 不采集、diagnose 仍采集（规则报告照常返回）。
     let cfg = if state.read_only {
         Err(("disabled", "只读模式下不调用模型".to_string()))
     } else {
@@ -860,6 +915,25 @@ pub async fn diagnose(
         }
     };
 
+    // chat+context：仅当 cfg 可用且 chat_context 开启才采集系统数据；否则跳过（省一次全量体检）。
+    // diagnose：无论如何都采集，规则报告即使 LLM 停用也要返回。
+    let chat_ctx_enabled = matches!(&cfg, Ok(c) if c.chat_context);
+    let (summary, findings, ctx_brief, chat_ctx) = if mode == "chat" {
+        if chat_ctx_enabled {
+            let ctx = collect(&state).await;
+            (String::new(), Vec::new(), empty_brief(), Some(build_chat_context(&ctx)))
+        } else {
+            (String::new(), Vec::new(), empty_brief(), None)
+        }
+    } else {
+        let ctx = collect(&state).await;
+        let findings = run_diagnosis(&ctx, scope);
+        let summary = build_summary(&ctx, &findings);
+        (summary, findings, brief(&ctx), None)
+    };
+
+    // 门控三类分开：只读停用 / 未配置 / 可用。失败绝不静默降级成"看起来成功"。
+    // 只读模式不外发：出站请求是副作用，且持有最低读权限的人可反复触发。
     let mut llm_status = "used";
     let mut llm_error: Option<String> = None;
     let mut answer: Option<String> = None;
@@ -871,7 +945,7 @@ pub async fn diagnose(
         }
         Ok(cfg) => {
             let result = if mode == "chat" {
-                generate_answer(&cfg, &question).await
+                generate_answer(&cfg, &question, chat_ctx.as_deref()).await
             } else {
                 generate_narrative(&cfg, &question, scope, &summary, &findings).await
             };
@@ -1126,6 +1200,40 @@ mod tests {
     fn chat_user_message_is_forwarded_verbatim_but_redacted() {
         assert_eq!(build_chat_user("  你好，什么是反向代理  "), "你好，什么是反向代理");
         assert_eq!(build_chat_user("token=abc123 怎么配置"), "token=<redacted> 怎么配置");
+    }
+
+    #[test]
+    fn chat_user_with_context_carries_question_and_redacts() {
+        // 负向对照：把 build_chat_user_with_context 改成「只返问题」这条即红（系统上下文丢失）。
+        let with = build_chat_user_with_context("token=abc 怎么配", "CPU 10%");
+        assert!(with.contains("token=<redacted> 怎么配"), "问题须脱敏：{with}");
+        assert!(with.contains("CPU 10%"), "须附带系统概要：{with}");
+        assert!(with.contains("已脱敏"), "须明确标注脱敏与仅供参考");
+        assert_eq!(build_chat_user("你好"), "你好", "不带上下文时仍是纯转发");
+    }
+
+    #[test]
+    fn chat_context_is_redacted_and_informative() {
+        // 负向对照：把 build_chat_context 改成「返回空串」这条即红（chat 上下文失效）。
+        // 构造一份有实采数据的上下文：CPU 88%、可用 40%、有进程。
+        let mut c = ctx(snap(88.0, 2.0, Some(vec![0.5; 4]), 40.0));
+        c.top_cpu = vec![ProcessInfo {
+            pid: 9, ppid: 1, name: "nginx".into(),
+            cpu_pct: 12.0, rss_kib: 4096, cmdline: String::new(), user: None,
+        }];
+        c.snap.disks = vec![DiskSample {
+            mount_point: "/".into(), device: "/dev/sda1".into(), fs_type: "ext4".into(),
+            total_bytes: 1000, used_bytes: 730, is_network_fs: false,
+        }];
+        let text = build_chat_context(&c);
+        assert!(text.contains("CPU 使用率 88%"), "应含 CPU 实采值：{text}");
+        assert!(text.contains("内存"), "应含内存维度");
+        assert!(text.contains("运行时长"), "应含运行时长");
+        assert!(text.contains("磁盘最高占用"), "应含磁盘维度");
+        assert!(text.contains("Top CPU 进程"), "应含 Top 进程");
+        assert!(text.contains("nginx"), "应点名进程");
+        // 出盒前脱敏：即便快照里没有密钥，函数也必须对泄漏形态负责（防御式）。
+        assert!(!text.contains("sk-live-"), "快照不得含密钥样式文本");
     }
 
     #[test]
