@@ -510,7 +510,8 @@ pub struct TestLlmResp {
     pub latency_ms: u64,
     pub endpoint: String,
     pub model: Option<String>,
-    /// 该 model 是否出现在 /v1/models 的返回里（model 未配置时恒 false）
+    /// 配置模型时表示已用该模型成功发起一次最小对话（/chat/completions）；
+    /// 未配模型时表示是否在 /v1/models 列表里（model 未配置时恒 false）
     pub model_found: bool,
     /// 可用模型数量（解析失败为 null）
     pub model_count: Option<usize>,
@@ -568,7 +569,17 @@ fn plain_api_key(state: &Shared, raw: &str) -> Option<String> {
     master.decrypt(&blob).ok().and_then(|b| String::from_utf8(b).ok())
 }
 
-/// `POST /api/v1/settings/llm/test`——真实探测 OpenAI 兼容的 `/v1/models`。
+/// 探测目标选择（修复 401 误报）：配了模型名 ⇒ 打 `/chat/completions`（真实鉴权
+/// + 模型校验，比只读 `/models` 更权威）；未配模型名 ⇒ 退回 `/models` 列表/计数。
+fn llm_probe_url(endpoint: &str, model: Option<&str>) -> (String, bool) {
+    match model {
+        Some(_) => (format!("{endpoint}/chat/completions"), true),
+        None => (format!("{endpoint}/models"), false),
+    }
+}
+
+/// `POST /api/v1/settings/llm/test`——真实探测 LLM 接入（配模型打
+/// `/chat/completions`，否则 `/v1/models`）。
 ///
 /// 设计要点：
 /// - **先测后存（仅 model / api_key）**：这两项可用当前输入验证，不必先保存
@@ -620,7 +631,8 @@ pub async fn test_llm(
         .filter(|s| !s.is_empty()).map(str::to_string);
 
     // 禁跟随重定向：否则一个公网 URL 可以 302 到内网/回环，`valid_endpoint`
-    // 的结构校验就形同虚设。测试连接只读一次 `/models`，不需要跳转。
+    // 的结构校验就形同虚设。测试连接只发一次请求（/chat/completions 或 /models），
+    // 不需要跳转。
     let client = match reqwest::Client::builder()
         .timeout(TEST_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
@@ -641,9 +653,25 @@ pub async fn test_llm(
         }
     };
 
-    let url = format!("{endpoint}/models");
+    // 探测策略（修复 401 误报）：配了模型 ⇒ 打 `/chat/completions`（真实鉴权 +
+    // 模型校验，更权威）；部分服务商（如 Agnes）即便密钥有效也对 `/v1/models`
+    // 返回 401，却对 `/chat/completions` 正常 ⇒ 只探 /models 会误报 401。
+    // 未配模型 ⇒ 退回 `/models` 列表/计数（旧行为）。
+    let (probe_url, use_chat_probe) = llm_probe_url(&endpoint, model.as_deref());
     let started = std::time::Instant::now();
-    let mut call = client.get(&url).header("accept", "application/json");
+    let mut call = if use_chat_probe {
+        client
+            .post(&probe_url)
+            .header("accept", "application/json")
+            .json(&serde_json::json!({
+                "model": model.as_deref().unwrap_or(""),
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 1,
+                "stream": false,
+            }))
+    } else {
+        client.get(&probe_url).header("accept", "application/json")
+    };
     if let Some(k) = api_key.as_deref() {
         call = call.bearer_auth(k);
     }
@@ -674,6 +702,23 @@ pub async fn test_llm(
                     model_count: None,
                     status: Some(status),
                     detail: status_detail(status, &body),
+                }
+            } else if use_chat_probe {
+                // 用配置模型成功发起一次最小对话 ⇒ 密钥被接受且模型可调用。
+                let detail = format!(
+                    "连通且模型可用（已用 `{}` 发起一次最小对话验证，{} ms）",
+                    model.as_deref().unwrap_or(""),
+                    latency_ms
+                );
+                TestLlmResp {
+                    ok: true,
+                    latency_ms,
+                    endpoint,
+                    model,
+                    model_found: true,
+                    model_count: None,
+                    status: Some(status),
+                    detail,
                 }
             } else {
                 let v = serde_json::from_str::<Value>(&body).ok();
@@ -862,6 +907,18 @@ mod tests {
         assert!(!chat_context_on(&t), "坏值不得当成开");
         t.insert(K_LLM_CHAT_CONTEXT.to_string(), "\"TRUE\"".into());
         assert!(!chat_context_on(&t), "大小写不将就：只认小写 true");
+    }
+
+    /// 401 误报回归：配了模型必须打 /chat/completions，未配才退回 /models。
+    /// 负向对照：若把 `llm_probe_url` 改成恒返回 /models，这条即红——复现 401 误报。
+    #[test]
+    fn llm_probe_prefers_chat_completions_when_model_set() {
+        let (u, chat) = llm_probe_url("https://x/v1", Some("gpt-4o"));
+        assert!(chat, "配了模型必须打 /chat/completions");
+        assert_eq!(u, "https://x/v1/chat/completions");
+        let (u2, chat2) = llm_probe_url("https://x/v1", None);
+        assert!(!chat2, "未配模型才退回 /models");
+        assert_eq!(u2, "https://x/v1/models");
     }
 
     /// 往 settings 表写一行（测试辅助）。

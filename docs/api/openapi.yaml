@@ -1428,7 +1428,7 @@ components:
         latency_ms:  { type: integer }
         endpoint:    { type: string }
         model:       { type: [string, "null"] }
-        model_found: { type: boolean, description: model 是否出现在 /v1/models 的返回里 }
+        model_found: { type: boolean, description: 配置模型时表示已用该模型成功发起一次最小对话验证（/chat/completions）；未配模型时表示是否在 /v1/models 列表里（model 未配置时恒 false） }
         model_count: { type: [integer, "null"], description: 可用模型数；响应不是预期 JSON 时为 null }
         status:      { type: [integer, "null"], description: HTTP 状态码；请求层失败（连不上/超时）时为 null }
         detail:      { type: string, description: 人话结论：成功摘要或失败原因 }
@@ -4328,7 +4328,7 @@ paths:
     post:
       operationId: post_settings_llm_test
       tags: [settings]
-      summary: 测试 AI 助手 LLM 接入（真实探测 OpenAI 兼容 /v1/models，需 settings.manage）
+      summary: 测试 AI 助手 LLM 接入（配模型时真实探测 /v1/chat/completions，否则 /v1/models，需 settings.manage）
       description: |
         **F-02① 彻底收紧**：目标 Endpoint 锁定为库里已保存的值，请求体里的
         endpoint 仅用于一致性校验，不一致直接 400（改动请先保存配置）。
@@ -4340,8 +4340,10 @@ paths:
         请求体 model / api_key 可省略：model 省略时取已保存值，api_key 省略时
         不携带任何密钥（**先测后存**仅对这两项成立，避免保存后才发现配错）。
 
-        判定：HTTP 2xx 且响应可解析为 OpenAI 兼容 JSON ⇒ ok=true，并核对
-        配置的 model 是否在 /v1/models 列表里（model_found）。
+        判定：若已配置 model，则向 /v1/chat/completions 发起一次最小对话
+        （max_tokens:1）验证——2xx 即表示密钥被接受且模型可调用（model_found=true），
+        这比只读 /v1/models 更权威，可避免部分服务商对 /v1/models 误报 401；
+        若未配置 model，则退回 GET /v1/models 列表并核对 model_found / model_count。
 
         **探测失败一律 ok:false + detail，不返回 500**——密钥填错是配置问题，
         不是服务器错误；返回 500 会让前端把「密钥无效」显示成「请求失败」。
