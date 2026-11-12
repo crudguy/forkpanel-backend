@@ -633,7 +633,7 @@ mod tests {
             (include_str!("routes/sites/apply.rs"), ".get(cap_keys::WEBSERVER_MANAGE)", 2, "apply / reload"),
             (include_str!("routes/sites/conf.rs"), ".get(cap_keys::WEBSERVER_MANAGE)", 3, "conf::*"),
             (include_str!("routes/sites/conf.rs"), ".get(cap_keys::LOGS_READ)", 1, "sites::logs"),
-            (include_str!("routes/logs.rs"), ".get(cap_keys::LOGS_READ)", 1, "logs::*"),
+            (include_str!("routes/logs.rs"), ".get(cap_keys::LOGS_READ)", 4, "logs::*（sources + read + download + stats 各一道）"),
             (include_str!("routes/sites/ssl.rs"), ".get(cap_keys::WEBSERVER_MANAGE)", 2, "ssl::*"),
             (include_str!("routes/sites/ssl.rs"), ".get(cap_keys::SSL_ACME)", 4, "ssl_apply / renew / sweep / 设置"),
             (include_str!("routes/sites/ssl.rs"), ".get(cap_keys::SSL_SELFSIGNED)", 2, "ssl_apply / cert_renew"),

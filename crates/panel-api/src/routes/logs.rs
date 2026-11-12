@@ -78,6 +78,9 @@ pub async fn read(
     Query(q): Query<ReadQ>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::LOG_VIEW)?;
+    if !state.capabilities.get(cap_keys::LOGS_READ).map(|c| c.supported).unwrap_or(false) {
+        return Err(ApiError::unsupported("logs.read"));
+    }
 
     let src = find_source(&state, &id).await?;
     let lines = q.lines.unwrap_or(200).min(MAX_LINES);
@@ -141,6 +144,9 @@ pub async fn download(
     AxPath(id): AxPath<String>, Query(q): Query<DownloadQ>,
 ) -> ApiResult<Response> {
     crate::auth::require(&s, perm::LOG_VIEW)?;
+    if !state.capabilities.get(cap_keys::LOGS_READ).map(|c| c.supported).unwrap_or(false) {
+        return Err(ApiError::unsupported("logs.read"));
+    }
     let src = find_source(&state, &id).await?;
     let lines = q.lines.unwrap_or(2000).min(DOWNLOAD_MAX_LINES);
     let grep = match q.grep {
@@ -212,6 +218,9 @@ pub async fn stats(
     AxPath(id): AxPath<String>, Query(q): Query<StatsQ>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::LOG_VIEW)?;
+    if !state.capabilities.get(cap_keys::LOGS_READ).map(|c| c.supported).unwrap_or(false) {
+        return Err(ApiError::unsupported("logs.read"));
+    }
     let src = find_source(&state, &id).await?;
     // 统计默认扫满硬上限：样本越大分布越可信，但仍受 MAX_LINES 保护
     let lines = q.lines.unwrap_or(MAX_LINES).min(MAX_LINES);

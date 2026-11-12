@@ -246,6 +246,8 @@ pub struct LogStreamQ {
     pub limit: Option<usize>,
     #[serde(default)]
     pub follow: Option<bool>,
+    /// 时间窗口（Unix 秒）。仅 journald 源有效；文件源行无时间戳，传了也会被忽略。
+    pub since: Option<i64>,
 }
 
 fn line_json(l: &panel_os::LogLine) -> String {
@@ -260,6 +262,7 @@ pub async fn follow_source(
     filter: Option<String>,
     level: Option<String>,
     limit: usize,
+    since: Option<i64>,
 ) -> axum::response::Response {
     let n = limit.clamp(1, 2000);
     let cap = state.tier.max_sse_clients();
@@ -272,14 +275,14 @@ pub async fn follow_source(
 
     // 守卫在计数 +1 之后立刻持有；下方 follow() 失败提前返回时由守卫回收（替代旧的显式 fetch_sub）
     let conn = SseConnGuard;
-    // level 一路传到 provider：此前这里硬编码 None，SSE 端点文档化的 level 参数被静默丢弃
-    // （历史补读与实时流都必须尊重它，否则"跟随中切的筛选"只对一次性读生效）
+    // level / since 一路传到 provider：此前这里硬编码 None，SSE 端点文档化的 level/since
+    // 参数被静默丢弃（历史补读与实时流都必须尊重它们，否则"跟随中切的筛选"只对一次性读生效）
     let history = state.os.logs().read(&src, panel_os::LogQuery {
-        lines: n, grep: filter.clone(), level: level.clone(), follow: false, since_unix: None,
+        lines: n, grep: filter.clone(), level: level.clone(), follow: false, since_unix: since,
     }).await.unwrap_or_default();
 
     let rx = match state.os.logs().follow(&src, panel_os::LogQuery {
-        lines: n, grep: filter, level, follow: true, since_unix: None,
+        lines: n, grep: filter, level, follow: true, since_unix: since,
     }).await {
         Ok(rx) => rx,
         Err(e) => {
@@ -329,7 +332,7 @@ pub async fn log_stream(
     let Some(src) = srcs.into_iter().find(|s| s.id == want) else {
         return ApiError::not_found("log source").into_response();
     };
-    follow_source(state.clone(), src, q.filter, q.level, q.limit.unwrap_or(200)).await
+    follow_source(state.clone(), src, q.filter, q.level, q.limit.unwrap_or(200), q.since).await
 }
 
 /// 服务日志跟随频道（契约：`/api/v1/services/{unit}/journal/stream`）。
