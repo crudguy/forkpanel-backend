@@ -1036,11 +1036,15 @@ components:
       type: object
       properties:
         question:     { type: string }
-        scope:        { type: string, enum: [all, cpu, mem, disk, log, service, security, backup] }
+        mode:         { type: string, enum: [chat, diagnose], description: 本次意图；由请求方显式指定，缺省 diagnose }
+        scope:        { type: string, enum: [all, cpu, mem, disk, log, service, security, backup], description: 诊断域；仅 diagnose 模式有效，chat 模式恒为 all }
         generated_at: { type: integer }
-        summary:      { type: string }
-        narrative:    { type: string, nullable: true, description: LLM 人话叙事（未配置 LLM 时缺省不返回） }
-        findings:     { type: array, items: { $ref: '#/components/schemas/AssistantFinding' } }
+        summary:      { type: string, description: 规则诊断一句话结论；chat 模式为空串 }
+        answer:       { type: string, nullable: true, description: chat 模式的模型生成内容（原样转发用户消息后的回答） }
+        narrative:    { type: string, nullable: true, description: diagnose 模式的 LLM 人话解读；LLM 不可用时缺省不返回 }
+        llm_status:   { type: string, enum: [used, not_configured, disabled, failed], description: LLM 调用状态；恒存在，失败/未配置不得静默降级 }
+        llm_error:    { type: string, nullable: true, description: 失败分类文案（不含对方响应体与密钥）；used 时缺省不返回 }
+        findings:     { type: array, items: { $ref: '#/components/schemas/AssistantFinding' }, description: 规则发现；chat 模式为空数组 }
         ctx:          { $ref: '#/components/schemas/AssistantContext' }
 
     AssistantFinding:
@@ -4479,12 +4483,19 @@ paths:
     post:
       operationId: post_assistant_diagnose
       tags: [assistant]
-      summary: 诊断问答（内置规则引擎，只读）
+      summary: AI 助手问答（显式 mode 分流，只读）
       description: |
-        采集指标/进程/服务/日志/安全基线/备份记录，按确定性规则产出
-        Finding{severity, evidence(真实数据引用), suggestion, action}。
-        问句经轻量关键词路由到诊断域（all/cpu/mem/disk/log/service/security/backup）；
-        未命中即全量体检。**只读**：action 仅 navigate，处置由用户在对应视图人工确认。
+        **意图由请求体的 mode 显式决定，不靠关键词猜测**，缺省 diagnose 以兼容既有调用。
+        - mode=chat：把 question 原样（脱敏后）转发给已配置的 LLM，返回 answer 作为主响应；
+          不采集系统数据、不外发诊断上下文，findings 为空、ctx 为零值、summary 为空串。
+          普通对话因此不会被误判成体检。
+        - mode=diagnose：采集指标/进程/服务/日志/安全基线/备份记录，按确定性规则产出
+          Finding{severity, evidence(真实数据引用), suggestion, action}；question 同时进入
+          LLM 提示词，narrative 围绕问题作答。关键词路由只在此模式内选诊断域
+          （all/cpu/mem/disk/log/service/security/backup），未命中即全量体检。
+        **只读**：action 仅 navigate，处置由用户在对应视图人工确认。
+        响应恒带 llm_status；LLM 未配置/停用/失败时如实上报并带 llm_error，绝不静默
+        把降级报告伪装成调用成功。
       security: [cookieAuth]
       requestBody:
         required: true
@@ -4494,6 +4505,7 @@ paths:
               type: object
               properties:
                 question: { type: [string, "null"], description: 自然语言问句，可空 }
+                mode:     { type: [string, "null"], enum: [chat, diagnose, null], description: 显式意图；chat=自由对话转发消息，diagnose=规则体检；缺省 diagnose }
       responses:
         '200': { description: 诊断报告, content: { application/json: { schema: { $ref: '#/components/schemas/AssistantReport' } } } }
         '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' }

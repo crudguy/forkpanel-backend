@@ -16,6 +16,18 @@
 //! 关时 `settings::llm_config()` 直接返回 None（不外发任何数据）；
 //! ② **发送前脱敏**（`redact_for_llm`：IPv4/邮箱/密钥样式键值/Bearer）；
 //! ③ **披露**：会外发什么由 `settings::NARRATIVE_NOTE` 单一维护并原样展示。
+//!
+//! **两种意图（显式 mode，不靠猜关键词）**：
+//! - `mode=chat`（自由输入）：**原样转发用户消息**到 LLM，返回 `answer` 作为主响应；
+//!   不采集系统数据、不外发诊断上下文，因此普通对话不会再被当成体检。
+//! - `mode=diagnose`（快捷提问 / 页面解释）：保留规则诊断引擎，`question` 同时
+//!   进入 LLM 提示词，`narrative` 围绕问题作答；`findings/ctx` 只在此模式有实值。
+//!
+//! 缺省 `diagnose` 以兼容既有调用；关键词路由只用于诊断模式内选域，**绝不**
+//! 用来判定「用户是不是想体检」。
+//!
+//! **LLM 状态不再静默**：响应恒带 `llm_status`（used/not_configured/disabled/failed）
+//! 与失败分类 `llm_error`；失败在后端日志留痕，前端不再把降级报告冒充成功。
 
 use crate::auth::perm;
 use crate::error::{ok, ApiResult};
@@ -36,16 +48,27 @@ const SAMPLE_WINDOW: Duration = Duration::from_millis(400);
 #[derive(Debug, Serialize)]
 pub struct AssistantReport {
     pub question: String,
+    /// 本次意图：chat（自由对话，转发消息）| diagnose（规则体检）。
+    /// 由请求方显式给出，关键词路由不参与判定。
+    pub mode: &'static str,
     /// 命中的诊断域：all|cpu|mem|disk|log|service|security|backup
     pub scope: &'static str,
     pub generated_at: i64,
     pub summary: String,
-    /// LLM 人话叙事（可选）：仅当面板已配置 LLM 且调用成功时填充；
-    /// 未配置/失败/超时则省略（serde skip_serializing_if），回退纯规则报告。
+    /// chat 模式的模型生成内容（diagnose 模式省略）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
+    /// LLM 人话叙事（diagnose 模式且调用成功时填充）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub narrative: Option<String>,
+    /// LLM 调用状态：used | not_configured | disabled | failed。
+    /// **恒存在**：失败/未配置时也必须如实上报，不许静默降级成"看起来成功"。
+    pub llm_status: &'static str,
+    /// 失败分类文案（不含对方响应体、不含密钥）；used 时省略
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_error: Option<String>,
     pub findings: Vec<Finding>,
-    /// 体检基线：即使无异常也给出关键真实数值
+    /// 体检基线：diagnose 模式为真实数值；chat 模式不采集，为零值占位
     pub ctx: ContextBrief,
 }
 
@@ -99,6 +122,8 @@ pub struct Action {
 #[derive(Debug, Deserialize)]
 pub struct DiagnoseReq {
     pub question: Option<String>,
+    /// 显式意图：chat | diagnose（缺省 diagnose，兼容既有调用）
+    pub mode: Option<String>,
 }
 
 // ───────────────────────── 诊断上下文 ─────────────────────────
@@ -446,8 +471,8 @@ fn brief(ctx: &Ctx) -> ContextBrief {
     }
 }
 
-/// LLM 叙事请求超时。宁可让用户多等若干秒拿到人话解读，也不要挂住一个 axum worker；
-/// 超时即视为「叙事不可用」，回退纯规则报告（不影响 findings/summary）。
+/// LLM 请求超时（叙事层与对话模式共用）。宁可让用户多等若干秒，也不要挂住一个
+/// axum worker；超时按 LlmFailure 上报，不再静默吞掉。
 const NARRATIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
 // ───────────────────────── 外发脱敏（P0-2） ─────────────────────────
@@ -625,14 +650,19 @@ pub(crate) fn redact_for_llm(s: &str) -> String {
     out
 }
 
-/// 把结构化诊断拼成给 LLM 的纯数据提示词。**只含我们真实采集到的字段**——
-/// 系统提示明确要求不得编造诊断中没有的数据，从源头杜绝幻觉式臆测。
-/// 所有携带原始数据的字段出盒前经 `redact_for_llm` 脱敏（P0-2）。
-fn build_prompt(scope: &str, summary: &str, findings: &[Finding]) -> String {
-    // 出盒前脱敏：summary 与 evidence 是唯二携带原始数据的字段（进程 cmdline、
-    // 日志原文都在 evidence 里）。title/suggestion 是规则生成的固定文案，
-    // 一并过脱敏只是廉价保险。
+/// 把结构化诊断拼成给 LLM 的提示词。**用户问句与实采数据一起出盒**——
+/// 否则模型只会复述体检结论，与用户问了什么完全无关（本次修复的核心）。
+/// 所有携带原始文本的字段出盒前经 `redact_for_llm` 脱敏（P0-2）。
+fn build_prompt(question: &str, scope: &str, summary: &str, findings: &[Finding]) -> String {
+    // 出盒前脱敏：question 是用户自由输入，可能粘了密钥；summary 与 evidence
+    // 携带系统实采数据（进程 cmdline、日志原文）。三者一个都不能漏。
     let mut s = String::new();
+    let q = redact_for_llm(question.trim());
+    if q.is_empty() {
+        s.push_str("用户未填写具体问题，请按体检结论作答。\n");
+    } else {
+        s.push_str(&format!("用户问题：{q}\n"));
+    }
     s.push_str(&format!("诊断范围：{scope}\n一句话结论：{}\n", redact_for_llm(summary)));
     if findings.is_empty() {
         s.push_str("未发现异常项。\n");
@@ -652,88 +682,225 @@ fn build_prompt(scope: &str, summary: &str, findings: &[Finding]) -> String {
         }
     }
     s.push_str(
-        "\n请用简体中文写一段 2-4 句的人话总结：先说整体状况，再点最关键的一两件事与优先处置，\
-         不要给出命令行，不要编造诊断结果里没有的数据。",
+        "\n请围绕上面的用户问题，用简体中文写一段 2-4 句的人话总结：以诊断数据为依据，\
+         先回应问题，再点最关键的一两件事与优先处置，不要给出命令行，\
+         不要编造诊断结果里没有的数据。",
     );
     s
 }
 
-/// 请求一次 OpenAI 兼容 `/chat/completions`，把规则诊断转成人话叙事。
-/// **全链路失败即 `None`**——LLM 是增强层，任何错误（无配置/网络/超时/非 2xx/解析失败）
-/// 都不许影响主报告；错误只在后端日志留痕，前端永远拿到一份可用的规则诊断。
-async fn generate_narrative(
+/// LLM 调用失败的分类。**只保留可排障的类别，绝不携带对方响应体或密钥**——
+/// 端点由管理员填写，错误页常带内部主机名，密钥更不能出现在响应或日志里。
+#[derive(Debug)]
+enum LlmFailure {
+    /// 传输/客户端错误，值为粗分类（timeout/connect/request/decode/client）
+    Transport(&'static str),
+    Http(u16),
+    Parse,
+}
+
+impl LlmFailure {
+    /// 用户可见的失败原因。分类文案，不是对方响应原文。
+    fn detail(&self) -> String {
+        match self {
+            LlmFailure::Transport(kind) => format!("连接模型服务失败（{kind}）"),
+            LlmFailure::Http(s) => match s {
+                401 => "模型服务拒绝密钥（HTTP 401）".into(),
+                403 => "模型服务拒绝访问（HTTP 403）".into(),
+                404 => "对话接口不存在（HTTP 404）".into(),
+                429 => "模型服务限流（HTTP 429）".into(),
+                n if *n >= 500 => format!("模型服务异常（HTTP {n}）"),
+                n => format!("模型服务返回 HTTP {n}"),
+            },
+            LlmFailure::Parse => "模型响应解析失败".into(),
+        }
+    }
+}
+
+/// 把 reqwest 错误压成粗分类：Display 可能带 URL/主机，不进日志也不回显。
+fn classify_transport(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout() { "timeout" }
+    else if e.is_connect() { "connect" }
+    else if e.is_request() { "request" }
+    else if e.is_body() || e.is_decode() { "decode" }
+    else { "other" }
+}
+
+/// 唯一的外发出口：叙事层与对话模式共用，避免两份实现各自吞错。
+/// 失败返回分类错误，由调用方写日志并如实写进 `llm_status`。
+async fn call_llm(
     cfg: &crate::routes::settings::LlmConfig,
-    scope: &str,
-    summary: &str,
-    findings: &[Finding],
-) -> Option<String> {
-    let prompt = build_prompt(scope, summary, findings);
-    let client = reqwest::Client::builder().timeout(NARRATIVE_TIMEOUT).build().ok()?;
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+) -> Result<String, LlmFailure> {
+    let client = reqwest::Client::builder()
+        .timeout(NARRATIVE_TIMEOUT)
+        .build()
+        .map_err(|_| LlmFailure::Transport("client"))?;
     let url = format!("{}/chat/completions", cfg.endpoint.trim_end_matches('/'));
     let body = serde_json::json!({
         "model": cfg.model,
         "messages": [
-            {"role": "system", "content": "你是服务器运维助手，擅长把结构化诊断翻译成运维人员能一眼看懂的人话。"},
-            {"role": "user", "content": prompt},
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
         ],
         "temperature": 0.3,
-        "max_tokens": 400,
+        "max_tokens": max_tokens,
     });
-    let resp = client.post(&url).bearer_auth(&cfg.api_key).json(&body).send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
+    let resp = client.post(&url).bearer_auth(&cfg.api_key).json(&body).send().await
+        .map_err(|e| LlmFailure::Transport(classify_transport(&e)))?;
+    let status = resp.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(LlmFailure::Http(status));
     }
-    let v: serde_json::Value = resp.json().await.ok()?;
+    let v: serde_json::Value = resp.json().await.map_err(|_| LlmFailure::Parse)?;
     v.get("choices")
         .and_then(|c| c.get(0))
         .and_then(|c| c.get("message"))
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_str())
         .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or(LlmFailure::Parse)
+}
+
+/// diagnose 模式：把用户问句与规则诊断一起交给模型，生成 `narrative`。
+async fn generate_narrative(
+    cfg: &crate::routes::settings::LlmConfig,
+    question: &str,
+    scope: &str,
+    summary: &str,
+    findings: &[Finding],
+) -> Result<String, LlmFailure> {
+    let prompt = build_prompt(question, scope, summary, findings);
+    call_llm(
+        cfg,
+        "你是服务器运维助手，擅长结合系统诊断数据、针对用户的问题给出运维人员能一眼看懂的人话解读。",
+        &prompt,
+        400,
+    )
+    .await
+}
+
+/// chat 模式：用户消息原样成为 user message（仅脱敏），不注入任何系统诊断数据。
+/// 这是「正常对话不被误判为体检」的实现点。
+fn build_chat_user(question: &str) -> String {
+    redact_for_llm(question.trim())
+}
+
+async fn generate_answer(
+    cfg: &crate::routes::settings::LlmConfig,
+    question: &str,
+) -> Result<String, LlmFailure> {
+    call_llm(
+        cfg,
+        "你是服务器运维助手，用简体中文简洁、准确地回答用户的问题；不要编造未提供的系统数据。",
+        &build_chat_user(question),
+        800,
+    )
+    .await
+}
+
+/// 意图只认显式 mode，缺省 diagnose（兼容既有调用）。**关键词不参与意图判定**。
+fn parse_mode(raw: Option<&str>) -> &'static str {
+    match raw.map(str::trim).map(|s| s.to_ascii_lowercase()).as_deref() {
+        Some("chat") => "chat",
+        _ => "diagnose",
+    }
+}
+
+/// chat 模式不采集系统数据：契约里 `ctx` 必填，用零值占位，前端也不渲染。
+fn empty_brief() -> ContextBrief {
+    ContextBrief {
+        cpu_pct: 0.0, load1: 0.0, load5: 0.0, load15: 0.0,
+        mem_used_kib: 0, mem_total_kib: 0, proc_count: 0, uptime_sec: 0,
+        top_disk: None,
+    }
 }
 
 // ───────────────────────── 端点 ─────────────────────────
 
 /// POST /api/v1/assistant/diagnose
 /// 挂在独立子路由（仅 require_auth，不经 guard_write/read_only_guard）：
-/// 诊断是**只读**语义，只读模式下同样可用；POST 仅为承载 question 请求体。
+/// 只读模式下同样可用；POST 仅为承载 question / mode 请求体。
 pub async fn diagnose(
     State(state): State<Shared>,
     Auth(s): Auth,
     PanelJson(req): PanelJson<DiagnoseReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SYSTEM_VIEW)?;
-    // 一次诊断会做全量采集（指标/进程/服务/日志/基线/备份），成本远高于普通读接口；
-    // 可选的 LLM 叙事还会外发请求 ⇒ 按重活档限流，避免脚本化空转打满宿主。
+    // 诊断模式做全量采集、两种模式都可能外发请求 ⇒ 按重活档限流。
     crate::ratelimit::check_heavy(&state, &s.username, "assistant.diagnose")?;
 
     let question = req.question.unwrap_or_default();
+    let mode = parse_mode(req.mode.as_deref());
+    // 关键词路由只在诊断模式内选域，绝不用来判定「用户是不是想体检」。
     let scope = route_scope(&question);
-    let ctx = collect(&state).await;
-    let findings = run_diagnosis(&ctx, scope);
-    let summary = build_summary(&ctx, &findings);
-    // LLM 叙事：仅当已配置且调用成功才填充；失败/未配置 → None（优雅降级）。
-    //
-    // 只读模式下一律不外发：read_only 的语义是「不改变系统」，出站请求同样是副作用
-    // （把诊断摘要送到第三方），且持有最低读权限的人可反复触发。此时仍返回纯规则报告。
-    let narrative = if state.read_only {
-        None
+
+    // chat 不采集系统数据：普通对话不该被拖进全量体检，也不产生可外发的诊断上下文。
+    let (summary, findings, ctx_brief) = if mode == "chat" {
+        (String::new(), Vec::new(), empty_brief())
+    } else {
+        let ctx = collect(&state).await;
+        let findings = run_diagnosis(&ctx, scope);
+        let summary = build_summary(&ctx, &findings);
+        (summary, findings, brief(&ctx))
+    };
+
+    // 门控三类分开：只读停用 / 未配置 / 可用。失败绝不静默降级成"看起来成功"。
+    // 只读模式不外发：出站请求是副作用，且持有最低读权限的人可反复触发。
+    let cfg = if state.read_only {
+        Err(("disabled", "只读模式下不调用模型".to_string()))
     } else {
         match crate::routes::settings::llm_config(&state).await {
-            Ok(Some(cfg)) => generate_narrative(&cfg, scope, &summary, &findings).await,
-            _ => None,
+            Ok(Some(c)) => Ok(c),
+            Ok(None) => Err(("not_configured", "模型未配置或叙事层未开启".to_string())),
+            Err(_) => Err(("not_configured", "模型配置读取失败".to_string())),
         }
     };
+
+    let mut llm_status = "used";
+    let mut llm_error: Option<String> = None;
+    let mut answer: Option<String> = None;
+    let mut narrative: Option<String> = None;
+    match cfg {
+        Err((status, reason)) => {
+            llm_status = status;
+            llm_error = Some(reason);
+        }
+        Ok(cfg) => {
+            let result = if mode == "chat" {
+                generate_answer(&cfg, &question).await
+            } else {
+                generate_narrative(&cfg, &question, scope, &summary, &findings).await
+            };
+            match result {
+                Ok(text) => {
+                    if mode == "chat" { answer = Some(text); } else { narrative = Some(text); }
+                }
+                Err(failure) => {
+                    eprintln!("[panel] assistant.llm 调用失败（mode={mode}）：{}", failure.detail());
+                    llm_status = "failed";
+                    llm_error = Some(failure.detail());
+                }
+            }
+        }
+    }
+
     let report = AssistantReport {
         question,
+        mode,
         scope,
         generated_at: crate::now_unix(),
         summary,
+        answer,
         narrative,
+        llm_status,
+        llm_error,
         findings,
-        ctx: brief(&ctx),
+        ctx: ctx_brief,
     };
-    // 诊断读取全量系统数据、并可能外发 LLM ⇒ 留痕（此前该端点无任何审计记录）。
     crate::routes::audit(&state, &s, "assistant.diagnose", scope, "ok").await;
     Ok(ok(report))
 }
@@ -869,7 +1036,7 @@ mod tests {
             suggestion: "按占用排行定位来源进程".into(),
             action: Some(Action { kind: "navigate", view: "/processes" }),
         };
-        let p = build_prompt("cpu", "发现 1 项严重", std::slice::from_ref(&f));
+        let p = build_prompt("为什么 CPU 高", "cpu", "发现 1 项严重", std::slice::from_ref(&f));
         assert!(p.contains("cpu"), "应含诊断域");
         assert!(p.contains("发现 1 项严重"), "应含一句话结论");
         assert!(p.contains("mining_frenzy"), "应含真实证据（进程点名）");
@@ -929,7 +1096,7 @@ mod tests {
             suggestion: "检查 /var/log/auth.log 与发信配置".into(),
             action: None,
         };
-        let p = build_prompt("log", "内网 10.0.0.5 有暴力破解痕迹", std::slice::from_ref(&f));
+        let p = build_prompt("看看最近日志", "log", "内网 10.0.0.5 有暴力破解痕迹", std::slice::from_ref(&f));
         assert!(!p.contains("10.0.0.5"), "IP 必须脱敏");
         assert!(!p.contains("admin@example.com"), "邮箱必须脱敏");
         assert!(!p.contains("sk-live-9f8e7d"), "密钥必须脱敏");
@@ -940,5 +1107,55 @@ mod tests {
         // 诊断信号仍在——脱敏脱到叙事失效同样是失败
         assert!(p.contains("sshd") && p.contains("Failed password"), "进程与事件类型要保留");
         assert!(p.contains("/var/log/auth.log"), "路径是诊断证据，刻意不脱敏");
+    }
+
+    #[test]
+    fn prompt_forwards_the_user_question_and_redacts_it() {
+        // 本次修复的核心：问句必须进提示词，否则模型只会复述体检结论。
+        let p = build_prompt("什么是反向代理", "all", "未发现异常", &[]);
+        assert!(p.contains("什么是反向代理"), "用户问题必须出现在出盒提示词里");
+        assert!(p.contains("先回应问题"), "指令须要求围绕问题作答");
+        // 用户自由输入也可能粘了密钥 ⇒ 出盒前同样脱敏
+        let q = build_prompt("我的 api_key=sk-live-9f8e7d 报错", "all", "未发现异常", &[]);
+        assert!(!q.contains("sk-live-9f8e7d"), "问句里的密钥必须脱敏");
+        assert!(q.contains("<redacted>"), "应有脱敏占位符");
+        assert!(build_prompt("", "all", "未发现异常", &[]).contains("用户未填写具体问题"));
+    }
+
+    #[test]
+    fn chat_user_message_is_forwarded_verbatim_but_redacted() {
+        assert_eq!(build_chat_user("  你好，什么是反向代理  "), "你好，什么是反向代理");
+        assert_eq!(build_chat_user("token=abc123 怎么配置"), "token=<redacted> 怎么配置");
+    }
+
+    #[test]
+    fn intent_comes_from_explicit_mode_not_keywords() {
+        // 负向对照：把 parse_mode 改成「按关键词猜意图」这条即红。
+        assert_eq!(parse_mode(Some("chat")), "chat");
+        assert_eq!(parse_mode(Some(" CHAT ")), "chat");
+        assert_eq!(parse_mode(None), "diagnose", "缺省兼容既有调用");
+        assert_eq!(parse_mode(Some("unknown")), "diagnose");
+        // 普通对话的关键词路由结果仍是 all（诊断域），但意图由 mode 独立决定：
+        // chat 模式不会因此跑体检，也不消费 route_scope 的返回值作意图。
+        assert_eq!(route_scope("你好，帮我写段 nginx 配置"), "all");
+        assert_eq!(parse_mode(Some("chat")), "chat");
+    }
+
+    #[test]
+    fn llm_failure_detail_never_leaks_body_or_key() {
+        let cases = [
+            LlmFailure::Transport("timeout"),
+            LlmFailure::Http(401),
+            LlmFailure::Http(404),
+            LlmFailure::Http(503),
+            LlmFailure::Parse,
+        ];
+        for c in &cases {
+            let d = c.detail();
+            assert!(!d.contains("sk-"), "失败文案不得含密钥");
+            assert!(!d.contains("Internal-Service"), "失败文案不得含对方响应体");
+        }
+        assert!(LlmFailure::Http(401).detail().contains("401"));
+        assert!(LlmFailure::Parse.detail().contains("解析"));
     }
 }
