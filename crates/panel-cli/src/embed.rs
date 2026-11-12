@@ -53,10 +53,25 @@ fn is_hashed(p: &str) -> bool {
         && p.rsplit('/').next().unwrap_or("").split('.').count() >= 3
 }
 
+/// 构建产物可能出现的静态资源扩展名白名单。
+///
+/// ⚠ 不能用「最后一段含点号 = 资源」：SPA 路由参数本身可能带点号。本项目
+///   `services/:unit` 的 unit 是 systemd 单元名（`accounts-daemon.service`、
+///   `foo.socket`、`bar.timer`…），旧判据会把刷新 / 分享链接判成资源并回
+///   `404 asset not embedded` —— 从列表点进去正常、直接输 URL 必 404。
+///   白名单由下方 `every_built_asset_extension_is_in_whitelist` 单测钉住：
+///   前端一旦新增资源类型没登记，测试会红，不会退化成静默回退 HTML。
+const ASSET_EXTENSIONS: &[&str] = &[
+    "html", "js", "mjs", "cjs", "css", "map", "json", "webmanifest",
+    "svg", "png", "jpg", "jpeg", "gif", "webp", "avif", "ico",
+    "woff", "woff2", "ttf", "eot", "otf", "txt", "xml", "wasm",
+];
+
 /// 该路径是否"本来就应该是一个静态文件"（而非前端路由）。
 ///
-/// 判据：最后一段含 `.`（有扩展名）即认为是资源请求，例如 `assets/x.js`、
-/// `favicon.ico`、`manifest.json`。SPA 路由（`/sites`、`/processes`）没有扩展名。
+/// 判据：最后一段是「名字 + 点 + **已知静态资源扩展名**」才算资源，例如
+/// `assets/x.js`、`favicon.ico`、`manifest.json`。仅含点号但后缀不在白名单的
+/// （systemd unit 名等 SPA 路由参数）一律当路由 → 走 SPA 回退。
 ///
 /// 为什么要分开：SPA 回退对**路由**是必要的（刷新 `/sites` 不能 404），但对
 /// **资源**是错的——浏览器请求 `index.js` 拿到 `text/html` 会直接报 MIME 错误，
@@ -64,8 +79,16 @@ fn is_hashed(p: &str) -> bool {
 /// 实际报错信息与真因（文件没打进去）毫无关系。这与 `/api` 不回退 HTML 同源。
 fn looks_like_asset(p: &str) -> bool {
     let last = p.rsplit('/').next().unwrap_or("");
-    // 点号开头是隐藏文件（.well-known 之类），不当资源；纯点号结尾也不当资源
-    !last.is_empty() && last != "." && last != ".." && last.contains('.') && !last.starts_with('.')
+    // 点号开头是隐藏文件（.well-known 之类）、纯点号结尾：都不当资源
+    if last.is_empty() || last == "." || last == ".." || last.starts_with('.') {
+        return false;
+    }
+    match last.rsplit_once('.') {
+        Some((stem, ext)) => {
+            !stem.is_empty() && ASSET_EXTENSIONS.iter().any(|e| (*e).eq_ignore_ascii_case(ext))
+        }
+        None => false,
+    }
 }
 
 /// 静态资源 handler
@@ -106,7 +129,8 @@ pub async fn static_handler(uri: Uri) -> Response {
                 ).into_response();
             }
             // SPA 回退：仅对非 API **且非静态资源**的路径生效。
-            // 资源请求（带扩展名）未命中必须如实 404：回退成 HTML 会让浏览器
+            // 资源请求（扩展名在 ASSET_EXTENSIONS 白名单）未命中必须如实 404：
+            // 回退成 HTML 会让浏览器
             // 报 MIME 错误，且把「部署缺文件」这个真因掩盖成"看起来 200 正常"。
             if looks_like_asset(path) {
                 return (StatusCode::NOT_FOUND, "asset not embedded").into_response();
@@ -265,8 +289,8 @@ mod tests {
         }
     }
 
-    /// `looks_like_asset` 的正反两态：SPA 路由不算资源，带扩展名才算。
-    /// 边界（点号开头 / 仅点号结尾）单独钉住——它们决定了这些路径会不会被误判成资源。
+    /// `looks_like_asset` 的正反两态：SPA 路由不算资源，静态资源扩展名才算。
+    /// 边界（点号开头 / 仅点号结尾 / 路由参数带点号）单独钉住。
     #[test]
     fn asset_detection_distinguishes_routes_from_files() {
         // 资源：应当 404，不回退
@@ -278,10 +302,72 @@ mod tests {
         assert!(!looks_like_asset("sites"));
         assert!(!looks_like_asset("processes/detail"));
         assert!(!looks_like_asset(""));
+        // ★ SPA 路由参数带点号：systemd unit 名不是资源（刷新 / 分享链接必须回退）
+        assert!(!looks_like_asset("services/accounts-daemon.service"));
+        assert!(!looks_like_asset("services/systemd-journald.socket"));
+        assert!(!looks_like_asset("services/foo.timer"));
+        assert!(!looks_like_asset("services/bar.target"));
         // 边界
         assert!(!looks_like_asset(".well-known"));      // 点号开头 = 隐藏文件，不当资源
         assert!(!looks_like_asset("dir/."));            // 纯点号
         assert!(!looks_like_asset("."));
         assert!(!looks_like_asset(".."));
+    }
+
+    /// `services/:unit` 的 unit 是 systemd 单元名，天然带点号。刷新 / 分享链接
+    /// 会直接打到后端，必须回退成 SPA 入口，不能 404 `asset not embedded`。
+    /// 走真的 static_handler（不是只测纯函数），钉住端到端行为。
+    #[tokio::test]
+    async fn service_unit_deep_links_fall_back_to_spa() {
+        for path in [
+            "/services/accounts-daemon.service",
+            "/services/systemd-journald.socket",
+            "/services/foo.timer",
+            "/services/bar.target",
+        ] {
+            let uri: Uri = path.parse().expect("合法 URI");
+            let res = static_handler(uri).await;
+            assert_eq!(res.status(), StatusCode::OK, "{path} 必须回退 SPA，不能 404");
+            let ctype = res
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            assert!(ctype.starts_with("text/html"),
+                    "{path} 应返回 SPA 入口 HTML，实际 {ctype:?}");
+        }
+    }
+
+    /// 白名单棘轮：web/dist 里真实出现的扩展名必须全部登记，否则新增资源类型
+    /// 会在缺失时被误判成路由、静默回退 HTML（掩盖「chunk 没打进二进制」）。
+    /// 扫描自检：目录读不到 / 没解析出 js|css|html 就判红，杜绝空集恒绿。
+    #[test]
+    fn every_built_asset_extension_is_in_whitelist() {
+        fn walk(dir: &std::path::Path, out: &mut std::collections::BTreeSet<String>) {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for entry in rd.flatten() {
+                    let p = entry.path();
+                    if p.is_dir() {
+                        walk(&p, out);
+                    } else if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+                        out.insert(ext.to_ascii_lowercase());
+                    }
+                }
+            }
+        }
+        let dist = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web/dist");
+        let mut exts = std::collections::BTreeSet::new();
+        walk(&dist, &mut exts);
+        assert!(
+            exts.contains("js") && exts.contains("css") && exts.contains("html"),
+            "扫描链路自检：{dist:?} 应至少含 js/css/html，实际 {exts:?}"
+        );
+        let missing: Vec<&String> = exts
+            .iter()
+            .filter(|e| !ASSET_EXTENSIONS.iter().any(|w| (*w).eq_ignore_ascii_case(e.as_str())))
+            .collect();
+        assert!(missing.is_empty(),
+                "web/dist 出现未登记的静态资源扩展名 {missing:?}：需同步 ASSET_EXTENSIONS");
     }
 }
