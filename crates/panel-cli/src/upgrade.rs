@@ -111,26 +111,69 @@ fn normalize_tag(v: &str) -> String {
     if t.starts_with('v') { t.to_string() } else { format!("v{t}") }
 }
 
-async fn rollback(bin: &Path, bak: &Path) {
+/// 尽力把旧二进制换回去，并**如实返回是否换回成功**。
+///
+/// ⚠ 二轮审计 P0-9 同型：`security.rs` 曾因 `let _ = copy(...)` + 无条件宣称
+/// 「已自动回滚」被判 P0。这里原本返回 `()`：无备份 / copy 失败 / rename 失败
+/// 三种失败都只打日志，而两个调用方一律回「升级失败并已回滚」——运维据此以为
+/// 旧版本还在、不再手工检查，实际磁盘上可能已是装坏的新二进制。
+/// 结果必须由本函数回传，调用方只准用 [`upgrade_failure_detail`] 生成文案。
+async fn rollback(bin: &Path, bak: &Path) -> bool {
     if !bak.exists() {
         eprintln!("  ⚠ 没有可回滚的备份（{}），请手动检查", bak.display());
-        return;
+        restart_panel().await;
+        return false;
     }
     let tmp = bin.with_file_name("panel.rollback");
-    if std::fs::copy(bak, &tmp).is_ok() {
-        let _ = panel_os::fs::set_mode(&tmp, 0o755);
-        match std::fs::rename(&tmp, bin) {
-            Ok(()) => eprintln!("  ✓ 已回滚到旧二进制 {}", bin.display()),
-            Err(e) => eprintln!("  ✗ 回滚失败：{e}（备份仍在 {}）", bak.display()),
-        }
+    if std::fs::copy(bak, &tmp).is_err() {
+        eprintln!(
+            "  ✗ 回滚失败：无法从备份 {} 复制出 {}（备份仍在）",
+            bak.display(), tmp.display()
+        );
+        restart_panel().await;
+        return false;
     }
+    let _ = panel_os::fs::set_mode(&tmp, 0o755);
+    let ok = match std::fs::rename(&tmp, bin) {
+        Ok(()) => {
+            eprintln!("  ✓ 已回滚到旧二进制 {}", bin.display());
+            true
+        }
+        Err(e) => {
+            eprintln!("  ✗ 回滚失败：{e}（备份仍在 {}）", bak.display());
+            false
+        }
+    };
     // 尽力把服务拉回旧版本；失败也不掩盖上面的错误。
+    restart_panel().await;
+    ok
+}
+
+/// 回滚后尽力重启服务。单独抽出，保证每条失败分支都不会漏掉这一步。
+async fn restart_panel() {
     let _ = cmd_run(
         Bin::Systemctl,
         &["--no-block", "restart", "panel"],
         CmdOpt { timeout: Duration::from_secs(15), ..Default::default() },
     )
     .await;
+}
+
+/// 升级失败的**结果**文案：必须如实区分回滚是否成功。
+///
+/// 抽成纯函数才能被单测钉住（与 `security.rs::sshd_validate_failure_detail`
+/// 同一范式）。调用方**不得**再写死「已回滚」。
+pub(crate) fn upgrade_failure_detail(
+    rolled_back: bool, bin: &Path, bak: &Path, why: &str,
+) -> String {
+    if rolled_back {
+        format!("升级失败，已回滚旧二进制（备份 {bak}）：{why}", bak = bak.display())
+    } else {
+        format!(
+            "升级失败且**自动回滚失败**：{bin} 可能仍是新版本、panel 服务可能未启动（备份 {bak}）。请先手工检查二进制版本与服务状态，必要时用备份恢复，再查日志：{why}",
+            bin = bin.display(), bak = bak.display()
+        )
+    }
 }
 
 async fn run_async(opts: Opts) -> Result<()> {
@@ -267,15 +310,15 @@ async fn run_async(opts: Opts) -> Result<()> {
     .await;
     let install_ok = matches!(&out, Ok(o) if o.code == Some(0));
     if !install_ok {
-        let detail = match &out {
+        let why = match &out {
             Ok(o) => panel_core::sanitize::stderr(&o.stderr),
             Err(e) => e.to_string(),
         };
-        eprintln!("  ✗ install.sh 失败：{detail}");
-        rollback(&bin, &bak).await;
+        eprintln!("  ✗ install.sh 失败：{why}");
+        let rolled_back = rollback(&bin, &bak).await;
         return Err(PanelError::Command {
             bin: "install.sh".into(),
-            detail: format!("升级失败并已回滚：{detail}"),
+            detail: upgrade_failure_detail(rolled_back, &bin, &bak, &why),
         });
     }
 
@@ -288,13 +331,70 @@ async fn run_async(opts: Opts) -> Result<()> {
     .await?;
     if active.code != Some(0) {
         eprintln!("  ✗ 升级后 panel 未处于 active（systemctl is-active != 0）");
-        rollback(&bin, &bak).await;
-        return Err(PanelError::Internal(
-            "升级后服务未启动，已回滚旧版本；请查 journalctl -u panel -n 50".into(),
-        ));
+        let rolled_back = rollback(&bin, &bak).await;
+        return Err(PanelError::Internal(upgrade_failure_detail(
+            rolled_back,
+            &bin,
+            &bak,
+            "升级后服务未启动（systemctl is-active != 0）；请查 journalctl -u panel -n 50",
+        )));
     }
 
     println!("    ✓ 服务已启动（systemd active）");
     println!("升级完成：{current} → {tag}（备份保留在 {}）", bak.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P0-9 同型：回滚失败时**不得**宣称「已回滚」。
+    #[test]
+    fn upgrade_failure_detail_is_truthful_about_rollback() {
+        let bin = Path::new("/usr/local/bin/panel");
+        let bak = Path::new("/usr/local/bin/panel.bak");
+        let ok = upgrade_failure_detail(true, bin, bak, "install.sh 退出 1");
+        assert!(ok.contains("已回滚"), "回滚成功应如实说明：{ok}");
+        assert!(!ok.contains("回滚失败"), "回滚成功不该出现失败字样：{ok}");
+        assert!(ok.contains("panel.bak"), "要告诉用户备份在哪：{ok}");
+
+        let bad = upgrade_failure_detail(false, bin, bak, "install.sh 退出 1");
+        assert!(bad.contains("回滚失败"), "回滚失败必须说出来：{bad}");
+        assert!(
+            !bad.contains("已回滚"),
+            "回滚失败却宣称「已回滚」= 谎报，运维会以为旧版本还在：{bad}"
+        );
+        assert!(bad.contains("手工检查"), "必须给出行动指引：{bad}");
+        assert!(bad.contains("panel.bak"), "要告诉用户备份在哪：{bad}");
+        assert!(bad.contains("/usr/local/bin/panel"), "要指出当前二进制路径：{bad}");
+    }
+
+    /// 只测纯函数挡不住「调用点没接线」——本项目的恒绿变种之一。
+    /// 两条失败路径都必须把 rollback 的 bool 交给纯函数，且不得再写死旧文案。
+    #[test]
+    fn both_failure_paths_wire_rollback_result() {
+        let src = include_str!("upgrade.rs");
+        // 剥注释 + 剥测试模块（本文件自身含这些字面量，不剥会自证）
+        let body = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let code: String = body
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            code.matches("rollback(&bin, &bak).await").count(),
+            2,
+            "install.sh 失败与判活失败两条路径都必须取回 rollback 的结果"
+        );
+        assert_eq!(
+            code.matches("upgrade_failure_detail(").count(),
+            3,
+            "定义 1 处 + 两个调用点，缺一即为漏接线"
+        );
+        assert!(
+            !code.contains("已回滚：") && !code.contains("已回滚旧版本"),
+            "结果文案不得再写死「已回滚」"
+        );
+    }
 }
