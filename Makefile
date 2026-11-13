@@ -71,7 +71,7 @@ guards:
 	bash ci/check-ui-guards.sh
 	# F-20：两个防火墙后端的 apply 必须只新增、不删（行为测试挡不住各写一份）
 	python3 ci/check_firewall_append_only.py
-	# F-02①：测试连接锁已保存 Endpoint、绝不携带已存密钥（行为测试挡不住把密钥读回来）
+	# F-02①：测试连接锁已保存 Endpoint、密钥只经 resolve_probe_key（留空回退已存）；行为测试挡不住把密钥发到非已保存 Endpoint
 	python3 ci/check_llm_test_tightening.py
 	# 阻塞子进程调用出口唯一性：run_sync 是同步的，裸调会钉住 tokio worker（Q-01）
 	bash ci/check-blocking-calls.sh

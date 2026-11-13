@@ -433,7 +433,7 @@ pub async fn patch(
 /// 本机/内网网关（`http://127.0.0.1:11434/v1`）是**刻意保留的合法用例**：面板的
 /// 典型部署就是连本机 Ollama。因此这里不做「禁私网」的一刀切；SSRF 的收敛放在
 /// `test_llm`：URL 内嵌 userinfo、禁跟随重定向、不回显对方响应体，以及 F-02① 的
-/// 「目标 Endpoint 锁定为已保存值 + 绝不携带已存密钥」。
+/// 「目标 Endpoint 锁定为已保存值」（回退已存密钥只发到管理员自己的端点，无外带风险）。
 fn valid_endpoint(url: &str) -> bool {
     (url.starts_with("http://") || url.starts_with("https://"))
         && url.len() <= 256
@@ -477,8 +477,9 @@ fn url_host(url: &str) -> Option<&str> {
 /// F-02①：测试连接的目标 Endpoint **只能取库里已保存的值**。
 ///
 /// 请求体里的 endpoint 只做一致性校验，绝不拿它当探测目标：目标主机由配置者保存，
-/// 调用者无法把请求（以及任何密钥）导向自己控制的机器。再配合 `test_llm` 里
-/// 「绝不读取已存 api_key」，整条 admin → 明文密钥 的外带链就断了。
+/// 调用者无法把请求（以及任何密钥）导向自己控制的机器。正因为目标锁死，
+/// `test_llm` 里「框留空回退已存密钥」也只会对管理员自己的端点鉴权——
+/// 原 F-02①「绝不读已存密钥」要防的外带链，在 Endpoint 锁死后已由本函数兜住。
 /// 本机 / 内网网关不受影响——已保存的 127.0.0.1 照样能测。
 fn resolve_probe_endpoint(saved: &str, requested: Option<&str>) -> Result<String, &'static str> {
     if let Some(p) = requested.map(str::trim).filter(|s| !s.is_empty()) {
@@ -603,12 +604,14 @@ fn llm_probe_url(endpoint: &str, model: Option<&str>) -> (String, bool) {
 ///
 /// 设计要点：
 /// - **先测后存（仅 model / api_key）**：这两项可用当前输入验证，不必先保存
-///   （C10 原话："避免保存后才报错"）。⚠ F-02①：Endpoint 与已存密钥是例外——
-///   Endpoint 锁定为已保存值（改动须先保存），已存密钥绝不参与测试，只带本次
-///   输入的 key。理由见 [`resolve_probe_endpoint`]。
+///   （C10 原话："避免保存后才报错"）。⚠ F-02①：Endpoint 锁定为已保存值
+///   （改动须先保存）；api_key 框里填了就用填的，留空则回退到库里已存的
+///   （解密后只用于本次探测，见 [`resolve_probe_key`]）。Endpoint 锁死后回退
+///   已存密钥无外带风险。
 /// - **绝不 500**：所有探测失败都落成 `ok:false + detail`，配置错了是用户的事，
 ///   不是服务器错误——返回 500 会让前端把"密钥填错"显示成"请求失败"。
-/// - **密钥不落日志、不回显**：只回布尔与结论；库里已存的密钥连解密都不做。
+/// - **密钥不落日志、不回显**：只回布尔与结论；回退已存密钥仅解密后用于本次
+///   探测，不落库、不回显、不入日志。
 /// - 这是一次由管理员发起的外发请求（SSRF 面）；仅 `settings.manage` 可调用，
 ///   目标锁定为已保存的 Endpoint、禁跟随重定向、不回显对方响应体（截断到 200 字符）。
 pub async fn test_llm(
