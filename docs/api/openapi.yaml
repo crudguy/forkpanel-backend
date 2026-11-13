@@ -1415,11 +1415,11 @@ components:
           items: { $ref: '#/components/schemas/DashboardCardPref' }
     LlmTestReq:
       type: object
-      description: F-02①：endpoint 仅用于与已保存值的一致性校验（不参与探测目标）；api_key 仅用本次输入，省略则完全不携带密钥，绝不回退到库里已存值
+      description: F-02①：endpoint 仅用于与已保存值的一致性校验（不参与探测目标）；api_key 省略则回退到库里已存的密钥（Endpoint 已锁定，无外带风险），填了则优先用填的（先测后存）
       properties:
         endpoint: { type: string, description: 必须与已保存的 API Endpoint 相同；改动请先调用 PATCH 保存 }
         model:    { type: string, description: 省略则取库里已保存值（先测后存） }
-        api_key:  { type: string, description: 本次输入的明文密钥，仅用于本次探测：不落库、不回显、不入日志；省略则不携带任何密钥 }
+        api_key:  { type: string, description: 本次输入的明文密钥，仅用于本次探测：不落库、不回显、不入日志；省略则回退到库里已存的密钥（留空即用已存密钥测试当前配置） }
     LlmTestResult:
       type: object
       description: 探测结论。**探测失败一律 ok:false + detail，不返回 500**——配置错是用户的事，不是服务器错误
@@ -4332,13 +4332,16 @@ paths:
       description: |
         **F-02① 彻底收紧**：目标 Endpoint 锁定为库里已保存的值，请求体里的
         endpoint 仅用于一致性校验，不一致直接 400（改动请先保存配置）。
-        同时**绝不读取库里已存的 api_key**：只携带本次请求里输入的明文密钥，
-        未输入就不带 Authorization 头（匿名探测）。这两条一起切断了把已保存的
-        LLM 密钥外带到任意主机的通路；本机 / 内网网关（已保存的 127.0.0.1
-        Ollama）不受影响。
+        请求体里的 api_key 省略时，**回退到库里已存的密钥**（解密后只用于本次探测）；
+        填了则优先用填的（先测后存）。F-02① 的收紧点在此：**目标 Endpoint 仍锁定为
+        已保存值**，回退已存密钥只会对管理员自己的端点鉴权，绝不外带到任意主机——这是
+        当初「绝不读已存密钥」要防的唯一风险，Endpoint 锁死后已不构成。本机 / 内网
+        网关（已保存的 127.0.0.1 Ollama）不受影响。
 
-        请求体 model / api_key 可省略：model 省略时取已保存值，api_key 省略时
-        不携带任何密钥（**先测后存**仅对这两项成立，避免保存后才发现配错）。
+        请求体 model / api_key 可省略：model 省略时取已保存值；api_key 省略时回退已存
+        密钥（**先测后存**仅对「框里填了新密钥」成立，避免保存后才发现配错；留空则用
+        已存密钥测试当前配置）。若两者都没有任何可用密钥，返回明确的「未配置 API Key」
+        提示，而非误导性的 401。
 
         判定：若已配置 model，则向 /v1/chat/completions 发起一次最小对话
         （max_tokens:1）验证——2xx 即表示密钥被接受且模型可调用（model_found=true），

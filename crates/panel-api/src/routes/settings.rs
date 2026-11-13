@@ -558,6 +558,10 @@ fn err_detail(e: &reqwest::Error) -> String {
 }
 
 /// 从 `enc:<hex>` 解出明文（库里 api_key 的落库形态）。
+///
+/// `raw` 必须是 **DB 里的原始 JSON 字符串**（`"enc:…"`，带外层引号）——`from_str`
+/// 解析出内层串再剥 `enc:` 前缀。⚠ 别传已经 `stored()` 拆出的内层串（无引号，
+/// 会被 `from_str` 当成非法 JSON 直接失败，静默返回 None）。
 fn plain_api_key(state: &Shared, raw: &str) -> Option<String> {
     let s = serde_json::from_str::<Value>(raw).ok().and_then(|v| v.as_str().map(str::to_string))?;
     let hex = s.strip_prefix("enc:")?;
@@ -567,6 +571,22 @@ fn plain_api_key(state: &Shared, raw: &str) -> Option<String> {
     }
     let master = state.require_secret_key().ok()?;
     master.decrypt(&blob).ok().and_then(|b| String::from_utf8(b).ok())
+}
+
+/// 探测要用的密钥（修复空密钥回归）：本次输入的优先（先测后存）；留空则回退到
+/// 库里已存的（解密后）。
+///
+/// ⚠ 对 F-02①「测试连接绝不读取已存 api_key」的**有界放宽**：原规则为防止把管理员
+/// 密钥导向攻击者主机，但 `resolve_probe_endpoint` 已把探测目标**锁定为已保存值**，
+/// 回退已存密钥只会对管理员自己的端点鉴权，无外带风险。且 Agnes 这类服务对
+/// `/chat/completions` 强制鉴权——若留空不回退已存密钥，用户"已存正确 key、框留空点
+/// 测试"会被误报成 401（密钥其实是对的，只是没在框里重输一遍）。
+/// 优先级：填了 ⇒ 用填的（先测后存）；没填 ⇒ 用已存的；都没有 ⇒ None（调用方给明确指引）。
+fn resolve_probe_key(state: &Shared, stored_raw: Option<&str>, typed: Option<&str>) -> Option<String> {
+    if let Some(k) = typed.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(k.to_string());
+    }
+    stored_raw.and_then(|raw| plain_api_key(state, raw))
 }
 
 /// 探测目标选择（修复 401 误报）：配了模型名 ⇒ 打 `/chat/completions`（真实鉴权
@@ -625,10 +645,10 @@ pub async fn test_llm(
         Some(m) => Some(m.to_string()),
         None => stored(K_LLM_MODEL),
     };
-    // F-02①：**绝不读取库里已存的 api_key**。测试连接只带本次输入的明文密钥，
-    // 未输入就不带 Authorization 头（匿名探测）。已存密钥只供叙事层使用。
-    let api_key = req.api_key.as_deref().map(str::trim)
-        .filter(|s| !s.is_empty()).map(str::to_string);
+    // 探测密钥：本次输入的优先（先测后存）；留空回退到库里已存的（解密后）。
+    // 见 `resolve_probe_key`：Endpoint 已锁定为已保存值，回退已存密钥无外带风险，
+    // 且能修复 Agnes 类服务对 /chat/completions 强制鉴权导致的留空误报 401。
+    let api_key = resolve_probe_key(&state, table.get(K_LLM_API_KEY).map(String::as_str), req.api_key.as_deref());
 
     // 禁跟随重定向：否则一个公网 URL 可以 302 到内网/回环，`valid_endpoint`
     // 的结构校验就形同虚设。测试连接只发一次请求（/chat/completions 或 /models），
@@ -658,6 +678,20 @@ pub async fn test_llm(
     // 返回 401，却对 `/chat/completions` 正常 ⇒ 只探 /models 会误报 401。
     // 未配模型 ⇒ 退回 `/models` 列表/计数（旧行为）。
     let (probe_url, use_chat_probe) = llm_probe_url(&endpoint, model.as_deref());
+    // 打 /chat/completions 必须带密钥：若本次没填、库里也没有可用密钥，提前给明确
+    // 指引，而不是打到对端撞 401 再报"密钥被拒绝"（那会误导用户以为存的密钥错了）。
+    if use_chat_probe && api_key.is_none() {
+        return Ok(ok(TestLlmResp {
+            ok: false,
+            latency_ms: 0,
+            endpoint,
+            model,
+            model_found: false,
+            model_count: None,
+            status: None,
+            detail: "未配置 API Key：测试连接调用 /chat/completions 需要密钥。请在上方密钥框输入（先测后存），或先保存一份密钥再测。".to_string(),
+        }));
+    }
     let started = std::time::Instant::now();
     let mut call = if use_chat_probe {
         client
@@ -919,6 +953,57 @@ mod tests {
         let (u2, chat2) = llm_probe_url("https://x/v1", None);
         assert!(!chat2, "未配模型才退回 /models");
         assert_eq!(u2, "https://x/v1/models");
+    }
+
+    /// P0 回归（空密钥 401）：`resolve_probe_key` 在框留空时必须回退到库里已存的
+    /// （解密后）密钥；填了则用填的（先测后存）；都没有才 None。直接用生产
+    /// `plain_api_key` 解密，不是测试自持实现。
+    /// 负向对照：把回退分支删掉（恒返回 typed）⇒ ① 即红，复现"Agnes 误报 401"。
+    #[tokio::test]
+    async fn resolve_probe_key_falls_back_to_stored() {
+        let dir = std::env::temp_dir().join(format!("panel-probekey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("t.db");
+        let tier = panel_core::Tier::Nano;
+        {
+            let mut c = panel_db::open(&db_path, tier, "NORMAL").unwrap();
+            panel_db::migrate::apply(&mut c).unwrap();
+        }
+        let writer = std::sync::Arc::new(
+            panel_db::WriterActor::spawn(db_path.clone(), tier, "NORMAL").unwrap());
+        let pool = std::sync::Arc::new(panel_db::ReadPool::new(&db_path, tier).unwrap());
+        let tasks = std::sync::Arc::new(panel_task::TaskRunner::new(
+            writer.clone(), tier, dir.join("tasks"), db_path.clone(), "NORMAL".to_string()));
+        let metrics = std::sync::Arc::new(std::sync::Mutex::new(
+            panel_db::aggregator::Aggregator::new(tier)));
+        let master = panel_core::crypto::MasterKey::from_bytes(&[7u8; 32]).unwrap();
+        // 库里存一把加密密钥（与 PATCH 落库格式一致）：先 encrypt 再 move 进 state
+        let blob = master.encrypt(b"sk-stored").unwrap();
+        let hex: String = blob.iter().map(|b| format!("{b:02x}")).collect();
+        let stored_raw = serde_json::to_string(&format!("enc:{hex}")).unwrap();
+        let os: std::sync::Arc<dyn panel_os::OsAdapter> =
+            std::sync::Arc::new(panel_os::mock::MockOsAdapter::new());
+        let state = std::sync::Arc::new(crate::AppState::new(
+            os, writer, pool, tasks, metrics, tier, Some(master), false, 5,
+            std::time::Duration::from_secs(1800), std::time::Duration::from_secs(43_200),
+            90, 50_000, true, true, "NORMAL".to_string(), 7, false, None));
+
+        // ① 框留空 ⇒ 回退已存密钥（修复 Agnes 类误报 401 的核心）
+        assert_eq!(
+            resolve_probe_key(&state, Some(&stored_raw), None).as_deref(),
+            Some("sk-stored"),
+            "留空必须回退已存密钥，否则 Agnes 类服务误报 401"
+        );
+        // ② 填了 ⇒ 用填的（先测后存），优先级高于已存
+        assert_eq!(
+            resolve_probe_key(&state, Some(&stored_raw), Some("sk-typed")).as_deref(),
+            Some("sk-typed")
+        );
+        // ③ 都没 ⇒ None（调用方给明确指引，而非误报 401）
+        assert!(resolve_probe_key(&state, None, None).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 往 settings 表写一行（测试辅助）。
