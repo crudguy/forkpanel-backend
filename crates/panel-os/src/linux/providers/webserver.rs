@@ -1,5 +1,31 @@
 use super::*;
 
+/// 站点默认加固片段的**单一事实源**：编译期内嵌，不产生运行时文件依赖。
+///
+/// 详见 `deploy/site-defaults.inc` 文件头。渲染时把指令行内联进
+/// `conf.d/panel-<host>.conf` 的主 server 块，而不是生成一条 `include` 指令——
+/// 后者需要随安装包分发到固定绝对路径，而 `build-static.sh` 只打包三件脚本，
+/// 漏一处即 `nginx -t` 失败、站点全部下发不了。
+const SITE_DEFAULTS_INC: &str = include_str!("../../../../../deploy/site-defaults.inc");
+
+/// 取出片段里的**生效指令行**（剔注释与空行），补上 server 级缩进。
+///
+/// 注释只在 `.inc` 里给维护者看，不进用户可见的 nginx 配置原文；这样片段文件
+/// 可以写足取舍理由，而不必担心把内部说明一起发到站点配置里。
+pub(super) fn site_defaults_directives() -> String {
+    let mut out = String::new();
+    for line in SITE_DEFAULTS_INC.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        out.push_str("    ");
+        out.push_str(t);
+        out.push('\n');
+    }
+    out
+}
+
 
 /// nginx 站点配置的渲染与下发。
 ///
@@ -385,6 +411,15 @@ pub(super) fn render_nginx(spec: &SiteSpec) -> String {
         out.push_str("    listen 80;\n");   // 兜底：一个 listen 都没写时不生成无监听的 server
     }
     out.push_str(&format!("    server_name {main_names};\n\n"));
+
+    // ── 站点默认加固（server 级；内联自 deploy/site-defaults.inc）──
+    // 必须留在**主 server 块内**：nginx 的 add_header 在「本级有定义时」不再继承上级，
+    // 站点开启 HSTS 时本块内已有一条 add_header，若把默认头放 http 级 drop-in 会被
+    // 全部静默遮蔽。放 server 级则与 HSTS 同级累加，两类头都会发出。
+    // 位置刻意在 custom_conf 之前：用户片段排在其后，需要调整时一眼能看见顺序。
+    out.push_str("    # ── 站点默认加固（内联片段）──\n");
+    out.push_str(&site_defaults_directives());
+    out.push('\n');
 
     if let (Some(cert), Some(key)) = (&spec.tls_cert, &spec.tls_key) {
         out.push_str(&format!("    ssl_certificate     {};\n", cert.display()));

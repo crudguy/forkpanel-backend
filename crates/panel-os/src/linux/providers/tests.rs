@@ -374,6 +374,75 @@ use super::*;
         assert!(out.contains("return 403; }"), "默认应含敏感文件拒绝：\n{out}");
     }
 
+    // ── 站点默认加固（内联片段）──────────────────────────────────────────
+    #[test]
+    fn site_defaults_are_inlined_at_server_level_not_included() {
+        let out = render_nginx(&spec_static());
+        let d = site_defaults_directives();
+        // 同时钉住「渲染器真的调用了 site_defaults_directives」：把片段抄一份进
+        // render_nginx 会让 out 不含这份精确文本（测试自持实现 / 两份实现漂移）。
+        assert!(out.contains(&d), "渲染输出必须原样内联片段指令：\n{out}");
+        // 恰好一次：出现两次说明有人在别处又塞了一份（http 级那份会被静默遮蔽）
+        assert_eq!(out.matches("server_tokens off;").count(), 1, "默认片段只能内联一次：\n{out}");
+        // server 级：位于主 server 块内、任何 location 之外
+        let srv = out.find("server {").expect("应有 server 块");
+        let pos = out.find(&d).expect("应有默认片段");
+        let first_loc = out.find("    location").unwrap_or(out.len());
+        assert!(
+            srv < pos && pos < first_loc,
+            "默认片段必须在主 server 块内、location 之外（否则 add_header 继承规则会吃掉它）：\n{out}"
+        );
+        // 绝不生成运行时 include：外部文件会引入分发依赖与版本链盲区
+        assert!(!out.contains("site-defaults.inc"), "不得生成运行时 include：\n{out}");
+    }
+
+    #[test]
+    fn site_defaults_contain_only_the_three_safe_directives() {
+        let d = site_defaults_directives();
+        let lines: Vec<&str> = d.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        // 硬编码清单是**故意**的：新增任何一条默认头都必须先评估对用户应用的兼容性
+        // （iframe 嵌入 / 定位 / 摄像头 / 跨域 / 缓存），不能「顺手加一条」。
+        assert_eq!(
+            lines,
+            vec![
+                "server_tokens off;",
+                r#"add_header X-Content-Type-Options "nosniff" always;"#,
+                r#"add_header Referrer-Policy "strict-origin-when-cross-origin" always;"#,
+            ],
+            "默认集合必须恰好这三条：\n{d}"
+        );
+        // `.inc` 里给维护者看的说明不得进用户可见的配置原文
+        for leak in ["为什么是", "边界（", "可选加固", "build-static.sh", "ci/check_site_defaults"] {
+            assert!(!d.contains(leak), "维护者说明泄漏进产物：{leak:?}\n{d}");
+        }
+    }
+
+    #[test]
+    fn site_defaults_survive_hsts_in_the_same_server_block() {
+        let mut s = spec_static();
+        s.tls_cert = Some(PathBuf::from("/etc/forkpanel/ssl/example.com.crt"));
+        s.tls_key = Some(PathBuf::from("/etc/forkpanel/ssl/example.com.key"));
+        s.hsts = true;
+        s.hsts_max_age = 300;
+        let out = render_nginx(&s);
+        let d = site_defaults_directives();
+        assert!(out.contains(&d), "开启 HSTS 后默认头仍须在主 server 块内：\n{out}");
+        let hsts = out.find("Strict-Transport-Security").expect("应有 HSTS");
+        let defaults = out.find(&d).expect("应有默认片段");
+        let first_srv = out.find("server {").expect("应有 server 块");
+        // nginx 的 add_header 只在「本级一条都没有」时继承上级。HSTS 已在 server 级
+        // 写了一条，默认头若被挪到 http 级就会全部静默失效——两者必须同在 server 级。
+        assert!(defaults > first_srv && hsts > first_srv,
+            "默认头与 HSTS 必须都在 server 级（同级累加）：\n{out}");
+    }
+
+    #[test]
+    fn site_defaults_are_not_emitted_for_caddy() {
+        let out = render_caddy(&spec_static());
+        assert!(!out.contains("server_tokens off"), "caddy 不得收到 nginx 指令：\n{out}");
+        assert!(!out.contains("add_header X-Content-Type-Options"), "caddy 不得收到 nginx 指令：\n{out}");
+    }
+
     /// 真机语法校验：把渲染结果交给**真实的** `nginx -t`。
     ///
     /// 上面那些断言只能证明"生成的东西符合我以为的 nginx 语法"——那正是最容易错的

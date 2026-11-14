@@ -127,6 +127,10 @@ guards:
 	# 事件按 kind 分类、钩子必须真被调用（不是只存着）、backup.sweep 不得吞 Err、
 	# shell 与 Rust 指向同一个文件名（改名只改一处＝崩溃告警静默失效）。
 	python3 ci/check_alert_wiring.py
+	# 站点默认加固片段：三条安全配置编译期内嵌后内联进主 server 块，禁止改成
+	# 运行时 include（分发依赖 + 版本链盲区），禁止默认开 CORS / CSP / HSTS /
+	# gzip / X-Frame-Options / Permissions-Policy。判据剔注释，防说明冒充指令。
+	python3 ci/check_site_defaults.py
 
 # 内嵌前端新鲜度：改完前端只 cargo build **不会**重新 embed，必须
 # ① vite build → ② rm -rf web/dist/* → ③ cp -a → ④ touch embed.rs → ⑤ cargo build。
