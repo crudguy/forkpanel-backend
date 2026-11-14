@@ -448,11 +448,6 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// 便于调用方构造目录：`<data_dir>/compose-stacks/<project>`
-pub fn stack_working_dir(root: &Path, project: &str) -> String {
-    stack_dir(root, project).to_string_lossy().to_string()
-}
-
 // ─────────────── 安全导入助手（解析外部 compose YAML） ───────────────
 
 /// 导入时允许的最大 YAML 体积，防 DoS（`serde_yaml` 解析大文档有成本）。
