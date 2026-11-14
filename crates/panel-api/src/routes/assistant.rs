@@ -738,6 +738,7 @@ async fn call_llm(
 ) -> Result<String, LlmFailure> {
     let client = reqwest::Client::builder()
         .timeout(NARRATIVE_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| LlmFailure::Transport("client"))?;
     let url = format!("{}/chat/completions", cfg.endpoint.trim_end_matches('/'));
@@ -887,8 +888,9 @@ fn fmt_uptime(sec: u64) -> String {
 // ───────────────────────── 端点 ─────────────────────────
 
 /// POST /api/v1/assistant/diagnose
-/// 挂在独立子路由（仅 require_auth，不经 guard_write/read_only_guard）：
-/// 只读模式下同样可用；POST 仅为承载 question / mode 请求体。
+/// 挂在独立子路由（require_auth + guard_write，刻意不经 read_only_guard）：
+/// 只读模式下同样可用；POST 仅为承载 question / mode 请求体，但一次调用会全量
+/// 采集并可外发 LLM，仍须过 guard_write 的 CSRF 校验（接线见 routes.rs）。
 pub async fn diagnose(
     State(state): State<Shared>,
     Auth(s): Auth,
