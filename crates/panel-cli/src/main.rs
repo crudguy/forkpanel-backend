@@ -395,7 +395,7 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Migrate => cmd::db::migrate(&cli, os.clone()),
 
         // 启动流程整体搬进 `cmd/serve.rs`：它原本占掉本函数 187 行，
-        // 让 17 条子命令的分派表彻底看不清。`os` 按值移交——serve 会用配置里的
+        // 让子命令分派表彻底看不清。`os` 按值移交——serve 会用配置里的
         // `[paths]` 覆盖重建适配器，原先那个只在读到配置前用于定位配置文件。
         Cmd::Serve => cmd::serve::run(&cli, os),
 

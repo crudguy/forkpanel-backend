@@ -85,7 +85,7 @@ pub struct AppState {
     pub session_idle: std::time::Duration,
     pub session_absolute: std::time::Duration,
     /// 审计保留天数（来自 config.toml `[audit]`）。设置页 deployment 段只读展示用，
-    /// 也证明该项已接线——`main.rs` 的清理任务据此调用 `prune_audit` 强制落盘。
+    /// 也证明该项已接线——`cmd/serve.rs` 的 `db.cleanup` 任务据此调用 `prune_audit` 强制落盘。
     pub audit_retention_days: u32,
     /// 审计单表行数上限（来自 config.toml `[audit]`）。同上，deployment 段只读展示。
     pub audit_max_rows: u64,
@@ -94,10 +94,10 @@ pub struct AppState {
     /// 哪怕 bind 写了 0.0.0.0）——直接关系到面板暴露面。
     pub localhost_only: bool,
     /// 每日自动备份开关（来自 config.toml `[db] daily_backup`）。deployment 段展示用。
-    /// **真实生效**：`main.rs` 的调度器据此注册每日备份任务（nano 档位除外）。
+    /// **真实生效**：`cmd/serve.rs` 的 `register_internal_jobs` 据此注册每日备份任务（nano 档位除外）。
     pub daily_backup: bool,
     /// 每日自动备份的保留份数（来自 config.toml `[db] backup_keep`，默认 7）。
-    /// **真实生效**：`main.rs` 的 `db.backup` 任务写完立刻按它裁剪 `panel-<ts>.db`
+    /// **真实生效**：`cmd/serve.rs` 的 `db.backup` 任务写完立刻按它裁剪 `panel-<ts>.db`
     /// （此前只增不减，一年堆 365 份）。备份页系统卡片只读展示——页面写死
     /// 「保留 7 份」会在用户改成 3 份时变成谎言。
     pub backup_keep: i64,

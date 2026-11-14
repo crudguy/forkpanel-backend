@@ -2,8 +2,9 @@
 //!
 //! **诚实三段模型**——settings 表的 8 个种子行当前**全部是死数据**（无运行时
 //! 消费点），绝不能伪装成"可改即生效"：
-//! - `runtime`：真正可改且立即生效的键（当前 = AI 助手 LLM 四键：endpoint / model /
-//!   api_key / **narrative 独立开关**）。开关关闭时 `llm_config()` 返回 `None`
+//! - `runtime`：真正可改且立即生效的键（白名单以 `RUNTIME_KEYS` 为准：AI 助手 LLM 的
+//!   endpoint / model / api_key / **narrative 独立开关** / chat_context 系统概要开关）。
+//!   开关关闭时 `llm_config()` 返回 `None`
 //!   ⇒ 诊断不外发任何数据（与未配置同路，回退纯规则报告）；开启时每次诊断会把
 //!   指标摘要 + 规则结论 + 最近 20 条 error 级日志（**发送前脱敏**，见
 //!   `assistant::redact_for_llm`）POST 到管理员配置的端点。
@@ -14,7 +15,7 @@
 //!   修改必须走 config.toml / 环境变量并重启——PATCH 这类键返回 400
 //! - `reserved`：种子预留、尚未接线的键（audit/metrics retention 等），
 //!   展示表内值并标注 `wired:false`。⚠ 注意：审计保留**实际已通过 config.toml
-//!   `[audit]` 实现**（部署级，见 `main.rs` 的 `prune_audit`），指标保留为内置
+//!   `[audit]` 实现**（部署级，见 `cmd/serve.rs` 的 `prune_audit`），指标保留为内置
 //!   默认（`aggregator::Retention::default()` = 7d/90d）；本表种子**不**是生效来源。
 //!   将来若把保留策略迁到设置页再消费这些键，务必移除 config.toml 那一路，
 //!   勿让两路并存造成双源冲突。

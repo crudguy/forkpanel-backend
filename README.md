@@ -90,7 +90,7 @@ crates/
   panel-db/            SQLite：WriterActor 单写串行化 + ReadPool + 迁移 + 备份 + 环形缓冲
   panel-api/           axum：router、middleware、handler、SSE、错误码
   panel-task/          任务队列、调度器、cron 执行器
-  panel-cli/           二进制入口：17 个子命令（init / serve / upgrade / uninstall / backup / menu …），
+  panel-cli/           二进制入口：init / serve / upgrade / uninstall / backup / menu 等子命令，
                        完整清单以 `panel --help` 为准——别在这里抄一份会过期的
 migrations/            内嵌 SQL（编号 + 校验和）
 docs/api/openapi.yaml  ★ 前后端唯一接口契约（事实源）

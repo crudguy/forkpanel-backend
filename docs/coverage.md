@@ -183,7 +183,7 @@
 **51.68% 不代表「一半代码没测」，26.39% 也不代表「界面没测过」**——两侧的分母都包含
 大量「只能靠真机验证」的代码：
 
-- 覆盖率高的一侧正好是纯逻辑层：`panel-core/src/sensitive.rs` 100%（敏感路径黑名单）、
+- 覆盖率高的一侧正好是纯逻辑层：`panel-os/src/sensitive.rs` 100%（敏感路径黑名单）、
   `clock.rs` / `sync.rs` 100%、`lib.rs` 98.34%、`panel-db/src/ring.rs` 98.41%、
   `panel-core/src/expose.rs` 96.95%、`panel-api/src/totp.rs` 93.92%、
   `panel-cli/src/config.rs` 94.51%。这类代码**本来就应该**被测到接近满。
@@ -317,8 +317,10 @@ make e2e-install                                # 安装脚本（吃 release pan
   环境不具备时首个脚本即 `[skip]`，聚合器立即停止并明确"未验证任何东西"。
 - **不进 `make check`**：CI 无真机服务，脚本只会走 `[skip]` 分支——那是恒绿，
   比没有守卫更危险。人工在真机跑。
-- `e2e-restore` 吃 `PANEL_E2E_BIN`（默认 `./target/debug/panel`）。⚠ `make check`
-  只编 test profile，**不更新** `target/debug/panel`，改了源码要先 `cargo build --bin panel`。
+- `e2e-restore` 单跑吃位置参数 `BIN`（`make e2e-restore BIN=...`，默认
+  `./target/debug/panel`）；经 `make e2e-all` 聚合时改由 `PANEL_E2E_BIN` 传入
+  （见 `ci/e2e-all.sh`）——两个入口别混用。⚠ `make check` 只编 test profile，
+  **不更新** `target/debug/panel`，改了源码要先 `cargo build --bin panel`。
 - `e2e-install` 吃 release 产物（debug 的 `rust-embed` 运行期读磁盘，装到别处找不到前端）。
   它**刻意不进 `e2e-all`**：`e2e-all` 的语义是"对着一个跑着的后端打 API"，而它自己在
   ns 里造环境，且独占回环端口；混进去会让"后端不可达"的判定语义变模糊。

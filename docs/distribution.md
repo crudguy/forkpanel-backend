@@ -114,9 +114,11 @@ sudo panel uninstall        # 等价于 /usr/local/bin/panel --config /etc/forkp
 > `RELEASE_PUBKEY` 描述为「演示密钥」，而安装器注释又称它「并非占位演示密钥」，
 > 两处自相矛盾 —— 靠人判断密钥身份本身就是风险。
 
-- **四处公钥是同一把**：`deploy/get-panel.sh` 内嵌 PEM、`deploy/release-pubkey.pub`
-  （`panel upgrade` 用 `include_str!` 引用）、`deploy/mirror-sync.sh` 内嵌 PEM，
-  由 `ci/check-docs-consistency.sh` 与 `ci/verify-release-assets.sh` 双重比对。
+- **三处公钥是同一把**：`deploy/get-panel.sh` 内嵌 PEM、`deploy/release-pubkey.pub`
+  （`panel upgrade` 用 `include_str!` 引用）、`deploy/mirror-sync.sh` 内嵌 PEM；
+  更换密钥时还须同步第 4 处 `PANEL_RELEASE_KEY` 私钥（见下）。两个守卫
+  `ci/check-docs-consistency.sh` 与 `ci/verify-release-assets.sh` 目前只比对前两处，
+  `mirror-sync.sh` 内嵌的 PEM 未纳入守卫——轮换时务必手工核对第三处。
 - **唯一信任根是 GitHub repo secret `PANEL_RELEASE_KEY`**（ed25519 私钥）。
 - **每次发版自动证明匹配**：`release.yml` 在上传 Release **之前**调用
   `ci/verify-release-assets.sh`，用**安装器内嵌的那把公钥**（不是从私钥导出的公钥）
@@ -125,7 +127,7 @@ sudo panel uninstall        # 等价于 /usr/local/bin/panel --config /etc/forkp
   发版**当场失败**，不会把用户验不过的资产发出去。
 - ⚠ 但流水线回验**不能证明私钥从未外泄**。若维护者无法确认当前 secret 对应私钥
   的保管历史（例如曾在本机明文留存、经协作环节传递），仍必须按上一节
-  「首次发布前：生成并配置正式密钥」重新生成并轮换：四处同步公钥、重新发版、
+  「首次发布前：生成并配置正式密钥」重新生成并轮换：三处同步公钥（并轮换私钥）、重新发版、
   替换历史 Release 资产、对外公布公钥指纹。这一步需要维护者本人执行，
   AI / 脚本不代生成私钥。
 

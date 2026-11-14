@@ -310,7 +310,7 @@ pub struct UpgradablePkg {
 /// - `20.19.0` vs `24.21.0` → 20≠24（Node.js 跨主版本）
 ///
 /// 任一无法解析主版本号时返回 `false`（保守：解析不出就**不**当作跨主版本，
-/// 避免把可安全升级的包误判成高风险而阻断）。`stub.rs` 解析与 `services.rs`
+/// 避免把可安全升级的包误判成高风险而阻断）。`linux/providers/packages.rs` 解析与 `services.rs`
 /// 升级守卫共用本函数，避免两处各写一份漂移。
 pub fn version_major_jump(a: &str, b: &str) -> bool {
     let major = |v: &str| -> Option<u32> {

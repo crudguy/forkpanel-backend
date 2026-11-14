@@ -692,7 +692,7 @@ pub async fn packages_list(
 /// 查询某个白名单包在当前软件源里可供安装的版本（新→旧）。
 ///
 /// 为什么单独成端点而不是塞进 packages_list：列包是高频调用（页面加载/轮询），
-/// 而版本查询要为每个包跑一次 apt-cache——25 个包全查会明显拖慢列表。
+/// 而版本查询要为每个包跑一次 apt-cache——白名单里的包全查会明显拖慢列表。
 /// 改为安装弹窗打开时才按单个包查询（懒加载）。
 pub async fn package_versions(
     State(state): State<Shared>, Auth(s): Auth, AxPath(name): AxPath<String>,

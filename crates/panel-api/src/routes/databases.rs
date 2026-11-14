@@ -605,7 +605,7 @@ pub async fn restore(
     Ok(ok(serde_json::json!({ "task_id": tid })))
 }
 
-/// 库还原任务体：覆盖前快照与具体导入逻辑都下沉到 provider（见 stub.rs）。
+/// 库还原任务体：覆盖前快照与具体导入逻辑都下沉到 provider（见 `linux/providers/databases.rs`）。
 /// 此处只驱动任务进度与结果——不重复实现引擎差异（sqlite 先备份再复制、
 /// mysql/pg 走外部客户端导入）。
 pub(crate) struct DbRestoreTask {

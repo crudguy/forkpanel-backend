@@ -296,7 +296,7 @@ e2e-expose:
 
 # 分发脚本 E2E（deploy/get-panel.sh，离线）：用本地 http 源模拟"死源→好源回退"、
 # 镜像源坏签名/篡改被验签拒绝（防投毒）、PANEL_RELEASE_BASE 钉死单源、内嵌公钥与测试
-# 公钥互不通用。全程不碰真实 GitHub，跑完输出 7 条断言。
+# 公钥互不通用。全程不碰真实 GitHub，跑完输出 9 条断言。
 # 守卫自证：把 get-panel.sh 的 `openssl dgst -verify` 判否分支改坏（去掉 exit 1）再跑，
 # 场景 3/4/7 必须变红；还原后转绿。
 #   make e2e-get-panel
