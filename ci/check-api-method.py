@@ -22,16 +22,30 @@
 2. 每个调用点：前端方法必须 ∈ 契约该 path 允许的方法集合；
 3. 前端用到契约里没有的 path ⇒ 判红（路径拼错同样是静默 404）。
 
+前端仓定位：优先读 `PANEL_FRONTEND_ROOT`（ci.yml / release.yml 都设了它，指向
+checkout 进来的 `./forkpanel-frontend`）；未设时回退到本地布局的兄弟目录
+`../forkpanel-frontend`。⚠ 2026-11-15 实证：此前硬编码兄弟目录，GitHub Actions
+把前端仓检出在后端仓**内部**，路径少一层 ⇒ make check 恒判红 ⇒ 发版被阻断。
+前端仓整体未检出时诚实 `[skip]`（非通过）；检出但文件缺失仍判红，不掩盖。
+
 负向对照：把 FilesView 的 `api.put(API.files.write())` 改回 `api.post` ⇒ 本条判红。
 """
+import os
 import re
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 CONTRACT = ROOT / 'docs/api/openapi.yaml'
-ENDPOINTS = ROOT.parent / 'forkpanel-frontend/src/api/endpoints.ts'
-FE_SRC = ROOT.parent / 'forkpanel-frontend/src'
+
+# 前端仓路径：CI 里前端仓被 checkout 进后端仓内部（ci.yml / release.yml 的
+# `path: forkpanel-frontend`），靠 PANEL_FRONTEND_ROOT 指；本地两仓是兄弟目录，
+# 未设 env 时回退。口径与 ci/check-api-contract.sh 一致（env > 默认）。
+FE_ROOT = (Path(os.environ['PANEL_FRONTEND_ROOT'])
+           if os.environ.get('PANEL_FRONTEND_ROOT')
+           else ROOT.parent / 'forkpanel-frontend')
+ENDPOINTS = FE_ROOT / 'src/api/endpoints.ts'
+FE_SRC = FE_ROOT / 'src'
 
 # 调用写法 → 真实 HTTP 方法
 VERB = {
@@ -152,7 +166,7 @@ def load_calls():
             if line.lstrip().startswith(('//', '*', '/*')):
                 continue
             for m in pat.finditer(line):
-                calls.append((str(f.relative_to(ROOT.parent)), i,
+                calls.append((str(f.relative_to(FE_ROOT)), i,
                               VERB[m.group(1)], m.group(2), m.group(3)))
     return calls
 
@@ -161,8 +175,16 @@ def main():
     if not CONTRACT.exists():
         print(f'[api-method] 契约不存在: {CONTRACT}')
         return 1
+    # 前端仓整体未检出（CI continue-on-error / 本地没 clone）：诚实跳过，非通过。
+    # 但「目录在却缺文件」属于检出异常，必须判红，不能被 skip 掩盖。
+    if not FE_ROOT.is_dir():
+        print(f'[skip] check-api-method.py：前端仓未检出（{FE_ROOT}）——本轮跳过（非通过）')
+        return 0
     if not ENDPOINTS.exists():
-        print(f'[api-method] endpoints.ts 不存在: {ENDPOINTS}')
+        print(f'[api-method] endpoints.ts 不存在: {ENDPOINTS}（前端仓已检出但文件缺失）')
+        return 1
+    if not FE_SRC.is_dir():
+        print(f'[api-method] 前端 src 不存在: {FE_SRC}（前端仓已检出但结构异常）')
         return 1
 
     contract = load_contract()

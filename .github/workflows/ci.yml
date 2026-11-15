@@ -21,17 +21,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # 契约 / 权限点 / 包白名单 / UI 守卫 / 内嵌新鲜度五个门禁都需要前端。
-      # 前端是**私有**独立仓：配了 secrets.FRONTEND_REPO_TOKEN 才拉得下来。
+      # 前端仓现已公开：secret 未配时用 github.token 兜底即可检出；secret 只在
+      # 将来改回私有仓时才需要（与 release.yml 同一口径）。此前只传
+      # secrets.FRONTEND_REPO_TOKEN，未配时为空 ⇒ 检出失败 ⇒ main CI 长期红。
       # ⚠ `check-ui-guards.sh` 在前端入口缺失时**硬判红**（不是 [skip]），
       #   所以「CI 要求前端仓必须检出」是既有约束，不是本 job 新增的。
-      - name: 检出前端仓（私有仓需 secrets.FRONTEND_REPO_TOKEN）
+      - name: 检出前端仓
         id: frontend
         uses: actions/checkout@v4
         continue-on-error: true
         with:
           repository: crudguy/forkpanel-frontend
           path: forkpanel-frontend
-          token: ${{ secrets.FRONTEND_REPO_TOKEN }}
+          token: ${{ secrets.FRONTEND_REPO_TOKEN || github.token }}
 
       # ⭐ 内嵌新鲜度（ci/check-embed-fresh.sh）在 CI 的**唯一**覆盖来源。
       #   该门禁比对 `web/dist` 与前端 `dist`。此前 CI 从不构建前端、`FE_DIST`
