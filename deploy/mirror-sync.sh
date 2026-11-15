@@ -55,7 +55,7 @@ else
   USE_PUBKEY="$(mktemp)"; TMP_PUBKEY="$USE_PUBKEY"
   cat > "$USE_PUBKEY" <<'EOF'
 -----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEAcw1u+sjeBdzxlMwz88QBli5DCBTi705rQcIdIIPRKGU=
+MCowBQYDK2VwAyEAsnDPJRk5dR/6S9gpeN3hXAlir96fOJfpcI38Rf33s9c=
 -----END PUBLIC KEY-----
 EOF
 fi

@@ -184,7 +184,7 @@ if [ -n "${PANEL_PUBKEY_FILE:-}" ]; then
   echo "==> 使用外部公钥：$PUBKEY_FILE"
 else
   RELEASE_PUBKEY='-----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEAcw1u+sjeBdzxlMwz88QBli5DCBTi705rQcIdIIPRKGU=
+MCowBQYDK2VwAyEAsnDPJRk5dR/6S9gpeN3hXAlir96fOJfpcI38Rf33s9c=
 -----END PUBLIC KEY-----'
   printf '%s\n' "$RELEASE_PUBKEY" > "$WORK/pubkey.pem"
   PUBKEY_FILE="$WORK/pubkey.pem"
