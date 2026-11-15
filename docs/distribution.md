@@ -6,7 +6,8 @@ ForkPanel 以**单一静态二进制 + 一键安装器**的形式分发。用户
 
 ```bash
 # 两步法（推荐）：先把脚本下载到本地，确认完整再执行，避免管道中途断流半执行
-wget -O get-panel.sh https://raw.githubusercontent.com/crudguy/forkpanel-backend/main/deploy/get-panel.sh
+TAG=v0.1.1
+wget -O get-panel.sh https://raw.githubusercontent.com/crudguy/forkpanel-backend/$TAG/deploy/get-panel.sh
 # curl 备选：curl -fSL --retry 5 --retry-delay 2 -o get-panel.sh <同一 URL>
 sudo sh get-panel.sh
 ```
@@ -21,16 +22,18 @@ sudo sh get-panel.sh
 ## 安装指定版本
 
 ```bash
-# 两步法：先下载（版本变量只影响执行，不影响下载），再执行时指定版本
-wget -O get-panel.sh https://raw.githubusercontent.com/crudguy/forkpanel-backend/main/deploy/get-panel.sh
-PANEL_VERSION=0.1.0 sudo -E sh get-panel.sh
+# 两步法：TAG 钉死取脚本的版本（信任根），PANEL_VERSION 只影响执行时下载的二进制
+TAG=v0.1.1
+wget -O get-panel.sh https://raw.githubusercontent.com/crudguy/forkpanel-backend/$TAG/deploy/get-panel.sh
+PANEL_VERSION=0.1.1 sudo -E sh get-panel.sh
 ```
 
 ## 仅下载验签、不安装（调试 / 审计）
 
 ```bash
 # 两步法：先下载，再传 --no-install 仅验签不安装
-wget -O get-panel.sh https://raw.githubusercontent.com/crudguy/forkpanel-backend/main/deploy/get-panel.sh
+TAG=v0.1.1
+wget -O get-panel.sh https://raw.githubusercontent.com/crudguy/forkpanel-backend/$TAG/deploy/get-panel.sh
 sudo sh get-panel.sh --no-install
 ```
 产物留在临时目录（脚本会打印路径），不触动系统。
@@ -58,8 +61,9 @@ PANEL_CACHE_DIR=/data/forkpanel-cache sudo -E sh get-panel.sh
 默认源是 GitHub Releases。若想走自建源（如 `releases.forkpanel.dev`）或镜像：
 
 ```bash
-# 两步法：先下载**固定 tag** 的脚本（不要用 main 分支实时版），执行时切到自建/镜像源
-wget -O get-panel.sh https://raw.githubusercontent.com/crudguy/forkpanel-backend/main/deploy/get-panel.sh
+# 两步法：先下载钉死版本 tag（$TAG）的脚本，执行时切到自建/镜像源
+TAG=v0.1.1
+wget -O get-panel.sh https://raw.githubusercontent.com/crudguy/forkpanel-backend/$TAG/deploy/get-panel.sh
 PANEL_RELEASE_BASE=https://releases.forkpanel.dev sudo -E sh get-panel.sh
 ```
 
@@ -94,6 +98,10 @@ sudo panel uninstall        # 等价于 /usr/local/bin/panel --config /etc/forkp
   1. **私钥泄露**（最严重）：必须立即换，并通知用户「旧公钥作废、请重新拉取安装器」；
   2. **主动定期轮转**（安全好习惯，如每年一次）。
 - 正常发版**不要**换密钥，沿用同一对即可。
+
+> ⚠ 轮换后，此前已发布的 Release 资产仍由**旧私钥**签名，新公钥验不过——
+> 用户必须钉到轮换后重新发版的 tag（见「安装指定版本」），并重新拉取安装器。
+> 这也是宣发一律钉死版本 tag、不从 `main` 实时取脚本的原因之一。
 
 ### 首次发布前：生成并配置正式密钥（一次性）
 

@@ -900,7 +900,8 @@ fn print_expose_help() {
 
 fn print_upgrade_help() {
     println!("升级（下载签名二进制 → 验签 → 替换并重启；配置与数据保留）：");
-    println!("  wget -O get-panel.sh https://raw.githubusercontent.com/crudguy/forkpanel-backend/main/deploy/get-panel.sh");
+    println!("  TAG=v0.1.1   # 钉到已发布版本；换版只改这里");
+    println!("  wget -O get-panel.sh https://raw.githubusercontent.com/crudguy/forkpanel-backend/$TAG/deploy/get-panel.sh");
     println!("  sudo sh get-panel.sh");
     println!("注：PANEL_VERSION 不带 v 前缀（脚本自己拼 /v<版本>）。");
 }

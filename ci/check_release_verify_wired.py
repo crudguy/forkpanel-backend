@@ -8,12 +8,15 @@
   ① release.yml 剔注释后恰好 1 处调用 ci/verify-release-assets.sh；
   ② 该调用在上传 Release **之前**（发布后再验已经晚了）；
   ③ 回验脚本与用户侧同源（dgst -verify + 安装器内嵌公钥），不是私钥导出公钥自验；
-  ④ 宣发口径不再是从 main 实时 curl | sh（脚本里内嵌公钥，取脚本即取信任根）。
+  ④ 宣发口径全仓钉死版本 tag：任何文件都不许宣传从 main 实时取脚本 URL
+     （含两步法 wget -O；脚本里内嵌公钥，取脚本即取信任根），同时保留
+     $TAG 取脚本样板，防止「删光安装指引也恒绿」。
 
 恒绿纪律：判据剔注释、提取先断言非空、直接盯被检查的那份文件。
 
 用法：python3 ci/check_release_verify_wired.py [仓库根目录]
 """
+import os
 import re
 import sys
 from pathlib import Path
@@ -90,14 +93,48 @@ if "amd64" in vs_code and "arm64" in vs_code:
 else:
     bad("双架构判据不完整")
 
-print("== [4] 宣发口径不再从 main 实时取安装脚本 ==")
+print("== [4] 宣发口径：全仓零 main 分支实时 URL，且保留钉死 tag 的取脚本方式 ==")
 # ⚠ 这条**必须读原始 wf（含注释）**：release.yml 的用户侧安装说明本来就写在
 #   文件头注释里，若沿用 wf_code（已剔注释），判据永远看不到目标 ⇒ 恒绿。
 #   「断言前剔注释」是为了防注释里的假调用冒充真指令，不是所有判据都该剔。
 if re.search(r"main/deploy/get-panel\.sh\s*\|\s*sh", wf):
     bad("release.yml 仍在宣传 curl | sh 从 main 取脚本（取脚本即取内嵌公钥）")
 else:
-    ok("已改为两步法 + 固定版本 URL")
+    ok("release.yml 没有 curl | sh 从 main 取脚本")
+
+# 4b) 两步法同样不能从 main 取：脚本内嵌公钥，取脚本即取信任根。
+#     全仓扫描（排除构建产物 / 版本库 / 会话工作区里的负向对照快照），
+#     新增任何文件漏写这条 URL 都会当场判红，不靠人工维护文件清单。
+BAD_URL = "raw.githubusercontent.com/crudguy/forkpanel-backend/main/deploy/get-panel.sh"
+SKIP_DIRS = {".git", "target", "node_modules", "dist", "coverage", ".workbuddy", ".idea", "web"}
+SELF = "ci/check_release_verify_wired.py"  # 本文件含 BAD_URL 作判据，跳过自身
+leaks = []
+for dirpath, dirnames, filenames in os.walk(ROOT):
+    dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+    for fn in filenames:
+        rel = (Path(dirpath) / fn).relative_to(ROOT).as_posix()
+        if rel == SELF:
+            continue
+        try:
+            text = (ROOT / rel).read_text()
+        except (UnicodeDecodeError, OSError):
+            continue
+        if BAD_URL in text:
+            leaks.append(rel)
+if leaks:
+    bad(f"仍有 {len(leaks)} 个文件宣传 main 分支实时 URL：{', '.join(sorted(leaks))}（须钉死版本 tag）")
+else:
+    ok("全仓无 main 分支实时取脚本 URL")
+
+# 4c) 正向断言：钉死 tag 的取脚本样板必须还在，防止「把安装指引删光也绿」。
+#     判据认 $TAG 变量而非具体版本号——以后发新版不必改守卫。
+for rel in [".github/workflows/release.yml", "README.md", "docs/distribution.md",
+            "docs/deployment.md", "deploy/get-panel.sh", "crates/panel-cli/src/main.rs"]:
+    t = read(rel)
+    if "$TAG/deploy/get-panel.sh" in t:
+        ok(f"{rel} 保留钉死 tag（$TAG）取脚本 URL")
+    else:
+        bad(f"{rel} 缺 $TAG 取脚本 URL——删光安装指引也会让 4b 恒绿")
 
 if fail:
     print("✗ check_release_verify_wired：发版签名回验接线未通过")

@@ -4,7 +4,8 @@
 #
 # 用法（推荐先下载到本地、确认完整，再本地执行；避免 `curl | sh` 中途断流导致脚本半执行）：
 #   0) 先把本脚本下载到本地，再执行（wget 重试+续传，curl 备选）：
-#        wget -O get-panel.sh https://raw.githubusercontent.com/crudguy/forkpanel-backend/main/deploy/get-panel.sh
+#        TAG=v0.1.1
+#        wget -O get-panel.sh https://raw.githubusercontent.com/crudguy/forkpanel-backend/$TAG/deploy/get-panel.sh
 #        sudo sh get-panel.sh
 #   1) 官方一键脚本域名（规划中，尚未部署，请勿使用）：
 #        curl -fsSL https://get.forkpanel.dev | sh

@@ -13,7 +13,9 @@
 ```bash
 # 两步法（推荐，比 curl | sh 更稳）：先把脚本下到本地，确认完整再执行
 # —— 避免管道中途断流让 sh 只执行到半截脚本（留下脏状态）；wget 自带重试+续传
-wget -O get-panel.sh https://raw.githubusercontent.com/crudguy/forkpanel-backend/main/deploy/get-panel.sh
+# 钉死版本 tag：脚本内嵌验签公钥，取脚本即取信任根，不要用 main 分支实时版
+TAG=v0.1.1
+wget -O get-panel.sh https://raw.githubusercontent.com/crudguy/forkpanel-backend/$TAG/deploy/get-panel.sh
 # 没有 wget 时：curl -fSL --retry 5 --retry-delay 2 -o get-panel.sh <同一 URL>
 sudo sh get-panel.sh
 ```
