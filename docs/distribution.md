@@ -117,8 +117,8 @@ sudo panel uninstall        # 等价于 /usr/local/bin/panel --config /etc/forkp
 - **三处公钥是同一把**：`deploy/get-panel.sh` 内嵌 PEM、`deploy/release-pubkey.pub`
   （`panel upgrade` 用 `include_str!` 引用）、`deploy/mirror-sync.sh` 内嵌 PEM；
   更换密钥时还须同步第 4 处 `PANEL_RELEASE_KEY` 私钥（见下）。两个守卫
-  `ci/check-docs-consistency.sh` 与 `ci/verify-release-assets.sh` 目前只比对前两处，
-  `mirror-sync.sh` 内嵌的 PEM 未纳入守卫——轮换时务必手工核对第三处。
+  `ci/check-docs-consistency.sh` 与 `ci/verify-release-assets.sh` 逐字节比对三处，
+  任一处漂移即判红——轮换时不必手工核对第三处。
 - **唯一信任根是 GitHub repo secret `PANEL_RELEASE_KEY`**（ed25519 私钥）。
 - **每次发版自动证明匹配**：`release.yml` 在上传 Release **之前**调用
   `ci/verify-release-assets.sh`，用**安装器内嵌的那把公钥**（不是从私钥导出的公钥）

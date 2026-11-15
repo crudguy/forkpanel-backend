@@ -105,6 +105,25 @@ else
   fi
 fi
 
+# 6b) 第三处公钥：mirror-sync.sh 内嵌 PEM 必须与安装器一致（镜像链验签信任根）。
+#     只比前两处时，第三处被换成别的公钥没人发现 —— 镜像源把自己的公钥塞进
+#     mirror-sync.sh，用户从镜像装到的包照样"验过"，但已不是发布者签的。
+#     提取口径与第 6 项一致；判空是硬要求，空产出绝不当作通过（恒绿守卫）。
+MIRROR="$HERE/deploy/mirror-sync.sh"
+if [ ! -f "$MIRROR" ]; then
+  bad "缺少 deploy/mirror-sync.sh（镜像链验签公钥）"
+else
+  MIR_B64="$(grep -A1 'BEGIN PUBLIC KEY' "$MIRROR" | tail -1 | tr -d " \t'")"
+  EMB_B64="$(grep -A1 'BEGIN PUBLIC KEY' "$GPGUARD" | tail -1 | tr -d " \t'")"
+  if [ -z "$MIR_B64" ] || [ -z "$EMB_B64" ]; then
+    bad "mirror-sync.sh / get-panel.sh 公钥提取为空（正则失效，守卫不可信）"
+  elif [ "$MIR_B64" = "$EMB_B64" ]; then
+    ok "镜像链公钥一致（mirror-sync.sh == get-panel.sh）"
+  else
+    bad "镜像链公钥不一致：mirror-sync.sh 内嵌 PEM 必须与安装器逐字节相同"
+  fi
+fi
+
 # 7) 命名纪律：受控文档 / README / 源码注释里**不得点名同类商业产品**
 #    纪律来源：对外文档与代码注释一律用「主流集中式面板」这类泛称，保留对比结论但不点名。
 #    ⚠ 这份名单是**唯一**允许出现这些名字的地方（机器可读的黑名单）；文档正文里

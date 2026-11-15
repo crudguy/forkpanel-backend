@@ -46,6 +46,22 @@ if [ "$B64" != "$FILE_B64" ]; then
 else
   pass "安装器内嵌公钥 == release-pubkey.pub（单一信任根）"
 fi
+# 第三处公钥：mirror-sync.sh 内嵌 PEM 也必须与安装器逐字节一致。
+# 只比前两处时，镜像链被换成另一把公钥没人发现 —— 镜像源签的包照样能验过，
+# 但已不是发布者签的。与 B3「四处指纹一致」的验收判据对齐。
+MIRROR="$ROOT/deploy/mirror-sync.sh"
+if [ ! -f "$MIRROR" ]; then
+  fail "缺少 deploy/mirror-sync.sh（镜像链验签公钥）"
+else
+  MIR_B64="$(grep -A1 'BEGIN PUBLIC KEY' "$MIRROR" | tail -1 | tr -d " \t'")"
+  if [ -z "$MIR_B64" ]; then
+    fail "mirror-sync.sh 公钥提取为空（正则失效，判据不可信，绝不当作通过）"
+  elif [ "$MIR_B64" = "$B64" ]; then
+    pass "镜像链公钥 == 安装器内嵌公钥（第三处信任根）"
+  else
+    fail "镜像链公钥不一致：mirror-sync.sh 内嵌 PEM 与安装器不同"
+  fi
+fi
 {
   printf '%s\n' '-----BEGIN PUBLIC KEY-----'
   printf '%s\n' "$B64"
