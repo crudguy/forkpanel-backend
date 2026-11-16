@@ -59,6 +59,10 @@ use panel_db::ReadPool;
 use std::sync::Arc;
 
 /// 全应用共享状态
+/// 「核准 IP」写回回调：入参为已校验的 IP 字符串，写回 config.toml `[info]`。
+/// 实现由 serve 注入（panel-cli 的 `write_config_key`，含整份重解析校验）。
+pub type WritePublicIpFn = std::sync::Arc<dyn Fn(&str) -> panel_core::Result<()> + Send + Sync>;
+
 pub struct AppState {
     pub os: Arc<dyn panel_os::OsAdapter>,
     pub db: Arc<panel_db::WriterActor>,
@@ -105,9 +109,13 @@ pub struct AppState {
     /// **默认 false**：升级会替换 root 二进制并重启，属最高危操作；只有显式打开
     /// 才出现按钮、端点才受理。命令行升级（`sudo panel upgrade`）不受此开关影响。
     pub allow_web_upgrade: bool,
-    /// 公网出口 IP（来自 config.toml `[info] public_ip`，`panel init` 探测一次写入）。
-    /// **纯展示**：仅随 /system/overview 下发，不参与任何运行时决策；None = 未探测到。
-    pub public_ip: Option<String>,
+    /// 公网出口 IP（来自 config.toml `[info] public_ip`，`panel init` 探测一次写入；
+    /// Web 端「核准 IP」运行期可刷新）。**纯展示**：不参与任何运行时决策。
+    /// RwLock：核准后 GET / overview 立即读新值，无需重启。
+    pub public_ip: tokio::sync::RwLock<Option<String>>,
+    /// 写回 `[info] public_ip` 的回调（serve 注入 panel-cli 的 `write_config_key`）：
+    /// 写盘前的整份重解析校验在 panel-cli，panel-api 不依赖它——依赖方向不能反。
+    pub write_public_ip: WritePublicIpFn,
     /// SQLite 落盘同步档（来自 config.toml `[db] synchronous`，归一化后的大写值）。
     /// **真实生效**：`panel_db::open` 据此设置 `PRAGMA synchronous`（非法值启动即报错）。
     pub db_synchronous: String,
@@ -154,6 +162,7 @@ impl AppState {
                audit_retention_days: u32, audit_max_rows: u64,
                localhost_only: bool, daily_backup: bool, db_synchronous: String,
                backup_keep: i64, allow_web_upgrade: bool, public_ip: Option<String>,
+               write_public_ip: WritePublicIpFn,
                alert: Option<Arc<crate::alert::AlertSink>>) -> Self {
         let capabilities = os.capabilities();
         // 会话持久化：把写者交给 SessionCache（`sessions` 表 001 已定义、此前无人使用）。
@@ -162,7 +171,8 @@ impl AppState {
         Self {
             os, db, pool, tasks, metrics, tier, capabilities, session_idle, session_absolute,
             audit_retention_days, audit_max_rows, localhost_only, daily_backup, db_synchronous,
-            backup_keep, allow_web_upgrade, public_ip,
+            backup_keep, allow_web_upgrade,
+            public_ip: tokio::sync::RwLock::new(public_ip), write_public_ip,
             sessions: Arc::new(crate::auth::SessionCache::new_with_db(
                 session_idle,
                 session_absolute,
@@ -297,7 +307,7 @@ pub(crate) mod test_support {
         crate::AppState::new(
             os, writer, pool, tasks, metrics, tier, None, false, 5,
             std::time::Duration::from_secs(1800), std::time::Duration::from_secs(43_200),
-            90, 50_000, true, true, "NORMAL".to_string(), 7, false, None, None)
+            90, 50_000, true, true, "NORMAL".to_string(), 7, false, None, std::sync::Arc::new(|_: &str| Ok::<(), panel_core::PanelError>(())), None)
     }
 
     /// 源码守卫取「**生产段**」：剔注释行 + 剔 `#[cfg(test)]` 包裹的块。

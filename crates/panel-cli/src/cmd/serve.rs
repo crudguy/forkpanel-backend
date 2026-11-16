@@ -183,11 +183,17 @@ pub(crate) fn run(cli: &Cli, os: Arc<dyn panel_os::OsAdapter>) -> Result<()> {
         // 注册 `db.backup` 时就取它做裁剪阈值（见下方 register_internal_jobs），
         // 这里同时注入 AppState 供备份页显示"实际保留几份"。
         let backup_keep = cfg.db.backup_keep;
+        // 「核准 IP」的写回回调：config.toml 的整份重解析校验在 panel-cli
+        // （panel-api 不依赖它），serve 在这里注入路径与写入能力。
+        let write_public_ip = {
+            let p = cli.config.clone().unwrap_or_else(|| layout0.config_dir().join("config.toml"));
+            Arc::new(move |ip: &str| crate::config::write_config_key(&p, "info", "public_ip", &format!("\"{ip}\"")))
+        };
         let state = Arc::new(panel_api::AppState::new(
             os.clone(), writer.clone(), pool, tasks.clone(), metrics.clone(), tier,
             master_key, read_only, max_login_attempts, session_idle, session_absolute,
             audit_retention_days, audit_max_rows, localhost_only, daily_backup,
-            db_synchronous, backup_keep, cfg.danger.allow_web_upgrade, cfg.info.public_ip.clone(), alert.clone()));
+            db_synchronous, backup_keep, cfg.danger.allow_web_upgrade, cfg.info.public_ip.clone(), write_public_ip, alert.clone()));
 
         // ── 内部周期任务 ──
         register_internal_jobs(&sched_in, &os, writer.clone(), metrics.clone(), &layout, &cfg, tier, state.clone()).await;

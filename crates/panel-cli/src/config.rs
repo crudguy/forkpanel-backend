@@ -6,6 +6,8 @@
 //! - 未知字段**拒绝**启动（deny_unknown_fields），避免"配了但没生效"的静默失败。
 
 use panel_core::{PanelError, Result, Tier};
+// 解析下沉到 panel-core（Web 端核准也要用），此处 re-export 保持调用点不变。
+pub use panel_core::public_ip::parse_public_ip;
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, path::{Path, PathBuf}};
 
@@ -288,15 +290,6 @@ pub fn parse_duration(s: &str) -> Result<std::time::Duration> {
             reason: format!("unknown unit in {s:?} (use s/m/h/d)") }),
     };
     Ok(std::time::Duration::from_secs(secs))
-}
-
-/// 解析并归一化公网 IP 文本。**唯一校验入口**（init 探测与 validate_implemented
-/// 共用）：只接受 IPv4/IPv6 字面量。回显服务的输出偶尔带杂质（多余空格、
-/// HTML 错误页），宁可判定失败不写配置，也不把垃圾落盘。纯函数，无网络调用。
-pub fn parse_public_ip(s: &str) -> Option<std::net::IpAddr> {
-    let s = s.trim();
-    if s.is_empty() || s.chars().any(|c| c.is_whitespace()) { return None; }
-    s.parse().ok()
 }
 
 /// 在 config.toml 的 `[server]` 段**原子**替换或追加一个键，保留注释与其它段。
@@ -656,19 +649,6 @@ session_absolute = "2h"
         // 与硬编码值不同，证明这条测试有判别力（不是默认值蒙对）
         assert_ne!(idle.as_secs(), 30 * 60);
         assert_ne!(abs.as_secs(), 12 * 3600);
-    }
-
-    #[test]
-    fn parse_public_ip_accepts_only_ip_literals() {
-        use std::net::IpAddr;
-        assert_eq!(parse_public_ip("203.0.113.7"), Some(IpAddr::from([203, 0, 113, 7])));
-        assert_eq!(parse_public_ip(" 2001:db8::1\n"), Some("2001:db8::1".parse().unwrap()),
-            "首尾空白允许（curl 输出常带换行）");
-        assert_eq!(parse_public_ip(""), None, "空输出不算探测成功");
-        assert_eq!(parse_public_ip("1.2.3.4 x"), None, "内嵌杂质必须整体拒绝");
-        assert_eq!(parse_public_ip("1.2.3.4/24"), None, "带掩码不是纯 IP");
-        assert_eq!(parse_public_ip("999.1.1.1"), None, "越界段不是合法 IP");
-        assert_eq!(parse_public_ip("<html>oops</html>"), None, "回显服务故障页必须拒绝");
     }
 
     #[test]

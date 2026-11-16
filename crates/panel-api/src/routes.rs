@@ -104,6 +104,7 @@ pub fn build_router(state: Shared) -> Router {
     let system_r = Router::new()
         .route("/api/v1/system/capabilities", get(system::capabilities))
         .route("/api/v1/system/overview", get(system::overview))
+        .route("/api/v1/system/public-ip", get(system::public_ip).post(system::public_ip_refresh))
         .route("/api/v1/metrics/realtime", get(system::realtime))
         .route("/api/v1/metrics/history", get(system::history))
         .route("/api/v1/system/users", get(system::users))
@@ -577,7 +578,7 @@ mod tests {
         let state = std::sync::Arc::new(crate::AppState::new(
             os, writer, pool, tasks, metrics, tier, None, false, 5,
             std::time::Duration::from_secs(1800), std::time::Duration::from_secs(43_200),
-            90, 50_000, true, true, "NORMAL".to_string(), 7, false, None, None));
+            90, 50_000, true, true, "NORMAL".to_string(), 7, false, None, std::sync::Arc::new(|_: &str| Ok::<(), panel_core::PanelError>(())), None));
 
         let app = crate::routes::build_router(state);
         let res = app
