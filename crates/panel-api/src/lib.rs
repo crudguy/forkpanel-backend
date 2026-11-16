@@ -105,6 +105,9 @@ pub struct AppState {
     /// **默认 false**：升级会替换 root 二进制并重启，属最高危操作；只有显式打开
     /// 才出现按钮、端点才受理。命令行升级（`sudo panel upgrade`）不受此开关影响。
     pub allow_web_upgrade: bool,
+    /// 公网出口 IP（来自 config.toml `[info] public_ip`，`panel init` 探测一次写入）。
+    /// **纯展示**：仅随 /system/overview 下发，不参与任何运行时决策；None = 未探测到。
+    pub public_ip: Option<String>,
     /// SQLite 落盘同步档（来自 config.toml `[db] synchronous`，归一化后的大写值）。
     /// **真实生效**：`panel_db::open` 据此设置 `PRAGMA synchronous`（非法值启动即报错）。
     pub db_synchronous: String,
@@ -150,7 +153,7 @@ impl AppState {
                session_idle: std::time::Duration, session_absolute: std::time::Duration,
                audit_retention_days: u32, audit_max_rows: u64,
                localhost_only: bool, daily_backup: bool, db_synchronous: String,
-               backup_keep: i64, allow_web_upgrade: bool,
+               backup_keep: i64, allow_web_upgrade: bool, public_ip: Option<String>,
                alert: Option<Arc<crate::alert::AlertSink>>) -> Self {
         let capabilities = os.capabilities();
         // 会话持久化：把写者交给 SessionCache（`sessions` 表 001 已定义、此前无人使用）。
@@ -159,7 +162,7 @@ impl AppState {
         Self {
             os, db, pool, tasks, metrics, tier, capabilities, session_idle, session_absolute,
             audit_retention_days, audit_max_rows, localhost_only, daily_backup, db_synchronous,
-            backup_keep, allow_web_upgrade,
+            backup_keep, allow_web_upgrade, public_ip,
             sessions: Arc::new(crate::auth::SessionCache::new_with_db(
                 session_idle,
                 session_absolute,
@@ -294,7 +297,7 @@ pub(crate) mod test_support {
         crate::AppState::new(
             os, writer, pool, tasks, metrics, tier, None, false, 5,
             std::time::Duration::from_secs(1800), std::time::Duration::from_secs(43_200),
-            90, 50_000, true, true, "NORMAL".to_string(), 7, false, None)
+            90, 50_000, true, true, "NORMAL".to_string(), 7, false, None, None)
     }
 
     /// 源码守卫取「**生产段**」：剔注释行 + 剔 `#[cfg(test)]` 包裹的块。

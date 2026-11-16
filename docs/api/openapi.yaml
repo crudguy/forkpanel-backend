@@ -296,6 +296,7 @@ components:
         load1:         { type: number }
         uptime_sec:    { type: integer }
         degraded:      { type: boolean, description: "true=已触发低配降频" }
+        public_ip:     { type: string, nullable: true, description: "公网出口 IP（panel init 探测一次写入；未探测到为 null）" }
         alerts:        { type: array, items: { $ref: '#/components/schemas/Alert' } }
     Directories:
       type: object

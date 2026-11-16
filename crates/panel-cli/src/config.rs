@@ -36,6 +36,10 @@ pub struct Config {
     #[serde(default)]
     pub danger: Danger,
 
+    /// 展示性事实（`panel init` 探测一次写入；serve 只读下发，不参与任何决策）。
+    #[serde(default)]
+    pub info: Info,
+
     /// "auto" 依据内存/CPU 探测；也可强制指定档位
     #[serde(default = "default_tier")]
     pub tier: String,
@@ -136,6 +140,18 @@ pub struct Danger {
     pub allow_web_upgrade: bool,
 }
 
+/// 展示性事实段。**init 时探测一次**写入（目前只有公网出口 IP），此后
+/// serve 与各命令只读不写、也不据此做任何运行时决策——写错只影响展示。
+/// 手动改错仍会被 `validate_implemented` 拦下（宁可启动前报错，不静默显示垃圾）。
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct Info {
+    /// 公网**出口** IP。NAT 部署下拿到的是出口网关 IP，动态宽带会过期——
+    /// 面板仅展示，不做任何安全判断。
+    #[serde(default)]
+    pub public_ip: Option<String>,
+}
+
 fn default_bind() -> String { "127.0.0.1".into() }
 fn default_port() -> u16 { 2083 }
 fn default_tier() -> String { "auto".into() }
@@ -173,6 +189,7 @@ impl Default for Config {
         Self { server: Server::default(), paths: PathsOverride::default(),
                db: Db::default(), security: Security::default(),
                audit: Audit::default(), danger: Danger::default(),
+               info: Info::default(),
                metrics: Metrics::default(), tier: default_tier() }
     }
 }
@@ -239,6 +256,19 @@ impl Config {
                 }
             }
         }
+        // [info] public_ip：展示值写错也宁可在启动前报错，而不是把垃圾
+        // 静默发给前端（与 tls 同一哲学：宁可响亮失败，不假装正常）。
+        if let Some(ip) = &self.info.public_ip {
+            if parse_public_ip(ip).is_none() {
+                return Err(PanelError::Validation {
+                    field: "info",
+                    reason: format!(
+                        "`[info] public_ip = \"{ip}\"` 不是合法 IP 地址；删除该键、或改成公网 IP\
+                         （`panel init` 会自动探测一次并写入）"
+                    ),
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -260,7 +290,17 @@ pub fn parse_duration(s: &str) -> Result<std::time::Duration> {
     Ok(std::time::Duration::from_secs(secs))
 }
 
+/// 解析并归一化公网 IP 文本。**唯一校验入口**（init 探测与 validate_implemented
+/// 共用）：只接受 IPv4/IPv6 字面量。回显服务的输出偶尔带杂质（多余空格、
+/// HTML 错误页），宁可判定失败不写配置，也不把垃圾落盘。纯函数，无网络调用。
+pub fn parse_public_ip(s: &str) -> Option<std::net::IpAddr> {
+    let s = s.trim();
+    if s.is_empty() || s.chars().any(|c| c.is_whitespace()) { return None; }
+    s.parse().ok()
+}
+
 /// 在 config.toml 的 `[server]` 段**原子**替换或追加一个键，保留注释与其它段。
+/// （`[server]` 专属薄壳，实现在 [`write_config_key`]。）
 ///
 /// `value` 为最终写入文本（已含引号 / 类型后缀），调用方负责先校验取值合法。
 /// 写盘前先用 `Config::load` 重新解析整份文件——本构建 `deny_unknown_fields`，
@@ -268,12 +308,20 @@ pub fn parse_duration(s: &str) -> Result<std::time::Duration> {
 /// 相较原 `forkpanel-config.sh` 的 awk 文本编辑，此处改动后一定可解析，且权限沿用
 /// 原文件（不会把 0640 的 root 配置放宽成 0644）。
 pub fn write_server_key(path: &Path, key: &str, value: &str) -> Result<()> {
+    write_config_key(path, "server", key, value)
+}
+
+/// [`write_server_key`] 的泛化版：在任意 `[section]` 段原子替换或追加一个键。
+/// 语义完全一致：保留注释与其它段、不重排；写盘前整份重解析（本构建
+/// `deny_unknown_fields`，写坏立即报错，绝不落一份 serve 起不来的配置）；
+/// 权限沿用原文件。消费者：`panel menu/config` 改 `[server]`，`panel init` 写 `[info]`。
+pub fn write_config_key(path: &Path, section: &str, key: &str, value: &str) -> Result<()> {
     if !path.exists() {
         return Err(PanelError::NotFound(format!("config not found: {}", path.display())));
     }
     let original = std::fs::read_to_string(path)
         .map_err(|e| PanelError::Internal(format!("read config: {e}")))?;
-    let updated = replace_in_section(&original, "server", key, value)
+    let updated = replace_in_section(&original, section, key, value)
         .map_err(|e| PanelError::Internal(format!("patch config: {e}")))?;
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, &updated)
@@ -397,6 +445,11 @@ max_rows = 50000
 # 升级会替换 /usr/local/bin/panel 并重启；失败时 CLI 会自动回滚，但网络中断仍可能
 # 让你暂时失联。命令行升级（sudo panel upgrade）不受此开关影响。
 allow_web_upgrade = false
+
+# [info]
+# 展示性事实段：`panel init` 探测一次后写入（目前只有公网出口 IP），面板只读展示。
+# NAT 部署拿到的是出口网关 IP，动态宽带下可能过期；可手动修正或删除该键。
+# public_ip = "203.0.113.7"
 "#, cfg = cfg, data = data, site = site)
 }
 
@@ -603,6 +656,52 @@ session_absolute = "2h"
         // 与硬编码值不同，证明这条测试有判别力（不是默认值蒙对）
         assert_ne!(idle.as_secs(), 30 * 60);
         assert_ne!(abs.as_secs(), 12 * 3600);
+    }
+
+    #[test]
+    fn parse_public_ip_accepts_only_ip_literals() {
+        use std::net::IpAddr;
+        assert_eq!(parse_public_ip("203.0.113.7"), Some(IpAddr::from([203, 0, 113, 7])));
+        assert_eq!(parse_public_ip(" 2001:db8::1\n"), Some("2001:db8::1".parse().unwrap()),
+            "首尾空白允许（curl 输出常带换行）");
+        assert_eq!(parse_public_ip(""), None, "空输出不算探测成功");
+        assert_eq!(parse_public_ip("1.2.3.4 x"), None, "内嵌杂质必须整体拒绝");
+        assert_eq!(parse_public_ip("1.2.3.4/24"), None, "带掩码不是纯 IP");
+        assert_eq!(parse_public_ip("999.1.1.1"), None, "越界段不是合法 IP");
+        assert_eq!(parse_public_ip("<html>oops</html>"), None, "回显服务故障页必须拒绝");
+    }
+
+    #[test]
+    fn info_section_roundtrip_and_validation() {
+        let c: Config = toml::from_str("[info]\npublic_ip = \"203.0.113.7\"\n").unwrap();
+        assert_eq!(c.info.public_ip.as_deref(), Some("203.0.113.7"));
+        assert!(c.validate_implemented().is_ok(), "合法 IP 必须放行");
+
+        // 没写 [info] 段（旧配置）也必须照常解析
+        let old: Config = toml::from_str("[server]\nport = 2083\n").unwrap();
+        assert_eq!(old.info.public_ip, None);
+
+        // 手写垃圾：启动前拒绝，不静默发给前端
+        let mut bad = Config::default();
+        bad.info.public_ip = Some("not-an-ip".into());
+        let m = bad.validate_implemented().unwrap_err().to_string();
+        assert!(m.contains("public_ip"), "须点名字段：{m}");
+        assert!(m.contains("panel init"), "须给出可执行出路：{m}");
+    }
+
+    #[test]
+    fn write_config_key_appends_missing_section() {
+        let dir = std::env::temp_dir().join(format!("panel-info-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.toml");
+        std::fs::write(&p, "[server]\nport = 2083\n").unwrap();
+        // 配置里没有 [info] 段：write_config_key 必须补整段且整份仍可解析
+        write_config_key(&p, "info", "public_ip", "\"203.0.113.7\"").unwrap();
+        let c = Config::load(&p).unwrap();
+        assert_eq!(c.info.public_ip.as_deref(), Some("203.0.113.7"));
+        assert_eq!(c.server.port, 2083, "原有段不得被改");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

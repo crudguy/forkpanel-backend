@@ -187,7 +187,7 @@ pub(crate) fn run(cli: &Cli, os: Arc<dyn panel_os::OsAdapter>) -> Result<()> {
             os.clone(), writer.clone(), pool, tasks.clone(), metrics.clone(), tier,
             master_key, read_only, max_login_attempts, session_idle, session_absolute,
             audit_retention_days, audit_max_rows, localhost_only, daily_backup,
-            db_synchronous, backup_keep, cfg.danger.allow_web_upgrade, alert.clone()));
+            db_synchronous, backup_keep, cfg.danger.allow_web_upgrade, cfg.info.public_ip.clone(), alert.clone()));
 
         // ── 内部周期任务 ──
         register_internal_jobs(&sched_in, &os, writer.clone(), metrics.clone(), &layout, &cfg, tier, state.clone()).await;

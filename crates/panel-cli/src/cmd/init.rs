@@ -23,6 +23,18 @@ use panel_core::{PanelError, Result};
 
 use crate::{bootstrap, build_layout, config, create_owner, detect_tier, doctor, load_cfg, Cli};
 
+/// 探测公网**出口** IP（仅 `panel init` 调用一次）。任何失败都返回 None 由调用方
+/// 提示——init 绝不因无外网而失败（离线机器、防火墙、回显服务不可达都是正常
+/// 部署形态）。走 `panel_os` 的同步子进程出口（`Bin::Curl` 白名单，argv 直传）：
+/// `--fail` 把 HTTP 错误当失败，`--max-time 10` 早于 `run_sync` 的 30s 上限先到。
+fn probe_public_ip() -> Option<String> {
+    let out = panel_os::run_sync(
+        panel_os::Bin::Curl,
+        &["-s", "--fail", "--max-time", "10", "https://api.ipify.org"],
+    ).ok()?;
+    config::parse_public_ip(&out.stdout).map(|ip| ip.to_string())
+}
+
 /// 初始化面板：目录 / 主密钥 / 配置 / 库结构 / 首个 owner 账号。
 ///
 /// 幂等：配置已存在则复用（除非 `--force`），owner 已存在则跳过创建。
@@ -78,6 +90,19 @@ pub(crate) fn init(
         println!("（已有 owner 账号，跳过创建）");
     }
     drop(conn);
+    // 公网出口 IP：init 期间探测一次写入 `[info] public_ip`，serve 只读下发。
+    // 已有值不重探（幂等：重跑 init 不再外呼）；探测/写盘失败都只提示、不阻塞
+    // 初始化——这是一条锦上添花的展示信息，不能反客为主。
+    if let Some(cur) = &cfg.info.public_ip {
+        println!("（[info] public_ip 已配置 {cur}，不重探）");
+    } else if let Some(ip) = probe_public_ip() {
+        match config::write_config_key(&cfg_path, "info", "public_ip", &format!("\"{ip}\"")) {
+            Ok(()) => println!("公网 IP（出口）探测成功：{ip}（已写入 [info] public_ip）"),
+            Err(e) => println!("公网 IP 写入配置失败（不影响初始化）：{e}"),
+        }
+    } else {
+        println!("公网 IP 探测跳过（无外网或回显服务不可达）；需要时手动在 config.toml 配 [info] public_ip");
+    }
     println!("初始化完成");
     println!("  配置文件：{}", cfg_path.display());
     println!("  数据目录：{}", layout.data_dir().display());
@@ -100,3 +125,4 @@ pub(crate) fn doctor(cli: &Cli, os: Arc<dyn panel_os::OsAdapter>) -> Result<()> 
     if doctor::has_fail(&checks) { std::process::exit(1); }
     Ok(())
 }
+

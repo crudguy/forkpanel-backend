@@ -60,6 +60,8 @@ pub struct OverviewResp {
     pub tier: &'static str,
     /// 采样是否已被降频（低配保护，UI 需提示）
     pub degraded: bool,
+    /// 公网出口 IP（`panel init` 探测一次写入 config.toml `[info]`；未探测到为 null）。仅展示。
+    pub public_ip: Option<String>,
 }
 
 /// 一次性快照（仪表盘卡片数据）。
@@ -91,6 +93,7 @@ pub async fn overview(State(state): State<Shared>, Auth(s): Auth) -> ApiResult<J
             panel_core::Tier::Standard => "standard",
         },
         degraded: matches!(state.tier, panel_core::Tier::Nano),
+        public_ip: state.public_ip.clone(),
     }))
 }
 
