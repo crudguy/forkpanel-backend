@@ -161,4 +161,47 @@ else
 fi
 
 echo
+echo "== [F] 运行时 / 编译开发工具必须分成两类（防语义回退）=="
+# 历史形态：php-fpm/nodejs/default-jdk/golang-go/cargo 全在 label='运行环境' 一类。
+# 后三个是编译工具，服务器跑已编译好的程序并不需要，并列会误导用户以为必须装。
+# 判据同时钉「两类都在」「label 精确」「成员精确」——只数行数会让「合并 + 凑两行」蒙混过关。
+F_ROWS=$(grep -E "key: '(runtime|devtools)'," "$FE_SRC" 2>/dev/null || true)
+F_N=$(count "$F_ROWS")
+F_BAD=0
+if [ "$F_N" -ne 2 ]; then
+  fail "runtime / devtools 分类共 $F_N 行（应为 2：合并或漏配都会在这里红）"
+else
+  pass "runtime / devtools 两类均存在"
+  for spec in "runtime|运行时|nodejs php-fpm" "devtools|编译开发工具|cargo default-jdk golang-go"; do
+    IFS='|' read -r F_KEY F_LABEL F_PKGS <<< "$spec"
+    # 纯 shell 逐行取，避开 grep -q / head 在 pipefail 下的 SIGPIPE 偶发假失败
+    ROW=""
+    while IFS= read -r line; do
+      case "$line" in
+        *"key: '$F_KEY',"*) ROW="$line"; break ;;
+      esac
+    done <<< "$F_ROWS"
+    if [ -z "$ROW" ]; then
+      fail "$F_KEY 分类行未提取到"
+      F_BAD=1
+      continue
+    fi
+    case "$ROW" in
+      *"label: '$F_LABEL',"*) : ;;
+      *) fail "$F_KEY 的 label 应为「$F_LABEL」，实际行：$ROW"; F_BAD=1 ;;
+    esac
+    # 只从 pkgs 数组抽成员，避免把 label 误收进来；排序后精确比对
+    GOT=$(printf '%s\n' "$ROW" | grep -oE "pkgs: \[[^]]*\]" \
+      | grep -oE "'[a-z0-9][a-z0-9.+-]*'" | tr -d "'" | sort -u | tr '\n' ' ' | sed 's/ $//')
+    if [ "$GOT" != "$F_PKGS" ]; then
+      fail "$F_KEY 成员应为 [$F_PKGS]，实际 [$GOT]"
+      F_BAD=1
+    fi
+  done
+  if [ "$F_BAD" -eq 0 ]; then
+    pass "两类 label 与成员均精确（运行时=php-fpm/nodejs，编译工具=default-jdk/golang-go/cargo）"
+  fi
+fi
+
+echo
 if [ "$FAIL" -eq 0 ]; then echo "PASS：软件包白名单前后端一致"; exit 0; else echo "FAIL：白名单不一致"; exit 1; fi
