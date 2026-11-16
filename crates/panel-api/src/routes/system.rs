@@ -101,13 +101,22 @@ pub async fn overview(State(state): State<Shared>, Auth(s): Auth) -> ApiResult<J
 #[derive(Debug, serde::Deserialize)]
 pub struct RealtimeQ { pub since: Option<usize> }
 
+/// `since` 的 API 契约是「秒数」（openapi.yaml 亦如此描述），不是样本数。
+/// 按当前档位采样间隔换算，保证 1s / 2s / 5s 档下「60 秒」都真是 60 秒。
+fn samples_for_seconds(since: Option<usize>, interval_ms: u64) -> usize {
+    let iv = interval_ms.max(1);
+    let ms = (since.unwrap_or(60) as u64).saturating_mul(1000);
+    let n = (ms / iv) + u64::from(!ms.is_multiple_of(iv));
+    n.clamp(1, 3600) as usize
+}
+
 pub async fn realtime(
     State(state): State<Shared>,
     Auth(s): Auth,
     Query(q): Query<RealtimeQ>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SYSTEM_VIEW)?;
-    let n = q.since.unwrap_or(60).clamp(1, 3600);   // 上限保护：防止一次拉取全部缓冲
+    let n = samples_for_seconds(q.since, state.tier.sampling_interval_ms());
     let samples: Vec<_> = {
         let g = state.metrics.lock().unwrap_or_else(|e| e.into_inner());
         g.ring().last_n(n).iter().map(|s| serde_json::json!({
@@ -619,4 +628,20 @@ pub async fn public_ip_refresh(
     *state.public_ip.write().await = Some(probed.clone());
     crate::routes::audit(&state, &s, "system.public_ip.refresh", "config.toml", "ok").await;
     Ok(ok(json!({ "public_ip": probed })))
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn since_is_seconds_not_samples() {
+        assert_eq!(samples_for_seconds(None, 1000), 60);
+        assert_eq!(samples_for_seconds(Some(60), 2000), 30);
+        assert_eq!(samples_for_seconds(Some(60), 5000), 12);
+        assert_eq!(samples_for_seconds(Some(3600), 1000), 3600);
+        assert_eq!(samples_for_seconds(Some(99999), 1000), 3600); // 上限保护
+        assert_eq!(samples_for_seconds(Some(0), 1000), 1);
+    }
 }

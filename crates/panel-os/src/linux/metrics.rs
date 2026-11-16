@@ -19,7 +19,8 @@ struct Prev {
     cpu_total: Option<(u64, u64)>,          // (busy, total)
     per_core: HashMap<String, (u64, u64)>,
     proc_time: HashMap<i32, (u64, u64)>,    // pid -> (utime+stime, 采样时刻毫秒)
-    net: HashMap<String, (u64, u64)>,       // iface -> (rx, tx)
+    net: HashMap<String, (u64, u64, u64)>,  // iface -> (rx, tx, 采样时刻毫秒)
+
 }
 
 impl Default for LinuxMetrics {
@@ -252,6 +253,15 @@ fn parse_uptime(s: &str) -> u64 {
     s.split_whitespace().next().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0) as u64
 }
 
+/// 相邻两次 /proc/net/dev 计数差（字节）→ bit/s。
+/// 旧实现把字节差直接塞进 *_bps 字段并注释「由上一层换算」，但全仓没有那一层：
+/// 前端按 Mbps 展示时数值会差 8 倍，且非 1s 采样档位不准。这里按真实间隔换算。
+fn bits_per_second(delta_bytes: u64, dt_ms: u64) -> u64 {
+    if dt_ms == 0 { return 0 }
+    let bps = (delta_bytes as f64) * 8.0 * 1000.0 / dt_ms as f64;
+    if bps >= u64::MAX as f64 { u64::MAX } else { bps.round() as u64 }
+}
+
 fn parse_netdev(s: &str, prev: &mut Prev) -> Vec<NetSample> {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
@@ -262,17 +272,15 @@ fn parse_netdev(s: &str, prev: &mut Prev) -> Vec<NetSample> {
         let fields: Vec<u64> = it.filter_map(|v| v.parse().ok()).collect();
         if fields.len() < 10 { continue; }
         let (rx, tx) = (fields[0], fields[8]);
-        let (rx_rate, tx_rate) = match prev.net.insert(iface.clone(), (rx, tx)) {
-            Some((prx, ptx)) if rx >= prx && tx >= ptx => {
-                // 简化：以采样间隔（由调用方决定）近似；此处按 1s 归一，
-                // 实际速率由上一层聚合器用真实间隔换算
-                (rx - prx, tx - ptx)
+        let (rx_rate, tx_rate) = match prev.net.insert(iface.clone(), (rx, tx, now_ms)) {
+            Some((prx, ptx, at_ms)) if rx >= prx && tx >= ptx => {
+                let dt_ms = now_ms.saturating_sub(at_ms);
+                (bits_per_second(rx - prx, dt_ms), bits_per_second(tx - ptx, dt_ms))
             }
             _ => (0, 0),
         };
         out.push(NetSample { iface, rx_bytes: rx, tx_bytes: tx, rx_rate_bps: rx_rate, tx_rate_bps: tx_rate });
     }
-    let _ = now_ms;
     out
 }
 
@@ -425,6 +433,16 @@ mod tests {
             pid, ppid: 1, name: format!("p{pid}"), cpu_pct: cpu,
             rss_kib: rss, cmdline: String::new(), user: None,
         }
+    }
+
+    #[test]
+    fn net_rate_uses_real_interval_and_bits() {
+        // 1 MB/s = 8 Mbps；间隔翻倍但字节差也翻倍时速率必须不变
+        assert_eq!(bits_per_second(125_000, 1_000), 1_000_000);
+        assert_eq!(bits_per_second(250_000, 2_000), 1_000_000);
+        // 同一毫秒内重复采样不造尖峰；零差恒零
+        assert_eq!(bits_per_second(1_000, 0), 0);
+        assert_eq!(bits_per_second(0, 1_000), 0);
     }
 
     #[test]
