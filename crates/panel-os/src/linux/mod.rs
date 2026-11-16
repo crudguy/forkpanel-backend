@@ -128,16 +128,36 @@ fn make_firewall(paths: &Arc<LinuxPathLayout>) -> Arc<dyn FirewallProvider> {
     }
 }
 
+/// 从 `/etc/os-release` 内容解析发行版标识（纯函数，便于把各种字段组合钉死）。
+///
+/// 稳定版保持历史格式 `ID:VERSION_ID`（`debian:12`，即 openapi 示例）；
+/// 滚动发行版没有 `VERSION_ID`（Debian forky/sid 实测如此），若因此把整个
+/// `distro` 置 `null`，前端会拿 `os=linux` 顶包，把「发行版」显示成 Linux——
+/// 系统族不是发行版，故先试 `ID:VERSION_CODENAME`，再退 `ID`，最后退 `PRETTY_NAME`。
+pub fn parse_distro(os_release: &str) -> Option<String> {
+    let mut id = None;
+    let mut ver = None;
+    let mut codename = None;
+    let mut pretty = None;
+    for line in os_release.lines() {
+        let value = |key: &str| {
+            line.strip_prefix(key)
+                .map(|v| v.trim().trim_matches('"').trim_matches('\'').to_string())
+                .filter(|v| !v.is_empty())
+        };
+        if let Some(v) = value("ID=") { id = Some(v); }
+        if let Some(v) = value("VERSION_ID=") { ver = Some(v); }
+        if let Some(v) = value("VERSION_CODENAME=") { codename = Some(v); }
+        if let Some(v) = value("PRETTY_NAME=") { pretty = Some(v); }
+    }
+    if let (Some(i), Some(v)) = (&id, &ver) { return Some(format!("{i}:{v}")); }
+    if let (Some(i), Some(c)) = (&id, &codename) { return Some(format!("{i}:{c}")); }
+    id.or(codename).or(pretty)
+}
+
 /// 读取 /etc/os-release，避免硬编码发行版分支
 pub fn detect_platform() -> PlatformInfo {
-    let distro = std::fs::read_to_string("/etc/os-release").ok().and_then(|s| {
-        let mut id = None; let mut ver = None;
-        for line in s.lines() {
-            if let Some(v) = line.strip_prefix("ID=") { id = Some(v.trim_matches('"').to_string()); }
-            if let Some(v) = line.strip_prefix("VERSION_ID=") { ver = Some(v.trim_matches('"').to_string()); }
-        }
-        match (id, ver) { (Some(i), Some(v)) => Some(format!("{i}:{v}")), _ => None }
-    });
+    let distro = std::fs::read_to_string("/etc/os-release").ok().and_then(|s| parse_distro(&s));
     let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease").ok().map(|s| s.trim().to_string());
     PlatformInfo {
         os: panel_core::Os::Linux,
@@ -191,3 +211,42 @@ pub fn check_data_dir_fs(path: &std::path::Path) -> Result<(String, bool)> {
     Ok((name.to_string(), is_network))
 }
 pub use files::{LinuxFileProvider, is_sensitive_path};
+
+#[cfg(test)]
+mod distro_tests {
+    use super::parse_distro;
+
+    #[test]
+    fn stable_keeps_id_colon_version_id() {
+        let src = "PRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\nID=debian\nVERSION_ID=\"12\"\nVERSION_CODENAME=bookworm\n";
+        assert_eq!(parse_distro(src).as_deref(), Some("debian:12"));
+    }
+
+    #[test]
+    fn rolling_without_version_id_falls_back_to_codename() {
+        // 本机 Debian forky/sid 的真实字段组合（无 VERSION_ID）。
+        let src = "PRETTY_NAME=\"Debian GNU/Linux forky/sid\"\nID=debian\nVERSION_CODENAME=forky\n";
+        assert_eq!(parse_distro(src).as_deref(), Some("debian:forky"));
+    }
+
+    #[test]
+    fn id_only_then_pretty_name() {
+        assert_eq!(parse_distro("ID=alpine\n").as_deref(), Some("alpine"));
+        assert_eq!(parse_distro("PRETTY_NAME=\"Custom GNU/Linux 9 (x)\"\n").as_deref(),
+            Some("Custom GNU/Linux 9 (x)"));
+    }
+
+    #[test]
+    fn empty_values_do_not_become_a_distro() {
+        assert_eq!(parse_distro(""), None);
+        assert_eq!(parse_distro("ID=\nVERSION_ID=\"\"\n").as_deref(), None);
+    }
+
+    #[test]
+    fn detect_platform_really_calls_the_parser() {
+        // 只测纯函数挡不住「函数写了但探测仍用旧逻辑」：判据必须指向生产段。
+        let prod = panel_testutil::production_source(include_str!("mod.rs"));
+        assert_eq!(prod.matches("parse_distro(&s)").count(), 1,
+            "detect_platform 必须且只能调用一次 parse_distro");
+    }
+}
