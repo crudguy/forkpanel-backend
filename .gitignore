@@ -15,6 +15,9 @@ web/dist/
 /var/
 /data/
 *.bak
+# 公网出口 IP 独立状态文件：真实服务器 IP，绝不入库（即使 data_dir 被配到仓库内）
+public-ip.state
+.public-ip.state.tmp
 
 # ── 密钥与证书 ──
 master.key

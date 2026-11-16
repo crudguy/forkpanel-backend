@@ -183,17 +183,22 @@ pub(crate) fn run(cli: &Cli, os: Arc<dyn panel_os::OsAdapter>) -> Result<()> {
         // 注册 `db.backup` 时就取它做裁剪阈值（见下方 register_internal_jobs），
         // 这里同时注入 AppState 供备份页显示"实际保留几份"。
         let backup_keep = cfg.db.backup_keep;
-        // 「核准 IP」的写回回调：config.toml 的整份重解析校验在 panel-cli
-        // （panel-api 不依赖它），serve 在这里注入路径与写入能力。
+        // 「核准 IP」的写回回调：写 data_dir 下的独立状态文件，**不碰 config.toml**
+        // （后者被 git 跟踪，写回真实出口 IP 会污染仓库历史）。IP 校验在 panel-cli
+        // 的状态模块完成（panel-api 不依赖它），serve 在这里注入目录与写入能力。
+        let ip_state_dir = layout.data_dir();
         let write_public_ip = {
-            let p = cli.config.clone().unwrap_or_else(|| layout0.config_dir().join("config.toml"));
-            Arc::new(move |ip: &str| crate::config::write_config_key(&p, "info", "public_ip", &format!("\"{ip}\"")))
+            let dir = ip_state_dir.clone();
+            Arc::new(move |ip: &str| crate::public_ip_state::write(&dir, ip))
         };
+        // 启动读取：状态文件优先，config.toml [info] 仅作老部署回退源（升级不丢值）。
+        let initial_public_ip = crate::public_ip_state::effective(
+            &ip_state_dir, cfg.info.public_ip.clone());
         let state = Arc::new(panel_api::AppState::new(
             os.clone(), writer.clone(), pool, tasks.clone(), metrics.clone(), tier,
             master_key, read_only, max_login_attempts, session_idle, session_absolute,
             audit_retention_days, audit_max_rows, localhost_only, daily_backup,
-            db_synchronous, backup_keep, cfg.danger.allow_web_upgrade, cfg.info.public_ip.clone(), write_public_ip, alert.clone()));
+            db_synchronous, backup_keep, cfg.danger.allow_web_upgrade, initial_public_ip, write_public_ip, alert.clone()));
 
         // ── 内部周期任务 ──
         register_internal_jobs(&sched_in, &os, writer.clone(), metrics.clone(), &layout, &cfg, tier, state.clone()).await;

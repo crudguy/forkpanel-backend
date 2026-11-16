@@ -7,6 +7,8 @@ mod doctor;
 mod embed;
 /// 升级前一致快照：老库回滚的唯一锚点（项目无 down migration）。
 mod migrate_snapshot;
+/// 公网 IP 的独立状态文件：与 git 跟踪的 config.toml 解耦，避免真实出口 IP 入库。
+mod public_ip_state;
 mod upgrade;
 
 use clap::{CommandFactory, Parser, Subcommand};
@@ -1094,6 +1096,38 @@ mod wiring_guard_tests {
         assert!(
             !code.contains("request_log"),
             "build_router 不得再挂 request_log：生产链已在 main.rs 最外层挂载，双挂 = 每请求两行日志"
+        );
+    }
+
+    /// ⭐⭐⭐ 公网 IP 绝不许写回被 git 跟踪的 config.toml。
+    /// 真出口 IP 写在那里 → init/E2E 一跑工作区就脏 → 「全部提交」把真实服务器 IP
+    /// 提交进仓库历史（2026-11-16 实际踩过，靠人工 reset 才拦下）。判据指向两份
+    /// 生产文件（init 探测、serve 核准回调），用 production_source 剔注释与 test 块，
+    /// 避免「注释里留个旧调用」骗绿。同时钉死新写入函数确实被接线，防止只改了守卫
+    /// 却没接线（那样功能静默失效、守卫却绿）。
+    #[test]
+    fn public_ip_never_written_to_config_toml() {
+        let init = panel_testutil::production_source(include_str!("cmd/init.rs"));
+        let serve = panel_testutil::production_source(include_str!("cmd/serve.rs"));
+        for (name, src) in [("init.rs", &init), ("serve.rs", &serve)] {
+            assert!(
+                !src.contains("write_config_key"),
+                "{name} 不得再用 write_config_key 写公网 IP：config.toml 被 git 跟踪，真实出口 IP 入库即泄露"
+            );
+            assert!(
+                !src.contains("\"info\", \"public_ip\""),
+                "{name} 不得再出现 [info] public_ip 写入目标"
+            );
+            assert!(
+                src.contains("public_ip_state::write"),
+                "{name} 必须调用 public_ip_state::write 写独立状态文件（只禁不接线 = IP 功能静默失效）"
+            );
+        }
+        // 写入实现本身也必须落在 data_dir 状态文件，不得中途改回 config 路径。
+        let state = panel_testutil::production_source(include_str!("public_ip_state.rs"));
+        assert!(
+            state.contains("data_dir.join(STATE_FILE)"),
+            "状态文件须落在 data_dir，否则仍可能写进仓库内的 config 目录"
         );
     }
 }

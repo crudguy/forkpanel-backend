@@ -78,18 +78,23 @@ pub(crate) fn init(
         println!("（已有 owner 账号，跳过创建）");
     }
     drop(conn);
-    // 公网出口 IP：init 期间探测一次写入 `[info] public_ip`，serve 只读下发。
-    // 已有值不重探（幂等：重跑 init 不再外呼）；探测/写盘失败都只提示、不阻塞
-    // 初始化——这是一条锦上添花的展示信息，不能反客为主。
-    if let Some(cur) = &cfg.info.public_ip {
-        println!("（[info] public_ip 已配置 {cur}，不重探）");
+    // 公网出口 IP：init 期间探测一次写入**独立状态文件**（data_dir/public-ip.state），
+    // serve 只读下发。绝不写 config.toml——它是被 git 跟踪的部署模板，写回会把
+    // 真实出口 IP 带进仓库历史。已有值不重探（状态文件优先，config.toml [info]
+    // 仅作老部署回退），幂等；探测/写盘失败都只提示、不阻塞初始化——锦上添花的信息。
+    let ip_state_dir = layout.data_dir();
+    let existing_ip = crate::public_ip_state::read(&ip_state_dir)
+        .or_else(|| cfg.info.public_ip.clone());
+    if let Some(cur) = existing_ip {
+        println!("（公网 IP 已配置 {cur}，不重探）");
     } else if let Some(ip) = panel_os::publicip::probe_sync() {
-        match config::write_config_key(&cfg_path, "info", "public_ip", &format!("\"{ip}\"")) {
-            Ok(()) => println!("公网 IP（出口）探测成功：{ip}（已写入 [info] public_ip）"),
-            Err(e) => println!("公网 IP 写入配置失败（不影响初始化）：{e}"),
+        match crate::public_ip_state::write(&ip_state_dir, &ip) {
+            Ok(()) => println!("公网 IP（出口）探测成功：{ip}（已写入 {}）",
+                crate::public_ip_state::state_path(&ip_state_dir).display()),
+            Err(e) => println!("公网 IP 写入状态文件失败（不影响初始化）：{e}"),
         }
     } else {
-        println!("公网 IP 探测跳过（无外网或回显服务不可达）；需要时手动在 config.toml 配 [info] public_ip");
+        println!("公网 IP 探测跳过（无外网或回显服务不可达）；需要时可在设置页点「核准 IP」重试");
     }
     println!("初始化完成");
     println!("  配置文件：{}", cfg_path.display());

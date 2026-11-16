@@ -59,8 +59,9 @@ use panel_db::ReadPool;
 use std::sync::Arc;
 
 /// 全应用共享状态
-/// 「核准 IP」写回回调：入参为已校验的 IP 字符串，写回 config.toml `[info]`。
-/// 实现由 serve 注入（panel-cli 的 `write_config_key`，含整份重解析校验）。
+/// 「核准 IP」写回回调：入参为已校验的 IP 字符串，写回 data_dir 独立状态文件。
+/// 实现由 serve 注入（panel-cli 的 `public_ip_state::write`，含 IP 校验与原子写）。
+/// 绝不写 git 跟踪的 config.toml——真实出口 IP 不得进仓库历史。
 pub type WritePublicIpFn = std::sync::Arc<dyn Fn(&str) -> panel_core::Result<()> + Send + Sync>;
 
 pub struct AppState {
@@ -109,12 +110,12 @@ pub struct AppState {
     /// **默认 false**：升级会替换 root 二进制并重启，属最高危操作；只有显式打开
     /// 才出现按钮、端点才受理。命令行升级（`sudo panel upgrade`）不受此开关影响。
     pub allow_web_upgrade: bool,
-    /// 公网出口 IP（来自 config.toml `[info] public_ip`，`panel init` 探测一次写入；
+    /// 公网出口 IP（来自 data_dir 独立状态文件，`panel init` 探测一次写入；
     /// Web 端「核准 IP」运行期可刷新）。**纯展示**：不参与任何运行时决策。
     /// RwLock：核准后 GET / overview 立即读新值，无需重启。
     pub public_ip: tokio::sync::RwLock<Option<String>>,
-    /// 写回 `[info] public_ip` 的回调（serve 注入 panel-cli 的 `write_config_key`）：
-    /// 写盘前的整份重解析校验在 panel-cli，panel-api 不依赖它——依赖方向不能反。
+    /// 写回独立状态文件的回调（serve 注入 panel-cli 的 `public_ip_state::write`）：
+    /// IP 校验与原子写在 panel-cli，panel-api 不依赖它——依赖方向不能反。
     pub write_public_ip: WritePublicIpFn,
     /// SQLite 落盘同步档（来自 config.toml `[db] synchronous`，归一化后的大写值）。
     /// **真实生效**：`panel_db::open` 据此设置 `PRAGMA synchronous`（非法值启动即报错）。

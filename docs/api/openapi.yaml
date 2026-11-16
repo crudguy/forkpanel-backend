@@ -296,7 +296,7 @@ components:
         load1:         { type: number }
         uptime_sec:    { type: integer }
         degraded:      { type: boolean, description: "true=已触发低配降频" }
-        public_ip:     { type: string, nullable: true, description: "公网出口 IP（panel init 探测一次写入；未探测到为 null）" }
+        public_ip:     { type: string, nullable: true, description: "公网出口 IP（panel init 探测一次写入独立状态文件；未探测到为 null）" }
         alerts:        { type: array, items: { $ref: '#/components/schemas/Alert' } }
     Directories:
       type: object
@@ -1667,7 +1667,7 @@ paths:
     get:
       operationId: get_system_public_ip
       tags: [system]
-      summary: 当前核准的公网出口 IP（config.toml [info]，未核准为 null）
+      summary: 当前核准的公网出口 IP（独立状态文件，未核准为 null）
       responses:
         '200':
           description: ok
@@ -1679,9 +1679,9 @@ paths:
       tags: [system]
       summary: 重新探测公网出口 IP 并核准写回（owner + system.manage）
       description: |
-        主动触发一次出站探测（curl 回显服务），成功后写回 config.toml 的
-        [info] public_ip 并即时生效（GET / overview 同步更新）。失败（无外网 /
-        缺 curl / 回显服务不可达）返回 502，不改动任何配置。
+        主动触发一次出站探测（curl 回显服务），成功后写入 data_dir 下的独立状态文件
+        并即时生效（GET / overview 同步更新）。失败（无外网 /
+        缺 curl / 回显服务不可达）返回 502，不改动任何配置，也不会把真实出口 IP 写入被版本控制的配置文件。
       responses:
         '200':
           description: 已核准

@@ -60,7 +60,7 @@ pub struct OverviewResp {
     pub tier: &'static str,
     /// 采样是否已被降频（低配保护，UI 需提示）
     pub degraded: bool,
-    /// 公网出口 IP（`panel init` 探测一次写入 config.toml `[info]`；未探测到为 null）。仅展示。
+    /// 公网出口 IP（`panel init` 探测一次写入独立状态文件；未探测到为 null）。仅展示。
     pub public_ip: Option<String>,
 }
 
@@ -589,17 +589,17 @@ pub async fn reboot(
 
 // ═══════════════════════ 公网出口 IP（核准） ═══════════════════════
 
-/// 当前核准的公网出口 IP（`panel init` 探测一次写入 config.toml `[info]`，
+/// 当前核准的公网出口 IP（`panel init` 探测一次写入独立状态文件，
 /// 设置页「核准 IP」可刷新）。只读展示。
 pub async fn public_ip(State(state): State<Shared>, Auth(s): Auth) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SYSTEM_VIEW)?;
     Ok(ok(json!({ "public_ip": state.public_ip.read().await.clone() })))
 }
 
-/// 重新探测公网出口 IP 并写回 config.toml `[info] public_ip`（设置页「核准 IP」）。
+/// 重新探测公网出口 IP 并写回 data_dir 独立状态文件（设置页「核准 IP」）。
 ///
-/// 权限：`system.manage` + owner——写的是面板自身的部署文件 config.toml，
-/// 与 restart 同档（admin 可改设置表，但不能动部署文件）。
+/// 权限：`system.manage` + owner——写的是面板自身的运行数据，
+/// 与 restart 同档（admin 可改设置表，但不能动部署级事实）。
 /// 探测在 spawn_blocking 里跑（同步 curl 最长 10s，不得钉死 tokio worker）。
 pub async fn public_ip_refresh(
     State(state): State<Shared>,
@@ -610,7 +610,7 @@ pub async fn public_ip_refresh(
         return Err(ApiError::new(
             10003,
             StatusCode::FORBIDDEN,
-            "仅 owner 可核准公网 IP（admin 可查看，但不能写 config.toml）",
+            "仅 owner 可核准公网 IP（admin 可查看，但不能改部署级事实）",
         ));
     }
     let probed = tokio::task::spawn_blocking(panel_os::publicip::probe_sync)
@@ -620,13 +620,13 @@ pub async fn public_ip_refresh(
         .ok_or_else(|| ApiError::new(
             30000,
             StatusCode::BAD_GATEWAY,
-            "公网 IP 探测失败：无外网、缺 curl 或回显服务不可达（配置未改动；可稍后重试，或手动在 config.toml 配 [info] public_ip）",
+            "公网 IP 探测失败：无外网、缺 curl 或回显服务不可达（状态文件未改动；可稍后重试）",
         ))?;
     // 写回（回调由 serve 注入：整份重解析校验在 panel-cli，依赖方向不能反）。
     (state.write_public_ip)(&probed).map_err(ApiError::from)?;
     // 内存态同步更新：GET 与 overview 立即反映新值，无需重启。
     *state.public_ip.write().await = Some(probed.clone());
-    crate::routes::audit(&state, &s, "system.public_ip.refresh", "config.toml", "ok").await;
+    crate::routes::audit(&state, &s, "system.public_ip.refresh", "public-ip.state", "ok").await;
     Ok(ok(json!({ "public_ip": probed })))
 }
 

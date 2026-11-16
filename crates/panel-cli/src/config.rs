@@ -142,8 +142,10 @@ pub struct Danger {
     pub allow_web_upgrade: bool,
 }
 
-/// 展示性事实段。**init 时探测一次**写入（目前只有公网出口 IP），此后
-/// serve 与各命令只读不写、也不据此做任何运行时决策——写错只影响展示。
+/// 展示性事实段（目前只有公网出口 IP）。**兼容保留**：本字段源于早期版本
+/// 直接把探测结果写进 config.toml 的设计，会因配置文件被 git 跟踪而泄露真实
+/// 出口 IP。现写入目标已迁到 data_dir 的独立状态文件（见 `public_ip_state`），
+/// 本字段仅作老部署的**只读回退源**——serve 读状态文件优先、这里兜底，绝不回写。
 /// 手动改错仍会被 `validate_implemented` 拦下（宁可启动前报错，不静默显示垃圾）。
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -265,8 +267,8 @@ impl Config {
                 return Err(PanelError::Validation {
                     field: "info",
                     reason: format!(
-                        "`[info] public_ip = \"{ip}\"` 不是合法 IP 地址；删除该键、或改成公网 IP\
-                         （`panel init` 会自动探测一次并写入）"
+                        "`[info] public_ip = \"{ip}\"` 不是合法 IP 地址；删除该键即可\
+                         （新版本在设置页点「核准 IP」写入独立状态文件）"
                     ),
                 });
             }
@@ -307,7 +309,8 @@ pub fn write_server_key(path: &Path, key: &str, value: &str) -> Result<()> {
 /// [`write_server_key`] 的泛化版：在任意 `[section]` 段原子替换或追加一个键。
 /// 语义完全一致：保留注释与其它段、不重排；写盘前整份重解析（本构建
 /// `deny_unknown_fields`，写坏立即报错，绝不落一份 serve 起不来的配置）；
-/// 权限沿用原文件。消费者：`panel menu/config` 改 `[server]`，`panel init` 写 `[info]`。
+/// 权限沿用原文件。消费者：`panel menu/config` 改 `[server]`。
+/// 公网 IP **不走这里**（写 git 跟踪的 config.toml 会泄露真实 IP）——见 `public_ip_state`。
 pub fn write_config_key(path: &Path, section: &str, key: &str, value: &str) -> Result<()> {
     if !path.exists() {
         return Err(PanelError::NotFound(format!("config not found: {}", path.display())));
@@ -439,9 +442,10 @@ max_rows = 50000
 # 让你暂时失联。命令行升级（sudo panel upgrade）不受此开关影响。
 allow_web_upgrade = false
 
-# [info]
-# 展示性事实段：`panel init` 探测一次后写入（目前只有公网出口 IP），面板只读展示。
-# NAT 部署拿到的是出口网关 IP，动态宽带下可能过期；可手动修正或删除该键。
+# [info]（兼容旧配置，勿新增写入）
+# 公网出口 IP 现由 `panel init` / 设置页「核准 IP」写入数据目录的
+# public-ip.state。此处仅为老版本兼容回退而保留，面板不会回写本段。
+# NAT 部署拿到的是出口网关 IP，动态宽带下可能过期。
 # public_ip = "203.0.113.7"
 "#, cfg = cfg, data = data, site = site)
 }
@@ -666,7 +670,7 @@ session_absolute = "2h"
         bad.info.public_ip = Some("not-an-ip".into());
         let m = bad.validate_implemented().unwrap_err().to_string();
         assert!(m.contains("public_ip"), "须点名字段：{m}");
-        assert!(m.contains("panel init"), "须给出可执行出路：{m}");
+        assert!(m.contains("核准 IP"), "须给出可执行出路（新写入走状态文件）：{m}");
     }
 
     #[test]
