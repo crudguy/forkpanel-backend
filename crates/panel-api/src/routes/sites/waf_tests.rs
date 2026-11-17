@@ -1,11 +1,11 @@
     use super::*;
 
     fn req(enabled: bool, profile: Option<&str>, rate: Option<u32>, burst: Option<u32>) -> WafReq {
-        WafReq { enabled, profile: profile.map(str::to_string), rate_per_sec: rate, burst }
+        WafReq { enabled, profile: profile.map(str::to_string), rate_per_sec: rate, burst, conn_max: None }
     }
 
     fn spec(profile: panel_os::WafProfile, rate: Option<u32>, burst: u32) -> panel_os::WafSpec {
-        panel_os::WafSpec { profile, rate_per_sec: rate, burst }
+        panel_os::WafSpec { profile, rate_per_sec: rate, burst, conn_max: None }
     }
 
     /// 缺省必须**保留**而不是关闭：否则任何不知道 `waf` 字段的调用方
@@ -32,6 +32,36 @@
         let g2 = build_waf(Some(&req(true, None, None, None)), None).unwrap().unwrap();
         assert_eq!(g2.profile, panel_os::WafProfile::Basic);
         assert_eq!(g2.rate_per_sec, None);
+    }
+
+    /// 并发连接数与 rate 正交：不限速也能限连接数；0 = 不限、超上限必须挡住。
+    #[test]
+    fn conn_max_is_independent_of_rate_and_bounded() {
+        let with_conn = build_waf(
+            Some(&WafReq {
+                enabled: true, profile: None, rate_per_sec: None, burst: None, conn_max: Some(20),
+            }),
+            None,
+        ).unwrap().unwrap();
+        assert_eq!(with_conn.conn_max, Some(20), "不限速时连接数上限仍应生效");
+        assert_eq!(with_conn.rate_per_sec, None);
+
+        let zero = build_waf(
+            Some(&WafReq {
+                enabled: true, profile: None, rate_per_sec: None, burst: None, conn_max: Some(0),
+            }),
+            None,
+        ).unwrap().unwrap();
+        assert_eq!(zero.conn_max, None, "0 必须解释为不限，避免下发 limit_conn 0");
+
+        let bad = build_waf(
+            Some(&WafReq {
+                enabled: true, profile: None, rate_per_sec: None, burst: None,
+                conn_max: Some(WAF_CONN_MAX + 1),
+            }),
+            None,
+        );
+        assert!(bad.is_err(), "超上限必须 400，不能原样下发");
     }
 
     /// `rate=0` 若原样下发，nginx 会拒绝加载整份配置——必须解释成"不限速"。

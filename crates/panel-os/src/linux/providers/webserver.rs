@@ -886,6 +886,12 @@ pub(super) fn render_waf_http(server_names: &[String], w: &WafSpec) -> String {
         // 误判成"服务挂了"，而实际只是这个客户端被限流。
         o.push_str("limit_req_status 429;\n");
     }
+    if w.conn_max.is_some() {
+        // 并发连接数与 rate 各自独立：zone 名分开，互不挤占额度。
+        // 10m 与 limit_req_zone 同量级；429 而非默认 503（后者会被监控误判为宕机）。
+        o.push_str(&format!("limit_conn_zone $binary_remote_addr zone={t}_conn:10m;\n"));
+        o.push_str("limit_conn_status 429;\n");
+    }
     o.push('\n');
     o
 }
@@ -907,6 +913,9 @@ pub(super) fn render_waf_server(server_names: &[String], w: &WafSpec) -> String 
     }
     if let Some(_r) = w.rate_per_sec {
         o.push_str(&format!("    limit_req zone={t}_rl burst={} nodelay;\n", w.burst));
+    }
+    if let Some(n) = w.conn_max {
+        o.push_str(&format!("    limit_conn {t}_conn {n};\n"));
     }
 
     o

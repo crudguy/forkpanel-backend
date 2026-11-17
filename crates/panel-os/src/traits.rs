@@ -1279,6 +1279,9 @@ pub struct WafSpec {
     pub rate_per_sec: Option<u32>,
     /// 突发桶容量（仅在 `rate_per_sec` 有值时生效）
     pub burst: u32,
+    /// 每 IP 并发连接数上限（P1-5）；`None` = 不限制。
+    /// 与 rate 独立：一个管每秒请求数，一个管同时存活的连接数。
+    pub conn_max: Option<u32>,
 }
 
 /// 站点类型。

@@ -37,9 +37,9 @@ const NAME_MAX: usize = 64;
 const MAX_TEMPLATES: usize = 50;
 
 /// 列表 / 详情 SQL（列固定，禁 format! 拼 SQL——分层门禁）
-const SQL_LIST: &str = "SELECT id, name, waf_profile, rate_per_sec, burst, ip_allow, ip_deny, created_at, updated_at \
+const SQL_LIST: &str = "SELECT id, name, waf_profile, rate_per_sec, burst, conn_max, ip_allow, ip_deny, created_at, updated_at \
      FROM waf_templates ORDER BY id ASC";
-const SQL_ONE: &str = "SELECT id, name, waf_profile, rate_per_sec, burst, ip_allow, ip_deny, created_at, updated_at \
+const SQL_ONE: &str = "SELECT id, name, waf_profile, rate_per_sec, burst, conn_max, ip_allow, ip_deny, created_at, updated_at \
      FROM waf_templates WHERE id = ?1";
 
 /// 模板 DTO。ip_allow / ip_deny 以数组返回（落库是逗号拼接，与 Site 类型一致）。
@@ -50,6 +50,7 @@ pub struct TplDto {
     pub waf_profile: String,
     pub rate_per_sec: i64,
     pub burst: i64,
+    pub conn_max: i64,
     pub ip_allow: Vec<String>,
     pub ip_deny: Vec<String>,
     pub created_at: i64,
@@ -64,18 +65,19 @@ fn split_ips(s: &str) -> Vec<String> {
 }
 
 fn row_dto(r: &rusqlite::Row<'_>) -> rusqlite::Result<TplDto> {
-    let allow: String = r.get(5)?;
-    let deny: String = r.get(6)?;
+    let allow: String = r.get(6)?;
+    let deny: String = r.get(7)?;
     Ok(TplDto {
         id: r.get(0)?,
         name: r.get(1)?,
         waf_profile: r.get(2)?,
         rate_per_sec: r.get(3)?,
         burst: r.get(4)?,
+        conn_max: r.get(5)?,
         ip_allow: split_ips(&allow),
         ip_deny: split_ips(&deny),
-        created_at: r.get(7)?,
-        updated_at: r.get(8)?,
+        created_at: r.get(8)?,
+        updated_at: r.get(9)?,
     })
 }
 
@@ -91,6 +93,8 @@ pub struct TplReq {
     #[serde(default)]
     pub burst: Option<u32>,
     #[serde(default)]
+    pub conn_max: Option<u32>,
+    #[serde(default)]
     pub ip_allow: Option<String>,
     #[serde(default)]
     pub ip_deny: Option<String>,
@@ -102,6 +106,7 @@ struct Norm {
     profile: String,
     rate: i64,
     burst: i64,
+    conn_max: i64,
     ip_allow: String,
     ip_deny: String,
 }
@@ -122,6 +127,7 @@ fn normalize(req: &TplReq) -> Result<Norm, ApiError> {
             profile: req.profile.clone(),
             rate_per_sec: req.rate_per_sec,
             burst: req.burst,
+            conn_max: req.conn_max,
         }),
         None,
     )?
@@ -138,6 +144,7 @@ fn normalize(req: &TplReq) -> Result<Norm, ApiError> {
         profile,
         rate: spec.rate_per_sec.unwrap_or(0) as i64,
         burst: spec.burst as i64,
+        conn_max: spec.conn_max.unwrap_or(0) as i64,
         ip_allow: allow,
         ip_deny: deny,
     })
@@ -200,15 +207,15 @@ pub async fn create(
         ));
     }
     let now = now_unix();
-    let Norm { name, profile, rate, burst, ip_allow, ip_deny } = n;
+    let Norm { name, profile, rate, burst, conn_max, ip_allow, ip_deny } = n;
     let audit_name = name.clone();
     state
         .db
         .exec(move |conn| {
             conn.execute(
-                "INSERT INTO waf_templates(name, waf_profile, rate_per_sec, burst, ip_allow, ip_deny, created_at, updated_at) \
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-                rusqlite::params![name, profile, rate, burst, ip_allow, ip_deny, now],
+                "INSERT INTO waf_templates(name, waf_profile, rate_per_sec, burst, conn_max, ip_allow, ip_deny, created_at, updated_at) \
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+                rusqlite::params![name, profile, rate, burst, conn_max, ip_allow, ip_deny, now],
             )
             .map_err(|e| PanelError::Database(e.to_string()))?;
             Ok(panel_db::WriteAck { rows_changed: 1 })
@@ -237,8 +244,8 @@ pub async fn update(
         .exec(move |conn| {
             conn.execute(
                 "UPDATE waf_templates SET name = ?1, waf_profile = ?2, rate_per_sec = ?3, burst = ?4, \
-                 ip_allow = ?5, ip_deny = ?6, updated_at = ?7 WHERE id = ?8",
-                rusqlite::params![n.name, n.profile, n.rate, n.burst, n.ip_allow, n.ip_deny, now, id],
+                 conn_max = ?5, ip_allow = ?6, ip_deny = ?7, updated_at = ?8 WHERE id = ?9",
+                rusqlite::params![n.name, n.profile, n.rate, n.burst, n.conn_max, n.ip_allow, n.ip_deny, now, id],
             )
             .map_err(|e| PanelError::Database(e.to_string()))?;
             Ok(panel_db::WriteAck { rows_changed: 1 })
@@ -347,15 +354,15 @@ mod tests {
     fn create_update_delete_roundtrip() {
         let c = mem_db();
         c.execute(
-            "INSERT INTO waf_templates(name, waf_profile, rate_per_sec, burst, ip_allow, ip_deny, created_at, updated_at) \
-             VALUES('基线', 'basic', 0, 0, '', '', 100, 100)",
+            "INSERT INTO waf_templates(name, waf_profile, rate_per_sec, burst, conn_max, ip_allow, ip_deny, created_at, updated_at) \
+             VALUES('基线', 'basic', 0, 0, 0, '', '', 100, 100)",
             [],
         )
         .unwrap();
         let id1 = c.last_insert_rowid();
         c.execute(
-            "INSERT INTO waf_templates(name, waf_profile, rate_per_sec, burst, ip_allow, ip_deny, created_at, updated_at) \
-             VALUES('严格', 'strict', 50, 100, '10.0.0.0/24', '', 100, 100)",
+            "INSERT INTO waf_templates(name, waf_profile, rate_per_sec, burst, conn_max, ip_allow, ip_deny, created_at, updated_at) \
+             VALUES('严格', 'strict', 50, 100, 20, '10.0.0.0/24', '', 100, 100)",
             [],
         )
         .unwrap();
@@ -366,6 +373,7 @@ mod tests {
         assert_eq!(dto.name, "严格");
         assert_eq!(dto.waf_profile, "strict");
         assert_eq!((dto.rate_per_sec, dto.burst), (50, 100));
+        assert_eq!(dto.conn_max, 20, "并发连接数上限必须随模板一起落库（否则套用会静默清零）");
         assert_eq!(dto.ip_allow, vec!["10.0.0.0/24".to_string()]);
 
         // update 只动目标行且刷新 updated_at
@@ -386,7 +394,7 @@ mod tests {
     }
 
     fn req(name: &str) -> TplReq {
-        TplReq { name: name.to_string(), profile: None, rate_per_sec: None, burst: None, ip_allow: None, ip_deny: None }
+        TplReq { name: name.to_string(), profile: None, rate_per_sec: None, burst: None, conn_max: None, ip_allow: None, ip_deny: None }
     }
 
     /// 归一：默认 basic、rate 0=不限速；复用 build_waf 的约束

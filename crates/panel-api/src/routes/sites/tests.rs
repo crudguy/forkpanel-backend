@@ -145,6 +145,7 @@
             waf_profile: Some("basic".into()),
             waf_rate: None,
             waf_burst: Some(0),
+            waf_conn_max: None,
             upstreams_json: None,
             fpm: None,
             spa: 0,
@@ -255,19 +256,29 @@
     #[test]
     fn fingerprint_is_separator_safe() {
         // 分隔符回归：没有 \u{1f} 时 ("a","bc") 与 ("ab","c") 会撞同一指纹 → 漏报
-        let a = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None, false, None, None, None, "[]", None, "");
-        let b = deploy_fingerprint("ab", "c", "/r", "static", false, None, None, None, None, false, None, None, None, "[]", None, "");
+        let a = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None, false, None, None, None, None, "[]", None, "");
+        let b = deploy_fingerprint("ab", "c", "/r", "static", false, None, None, None, None, false, None, None, None, None, "[]", None, "");
         assert_ne!(a, b, "字段边界必须由分隔符保护");
         // 自定义片段（019）参与指纹：只差它一处也必须产生不同指纹
         // ——否则改了 custom_conf「未同步」不会亮，等于坏了 017 的核心承诺。
-        let c = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None, false, None, None, None, "[]", Some("add_header X-A 1;"), "");
+        let c = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None, false, None, None, None, None, "[]", Some("add_header X-A 1;"), "");
         assert_ne!(a, c, "custom_conf 必须进入指纹");
-        let d = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None, false, None, None, None, "[]", Some("add_header X-A 2;"), "");
+        let d = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None, false, None, None, None, None, "[]", Some("add_header X-A 2;"), "");
         assert_ne!(c, d, "custom_conf 内容变化必须反映到指纹");
         // 高级配置（020）同理：www 跳转 / TLS 档位 / 伪静态都会改变渲染结果，
         // 漏进指纹 = 改了它们「未同步」不亮（与 custom_conf 同款静默分叉）。
-        let e = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None, false, None, None, None, "[]", None, r#"{"www":"to_www"}"#);
+        let e = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None, false, None, None, None, None, "[]", None, r#"{"www":"to_www"}"#);
         assert_ne!(a, e, "高级配置必须进入指纹");
+    }
+
+    #[test]
+    fn fingerprint_includes_conn_limit() {
+        // 连接数上限会改变渲染输出，必须进指纹：否则改了它「未同步」不亮。
+        let base = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None,
+                                      false, None, None, None, None, "[]", None, "");
+        let with_conn = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None,
+                                           false, None, None, None, Some(32), "[]", None, "");
+        assert_ne!(base, with_conn, "waf_conn_max 必须参与指纹");
     }
 
     #[test]

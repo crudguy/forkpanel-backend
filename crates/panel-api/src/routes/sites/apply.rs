@@ -121,12 +121,17 @@ pub struct WafReq {
     /// 突发桶容量；缺省 = `rate * 2`
     #[serde(default)]
     pub burst: Option<u32>,
+    /// 每 IP 并发连接数上限（P1-5）；`None` / 0 = 不限制
+    #[serde(default)]
+    pub conn_max: Option<u32>,
 }
 
 /// 限速上限。上限存在的理由：`rate` 决定每 IP 的放行速率，`burst` 决定
 /// 单 IP 能用掉多少缓冲——两者都直接换内存（每个 zone 10m 是硬上限）。
 pub(crate) const WAF_RATE_MAX: u32 = 1000;
 pub(crate) const WAF_BURST_MAX: u32 = 10_000;
+/// 并发连接数上限：与 rate 同理，每个 zone 固定 10m，上限须有界。
+pub(crate) const WAF_CONN_MAX: u32 = 10_000;
 
 /// 归一化 + 校验 WAF 配置。
 ///
@@ -172,7 +177,18 @@ pub(crate) fn build_waf(
             "burst 仅在启用限速（rate_per_sec）时有意义",
         ));
     }
-    Ok(Some(panel_os::WafSpec { profile, rate_per_sec: rate, burst }))
+    // 并发连接数与 rate 正交：不限速也可以限制同时存活的连接数。
+    let conn_max = match r.conn_max {
+        None | Some(0) => None,
+        Some(n) if n > WAF_CONN_MAX => {
+            return Err(ApiError::bad_request(
+                "waf.conn_max",
+                format!("并发连接数上限 {WAF_CONN_MAX}"),
+            ))
+        }
+        Some(n) => Some(n),
+    };
+    Ok(Some(panel_os::WafSpec { profile, rate_per_sec: rate, burst, conn_max }))
 }
 
 /// 校验反代后端。
@@ -543,17 +559,18 @@ pub async fn apply(
         .map(|r| r.enabled != 0 && r.manual_conf != 0)
         .unwrap_or(false)
         && !regen;
-    // 落库四元组在这里就算好：`waf` 随即被 move 进 SiteSpec。
+    // 落库五元组在这里就算好：`waf` 随即被 move 进 SiteSpec。
     // 关掉 WAF 时一并清空——留着旧数值会让"下次重新打开"意外带上几年前的参数，
     // 而用户早就不记得了。
-    let (waf_on, waf_profile, waf_rate, waf_burst) = match &waf {
+    let (waf_on, waf_profile, waf_rate, waf_burst, waf_conn_max) = match &waf {
         Some(w) => (
             1i32,
             Some(w.profile.as_str().to_string()),
             w.rate_per_sec.map(i64::from),
             Some(i64::from(w.burst)),
+            w.conn_max.map(i64::from),
         ),
-        None => (0i32, None, None, None),
+        None => (0i32, None, None, None, None),
     };
 
     let (tls_cert, tls_key) = match &cur_row {
@@ -825,6 +842,7 @@ pub async fn apply(
         waf_profile.as_deref(),
         waf_rate,
         waf_burst,
+        waf_conn_max,
         &routes_json,
         custom_conf_db.as_deref(),
         &advanced_json,
@@ -857,10 +875,10 @@ pub async fn apply(
                                    hsts_preload, rewrite_preset, rewrite_custom,
                                    ip_allow, ip_deny, auth_basic, auth_user, lb_policy,
                                    proxy_connect_timeout, proxy_send_timeout, proxy_read_timeout,
-                                   log_access, log_error, log_error_level)
+                                   log_access, log_error, log_error_level, waf_conn_max)
                  VALUES(?1, ?2, ?3, ?4, 'nginx', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?20,
                         ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
-                        ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40)
+                        ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41)
                  ON CONFLICT(name) DO UPDATE SET
                     domains=excluded.domains, root=excluded.root, kind=excluded.kind, enabled=?5,
                     conf_path=?6, webserver='nginx',
@@ -883,6 +901,7 @@ pub async fn apply(
                     proxy_read_timeout=excluded.proxy_read_timeout,
                     log_access=excluded.log_access, log_error=excluded.log_error,
                     log_error_level=excluded.log_error_level,
+                    waf_conn_max=excluded.waf_conn_max,
                     manual_conf=COALESCE(?19, manual_conf)",
                 rusqlite::params![name, domains_json, root_str, kind_db, enabled_i32, conf_db, now,
                                   waf_on, waf_profile, waf_rate, waf_burst,
@@ -891,7 +910,8 @@ pub async fn apply(
                                   www_db, tls_profile_db, tls_min_db, hsts_db, hsts_max_age_db,
                                   hsts_sub_db, hsts_preload_db, rewrite_preset_db, rewrite_custom_db,
                                   ip_allow_db, ip_deny_db, auth_basic_db, auth_user_db, lb_policy_db,
-                                  pct_db, pst_db, prt_db, log_access_db, log_error_db, log_level_db],
+                                  pct_db, pst_db, prt_db, log_access_db, log_error_db, log_level_db,
+                                  waf_conn_max],
             )
             .map(|_| panel_db::WriteAck { rows_changed: 1 })
             .map_err(|e| PanelError::Database(e.to_string()))

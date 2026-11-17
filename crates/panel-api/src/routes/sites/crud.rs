@@ -132,6 +132,7 @@ pub async fn create(
                     waf_profile: None,
                     waf_rate_per_sec: None,
                     waf_burst: None,
+                    waf_conn_max: None,
                     upstreams: None,
                     fpm: None,
                     spa: false,
@@ -242,6 +243,7 @@ pub(super) async fn render_spec_for_row(
                 .unwrap_or(panel_os::WafProfile::Basic),
             rate_per_sec: row.waf_rate.map(|n| n as u32),
             burst: row.waf_burst.map(|n| n as u32).unwrap_or(0),
+            conn_max: row.waf_conn_max.and_then(|n| u32::try_from(n).ok()).filter(|n| *n > 0),
         })
     } else {
         None
@@ -601,6 +603,7 @@ pub async fn patch(
                 cur.waf_profile.as_deref(),
                 cur.waf_rate,
                 cur.waf_burst,
+                cur.waf_conn_max,
                 &cur.routes_json,
                 cur.custom_conf.as_deref(),
                 &advanced_json_of(&cur),

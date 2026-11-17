@@ -48,10 +48,14 @@ const MIGRATIONS: &[(u32, &str)] = &[
     // 030：审计表 append-only 触发器（§3.5 P1）——UPDATE 全禁，DELETE 须持
     // cleanup::prune_audit 的 temp 表令牌（保留期修剪是唯一合法删除通道）
     (30, include_str!("../../../migrations/030_audit_append_only.sql")),
+    // 031：站点并发连接数上限（P1-5）——随 WAF 一起渲染 limit_conn
+    (31, include_str!("../../../migrations/031_site_conn_limit.sql")),
+    // 032：模板也存并发连接数上限——否则套用模板会静默重置站点的 limit_conn
+    (32, include_str!("../../../migrations/032_waf_template_conn_limit.sql")),
 ];
 
 /// 当前 schema 版本
-pub const LATEST: u32 = 30;
+pub const LATEST: u32 = 32;
 
 pub fn apply(conn: &mut Connection) -> Result<u32> {
     conn.execute_batch(

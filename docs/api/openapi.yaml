@@ -525,6 +525,7 @@ components:
         waf_profile: { type: string, enum: [basic, strict], description: 防护档位（basic / strict） }
         rate_per_sec: { type: integer, description: CC 限速（每 IP 每秒请求数）；0 = 不限速 }
         burst:      { type: integer, description: 突发桶容量；0 = 由 rate×2 计算（仅限速时生效） }
+        conn_max:   { type: integer, description: 每 IP 并发连接数上限；0 / 缺省 = 不限（与限速正交） }
         ip_allow:   { type: array, items: { type: string }, description: IP 白名单（IPv4 或 IPv4/前缀）；非空即白名单模式（只放行名单内，其余拒绝），此时 ip_deny 被忽略 }
         ip_deny:    { type: array, items: { type: string }, description: IP 黑名单（IPv4 或 IPv4/前缀）；ip_allow 非空时被忽略 }
         created_at: { type: integer, description: 创建时间（unix 秒） }
@@ -627,6 +628,7 @@ components:
         waf_profile:      { type: [string, "null"], enum: [basic, strict, null], description: "WAF 档位；未启用为 null" }
         waf_rate_per_sec: { type: [integer, "null"], description: "CC 限速（每 IP 每秒请求数）；null = 不限速" }
         waf_burst:        { type: [integer, "null"], description: "突发桶容量" }
+        waf_conn_max:     { type: [integer, "null"], description: "每 IP 并发连接数上限；null = 不限" }
         upstreams:        { type: [array, "null"], items: { type: string }, description: "反代后端列表（kind=proxy 时存在，如 [\"http://127.0.0.1:3000\"]）；其余为 null" }
         fpm:              { type: [string, "null"], description: "php-fpm 目标（kind=php 时存在，unix:/path.sock | host:port）；其余为 null" }
         spa:              { type: boolean, description: "SPA 回退（kind=static 时有效）：true 时未命中文件的路径交给 /index.html（history 路由单页应用）。缺省 false" }
@@ -748,6 +750,7 @@ components:
         profile:      { type: string, enum: [basic, strict], default: basic, description: "basic = SQLi / XSS / 路径穿越 / 敏感文件探测 / 恶意 UA；strict 在其之上增加空 UA、非白名单方法（405）与更宽的注入 / 扫描器关键词。**严格档误杀概率更高**，故不设为默认" }
         rate_per_sec: { type: integer, minimum: 0, maximum: 1000, description: "CC 限速（每 IP 每秒请求数）；0 / 缺省 = 不限速。超限返回 429（而非 503——503 会让监控误判成服务挂了，实际只是这个客户端被限流）" }
         burst:        { type: integer, minimum: 0, maximum: 10000, description: "突发桶容量；缺省 = rate * 2" }
+        conn_max:     { type: integer, minimum: 0, maximum: 10000, description: "每 IP 并发连接数上限；0 / 缺省 = 不限。与 rate_per_sec 正交：不限速也可限制连接数（渲染 nginx limit_conn，超限 429）。防慢连接 / 长轮询挤占" }
     SiteCreate:
       type: object
       required: [name, domains]

@@ -19,6 +19,7 @@ UPDATE/DELETE 无痕改写（production-readiness §3.5 实测）。030 引入�
 判据剔注释、剥测试模块（ci/strip_tests.py 同约定）。
 """
 
+import re
 import sys
 from pathlib import Path
 
@@ -84,7 +85,16 @@ print("== [2] 迁移注册 ==")
 migrs = read("crates/panel-db/src/migrate.rs")
 if migrs:
     expect(migrs, 'include_str!("../../../migrations/030_audit_append_only.sql")', "030 已注册进 MIGRATIONS")
-    expect(migrs, "pub const LATEST: u32 = 30;", "LATEST=30")
+    # LATEST 断言**不能钉死具体数字**：后继迁移（031/032…）会不断递增它，
+    # 钉死就成了"每加一个迁移就得改守卫"的恒红——本守卫要守的是"030 已落地且
+    # LATEST 至少到 30"，不是"全仓只有 30 个迁移"。用正则取实际值再比下界。
+    m = re.search(r"pub const LATEST: u32 = (\d+);", migrs)
+    if not m:
+        bad("未找到 pub const LATEST: u32 = <n>;（迁移版本常量改名了？）")
+    elif int(m.group(1)) < 30:
+        bad(f"LATEST={m.group(1)} < 30：030 迁移必须已包含在版本里")
+    else:
+        ok(f"LATEST={m.group(1)}（≥30，030 已落地）")
 
 print("== [3] prune_audit 持令牌 ==")
 clean = strip_comments_and_tests(read("crates/panel-db/src/cleanup.rs"))

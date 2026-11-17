@@ -224,7 +224,7 @@ use super::*;
 
     fn spec_waf(profile: WafProfile, rate: Option<u32>, burst: u32) -> SiteSpec {
         let mut s = spec_static();
-        s.waf = Some(WafSpec { profile, rate_per_sec: rate, burst });
+        s.waf = Some(WafSpec { profile, rate_per_sec: rate, burst, conn_max: None });
         s
     }
 
@@ -324,6 +324,24 @@ use super::*;
         assert!(out.contains("rate=10r/s"), "{out}");
         assert!(out.contains("burst=20 nodelay"), "{out}");
         assert!(out.contains("limit_req_status 429"), "超限应 429（503 会被监控误判成服务挂了）：\n{out}");
+    }
+
+    /// 并发连接数：http 级声明 zone、server 级限流，未配置则整段不出现。
+    /// 负向对照：删掉任一渲染分支本测试即红。
+    #[test]
+    fn limit_conn_is_rendered_when_configured() {
+        let mut s = spec_waf(WafProfile::Basic, None, 0);
+        s.waf.as_mut().unwrap().conn_max = Some(32);
+        let out = render_nginx(&s);
+        let zone = out.find("limit_conn_zone $binary_remote_addr zone=panel_example_com_conn:10m;")
+            .expect("应声明并发连接 zone");
+        let srv = out.find("server {").unwrap();
+        assert!(zone < srv, "limit_conn_zone 是 http 级指令，必须在 server 之前：\n{out}");
+        assert!(out.contains("limit_conn_status 429"), "超限应 429 而非 503：\n{out}");
+        assert!(out.contains("limit_conn panel_example_com_conn 32;"), "server 级应限 32：\n{out}");
+
+        let off = render_nginx(&spec_waf(WafProfile::Basic, None, 0));
+        assert!(!off.contains("limit_conn"), "未配置连接数上限就不该出现 limit_conn：\n{off}");
     }
 
     #[test]
@@ -494,7 +512,7 @@ use super::*;
                     // 权限失败，而这与配置内容无关。测试改用高位端口：WAF 片段与端口
                     // 无关，结论不受影响。
                     s.listen = vec![18080, 18443];
-                    s.waf = Some(WafSpec { profile, rate_per_sec: rate, burst: 20 });
+                    s.waf = Some(WafSpec { profile, rate_per_sec: rate, burst: 20, conn_max: None });
                     specs.push(s);
                 }
             }
