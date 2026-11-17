@@ -56,10 +56,33 @@ fn row_dto(r: &rusqlite::Row<'_>) -> rusqlite::Result<NotificationDto> {
     })
 }
 
-/// 新通知。**level/source 为受控枚举**，非法值归为 `warn`/`system` 而非报错——
-/// 通知失败不该让业务操作失败。
+/// 通知级别（**编译期枚举**）。
+///
+/// 取值必须与 `docs/api/openapi.yaml` 的 `Notification.level` 枚举一致
+/// （info / warn / crit）。此前这里是 `&'static str` + 运行期白名单：
+/// 写错一个值只会被静默降级成 warn，调用方与测试都看不见——备份产物
+/// 校验失败因此长期以"警告"而非"错误"呈现。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifLevel {
+    Info,
+    Warn,
+    Crit,
+}
+
+impl NotifLevel {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Crit => "crit",
+        }
+    }
+}
+
+/// 新通知。`source` 为空时落库为 `system`（通知失败不该让业务操作失败）。
 pub struct NewNotification {
-    pub level: &'static str,
+    /// 级别由调用方在编译期确定，不再接受任意字符串
+    pub level: NotifLevel,
     pub source: &'static str,
     pub title: String,
     pub body: Option<String>,
@@ -69,15 +92,12 @@ pub struct NewNotification {
 
 /// 落一条通知。**永不因通知失败而中断调用方**：结果仅记日志。
 ///
-/// 各模块（备份/恢复/证书/任务）在失败或风险分支调用本函数。
+/// 当前生产者只有两处：备份/恢复计划（`routes::backups`）与 WAF 拦截告警
+/// （`routes::waf_alert`）。证书续期、站点下发、内部周期任务失败走外部告警
+/// （`alert.rs`，需配置 webhook）与 journald，**不会**自动落到站内通知——
+/// 新增来源必须显式调用本函数，别指望"失败钩子会兜住"。
 pub async fn push(db: &Arc<panel_db::WriterActor>, n: NewNotification) {
-    let level = match n.level {
-        "info" | "warn" | "crit" => n.level,
-        other => {
-            eprintln!("[panel] 通知 level 非法（{other}），已降级为 warn");
-            "warn"
-        }
-    };
+    let level = n.level.as_str();
     let source = if n.source.is_empty() { "system" } else { n.source };
     let ts = crate::now_unix();
     let res = db
@@ -222,5 +242,14 @@ mod tests {
         assert_eq!(0u32.clamp(1, MAX_LIMIT), 1);
         assert_eq!(9999u32.clamp(1, MAX_LIMIT), MAX_LIMIT);
         assert_eq!(DEFAULT_LIMIT, 50);
+    }
+
+    /// 落库字符串是 openapi 的契约，不能随手改。三个值各不相同，
+    /// 且与前端 `NOTIF_LEVEL_LABEL` 的键一一对应（前端另有单测钉住）。
+    #[test]
+    fn level_wire_values_match_contract() {
+        assert_eq!(NotifLevel::Info.as_str(), "info");
+        assert_eq!(NotifLevel::Warn.as_str(), "warn");
+        assert_eq!(NotifLevel::Crit.as_str(), "crit");
     }
 }

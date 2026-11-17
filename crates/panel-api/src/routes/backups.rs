@@ -1013,7 +1013,7 @@ impl panel_task::TaskBody for BackupJob {
                 crate::routes::notifications::push(
                     &self.writer,
                     crate::routes::notifications::NewNotification {
-                        level: "crit",
+                        level: crate::routes::notifications::NotifLevel::Crit,
                         source: "backup",
                         title: format!("备份计划 #{} 执行失败", self.id),
                         body: Some(msg),
@@ -1146,7 +1146,7 @@ impl BackupJob {
                 crate::routes::notifications::push(
                     &self.writer,
                     crate::routes::notifications::NewNotification {
-                        level: "error",
+                        level: crate::routes::notifications::NotifLevel::Crit,
                         source: "backup",
                         title: format!("备份计划 #{} 的产物校验失败，已删除该产物", self.id),
                         body: Some(format!(
@@ -1194,7 +1194,7 @@ impl BackupJob {
             crate::routes::notifications::push(
                 &self.writer,
                 crate::routes::notifications::NewNotification {
-                    level: "warn",
+                    level: crate::routes::notifications::NotifLevel::Warn,
                     source: "backup",
                     title: format!("备份计划 #{} 本地成功，但远端上传失败", self.id),
                     body: Some(format!(
@@ -1232,7 +1232,7 @@ impl BackupJob {
                 crate::routes::notifications::push(
                     &self.writer,
                     crate::routes::notifications::NewNotification {
-                        level: "warn",
+                        level: crate::routes::notifications::NotifLevel::Warn,
                         source: "backup",
                         title: format!("备份计划 #{} 远端旧产物清理失败", self.id),
                         body: Some(format!(
@@ -1909,7 +1909,7 @@ impl panel_task::TaskBody for RestoreJob {
                 crate::routes::notifications::push(
                     &self.writer,
                     crate::routes::notifications::NewNotification {
-                        level: "crit",
+                        level: crate::routes::notifications::NotifLevel::Crit,
                         source: "restore",
                         title: format!("恢复计划 #{} 失败，请人工确认现场状态", self.id),
                         body: Some(msg),

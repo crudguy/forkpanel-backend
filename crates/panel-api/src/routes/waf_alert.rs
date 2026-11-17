@@ -27,11 +27,12 @@ const THRESHOLD_MAX: i64 = 100_000;
 const WINDOW_MAX: i64 = 1440; // 24h
 
 /// 告警级别：命中达 3× 阈值升 crit，否则 warn。
-fn alert_level(count: i64, threshold: i64) -> &'static str {
+fn alert_level(count: i64, threshold: i64) -> crate::routes::notifications::NotifLevel {
+    use crate::routes::notifications::NotifLevel;
     if count >= threshold.saturating_mul(3) {
-        "crit"
+        NotifLevel::Crit
     } else {
-        "warn"
+        NotifLevel::Warn
     }
 }
 
@@ -224,11 +225,12 @@ mod tests {
 
     #[test]
     fn alert_level_escalates_at_triple() {
+        use crate::routes::notifications::NotifLevel;
         // 达 3× 阈值升 crit，之间 warn，等于阈值 warn
-        assert_eq!(alert_level(50, 50), "warn");
-        assert_eq!(alert_level(149, 50), "warn");
-        assert_eq!(alert_level(150, 50), "crit"); // 3×
-        assert_eq!(alert_level(500, 50), "crit");
+        assert_eq!(alert_level(50, 50), NotifLevel::Warn);
+        assert_eq!(alert_level(149, 50), NotifLevel::Warn);
+        assert_eq!(alert_level(150, 50), NotifLevel::Crit); // 3×
+        assert_eq!(alert_level(500, 50), NotifLevel::Crit);
     }
 
     #[test]
