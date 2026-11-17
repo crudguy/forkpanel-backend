@@ -27,8 +27,8 @@ ROOT = Path(__file__).resolve().parent.parent
 CRATES = ROOT / "crates"
 
 # 钉死值（2026-11-09 实测）：改构造点/接线会撞红，需有意识地更新
-TOTAL_PIN = 66
-SANITIZE_PIN = 34
+TOTAL_PIN = 67
+SANITIZE_PIN = 35
 
 HEAD = re.compile(r"(?:PanelError::)?(Command|ConfigInvalid)\s*\{")
 FIELD = re.compile(r"\bdetail\s*:")

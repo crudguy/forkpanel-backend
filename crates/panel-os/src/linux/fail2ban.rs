@@ -12,7 +12,7 @@
 //! **护栏**：
 //! - 能力位诚实：二进制缺失即报不支持，前端据此置灰，绝不伪造成功。
 //! - jail 名 / IP 参数严格校验（`is_safe_jail_name` + `IpAddr` 解析），防参数注入 argv。
-//! - 只调用 `fail2ban-client` 标准子命令（`ping`/`status`/`set … on|off|unbanip`），
+//! - 只调用 `fail2ban-client` 标准子命令（`ping`/`status`/`set … on|off|banip|unbanip`），
 //!   不触碰防火墙底层规则，与面板自有 `panel-managed` 规则体系互不干扰。
 
 use crate::cmd::{Bin, CmdOpt};
@@ -74,6 +74,29 @@ impl Fail2ban {
         ).await?;
         if out.code != Some(0) {
             return Err(PanelError::Command { bin: "fail2ban-client".into(), detail: panel_core::sanitize::stderr(&out.stderr) });
+        }
+        Ok(())
+    }
+
+    /// 把 IP 加入 jail 的封禁列表（等价 `fail2ban-client set <jail> banip <ip>`）。
+    ///
+    /// 与 `unban` 用同一套参数校验（jail 名白名单 + `IpAddr` 解析），防 argv 注入。
+    /// 封禁时长由 jail 的 `bantime` 决定；面板只下发"封谁"，不下发"封多久"。
+    pub async fn ban(jail: &str, ip: &str) -> Result<()> {
+        if !is_safe_jail_name(jail) || ip.parse::<std::net::IpAddr>().is_err() {
+            return Err(PanelError::Validation {
+                field: "jail/ip", reason: "jail 名或 IP 非法".into()
+            });
+        }
+        let out = crate::cmd::run(
+            Bin::Fail2banClient, &["set", jail, "banip", ip],
+            CmdOpt { timeout: Duration::from_secs(15), ..Default::default() },
+        ).await?;
+        if out.code != Some(0) {
+            return Err(PanelError::Command {
+                bin: "fail2ban-client".into(),
+                detail: panel_core::sanitize::stderr(&out.stderr),
+            });
         }
         Ok(())
     }

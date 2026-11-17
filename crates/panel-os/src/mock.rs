@@ -262,6 +262,7 @@ impl FirewallProvider for MockFirewall {
     }
     async fn fail2ban_set_jail(&self, _name: &str, _enabled: bool) -> Result<()> { Ok(()) }
     async fn fail2ban_unban(&self, _jail: &str, _ip: &str) -> Result<()> { Ok(()) }
+    async fn fail2ban_ban(&self, _jail: &str, _ip: &str) -> Result<()> { Ok(()) }
 }
 
 // ───────────────────────── 其余：显式不支持 ─────────────────────────

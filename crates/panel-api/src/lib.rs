@@ -134,6 +134,11 @@ pub struct AppState {
     /// **为什么不放进 settings 表**：告警要能报「库挂了」，配置就不能存在库里。
     /// 与崩溃告警（systemd `OnFailure=` → `notify-failure.sh`）共用同一份文件配置。
     pub alert: Option<Arc<crate::alert::AlertSink>>,
+    /// 登录锁定后自动把来源 IP 交给 fail2ban 封禁的 jail 名。`None` = 功能关闭。
+    ///
+    /// 由 `config.toml [security] auto_ban_on_lockout/auto_ban_jail` 经 serve 注入；
+    /// 默认关闭，因为封 IP 是破坏性动作且 `X-Real-IP` 仅在受信任反代后可信。
+    pub auto_ban_jail: Option<String>,
 }
 
 /// 只读模式是否生效：**config 基线或环境变量**，任一为真即开。
@@ -188,7 +193,16 @@ impl AppState {
             started_at: now_unix(),
             last_snapshot: tokio::sync::RwLock::new(None),
             alert,
+            auto_ban_jail: None,
         }
+    }
+
+    /// 部署期注入自动封禁 jail。默认 `None`（关闭）；只有 serve 在配置显式开启时
+    /// 才调用。用 builder 而非给 `new` 再加参数：后者要改 7 处调用点，且测试里
+    /// 很容易漏传导致"默认兜底"的假控制。
+    pub fn with_auto_ban_jail(mut self, jail: Option<String>) -> Self {
+        self.auto_ban_jail = jail;
+        self
     }
 
     /// 最近一次采集循环产出的快照（只读缓存）。

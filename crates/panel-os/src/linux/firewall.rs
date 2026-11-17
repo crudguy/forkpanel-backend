@@ -383,6 +383,10 @@ impl FirewallProvider for LinuxFirewall {
     async fn fail2ban_unban(&self, jail: &str, ip: &str) -> Result<()> {
         super::fail2ban::Fail2ban::unban(jail, ip).await
     }
+
+    async fn fail2ban_ban(&self, jail: &str, ip: &str) -> Result<()> {
+        super::fail2ban::Fail2ban::ban(jail, ip).await
+    }
 }
 
 /// 列出当前**面板自有**规则及其 ufw 真实编号（幂等判定用）。

@@ -329,6 +329,10 @@ impl FirewallProvider for NftFirewall {
     async fn fail2ban_unban(&self, jail: &str, ip: &str) -> Result<()> {
         super::fail2ban::Fail2ban::unban(jail, ip).await
     }
+
+    async fn fail2ban_ban(&self, jail: &str, ip: &str) -> Result<()> {
+        super::fail2ban::Fail2ban::ban(jail, ip).await
+    }
 }
 
 // ═══════════════════════════ 纯函数：解析 / 渲染 ═══════════════════════════

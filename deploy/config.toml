@@ -29,6 +29,10 @@ backup_keep = 7
 session_idle = "30m"
 session_absolute = "12h"
 max_login_attempts = 5
+# 登录锁定后自动封 IP（默认 false）。仅在 X-Real-IP 由受信任反代设置时开启，
+# 且 jail 必须已在 /etc/fail2ban/jail.local 定义并覆盖面板端口（默认 sshd jail 只封 22）。
+auto_ban_on_lockout = false
+auto_ban_jail = "forkpanel"
 read_only = false
 
 [audit]

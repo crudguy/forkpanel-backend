@@ -12,8 +12,8 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use panel_core::{
-    Capability, FirewallBackend, InitSystem, LogBackend, PlatformInfo, Result, SafePath,
-    UnitName,
+    Capability, FirewallBackend, InitSystem, LogBackend, PanelError, PlatformInfo, Result,
+    SafePath, UnitName,
 };
 use std::collections::HashMap;
 use std::{cmp::Ordering, path::PathBuf, time::Duration};
@@ -667,6 +667,14 @@ pub trait FirewallProvider: Send + Sync {
     async fn fail2ban_set_jail(&self, name: &str, enabled: bool) -> Result<()>;
     /// 解封某 jail 下的某个 IP（等价 `fail2ban-client set <jail> unbanip <ip>`）。
     async fn fail2ban_unban(&self, jail: &str, ip: &str) -> Result<()>;
+    /// 把 IP 加入某 jail 的封禁列表（`fail2ban-client set <jail> banip <ip>`）。
+    ///
+    /// 供面板登录锁定联动使用：封禁时长由该 jail 的 `bantime` 决定（面板不配置它，
+    /// 见 `sensitive.rs` 把 `jail.local` 列为只读敏感路径）。默认实现为"不支持"——
+    /// 没有 fail2ban 的后端不该假装封禁成功。
+    async fn fail2ban_ban(&self, _jail: &str, _ip: &str) -> Result<()> {
+        Err(PanelError::Unsupported("fail2ban.ban"))
+    }
 }
 
 // ═══════════════════════════ 网络 ═══════════════════════════

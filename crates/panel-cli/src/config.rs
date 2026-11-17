@@ -103,6 +103,14 @@ pub struct Security {
     pub session_absolute: String,      // "12h"
     #[serde(default = "default_attempts")]
     pub max_login_attempts: usize,
+    /// 登录锁定后自动把来源 IP 交给 fail2ban 封禁。**默认关闭**：封 IP 是破坏性动作，
+    /// 且 `X-Real-IP` 只在受信任反代后才可信——误开会把管理员自己锁在门外。
+    #[serde(default)]
+    pub auto_ban_on_lockout: bool,
+    /// 用于自动封禁的 fail2ban jail 名。该 jail 必须已在 `jail.local` 中定义，
+    /// 且 banaction 覆盖面板端口（默认 sshd jail 通常只封 22，挡不住面板 HTTP）。
+    #[serde(default = "default_auto_ban_jail")]
+    pub auto_ban_jail: String,
     /// 只读模式：所有写接口返回 403 READ_ONLY（常用于"先看后改"或演练）
     #[serde(default)]
     pub read_only: bool,
@@ -163,6 +171,7 @@ fn default_sync() -> String { "NORMAL".into() }
 fn default_idle() -> String { "30m".into() }
 fn default_abs() -> String { "12h".into() }
 fn default_attempts() -> usize { 5 }
+fn default_auto_ban_jail() -> String { "forkpanel".to_string() }
 fn default_retention() -> u32 { 90 }
 fn default_max_rows() -> u64 { 50_000 }
 fn default_true() -> bool { true }
@@ -176,7 +185,8 @@ impl Default for Db {
 impl Default for Security {
     fn default() -> Self {
         Self { session_idle: default_idle(), session_absolute: default_abs(),
-               max_login_attempts: default_attempts(), read_only: false }
+               max_login_attempts: default_attempts(), auto_ban_on_lockout: false,
+               auto_ban_jail: default_auto_ban_jail(), read_only: false }
     }
 }
 impl Default for Audit {
@@ -429,6 +439,10 @@ daily_backup = true
 session_idle = "30m"
 session_absolute = "12h"
 max_login_attempts = 5
+# 登录锁定后自动封 IP（默认 false）。仅在 X-Real-IP 由受信任反代设置时开启，
+# 且 jail 必须已在 /etc/fail2ban/jail.local 定义并覆盖面板端口。
+auto_ban_on_lockout = false
+auto_ban_jail = "forkpanel"
 read_only = false
 
 [audit]
@@ -461,6 +475,9 @@ mod tests {
         assert_eq!(c.audit.retention_days, 90);
         assert_eq!(c.db.synchronous, "NORMAL");
         assert!(c.addr().unwrap().ip().is_loopback());
+        assert!(!c.security.auto_ban_on_lockout,
+            "自动封 IP 默认必须关闭：X-Real-IP 可伪造，误开会把管理员锁在门外");
+        assert_eq!(c.security.auto_ban_jail, "forkpanel");
     }
 
     #[test]

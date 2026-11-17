@@ -37,6 +37,18 @@ pub struct MeResp {
     pub mfa_enabled: bool,
 }
 
+/// 自动封禁的 IP 白名单判定（纯函数，便于单测）。
+///
+/// 回环 / 未指定地址绝不封——那等于把自己锁在门外。`unknown` 与伪造 IP 也在此挡掉。
+/// 私网地址**不豁免**：内网爆破同样危险，是否启用由运维按网络环境决定。
+/// ⚠ 该 IP 来自 `X-Real-IP`，只有在受信任反代后才是真来源；配置默认关闭正是为此。
+fn auto_ban_target(ip: &str) -> Option<&str> {
+    match ip.parse::<std::net::IpAddr>() {
+        Ok(addr) if !addr.is_loopback() && !addr.is_unspecified() => Some(ip),
+        _ => None,
+    }
+}
+
 /// 登录失败跨过锁定阈值时：写一条 lockout 审计 + 推站内通知 + 走外部 webhook。
 ///
 /// 只在 **`n == lock_after` 那一次**触发。锁定期间被拦的请求仍会计数（防 1 req/s
@@ -74,6 +86,26 @@ async fn note_lockout(state: &Shared, ip: &str, ua: &str, username: &str, n: usi
         &detail,
     )
     .await;
+
+    // 自动封禁（可选，默认关闭）。fail2ban 的 bantime 决定封多久，面板不配置它。
+    // ⚠ 任何失败都只记日志/审计，绝不影响登录响应——安全联动不能把管理员也挡住。
+    if let Some(jail) = state.auto_ban_jail.as_deref() {
+        let Some(target) = auto_ban_target(ip) else {
+            eprintln!("[WARN] 自动封禁跳过不可信/不可封的来源 IP：{ip}");
+            return;
+        };
+        let result = match state.os.firewall().fail2ban_ban(jail, target).await {
+            Ok(()) => "ok",
+            Err(e) => {
+                eprintln!("[WARN] 自动封禁失败（jail={jail}, ip={target}）：{e}");
+                "fail"
+            }
+        };
+        let ban_detail = serde_json::json!({
+            "jail": jail, "ip": target, "trigger": "login.lockout"
+        }).to_string();
+        audit_actor(state, "system", ip, "security.auto_ban", target, result, &ban_detail).await;
+    }
 }
 
 /// 一次"真的执行了身份校验"的登录失败：计数 + 审计 + 必要时告警。
@@ -1032,7 +1064,10 @@ mod tests {
     }
 
     /// 构造带真实 DB 的最小 AppState（与 bootstrap 用例同源，目录带 pid+序号防并发互踩）。
-    async fn login_security_state() -> (std::sync::Arc<crate::AppState>, std::path::PathBuf) {
+    /// OS 适配器由调用方给：真 Linux 适配器测默认态，Mock 测自动封禁的成功路径。
+    async fn login_security_state_with(
+        os: std::sync::Arc<dyn panel_os::OsAdapter>, auto_ban_jail: Option<String>,
+    ) -> (std::sync::Arc<crate::AppState>, std::path::PathBuf) {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let base = std::env::temp_dir().join(format!("panel-login-audit-{}-{}", std::process::id(), n));
@@ -1051,14 +1086,12 @@ mod tests {
             writer.clone(), tier, base.join("tasks"), db_path.clone(), "NORMAL".to_string()));
         let metrics = std::sync::Arc::new(std::sync::Mutex::new(
             panel_db::aggregator::Aggregator::new(tier)));
-        let os = panel_os::adapter_with(panel_os::PathOverrides {
-            data_dir: Some(base.join("data")), ..Default::default()
-        });
         let state = std::sync::Arc::new(crate::AppState::new(
             os, writer, pool, tasks, metrics, tier, None, false, 5,
             std::time::Duration::from_secs(1800), std::time::Duration::from_secs(43_200),
             90, 50_000, true, true, "NORMAL".to_string(), 7, false, None,
-            std::sync::Arc::new(|_: &str| Ok::<(), panel_core::PanelError>(())), None));
+            std::sync::Arc::new(|_: &str| Ok::<(), panel_core::PanelError>(())), None)
+            .with_auto_ban_jail(auto_ban_jail));
         (state, base)
     }
 
@@ -1077,7 +1110,8 @@ mod tests {
     /// **行为测试**：失败留痕 + 跨阈值只告警一次（用真实 DB，不靠源码字符串）。
     #[tokio::test]
     async fn login_failures_are_audited_and_lockout_fires_once() {
-        let (state, base) = login_security_state().await;
+        let os = panel_os::adapter_with(panel_os::PathOverrides::default());
+        let (state, base) = login_security_state_with(os, None).await;
         let lock_after = state.logins.lock_after();
 
         for _ in 0..lock_after {
@@ -1110,6 +1144,66 @@ mod tests {
             "审计详情须带来源 IP 与用户名，供事后追溯：{detail}");
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 自动封禁的 IP 判定：回环/未指定/伪造一律不封，公网与私网都允许封。
+    #[test]
+    fn auto_ban_skips_self_and_invalid_ips() {
+        assert_eq!(auto_ban_target("203.0.113.9"), Some("203.0.113.9"));
+        assert_eq!(auto_ban_target("192.168.1.5"), Some("192.168.1.5"),
+            "内网爆破同样危险，私网不豁免");
+        for bad in ["127.0.0.1", "::1", "0.0.0.0", "unknown", "1.2.3.4:5"] {
+            assert_eq!(auto_ban_target(bad), None, "{bad} 绝不能被封（把自己锁在门外）");
+        }
+    }
+
+    async fn count_now(state: &crate::AppState, sql: &'static str) -> i64 {
+        state.pool.with(|conn| {
+            conn.query_row(sql, [], |r| r.get::<_, i64>(0))
+                .map_err(|e| panel_core::PanelError::Database(e.to_string()))
+        }).await.unwrap_or(-1)
+    }
+
+    /// **行为测试**：自动封禁默认关闭；显式开启后跨阈值才封，且留审计。
+    #[tokio::test]
+    async fn auto_ban_is_opt_in_and_audited() {
+        let lock_after = 5usize; // 仅用于循环次数，真实阈值取 state.logins.lock_after()
+
+        // ① 默认关闭：即便跨阈值也不写 security.auto_ban
+        let os = || std::sync::Arc::new(panel_os::mock::MockOsAdapter::new());
+        let (off, base_off) = login_security_state_with(os(), None).await;
+        let n = off.logins.lock_after();
+        let _ = lock_after;
+        for _ in 0..n {
+            note_login_failure(&off, "203.0.113.9", "curl/8", "victim", "bad_password").await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            count_now(&off, "SELECT COUNT(*) FROM audit_log WHERE action='security.auto_ban'").await,
+            0, "默认关闭时不得封任何 IP"
+        );
+        let _ = std::fs::remove_dir_all(&base_off);
+
+        // ② 显式开启：Mock fail2ban 返回 Ok，封禁结果落审计
+        let (on, base_on) = login_security_state_with(
+            os(), Some("forkpanel".to_string())).await;
+        let n = on.logins.lock_after();
+        for _ in 0..n {
+            note_login_failure(&on, "203.0.113.9", "curl/8", "victim", "bad_password").await;
+        }
+        let bans = count_where(&on,
+            "SELECT COUNT(*) FROM audit_log WHERE action='security.auto_ban'").await;
+        assert_eq!(bans, 1, "开启后跨阈值应恰好封一次（后续锁定期间请求不重复封）");
+
+        let detail = on.pool.with(|conn| {
+            conn.query_row(
+                "SELECT detail_json FROM audit_log WHERE action='security.auto_ban'",
+                [], |r| r.get::<_, String>(0),
+            ).map_err(|e| panel_core::PanelError::Database(e.to_string()))
+        }).await.unwrap();
+        assert!(detail.contains("forkpanel") && detail.contains("203.0.113.9"),
+            "封禁审计须记录 jail 与 IP：{detail}");
+        let _ = std::fs::remove_dir_all(&base_on);
     }
 
     /// ⭐ **接线守卫**：失败路径必须收口到 `note_login_failure` / `note_lockout`。
@@ -1158,6 +1252,15 @@ mod tests {
         assert!(
             lock_body.contains("just_locked(n)"),
             "告警必须只在跨阈值那一次触发，锁定期间持续请求不得刷屏"
+        );
+        // 自动封禁收口：同一处触发，且必须留审计（封禁失败也要看得见）
+        assert!(
+            lock_body.contains("fail2ban_ban(jail, target)"),
+            "跨阈值必须调用 fail2ban 封禁，否则联动只是配置摆设"
+        );
+        assert!(
+            lock_body.contains("security.auto_ban"),
+            "封禁结果（含失败）必须写审计，否则误封/漏封都无从追溯"
         );
     }
 
