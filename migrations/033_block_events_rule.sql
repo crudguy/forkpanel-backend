@@ -1,0 +1,11 @@
+-- 033：拦截事件补「命中规则」归因（P1-6b）。
+--
+-- 027 建表时明确写了「不做规则级归因」：WAF 规则 / 敏感文件拒绝 / IP 黑名单在
+-- nginx 与 caddy 里都返回同色 403，access log 无标记可区分，故只存状态码。
+-- 本迁移把那条边界补上——渲染侧在每条 `return` 前 `set $fw_hit "<规则>"`，并把
+-- access log 换成带 `"$fw_hit"` 的命名格式（format 名按站点净化、全机唯一，
+-- 否则 `log_format` 重名会让 nginx 拒绝整份配置）。
+--
+-- 默认 ''：**老站点不会立刻有值**（要等下一次「保存并应用」重渲染配置），
+-- 采集侧把空串当「未归因」，UI 显示"未归因"而不是谎称某条规则。
+ALTER TABLE block_events ADD COLUMN rule TEXT NOT NULL DEFAULT '';

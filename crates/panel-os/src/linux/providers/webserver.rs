@@ -294,6 +294,9 @@ pub(super) fn render_nginx(spec: &SiteSpec) -> String {
         None => names.clone(),
     };
     let has_tls = spec.tls_cert.is_some() && spec.tls_key.is_some();
+    // 是否产出了独立 access log：决定要不要写 WAF/ACL 命中的归因标记变量
+    // （没有日志可采时写 `set` 只是无害的死变量，但会让配置多噪声，故按需下发）。
+    let log_access = spec.access_log.is_some();
     let http_ports: Vec<u16> = spec.listen.iter().copied().filter(|p| *p != 443).collect();
     let https_ports: Vec<u16> = spec.listen.iter().copied().filter(|p| *p == 443).collect();
     let mut out = String::new();
@@ -447,7 +450,20 @@ pub(super) fn render_nginx(spec: &SiteSpec) -> String {
         out.push_str("    index index.html index.htm;\n\n");
     }
 
-    if let Some(al) = &spec.access_log { out.push_str(&format!("    access_log {};\n", al.display())); }
+    // access log 用**本站点专属命名格式**（nginx 内置 `combined` 之上追加 `$fw_hit`），
+    // 而不是默认 combined：威胁日志需要知道"哪条规则拦的"。
+    // ⚠ 格式名必须**每站唯一**：每个站点落一个独立的 conf.d 文件，但 `log_format`
+    // 定义在 http 作用域、全机共享——两个站点都叫 `wafhit` 会让 nginx 报
+    // `duplicate log_format` 并拒绝加载**整份**配置（一个站点出错，全机站点一起挂）。
+    // 故复用站点净化名（与 upstream/zone 名同源，天然唯一）。
+    if let Some(al) = &spec.access_log {
+        // `upstream_name` 已带 `panel_` 前缀（如 panel_example_com），此处只追加用途后缀。
+        let fmt = format!("{}_hit", upstream_name(&spec.server_names));
+        out.push_str(&format!(
+            "log_format {fmt} '$remote_addr - $remote_user [$time_local] \"$request\" '\n                     '$status $body_bytes_sent \"$http_referer\" \"$http_user_agent\" \"$fw_hit\"';\n"
+        ));
+        out.push_str(&format!("    access_log {} {fmt};\n", al.display()));
+    }
     if let Some(el) = &spec.error_log {
         // 级别（021）：错误日志不写级别也能跑，但默认的 error 之外常常要看 warn
         let lvl = spec.error_log_level.as_deref().unwrap_or("error");
@@ -461,12 +477,20 @@ pub(super) fn render_nginx(spec: &SiteSpec) -> String {
     if let Some(list) = &spec.ip_allow {
         if !list.is_empty() {
             out.push_str("    # ── 访问控制：白名单（名单外一律拒绝）──\n");
+            // 命中归因标记（P1-6b）：仅当站点开了 access log 才有意义——威胁日志
+            // 从日志里读不到标记就退化为「只知道被拒、不知哪条规则拒的」。
+            if log_access {
+                out.push_str("    set $fw_hit \"ip_allow\";\n");
+            }
             for ip in list { out.push_str(&format!("    allow {ip};\n")); }
             out.push_str("    deny all;\n\n");
         }
     } else if let Some(list) = &spec.ip_deny {
         if !list.is_empty() {
             out.push_str("    # ── 访问控制：黑名单 ──\n");
+            if log_access {
+                out.push_str("    set $fw_hit \"ip_deny\";\n");
+            }
             for ip in list { out.push_str(&format!("    deny {ip};\n")); }
             out.push('\n');
         }
@@ -488,11 +512,12 @@ pub(super) fn render_nginx(spec: &SiteSpec) -> String {
         out.push_str(&render_acme_challenge_location(&spec.root));
         out.push_str(&render_deny_locations(
             spec.waf.as_ref().is_some_and(|w| w.profile == WafProfile::Strict),
+            log_access,
         ));
     }
 
     if let Some(w) = &spec.waf {
-        out.push_str(&render_waf_server(&spec.server_names, w));
+        out.push_str(&render_waf_server(&spec.server_names, w, log_access));
     }
 
     match &spec.kind {
@@ -897,18 +922,39 @@ pub(super) fn render_waf_http(server_names: &[String], w: &WafSpec) -> String {
 }
 
 /// WAF 的 **server 级**片段（拦截判定 + 限速 + 隐藏文件拒绝）。
-pub(super) fn render_waf_server(server_names: &[String], w: &WafSpec) -> String {
+///
+/// `log_access`：站点是否产出独立 access log。为真时每条 `return` 前先
+/// `set $fw_hit "<规则>"`，采集器就能从日志里读出「是哪条规则拦的」——
+/// 否则 access log 里全是同色 403，威胁日志只能显示状态码（见 027 迁移的
+/// 「不做规则级归因」边界说明，本改动正是把那条边界补上）。
+pub(super) fn render_waf_server(server_names: &[String], w: &WafSpec, log_access: bool) -> String {
     let t = waf_token(server_names);
     let strict = w.profile == WafProfile::Strict;
     let mut o = String::new();
 
     o.push_str("\n    # ── WAF 拦截（命中即拒）──\n");
+    // 规则名与采集器的 `rule_label()`（panel-api routes/waf_events.rs）一一对应；
+    // 改这里必须同步改那边，跨 crate 的 `every_emitted_hit_tag_is_mapped` 单测会
+    // 扫描本文件的全部 `hit("<tag>")` 调用点位，缺一条即红。
+    let hit = |name: &str| -> String {
+        if log_access {
+            format!("    set $fw_hit \"{name}\";\n")
+        } else {
+            String::new()
+        }
+    };
+    o.push_str(&hit("waf_ua"));
     o.push_str(&format!("    if (${t}_ua)   {{ return 403; }}\n"));
+    o.push_str(&hit("waf_sqli"));
     o.push_str(&format!("    if (${t}_sqli) {{ return 403; }}\n"));
+    o.push_str(&hit("waf_xss"));
     o.push_str(&format!("    if (${t}_xss)  {{ return 403; }}\n"));
+    o.push_str(&hit("waf_trav"));
     o.push_str(&format!("    if (${t}_trav) {{ return 403; }}\n"));
     if strict {
+        o.push_str(&hit("waf_noua"));
         o.push_str(&format!("    if (${t}_noua)   {{ return 403; }}\n"));
+        o.push_str(&hit("waf_method"));
         o.push_str(&format!("    if (${t}_method) {{ return 405; }}\n"));
     }
     if let Some(_r) = w.rate_per_sec {
@@ -933,9 +979,17 @@ pub(super) fn render_waf_server(server_names: &[String], w: &WafSpec) -> String 
 ///
 /// `strict` 仅在 WAF 严格档追加「目录类」规则：默认档只挡文件（误杀面极小），
 /// 目录名匹配面大（`logs` / `backup` 这类名字在真实项目里很常见），故归严格档。
-pub(super) fn render_deny_locations(strict: bool) -> String {
+pub(super) fn render_deny_locations(strict: bool, log_access: bool) -> String {
     let mut o = String::new();
     o.push_str("\n    # ── 敏感文件拒绝（默认生效，无需开启任何防护）──\n");
+    // 归因标记：`waf_hidden` / `waf_repo` / `waf_backup` / `waf_path` 对应下面四条规则。
+    let hit = |name: &str| -> String {
+        if log_access {
+            format!("    set $fw_hit \"{name}\";\n")
+        } else {
+            String::new()
+        }
+    };
     // ⚠⚠ **必须用 server 级 `if`，不能用 `location ~` 正则**——这是本项目踩过的
     // 一个真坑（多路由上线后 `/.env` 直接 200 下载走源码）：
     //   nginx 的 location 优先级是「`=` > 前缀 `^~` > 正则 > 普通前缀」，
@@ -955,13 +1009,17 @@ pub(super) fn render_deny_locations(strict: bool) -> String {
     //   （`.` 前面是字母而非 `/`）。
     //   `(?!)` 是 PCRE 否定前瞻：放行 `/.well-known/`（ACME http-01 挑战文件落在这里，
     //   一刀切会把证书签发/续期打死，且症状是「证书莫名过期」，与本规则毫无字面关联）。
+    o.push_str(&hit("waf_hidden"));
     o.push_str("    if ($uri ~ \"/[.](?!well-known/)\") { return 403; }\n");
     // 版本库目录：同样**不加 `^` 锚点**，覆盖任意层级（`/x/.git/config` 也拦）。
     // 上一条 `"/[.]"` 已能拦 `/.git/…`，但拦不住 `/x/.git/…`，故这条针对目录名。
+    o.push_str(&hit("waf_repo"));
     o.push_str("    if ($uri ~* \"/[.](git|svn|hg)(/|$)\") { return 403; }\n");
     // 备份与编辑器残留：正常站点不需要对外提供这些
+    o.push_str(&hit("waf_backup"));
     o.push_str("    if ($uri ~* \"[.](sql|bak|old|orig|swp|save|tar|gz|tgz|zip|7z|rar)$\") { return 403; }\n");
     if strict {
+        o.push_str(&hit("waf_path"));
         o.push_str("    if ($uri ~* \"^/(config|conf|configs|logs?|backup|backups|dumps?|db|database)(/|$)\") { return 403; }\n");
     }
     o

@@ -45,6 +45,50 @@ struct AccessLine {
     status: u16,
     referer: String,
     user_agent: String,
+    /// 命中归因（新增字段，**可缺**）：面板自定义 log_format 在 combined 末尾多一个
+    /// `"$fw_hit"`。老站点（尚未重新应用配置）的日志仍是纯 combined，此时为空串。
+    /// 容错解析而不是强制要求——收紧成必需会让升级瞬间已有的日志全部采集失败。
+    rule: String,
+}
+
+/// 待落库的拦截事件。用具名结构体而不是 8 元组：字段一多，元组里的
+/// `String` 顺序就纯靠位置记忆，插入新字段极易把 referer 和 UA 写反，
+/// 而两者都是字符串、编译期完全无法发现（clippy 的 type_complexity 也在提醒这件事）。
+struct PendingEvent {
+    ts: i64,
+    remote_addr: String,
+    method: String,
+    uri: String,
+    status: i64,
+    referer: String,
+    user_agent: String,
+    /// 已映射的中文规则名；未知标记原样保留，空串＝未归因
+    rule: String,
+}
+
+/// `$fw_hit` 标记 → 用户可读的规则名。
+///
+/// ⚠ 这些字符串与 `panel-os` 渲染器里的 `set $fw_hit "<name>"` **一一对应**，
+/// 改一边必须改另一边（`waf_hit_tags_round_trip` 单测在 panel-os 侧钉住）。
+/// 未知标记原样透出（不吞掉）：将来加规则而忘了登记时，UI 会显示原始标记，
+/// 比静默显示"未知"更容易发现问题。
+fn rule_label(tag: &str) -> Option<&'static str> {
+    match tag.trim_matches('"') {
+        "" => None,
+        "waf_ua" => Some("恶意 UA"),
+        "waf_sqli" => Some("SQL 注入"),
+        "waf_xss" => Some("XSS"),
+        "waf_trav" => Some("路径穿越"),
+        "waf_noua" => Some("空 UA"),
+        "waf_method" => Some("非常见方法"),
+        "waf_hidden" => Some("隐藏文件"),
+        "waf_repo" => Some("版本库目录"),
+        "waf_backup" => Some("备份文件"),
+        "waf_path" => Some("敏感路径"),
+        "ip_allow" => Some("IP 白名单外"),
+        "ip_deny" => Some("IP 黑名单"),
+        _ => None,
+    }
 }
 
 /// 取第一个空白分隔的 token，返回 (token, 关闭空白后的剩余)。
@@ -158,10 +202,12 @@ fn parse_combined(line: &str) -> Option<AccessLine> {
     let (status_s, rest) = next_token(rest.trim_start())?;
     let (_bytes, rest) = next_token(rest.trim_start())?;
     let (referer, rest) = read_quoted(rest.trim_start())?;
-    let (user_agent, _rest) = read_quoted(rest.trim_start())?;
+    let (user_agent, rest) = read_quoted(rest.trim_start())?;
+    // 第五个带引号字段 = `$fw_hit`（面板自定义格式）；纯 combined 没有它 → 空串。
+    let rule = read_quoted(rest.trim_start()).map(|(r, _)| r.to_string()).unwrap_or_default();
     let status: u16 = status_s.parse().ok()?;
     let (method, uri) = split_request(&request);
-    Some(AccessLine { remote_addr: remote_addr.to_string(), ts, method, uri, status, referer, user_agent })
+    Some(AccessLine { remote_addr: remote_addr.to_string(), ts, method, uri, status, referer, user_agent, rule })
 }
 
 // ─────────────────────────── 采集器 ───────────────────────────
@@ -244,11 +290,25 @@ pub async fn collect_block_events(state: &Shared) -> Result<()> {
         let text = String::from_utf8_lossy(&buf[..consumed as usize]);
 
         // 4. 收集 403/405/429 事件
-        let mut evs: Vec<(i64, String, String, String, i64, String, String)> = Vec::new();
+        let mut evs: Vec<PendingEvent> = Vec::new();
         for line in text.lines() {
             if let Some(a) = parse_combined(line) {
                 if BLOCK_STATUSES.contains(&a.status) {
-                    evs.push((a.ts, a.remote_addr, a.method, a.uri, a.status as i64, a.referer, a.user_agent));
+                    // 归因标记落成用户可读标签；未知标记原样保留（便于发现漏登记）。
+                    let rule = match rule_label(&a.rule) {
+                        Some(label) => label.to_string(),
+                        None => a.rule.trim().trim_matches('"').to_string(),
+                    };
+                    evs.push(PendingEvent {
+                        ts: a.ts,
+                        remote_addr: a.remote_addr,
+                        method: a.method,
+                        uri: a.uri,
+                        status: a.status as i64,
+                        referer: a.referer,
+                        user_agent: a.user_agent,
+                        rule,
+                    });
                 }
             }
         }
@@ -259,11 +319,21 @@ pub async fn collect_block_events(state: &Shared) -> Result<()> {
         state
             .db
             .exec(move |conn| {
-                for (ts, addr, method, uri, status, referer, ua) in &evs {
+                for e in &evs {
                     conn.execute(
-                        "INSERT INTO block_events(site, ts, remote_addr, method, uri, status, referer, user_agent) \
-                         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                        rusqlite::params![name_c, ts, addr, method, uri, status, referer, ua],
+                        "INSERT INTO block_events(site, ts, remote_addr, method, uri, status, referer, user_agent, rule) \
+                         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        rusqlite::params![
+                            name_c,
+                            e.ts,
+                            e.remote_addr,
+                            e.method,
+                            e.uri,
+                            e.status,
+                            e.referer,
+                            e.user_agent,
+                            e.rule
+                        ],
                     )
                     .map_err(|e| PanelError::Database(e.to_string()))?;
                 }
@@ -312,7 +382,7 @@ pub async fn list_events(
         .with(move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, site, ts, remote_addr, method, uri, status, referer, user_agent FROM block_events \
+                    "SELECT id, site, ts, remote_addr, method, uri, status, referer, user_agent, rule FROM block_events \
                      WHERE (?1 IS NULL OR site = ?1) AND (?2 IS NULL OR status = ?2) AND (?3 IS NULL OR ts >= ?3) \
                      ORDER BY ts DESC, id DESC LIMIT ?4 OFFSET ?5",
                 )
@@ -331,6 +401,8 @@ pub async fn list_events(
                             "status": r.get::<_, i64>(6)?,
                             "referer": r.get::<_, String>(7)?,
                             "user_agent": r.get::<_, String>(8)?,
+                            // 空串 = 未归因（老配置未重渲染，或该请求不是被规则拦的）
+                            "rule": r.get::<_, String>(9)?,
                         }))
                     },
                 )
@@ -359,8 +431,72 @@ mod tests {
         assert_eq!(a.status, 403);
         assert_eq!(a.referer, "-");
         assert_eq!(a.user_agent, "curl/7.81.0");
+        // 纯 combined 没有 $fw_hit 字段：必须解析成功、归因为空串（不能因缺字段就丢弃整行，
+        // 否则升级瞬间还没重渲染的老站点日志会被整片跳过）
+        assert_eq!(a.rule, "", "纯 combined 的归因应为空串而非解析失败");
         // 15:38 +0800 = 07:38 UTC
         assert_eq!(a.ts, 20742 * 86400 + 7 * 3600 + 38 * 60);
+    }
+
+    /// 面板自定义格式（combined + `"$fw_hit"`）：末位字段要能读出来。
+    #[test]
+    fn parses_line_with_hit_tag() {
+        let line = r#"1.2.3.4 - - [16/Oct/2026:15:38:00 +0800] "GET /?q=1+union+select HTTP/1.1" 403 152 "-" "sqlmap/1.7" "waf_sqli""#;
+        let a = parse_combined(line).expect("带归因字段的行也应解析");
+        assert_eq!(a.status, 403);
+        assert_eq!(a.user_agent, "sqlmap/1.7", "UA 不能被归因字段吞掉");
+        assert_eq!(a.rule, "waf_sqli");
+        assert_eq!(rule_label(&a.rule), Some("SQL 注入"));
+    }
+
+    /// 归因标记 → 标签的映射：空串不冒认、未知标记不吞掉（留给 UI 显示原始值）。
+    #[test]
+    fn rule_label_maps_known_and_keeps_unknown() {
+        assert_eq!(rule_label(""), None, "空串=未归因，绝不能当成某条规则");
+        assert_eq!(rule_label("waf_hidden"), Some("隐藏文件"));
+        assert_eq!(rule_label("ip_deny"), Some("IP 黑名单"));
+        assert_eq!(rule_label("brand_new_rule"), None, "未知标记应原样透出");
+    }
+
+    /// ⚠ 跨 crate 契约：渲染器写出的 `$fw_hit` 标记，必须全部能被这里读懂。
+    /// 两处字符串分别住在 panel-os / panel-api，改一边漏另一边会**静默**退化成
+    /// 「未知标记」——这条测试是唯一的交叉校验点。
+    ///
+    /// 扫描口径：渲染器有两种写法——① 字面量 `set $fw_hit "ip_allow";`；
+    /// ② 辅助闭包 `hit("waf_ua")`（闭包里 format! 展开）。**不能直接扫
+    /// `set $fw_hit \"`**：那会把闭包自身的 `format!("…{name}…")` 当成标记名。
+    #[test]
+    fn every_emitted_hit_tag_is_mapped() {
+        let src = panel_testutil::production_source(
+            include_str!("../../../panel-os/src/linux/providers/webserver.rs"),
+        );
+        let mut tags: Vec<String> = Vec::new();
+
+        // ① 字面量写法
+        for cap in src.split("set $fw_hit \\\"").skip(1) {
+            let tag: String = cap.chars().take_while(|c| *c != '"' && *c != '\\').collect();
+            if !tag.is_empty() && !tag.starts_with('{') {
+                tags.push(tag);
+            }
+        }
+        // ② 闭包调用写法（源码文本是 `hit("waf_sqli")`——单个反斜杠都没有，
+        // 所以分隔串就是 `hit("` 这五个字符；写成 `hit(\"` 会一个都匹配不到）
+        for cap in src.split("hit(\"").skip(1) {
+            let tag: String = cap.chars().take_while(|c| *c != '"' && *c != '\\').collect();
+            if !tag.is_empty() {
+                tags.push(tag);
+            }
+        }
+
+        tags.sort();
+        tags.dedup();
+        assert!(tags.len() >= 12, "应扫到全部 12 个归因标记，实际 {:?}", tags);
+        for tag in &tags {
+            assert!(
+                rule_label(tag).is_some(),
+                "渲染器写出了 {tag}，但 rule_label() 不认识它（两处字符串已漂移）"
+            );
+        }
     }
 
     #[test]

@@ -344,6 +344,95 @@ use super::*;
         assert!(!off.contains("limit_conn"), "未配置连接数上限就不该出现 limit_conn：\n{off}");
     }
 
+    /// P1-6b：开了 access log 时，每条 `return` 前必须 `set $fw_hit`，且日志格式
+    /// 必须带上该变量——否则威胁日志只能看到同色 403，无法归因。
+    ///
+    /// 负向对照：删掉任一 `set $fw_hit`，对应断言即红。
+    #[test]
+    fn waf_hit_tags_are_emitted_only_with_access_log() {
+        let mut s = spec_waf(WafProfile::Strict, None, 0);
+        s.access_log = Some(std::path::PathBuf::from("/var/log/forkpanel/a.access.log"));
+        let out = render_nginx(&s);
+
+        // 六条 WAF 规则 + 四条敏感文件规则（严格档多一条 waf_path）+ 黑名单未配置
+        for tag in [
+            "waf_ua", "waf_sqli", "waf_xss", "waf_trav", "waf_noua", "waf_method",
+            "waf_hidden", "waf_repo", "waf_backup", "waf_path",
+        ] {
+            assert!(
+                out.contains(&format!("set $fw_hit \"{tag}\";")),
+                "缺少归因标记 {tag}：\n{out}"
+            );
+        }
+        // 日志格式带 $fw_hit，且名字按站点唯一（conf.d 下多站同文件作用域，重名即整份配置挂掉）
+        assert!(out.contains("\"$http_user_agent\" \"$fw_hit\"'"), "日志格式缺 $fw_hit：\n{out}");
+        assert!(
+            out.contains("log_format panel_example_com_hit"),
+            "log_format 名须按站点净化且唯一：\n{out}"
+        );
+        assert!(
+            out.contains("access_log /var/log/forkpanel/a.access.log panel_example_com_hit;"),
+            "access_log 须引用本站点专属格式：\n{out}"
+        );
+
+        // 没开 access log：不写 set / 不写 log_format（死变量会污染配置且无意义）
+        let off = render_nginx(&spec_waf(WafProfile::Strict, None, 0));
+        assert!(!off.contains("$fw_hit"), "未开日志就不该有归因标记：\n{off}");
+        assert!(!off.contains("log_format"), "未开日志就不该定义 log_format：\n{off}");
+    }
+
+    /// ⚠ 归因标记必须**紧贴在该条的 return 之前**。
+    ///
+    /// 只断言「`set $fw_hit "x";` 存在」是恒绿的空判据：把 set 写到 return 之后
+    /// （或者写到整个 WAF 块末尾）同样能通过，但日志里读到的 `$fw_hit` 恒为空串
+    /// ——威胁日志全显示「未归因」，功能等于没做，而测试与编译器都毫无反应。
+    /// 这里按「set 行 + 紧跟的 return 行」成对匹配，把顺序钉死。
+    #[test]
+    fn waf_hit_tags_immediately_precede_their_return() {
+        let mut s = spec_waf(WafProfile::Strict, None, 0);
+        s.access_log = Some(std::path::PathBuf::from("/var/log/forkpanel/a.access.log"));
+        let out = render_nginx(&s);
+        let lines: Vec<&str> = out.lines().collect();
+
+        let mut checked = 0usize;
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim();
+            if !t.starts_with("set $fw_hit ") {
+                continue;
+            }
+            let tag = t.trim_start_matches("set $fw_hit ").trim_end_matches(';').trim_matches('"');
+            // 下一条非空行必须就是 return
+            let next = lines[i + 1..].iter().map(|l| l.trim()).find(|l| !l.is_empty());
+            let Some(next) = next else { panic!("标记 {tag} 后没有任何指令") };
+            assert!(
+                next.starts_with("if (") && next.contains("return "),
+                "标记 {tag} 的下一条指令不是 if…return（顺序反了，日志里恒为空串）：\n  set → {next}"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 10, "应检查到至少 10 个归因标记，实际 {checked}：\n{out}");
+    }
+
+    /// 两个站点各自开日志时，log_format 名必须不同——重名会让 nginx 拒绝加载
+    /// **整份**配置（一站点出错、全机站点一起挂）。
+    #[test]
+    fn waf_log_format_names_are_per_site() {
+        let mut a = spec_waf(WafProfile::Basic, None, 0);
+        a.access_log = Some(std::path::PathBuf::from("/var/log/forkpanel/a.access.log"));
+        let mut b = spec_static();
+        b.server_names = vec!["b.example.com".into()];
+        b.waf = Some(WafSpec {
+            profile: WafProfile::Basic,
+            rate_per_sec: None,
+            burst: 0,
+            conn_max: None,
+        });
+        b.access_log = Some(std::path::PathBuf::from("/var/log/forkpanel/b.access.log"));
+        let (oa, ob) = (render_nginx(&a), render_nginx(&b));
+        assert!(oa.contains("log_format panel_example_com_hit"), "{oa}");
+        assert!(ob.contains("log_format panel_b_example_com_hit"), "{ob}");
+    }
+
     #[test]
     fn waf_basic_vs_strict_differences() {
         let basic = render_nginx(&spec_waf(WafProfile::Basic, None, 0));

@@ -544,10 +544,18 @@ components:
         status:     { type: integer, description: 状态码（403 拦截/拒绝、405 方法被拒、429 限速） }
         referer:    { type: string, description: Referer }
         user_agent: { type: string, description: User-Agent }
+        rule:
+          type: string
+          description: |
+            命中的规则归因标记（033）。取值 waf_ua / waf_sqli / waf_xss / waf_trav / waf_noua /
+            waf_method / waf_hidden / waf_repo / waf_backup / waf_path / ip_allow / ip_deny。
+            空串＝未归因（未开独立 access log 的历史日志，或该站点日志格式不含 `$fw_hit`）。
+            前端按此标记查中文规则名，未知标记原样透出。
       description: |
-        拦截事件（WAF 页「威胁日志」数据源）。⚠ 无规则级归因：WAF 规则 / 敏感文件拒绝 /
-        IP 黑名单都返回同色 403，access log 无标记可区分，故只记状态码。仅采集「开了独立
-        access log」的站点；由内部周期任务 waf.collect 每 60s 增量采集，保留 30 天。
+        拦截事件（WAF 页「威胁日志」数据源）。`rule` 由 nginx 变量 `$fw_hit` 提供：渲染器在每个
+        拒绝分支前写入标记，采集端通过自定义 log_format 的末位字段读回，从而能区分是 WAF 规则 /
+        敏感文件 / IP ACL 中的哪一条拦下了请求。仅采集「开了独立 access log」的站点；由内部周期
+        任务 waf.collect 每 60s 增量采集，保留 30 天。
 
     # ───────────── WAF 拦截告警配置（028） ─────────────
     WafAlertCfg:

@@ -52,10 +52,12 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (31, include_str!("../../../migrations/031_site_conn_limit.sql")),
     // 032：模板也存并发连接数上限——否则套用模板会静默重置站点的 limit_conn
     (32, include_str!("../../../migrations/032_waf_template_conn_limit.sql")),
+    // 033：拦截事件补命中规则归因（P1-6b）——渲染侧 `set $fw_hit` + 日志带该变量
+    (33, include_str!("../../../migrations/033_block_events_rule.sql")),
 ];
 
 /// 当前 schema 版本
-pub const LATEST: u32 = 32;
+pub const LATEST: u32 = 33;
 
 pub fn apply(conn: &mut Connection) -> Result<u32> {
     conn.execute_batch(
