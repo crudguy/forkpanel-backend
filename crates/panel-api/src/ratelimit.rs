@@ -49,6 +49,44 @@ const READ_LIMIT: usize = 30;
 /// 真实场景 = 用户数 × 动作数，10k 足够。
 const MAX_KEYS: usize = 10_000;
 
+/// 全局 per-IP 限流：每 IP 在窗口内允许的请求数（含未认证与静态资源）。
+///
+/// 阈值取 600 次/60 秒（10 req/s）的依据：正常用户加载一页约 20~40 个静态资源
+/// 加数个 API，前端轮询 6~12 次/分，均远低于此；而脚本化刷取、失控刷新会
+/// 立刻超过 10 req/s 被按住。这里**只护 L7 高频请求**，不具备网络层 DDoS
+/// 防护能力——面板前置 nginx / 防火墙仍是必要的。
+pub const IP_LIMIT: usize = 600;
+pub const IP_WINDOW: Duration = Duration::from_secs(60);
+
+/// 全局 per-IP 限流桶。与 `ActionLimiter` 刻意分开：后者按 `(user, action)`
+/// 分桶、只护已认证的重活；这里按**TCP 对端 IP** 分桶，护整站所有请求。
+/// 两者互不挤占额度——一个用户狂点安装不该让同 IP 的其他请求被连带限流。
+pub struct IpLimiter {
+    inner: ActionLimiter,
+}
+
+impl IpLimiter {
+    pub fn new() -> Self {
+        Self { inner: ActionLimiter::new(IP_LIMIT, IP_WINDOW) }
+    }
+
+    /// 放行 `Ok(())` 并记账；超限返回 `Err(retry_after_secs)`（不记账）。
+    /// `now` 仅为可测注入，生产传 `Instant::now()`。
+    pub fn check_ip(&self, ip: std::net::IpAddr, now: Instant) -> Result<(), u64> {
+        self.inner.check_at(&ip.to_string(), "all", now)
+    }
+
+    pub fn check(&self, ip: std::net::IpAddr) -> Result<(), u64> {
+        self.check_ip(ip, Instant::now())
+    }
+}
+
+impl Default for IpLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct ActionLimiter {
     /// key = `"{user}\u{1f}{action}"`
     hits: Mutex<HashMap<String, VecDeque<Instant>>>,
@@ -329,5 +367,27 @@ mod tests {
         assert!(l.check_at("bob", "pull", at(t0, 1)).is_ok());
         // 同一用户换个动作：不受影响
         assert!(l.check_at("alice", "backup", at(t0, 1)).is_ok());
+    }
+
+    /// 全局 IP 限流：滑窗、被拒不计数、按 IP 隔离。钉死 IP_LIMIT 常量
+    /// 被悄悄改小（正常浏览被误拦）或改大（失去限流意义）。
+    #[test]
+    fn ip_limiter_slides_isolates_and_does_not_count_rejections() {
+        assert_eq!(IP_LIMIT, 600, "改阈值前先核对正常浏览余量，别静默放行/误拦");
+        let l = IpLimiter::new();
+        let a: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let b: std::net::IpAddr = "192.0.2.2".parse().unwrap();
+        let t0 = Instant::now();
+        for _ in 0..IP_LIMIT {
+            assert!(l.check_ip(a, t0).is_ok());
+        }
+        let wait = l.check_ip(a, t0).unwrap_err();
+        assert!((1..=IP_WINDOW.as_secs()).contains(&wait));
+        // 被拒的请求不计数：连刷两次 wait 不变（不会把自己越锁越久）
+        assert_eq!(l.check_ip(a, t0).unwrap_err(), wait);
+        // 别的 IP 不受影响
+        assert!(l.check_ip(b, t0).is_ok());
+        // 窗口滑过即恢复
+        assert!(l.check_ip(a, at(t0, IP_WINDOW.as_secs() + 1)).is_ok());
     }
 }

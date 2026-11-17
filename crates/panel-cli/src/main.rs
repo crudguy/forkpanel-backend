@@ -1050,7 +1050,10 @@ mod wiring_guard_tests {
         // 判据跟着被检查的那份文件走：builder 调用顺序即层序，而这条链在 cmd/serve.rs
         let src = include_str!("cmd/serve.rs");
         let prod = panel_testutil::production_source(src);
-        let mount = "axum::middleware::from_fn_with_state(";
+        // ⚠ 锚点必须精确指向 request_log 本身：P1-4 新增的 IP 限流层同样用
+        // from_fn_with_state 且挂在其内层，若继续用泛化锚点，守卫会退化为
+        // 钉住 IP 层——届时删掉 request_log 仍恒绿（判据指向错）。
+        let mount = "panel_api::middleware::request_log";
         let at = prod
             .find(mount)
             .unwrap_or_else(|| panic!("serve 链必须挂 request_log 层（请求级结构化日志）: {mount}"));
@@ -1067,6 +1070,32 @@ mod wiring_guard_tests {
         assert!(
             hz_at < at,
             "request_log 必须加在 `/healthz` 之后：否则健康检查请求不留日志行"
+        );
+    }
+
+    /// ⭐ 全局 IP 限流的挂点守卫：唯一、在 fallback 之后、在 request_log 内层。
+    /// 行为测试（真 Router + ConnectInfo）证明逻辑正确，但挂在 build_router 内
+    /// 会漏掉 404 / SPA miss，挂到日志层之外会让 429 不留痕——两者都不会让
+    /// 任何行为测试变红，只能源码级钉死。
+    #[test]
+    fn ip_rate_limit_is_mounted_once_inside_request_log() {
+        let src = panel_testutil::production_source(include_str!("cmd/serve.rs"));
+        let needle = "panel_api::middleware::ip_rate_limit";
+        assert_eq!(
+            src.matches(needle).count(),
+            1,
+            "IP 限流必须恰好一个挂点：双挂会重复计数，漏挂则整站无 per-IP 限流"
+        );
+        let ip_at = src.find(needle).unwrap();
+        let log_at = src.find("panel_api::middleware::request_log").unwrap();
+        let fb_at = src.find(".fallback(embed::static_handler)").unwrap();
+        assert!(
+            fb_at < ip_at,
+            "IP 限流必须加在 `.fallback()` 之后：否则 404 / SPA miss 绕过限流"
+        );
+        assert!(
+            ip_at < log_at,
+            "IP 限流必须挂在 request_log 内层：被 429 的请求也要留日志行"
         );
     }
 

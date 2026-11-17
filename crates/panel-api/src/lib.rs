@@ -82,6 +82,9 @@ pub struct AppState {
     /// 档位比 `limits` 宽松——只读端点被前端轮询正常访问，限额必须高于轮询频率；
     /// 见 ratelimit.rs 的 `READ_LIMIT`。与 `limits` 分开是为了互不挤占额度。
     pub read_limits: Arc<crate::ratelimit::ActionLimiter>,
+    /// 全局 per-IP 限流（所有请求，含未认证与静态资源）；见 ratelimit.rs 的 `IpLimiter`。
+    /// 与 `limits` / `read_limits` 分开，避免一个用户的批量操作挤掉同 IP 其他请求。
+    pub ip_limits: Arc<crate::ratelimit::IpLimiter>,
     /// 只读模式（启动期算一次）。**单一真值**：guard、设置页展示、终端入口都读它，
     /// 不要再各自去读环境变量——那正是此前 config.toml 的 `read_only` 配了不生效的原因。
     pub read_only: bool,
@@ -187,6 +190,7 @@ impl AppState {
             logins: Arc::new(crate::auth::LoginGuard::new(max_login_attempts)),
             limits: Arc::new(crate::ratelimit::ActionLimiter::heavy()),
             read_limits: Arc::new(crate::ratelimit::ActionLimiter::read()),
+            ip_limits: Arc::new(crate::ratelimit::IpLimiter::new()),
             read_only,
             bootstrap: Arc::new(crate::auth::BootstrapGuard::new()),
             master_key,

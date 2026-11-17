@@ -8,7 +8,7 @@ use crate::{
     AppState,
 };
 use axum::{
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
     http::{header, HeaderMap, HeaderValue, Method},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -130,6 +130,33 @@ pub async fn read_only_guard(
         return ApiError::read_only().into_response();
     }
     next.run(req).await
+}
+
+/// 全局 per-IP 限流（L7 高频刷取）。生产链挂点：`.fallback()` 之后、
+/// `request_log` 之前——被 429 的请求也要留日志行。具体次序与唯一性由
+/// cmd/serve.rs 装配、main.rs 接线守卫钉死。
+///
+/// # IP 来源：只认 TCP 对端，不认转发头
+/// 取 `ConnectInfo<SocketAddr>`（由 `into_make_service_with_connect_info`
+/// 注入），**不读** `X-Forwarded-For` / `X-Real-IP`：无反代时那些头等于
+/// 客户端自填，改一个头就能绕过限流。代价是面板置于 nginx 之后时所有
+/// 请求落在同一桶（对端是 nginx）——那应由 nginx 自己限速，而不是让
+/// 面板信任可伪造的头。
+pub async fn ip_rate_limit(
+    State(limiter): State<Arc<crate::ratelimit::IpLimiter>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let Some(peer) = req.extensions().get::<ConnectInfo<std::net::SocketAddr>>() else {
+        // 无 ConnectInfo 只可能是库用法 / 单测 oneshot 直调（生产 axum::serve
+        // 一定注入）。此处放行：这是装配问题而非攻击面；fail-closed 会让
+        // 任何内嵌调用都 429，反而制造「配了就用不了」的假控制。
+        return next.run(req).await;
+    };
+    match limiter.check(peer.0.ip()) {
+        Ok(()) => next.run(req).await,
+        Err(wait) => ApiError::too_many_requests(wait).into_response(),
+    }
 }
 
 pub type SharedSessions = Arc<SessionCache>;
@@ -381,6 +408,51 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let body = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
         assert_eq!(&body[..], b"pong", "响应体必须原样透传");
+    }
+
+    /// 真 Router + 真 ConnectInfo：按 TCP 对端 IP 分桶，超限回 429，
+    /// 别的 IP 不受影响；无 ConnectInfo（库用法）放行。
+    /// 负向对照：去掉 `.layer(ip_rate_limit)` 后本测试立刻变红。
+    #[tokio::test]
+    async fn ip_rate_limit_blocks_flood_and_isolates_peers() {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Request, StatusCode};
+        use axum::response::Response;
+        use axum::{routing::get, Router};
+        use std::net::{IpAddr, SocketAddr};
+        use tower::ServiceExt;
+
+        async fn ping() -> &'static str { "pong" }
+        async fn hit(app: Router, ip: IpAddr) -> Response {
+            let req = Request::builder()
+                .uri("/ping")
+                .extension(ConnectInfo(SocketAddr::new(ip, 12345)))
+                .body(Body::empty())
+                .unwrap();
+            app.oneshot(req).await.unwrap()
+        }
+
+        let limiter = std::sync::Arc::new(crate::ratelimit::IpLimiter::new());
+        let app = Router::new()
+            .route("/ping", get(ping))
+            .layer(axum::middleware::from_fn_with_state(limiter, ip_rate_limit));
+
+        let a: IpAddr = "198.51.100.1".parse().unwrap();
+        let b: IpAddr = "198.51.100.2".parse().unwrap();
+        for _ in 0..crate::ratelimit::IP_LIMIT {
+            assert_eq!(hit(app.clone(), a).await.status(), StatusCode::OK);
+        }
+        assert_eq!(
+            hit(app.clone(), a).await.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "超过 IP_LIMIT 必须回 429"
+        );
+        assert_eq!(hit(app.clone(), b).await.status(), StatusCode::OK, "别的 IP 不受牵连");
+
+        // 没有 ConnectInfo 时放行：这是框架装配问题，不是攻击面
+        let req = Request::builder().uri("/ping").body(Body::empty()).unwrap();
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
     }
 
     // 注：request_log 的接线 / 次序守卫已移至 panel-cli 的 main.rs

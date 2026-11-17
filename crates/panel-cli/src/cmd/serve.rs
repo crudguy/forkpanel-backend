@@ -266,6 +266,14 @@ pub(crate) fn run(cli: &Cli, os: Arc<dyn panel_os::OsAdapter>) -> Result<()> {
             .layer(axum::middleware::from_fn(
                 panel_api::middleware::security_headers,
             ))
+            // 全局 per-IP 限流：挂在 request_log 内层（被 429 的请求也要留
+            // 日志行），且在 `.fallback()` 之后（404 / SPA miss 同样受限）。
+            // IP 取 TCP 对端 ConnectInfo，不读可伪造的 X-Forwarded-For；
+            // 反代场景对端统一是 nginx，应由 nginx 自己限速。
+            .layer(axum::middleware::from_fn_with_state(
+                state.ip_limits.clone(),
+                panel_api::middleware::ip_rate_limit,
+            ))
             // 请求级结构化日志：**最后加 = 最外层**。必须加在 `.fallback()`
             // 之后——axum 的 `.fallback()` 会整体替换既有 fallback 路由，且
             // 新 fallback 不被此前任何 `.layer()` 包裹；本层若加在它之前
