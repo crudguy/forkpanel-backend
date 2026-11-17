@@ -676,6 +676,8 @@ pub mod perm {
     pub const USER_MANAGE: &str     = "user.manage";
     pub const SETTINGS_MANAGE: &str = "settings.manage";
     pub const AUDIT_VIEW: &str      = "audit.view";
+    /// 「确认通知」是写操作：只读角色不能把全局未读徽标清掉。
+    pub const NOTIFICATION_MANAGE: &str = "notification.manage";
 }
 
 /// 内置角色名。**保留字**：自定义角色不得占用——同名两套权限定义是最难排查的 bug。
@@ -693,6 +695,7 @@ pub fn all_permissions() -> Vec<&'static str> {
         DB_VIEW, DB_MANAGE, FIREWALL_VIEW, FIREWALL_MANAGE, SECURITY_MANAGE,
         CRON_VIEW, CRON_MANAGE, LOG_VIEW, TASK_VIEW, TASK_MANAGE, BACKUP_VIEW, BACKUP_MANAGE,
         CONTAINER_VIEW, CONTAINER_MANAGE, USER_MANAGE, SETTINGS_MANAGE, AUDIT_VIEW,
+        NOTIFICATION_MANAGE,
     ]
 }
 
@@ -747,13 +750,14 @@ pub fn permissions_for_role(role: &str) -> Vec<String> {
             let mut v = view_only.clone();
             v.extend([SYSTEM_MANAGE, SERVICE_MANAGE, PACKAGE_MANAGE, SITE_MANAGE, SSL_MANAGE,
                       FILE_WRITE, DB_MANAGE, FIREWALL_MANAGE, SECURITY_MANAGE, CRON_MANAGE,
-                      TASK_MANAGE, BACKUP_MANAGE, CONTAINER_MANAGE, SETTINGS_MANAGE, USER_MANAGE]);
+                      TASK_MANAGE, BACKUP_MANAGE, CONTAINER_MANAGE, SETTINGS_MANAGE, USER_MANAGE,
+                      NOTIFICATION_MANAGE]);
             v
         }
         "operator" => {
             let mut v = view_only.clone();
             v.extend([SERVICE_MANAGE, SITE_MANAGE, SSL_MANAGE, CRON_MANAGE, TASK_MANAGE, BACKUP_MANAGE,
-                      CONTAINER_MANAGE, FILE_WRITE]);
+                      CONTAINER_MANAGE, FILE_WRITE, NOTIFICATION_MANAGE]);
             v
         }
         "viewer" => view_only,
@@ -768,13 +772,12 @@ pub fn require(session: &Session, p: &str) -> ApiResult<()> {
     else { Err(ApiError::forbidden(leak_static(p))) }
 }
 
-// 权限点都是 &'static str 常量；这里只在错误路径上做一次静态回退，避免生命周期扩散
+// 权限点都是 &'static str 常量；这里只在错误路径上做一次静态回退，避免生命周期扩散。
+// ⚠ 取值必须走 `all_permissions()` 这个单一事实源：曾手写一份清单，
+// 新加 `notification.manage` 时漏在里面，403 detail 变成 "unknown"，
+// 用户与排障者都看不出缺的是哪个权限。
 fn leak_static(p: &str) -> &'static str {
-    use perm::*;
-    for c in [SYSTEM_VIEW, SYSTEM_MANAGE, SERVICE_VIEW, SERVICE_MANAGE, PACKAGE_MANAGE,
-              SITE_VIEW, SITE_MANAGE, SSL_MANAGE, FILE_READ, FILE_WRITE, DB_VIEW, DB_MANAGE,
-              FIREWALL_VIEW, FIREWALL_MANAGE, SECURITY_MANAGE, CRON_VIEW, CRON_MANAGE,
-              LOG_VIEW, TASK_VIEW, TASK_MANAGE, BACKUP_VIEW, BACKUP_MANAGE, USER_MANAGE, SETTINGS_MANAGE, AUDIT_VIEW] {
+    for c in all_permissions() {
         if c == p { return c; }
     }
     "unknown"
@@ -820,7 +823,7 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), all.len(), "all_permissions 存在重复项");
-        assert_eq!(all.len(), 27, "权限常量增减时请同步 all_permissions 与其数量断言");
+        assert_eq!(all.len(), 28, "权限常量增减时请同步 all_permissions 与其数量断言");
 
         // 内置角色用到的权限必须都在白名单内，否则自定义角色会出现
         // "内置能用、自定义选不到"的不一致
@@ -889,6 +892,27 @@ mod tests {
         assert!(v.iter().any(|p| p == "system.view"));
         assert!(!v.iter().any(|p| p == "site.manage"));
         assert!(!v.iter().any(|p| p == "firewall.manage"));
+    }
+
+    #[test]
+    fn forbidden_detail_names_every_known_permission() {
+        // 403 的 detail.required 必须能指出具体权限点，不能退化成 "unknown"。
+        for p in all_permissions() {
+            assert_eq!(leak_static(p), p, "权限 {p} 漏进了 leak_static 的硬编码清单");
+        }
+        assert_eq!(leak_static("not.a.permission"), "unknown");
+    }
+
+    #[test]
+    fn only_writers_can_ack_notifications() {
+        // 只读角色能看通知，但不能标记已读/全部已读（那些操作改的是全局 read 旗标）。
+        let viewer = permissions_for_role("viewer");
+        assert!(viewer.iter().any(|p| p == "system.view"));
+        assert!(!viewer.iter().any(|p| p == "notification.manage"));
+        let operator = permissions_for_role("operator");
+        assert!(operator.iter().any(|p| p == "notification.manage"));
+        let owner = permissions_for_role("owner");
+        assert!(owner.iter().any(|p| p == "notification.manage"));
     }
 
     #[test]

@@ -4230,6 +4230,7 @@ paths:
       parameters:
         - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 200 } }
         - { name: unread_only, in: query, schema: { type: boolean, default: false } }
+        - { name: offset, in: query, schema: { type: integer, default: 0, minimum: 0 } }
       responses:
         '200':
           description: ok
@@ -4251,14 +4252,14 @@ paths:
     post:
       operationId: post_notifications_read_all
       tags: [notifications]
-      summary: 全部标记已读
+      summary: 全部标记已读（需 notification.manage）
       security: [cookieAuth, csrfHeader]
       responses: { '200': { description: ok } }
   /api/v1/notifications/{id}/read:
     post:
       operationId: post_notifications_id_read
       tags: [notifications]
-      summary: 单条标记已读
+      summary: 单条标记已读（需 notification.manage）
       security: [cookieAuth, csrfHeader]
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       responses:

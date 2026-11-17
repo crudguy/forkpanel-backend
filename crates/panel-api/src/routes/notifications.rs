@@ -27,9 +27,9 @@ use std::sync::Arc;
 
 // SQL 全部写成编译期常量（分层门禁 [5] 禁止 format! 拼 SQL，与 sites.rs 同一纪律）
 const SQL_LIST_ALL: &str =
-    "SELECT id, ts, level, source, title, body, read FROM notifications ORDER BY ts DESC LIMIT ?1";
+    "SELECT id, ts, level, source, title, body, read FROM notifications ORDER BY ts DESC LIMIT ?1 OFFSET ?2";
 const SQL_LIST_UNREAD: &str =
-    "SELECT id, ts, level, source, title, body, read FROM notifications WHERE read = 0 ORDER BY ts DESC LIMIT ?1";
+    "SELECT id, ts, level, source, title, body, read FROM notifications WHERE read = 0 ORDER BY ts DESC LIMIT ?1 OFFSET ?2";
 const DEFAULT_LIMIT: u32 = 50;
 const MAX_LIMIT: u32 = 200;
 
@@ -121,6 +121,8 @@ pub async fn push(db: &Arc<panel_db::WriterActor>, n: NewNotification) {
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
     pub limit: Option<u32>,
+    /// 分页游标；默认 0（最新一页）
+    pub offset: Option<u32>,
     /// true = 只要未读
     pub unread_only: Option<bool>,
 }
@@ -133,6 +135,7 @@ pub async fn list(
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::auth::require(&s, perm::SYSTEM_VIEW)?;
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    let offset = q.offset.unwrap_or(0);
     let unread_only = q.unread_only.unwrap_or(false);
 
     let items = state
@@ -144,7 +147,7 @@ pub async fn list(
                 .prepare(sql)
                 .map_err(|e| PanelError::Database(e.to_string()))?;
             let it = st
-                .query_map([limit], row_dto)
+                .query_map([limit, offset], row_dto)
                 .map_err(|e| PanelError::Database(e.to_string()))?;
             it.collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(|e| PanelError::Database(e.to_string()))
@@ -175,7 +178,7 @@ pub async fn mark_read(
     Auth(s): Auth,
     AxPath(id): AxPath<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    crate::auth::require(&s, perm::SYSTEM_VIEW)?;
+    crate::auth::require(&s, perm::NOTIFICATION_MANAGE)?;
     let changed = set_read(&state, Some(id)).await?;
     if changed == 0 {
         return Err(ApiError::not_found("notification"));
@@ -188,7 +191,7 @@ pub async fn read_all(
     State(state): State<Shared>,
     Auth(s): Auth,
 ) -> ApiResult<Json<serde_json::Value>> {
-    crate::auth::require(&s, perm::SYSTEM_VIEW)?;
+    crate::auth::require(&s, perm::NOTIFICATION_MANAGE)?;
     let changed = set_read(&state, None).await?;
     Ok(ok(serde_json::json!({ "updated": changed })))
 }
@@ -242,6 +245,16 @@ mod tests {
         assert_eq!(0u32.clamp(1, MAX_LIMIT), 1);
         assert_eq!(9999u32.clamp(1, MAX_LIMIT), MAX_LIMIT);
         assert_eq!(DEFAULT_LIMIT, 50);
+    }
+
+    /// 两条 WHERE 分支必须都带 OFFSET：曾各写一份 SQL，漏一条就会出现
+    /// 「全部列表能翻页、未读筛选的翻页永远是第一页」这种半残功能。
+    #[test]
+    fn both_list_branches_support_offset() {
+        for sql in [SQL_LIST_ALL, SQL_LIST_UNREAD] {
+            assert!(sql.contains("LIMIT ?1"), "缺 LIMIT：{sql}");
+            assert!(sql.contains("OFFSET ?2"), "缺 OFFSET：{sql}");
+        }
     }
 
     /// 落库字符串是 openapi 的契约，不能随手改。三个值各不相同，

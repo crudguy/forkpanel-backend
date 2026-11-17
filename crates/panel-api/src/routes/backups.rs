@@ -1150,7 +1150,7 @@ impl BackupJob {
                         source: "backup",
                         title: format!("备份计划 #{} 的产物校验失败，已删除该产物", self.id),
                         body: Some(format!(
-                            "备份文件已生成但**读不回来**，已删除以免它冒充有效备份。\n\n产物：{}\n原因：{e}",
+                            "备份文件已生成但读不回来，已删除以免它冒充有效备份。\n\n产物：{}\n原因：{e}",
                             out_path.display()
                         )),
                         // 按天去重：同一个坏盘不该每次调度都刷一条
@@ -1198,7 +1198,7 @@ impl BackupJob {
                     source: "backup",
                     title: format!("备份计划 #{} 本地成功，但远端上传失败", self.id),
                     body: Some(format!(
-                        "本地产物已生成，**异地副本缺失**，请检查远端配置。\n\n{detail}"
+                        "本地产物已生成，异地副本缺失，请检查远端配置。\n\n{detail}"
                     )),
                     // 按天去重：同一个坏配置不该每次调度都刷一条
                     dedup_key: Some(format!(
