@@ -26,9 +26,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 CRATES = ROOT / "crates"
 
-# 钉死值（2026-11-09 实测）：改构造点/接线会撞红，需有意识地更新
-TOTAL_PIN = 67
-SANITIZE_PIN = 35
+# 钉死值（2026-11-17 更新：P0-3 fail2ban params 读/写各新增 1 个 sanitized 构造点）
+TOTAL_PIN = 69
+SANITIZE_PIN = 37
 
 HEAD = re.compile(r"(?:PanelError::)?(Command|ConfigInvalid)\s*\{")
 FIELD = re.compile(r"\bdetail\s*:")

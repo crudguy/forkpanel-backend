@@ -675,6 +675,16 @@ pub trait FirewallProvider: Send + Sync {
     async fn fail2ban_ban(&self, _jail: &str, _ip: &str) -> Result<()> {
         Err(PanelError::Unsupported("fail2ban.ban"))
     }
+    /// 读取 jail 的 `(maxretry, bantime, findtime)` 运行期参数。
+    async fn fail2ban_get_params(&self, _jail: &str) -> Result<(i64, i64, i64)> {
+        Err(PanelError::Unsupported("fail2ban.get_params"))
+    }
+    /// 下发 jail 的封禁参数（仅运行期，不写 jail.local）。
+    async fn fail2ban_set_params(
+        &self, _jail: &str, _maxretry: i64, _bantime: i64, _findtime: i64,
+    ) -> Result<()> {
+        Err(PanelError::Unsupported("fail2ban.set_params"))
+    }
 }
 
 // ═══════════════════════════ 网络 ═══════════════════════════

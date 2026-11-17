@@ -78,6 +78,68 @@ impl Fail2ban {
         Ok(())
     }
 
+    /// 读取 jail 的三个封禁参数：`(maxretry, bantime, findtime)`。
+    ///
+    /// 通过 `fail2ban-client get <jail> <key>` 读**运行期真值**，不读 jail.local
+    /// （后者是敏感路径，面板只读不写）。jail 不存在时命令非零退出 ⇒ 如实报错。
+    pub async fn get_params(jail: &str) -> Result<(i64, i64, i64)> {
+        if !is_safe_jail_name(jail) {
+            return Err(PanelError::Validation { field: "jail", reason: "jail 名非法".into() });
+        }
+        let mut vals = Vec::with_capacity(3);
+        for key in ["maxretry", "bantime", "findtime"] {
+            let out = crate::cmd::run(
+                Bin::Fail2banClient, &["get", jail, key],
+                CmdOpt { timeout: Duration::from_secs(15), ..Default::default() },
+            ).await?;
+            if out.code != Some(0) {
+                return Err(PanelError::Command {
+                    bin: "fail2ban-client".into(),
+                    detail: panel_core::sanitize::stderr(&out.stderr),
+                });
+            }
+            let v = out.stdout.trim().parse::<i64>().map_err(|_| PanelError::Validation {
+                field: key, reason: format!("fail2ban 返回了非法数值：{}", out.stdout.trim()),
+            })?;
+            vals.push(v);
+        }
+        Ok((vals[0], vals[1], vals[2]))
+    }
+
+    /// 下发 jail 的封禁参数（运行期生效，`fail2ban-client set <jail> <key> <val>`）。
+    ///
+    /// ⚠ **不写 jail.local**（敏感路径，面板不碰），因此重启 fail2ban 后回落到
+    /// `jail.local` 的值——UI 必须明确告知，不能伪装成永久生效。
+    /// 先读旧值，任一步失败则尽力回滚已改的项，避免半套配置。
+    pub async fn set_params(jail: &str, maxretry: i64, bantime: i64, findtime: i64) -> Result<()> {
+        if !is_safe_jail_name(jail) {
+            return Err(PanelError::Validation { field: "jail", reason: "jail 名非法".into() });
+        }
+        let old = Self::get_params(jail).await?;
+        let next = [("maxretry", maxretry), ("bantime", bantime), ("findtime", findtime)];
+        let prev = [("maxretry", old.0), ("bantime", old.1), ("findtime", old.2)];
+        for (i, (key, val)) in next.iter().enumerate() {
+            let out = crate::cmd::run(
+                Bin::Fail2banClient, &["set", jail, key, &val.to_string()],
+                CmdOpt { timeout: Duration::from_secs(15), ..Default::default() },
+            ).await?;
+            if out.code != Some(0) {
+                // 尽力回滚已下发的项；回滚失败只记日志，原始错误才是根因。
+                for (rk, rv) in prev.iter().take(i) {
+                    let _ = crate::cmd::run(
+                        Bin::Fail2banClient, &["set", jail, rk, &rv.to_string()],
+                        CmdOpt { timeout: Duration::from_secs(15), ..Default::default() },
+                    ).await;
+                }
+                return Err(PanelError::Command {
+                    bin: "fail2ban-client".into(),
+                    detail: panel_core::sanitize::stderr(&out.stderr),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// 把 IP 加入 jail 的封禁列表（等价 `fail2ban-client set <jail> banip <ip>`）。
     ///
     /// 与 `unban` 用同一套参数校验（jail 名白名单 + `IpAddr` 解析），防 argv 注入。
@@ -118,7 +180,8 @@ impl Fail2ban {
 }
 
 /// jail 名只允许字母数字与 _ -（防参数注入进 fail2ban-client argv）。
-fn is_safe_jail_name(s: &str) -> bool {
+/// `pub` 供 API 层在构造请求时先做同样的校验并给出明确 400，而非等命令层报错。
+pub fn is_safe_jail_name(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 

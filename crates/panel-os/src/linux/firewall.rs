@@ -387,6 +387,14 @@ impl FirewallProvider for LinuxFirewall {
     async fn fail2ban_ban(&self, jail: &str, ip: &str) -> Result<()> {
         super::fail2ban::Fail2ban::ban(jail, ip).await
     }
+    async fn fail2ban_get_params(&self, jail: &str) -> Result<(i64, i64, i64)> {
+        super::fail2ban::Fail2ban::get_params(jail).await
+    }
+    async fn fail2ban_set_params(
+        &self, jail: &str, maxretry: i64, bantime: i64, findtime: i64,
+    ) -> Result<()> {
+        super::fail2ban::Fail2ban::set_params(jail, maxretry, bantime, findtime).await
+    }
 }
 
 /// 列出当前**面板自有**规则及其 ufw 真实编号（幂等判定用）。

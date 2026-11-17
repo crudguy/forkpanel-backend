@@ -195,7 +195,7 @@ mod tests {
     /// 教训的同类：只能源码级断言。写法参照 auth.rs 的 LoginGuard 接线守卫。
     #[test]
     fn heavy_handlers_are_actually_wired() {
-        let cases: [(&str, &str, &str); 25] = [
+        let cases: [(&str, &str, &str); 26] = [
             (include_str!("routes/services/packages.rs"), "pkg.install", "services::install"),
             (include_str!("routes/services/packages.rs"), "pkg.upgrade", "services::package_upgrade"),
             (include_str!("routes/services/packages.rs"), "pkg.remove", "services::package_remove"),
@@ -219,6 +219,7 @@ mod tests {
             (include_str!("routes/firewall.rs"), "firewall.rule_delete", "firewall::delete_rule"),
             (include_str!("routes/firewall.rs"), "fail2ban.set_jail", "firewall::fail2ban_set_jail"),
             (include_str!("routes/firewall.rs"), "fail2ban.unban", "firewall::fail2ban_unban"),
+            (include_str!("routes/firewall.rs"), "fail2ban.set_params", "firewall::fail2ban_set_params"),
             (include_str!("routes/sites/conf.rs"), "site.conf_put", "sites::conf_put"),
             (include_str!("routes/sites/conf.rs"), "site.conf_restore", "sites::conf_restore"),
             (include_str!("routes/sites/conf.rs"), "site.conf_rollback", "sites::conf_rollback"),
@@ -228,7 +229,7 @@ mod tests {
         // 清单只能证明「被点名的 action 还在」，证明不了「新加的写 handler 有没有接线」。
         // 对高风险文件额外按文件钉住数量：删一行 / 新增一个没接线的 handler 都会红。
         for (src, want, who) in [
-            (include_str!("routes/firewall.rs"), 5usize, "firewall"),
+            (include_str!("routes/firewall.rs"), 6usize, "firewall"),
             (include_str!("routes/sites/conf.rs"), 3usize, "sites::conf"),
             (include_str!("routes/settings.rs"), 1usize, "settings"),
         ] {
@@ -264,7 +265,7 @@ mod tests {
             assert!(n > 0, "{who} 未扫到任何限流接线（扫描失效，绝不能算通过）");
             n
         }).sum();
-        assert_eq!(total, 26, "全仓 check_heavy 接线总数 = {total}，期望 26；\
+        assert_eq!(total, 27, "全仓 check_heavy 接线总数 = {total}，期望 27；\
             删掉任一接线或新增未接线的重活 handler 都必须显式更新本断言");
         for (src, action, who) in cases {
             // 生产段：剔注释行 + 剥离测试块（测试里出现同形 needle 会假绿，

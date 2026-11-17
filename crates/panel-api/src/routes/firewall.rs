@@ -15,7 +15,7 @@ use crate::{
     error::{ok, ApiError, ApiResult},
     routes::{audit, Auth, Shared},
 };
-use axum::{extract::{Path as AxPath, State}, Json};
+use axum::{extract::{Path as AxPath, Query, State}, Json};
 use panel_core::cap_keys;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
@@ -380,9 +380,96 @@ pub async fn fail2ban_unban(
     Ok(ok(serde_json::json!({ "jail": req.jail, "ip": req.ip })))
 }
 
+// ── fail2ban jail 封禁参数（运行期） ──
+
+/// 参数范围：maxretry 1..=10000；bantime/findtime 1..=30 天（秒）。
+/// 只接受 i64，负数/0/超大值一律 400——把非法值传给 fail2ban-client 轻则无效重则
+/// 让 jail 永久封禁所有 IP（bantime=0 在部分版本表示永久），故必须在入口挡死。
+fn valid_jail_params(maxretry: i64, bantime: i64, findtime: i64) -> bool {
+    (1..=10_000).contains(&maxretry)
+        && (1..=2_592_000).contains(&bantime)
+        && (1..=2_592_000).contains(&findtime)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct JailParamsQuery { pub jail: String }
+
+#[derive(Debug, Deserialize)]
+pub struct JailParamsReq {
+    pub jail: String,
+    pub maxretry: i64,
+    pub bantime: i64,
+    pub findtime: i64,
+}
+
+fn validate_jail_name(jail: &str) -> Result<(), ApiError> {
+    if !panel_os::is_safe_jail_name(jail) {
+        return Err(ApiError::bad_request("jail", "jail 名只允许字母数字与 _ -"));
+    }
+    Ok(())
+}
+
+/// 读取 jail 当前**运行期**参数（非 jail.local 文件值）。
+pub async fn fail2ban_get_params(
+    State(state): State<Shared>, Auth(s): Auth, Query(q): Query<JailParamsQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::FIREWALL_MANAGE)?;
+    validate_jail_name(&q.jail)?;
+    if !state.capabilities.get(cap_keys::FAIL2BAN).map(|c| c.supported).unwrap_or(false) {
+        return Err(ApiError::unsupported("fail2ban.manage"));
+    }
+    let (maxretry, bantime, findtime) =
+        state.os.firewall().fail2ban_get_params(&q.jail).await?;
+    Ok(ok(serde_json::json!({
+        "jail": q.jail, "maxretry": maxretry,
+        "bantime": bantime, "findtime": findtime, "persistent": false
+    })))
+}
+
+/// 下发 jail 封禁参数（**仅运行期生效**，重启 fail2ban 后回落 jail.local）。
+/// 面板不写 jail.local（敏感路径），因此 UI 必须把 `persistent=false` 明确展示。
+pub async fn fail2ban_set_params(
+    State(state): State<Shared>, Auth(s): Auth, PanelJson(req): PanelJson<JailParamsReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::FIREWALL_MANAGE)?;
+    crate::ratelimit::check_heavy(&state, &s.username, "fail2ban.set_params")?;
+    validate_jail_name(&req.jail)?;
+    if !valid_jail_params(req.maxretry, req.bantime, req.findtime) {
+        return Err(ApiError::bad_request(
+            "params", "maxretry 需在 1..10000，bantime/findtime 需在 1..2592000 秒",
+        ));
+    }
+    if !state.capabilities.get(cap_keys::FAIL2BAN).map(|c| c.supported).unwrap_or(false) {
+        return Err(ApiError::unsupported("fail2ban.manage"));
+    }
+    state.os.firewall().fail2ban_set_params(
+        &req.jail, req.maxretry, req.bantime, req.findtime,
+    ).await?;
+    audit(&state, &s, "firewall.fail2ban.set_params", &req.jail, "ok").await;
+    Ok(ok(serde_json::json!({
+        "jail": req.jail, "maxretry": req.maxretry,
+        "bantime": req.bantime, "findtime": req.findtime, "persistent": false
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jail_params_reject_zero_negative_and_oversized_values() {
+        assert!(valid_jail_params(5, 600, 600));
+        assert!(valid_jail_params(1, 1, 1));
+        assert!(valid_jail_params(10_000, 2_592_000, 2_592_000));
+        // bantime=0 在部分 fail2ban 版本表示"永久封禁"，必须堵死
+        for bad in [
+            (0, 600, 600), (5, 0, 600), (5, 600, 0),
+            (-1, 600, 600), (5, -1, 600), (5, 600, -1),
+            (10_001, 600, 600), (5, 2_592_001, 600), (5, 600, 2_592_001),
+        ] {
+            assert!(!valid_jail_params(bad.0, bad.1, bad.2), "{bad:?} 不得下发");
+        }
+    }
 
     #[test]
     fn port_spec_parsing() {

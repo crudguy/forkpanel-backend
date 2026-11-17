@@ -253,7 +253,9 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/firewall/rules/{id}", delete(firewall::delete_rule))
         .route("/api/v1/firewall/fail2ban", get(firewall::fail2ban_status))
         .route("/api/v1/firewall/fail2ban/jail", post(firewall::fail2ban_set_jail))
-        .route("/api/v1/firewall/fail2ban/unban", post(firewall::fail2ban_unban));
+        .route("/api/v1/firewall/fail2ban/unban", post(firewall::fail2ban_unban))
+        .route("/api/v1/firewall/fail2ban/params", get(firewall::fail2ban_get_params))
+        .route("/api/v1/firewall/fail2ban/params", post(firewall::fail2ban_set_params));
 
     // ── 安全中心 ──
     let sec_r = Router::new()
@@ -630,7 +632,7 @@ mod tests {
             (include_str!("routes/services/packages.rs"), ".get(cap_keys::PACKAGE_INSTALL)", 5, "packages::*"),
             (include_str!("routes/services/packages.rs"), ".get(cap_keys::PACKAGE_UPGRADE)", 2, "packages::*"),
             (include_str!("routes/firewall.rs"), ".get(cap_keys::FIREWALL_MANAGE)", 4, "firewall::*"),
-            (include_str!("routes/firewall.rs"), ".get(cap_keys::FAIL2BAN)", 3, "firewall::*"),
+            (include_str!("routes/firewall.rs"), ".get(cap_keys::FAIL2BAN)", 5, "firewall::*（原有 3 + P0-3 params 读写各 1）"),
             (include_str!("routes/cron.rs"), ".get(cap_keys::SCHEDULER_MANAGE)", 7, "cron::* 每个 handler 一道"),
             (include_str!("routes/containers.rs"), ".get(cap_keys::CONTAINER_MANAGE)", 1, "ensure_supported helper 内一道"),
             (include_str!("routes/containers.rs"), "ensure_supported(&state)?", 14, "14 个 handler 的接线（含 docker update 与 limits）"),

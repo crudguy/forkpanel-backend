@@ -1182,6 +1182,15 @@ components:
         available: { type: boolean, description: fail2ban-client 是否存在 }
         active:    { type: boolean, description: fail2ban 服务是否运行中 }
         jails:     { type: array, items: { $ref: '#/components/schemas/Fail2banJail' } }
+    Fail2banJailParams:
+      type: object
+      description: jail 封禁参数（运行期值；persistent=false 表示重启 fail2ban 后回落 jail.local）
+      properties:
+        jail:      { type: string, example: forkpanel }
+        maxretry:  { type: integer, minimum: 1, maximum: 10000 }
+        bantime:   { type: integer, minimum: 1, maximum: 2592000, description: 封禁秒数 }
+        findtime:  { type: integer, minimum: 1, maximum: 2592000, description: 失败计数窗口秒数 }
+        persistent: { type: boolean, description: 恒为 false——面板不写 jail.local }
 
     # ───────────── 防火墙 ─────────────
     FirewallStatus:
@@ -3987,6 +3996,31 @@ paths:
           application/json:
             schema: { type: object, required: [jail, ip], properties: { jail: { type: string }, ip: { type: string } } }
       responses: { '200': { description: ok }, '501': { description: fail2ban 不可用 }, '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' } }
+  /api/v1/firewall/fail2ban/params:
+    get:
+      operationId: get_firewall_fail2ban_params
+      tags: [firewall]
+      summary: 读取 jail 的 maxretry/bantime/findtime（运行期值）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: jail, in: query, required: true, schema: { type: string }, description: jail 名（字母数字与 _ -） }]
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/Fail2banJailParams' } } }
+        '501': { description: fail2ban 不可用（未装 fail2ban-client） }
+    post:
+      operationId: post_firewall_fail2ban_params
+      tags: [firewall]
+      summary: 下发 jail 封禁参数（仅运行期生效，重启后回落 jail.local）
+      security: [cookieAuth, csrfHeader]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [jail, maxretry, bantime, findtime], properties: { jail: { type: string }, maxretry: { type: integer }, bantime: { type: integer }, findtime: { type: integer } } }
+      responses: { '200': { description: ok }, '400': { description: 参数越界或 jail 名非法 }, '501': { description: fail2ban 不可用 }, '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' } }
 
   # ───────── 安全 ─────────
   /api/v1/security/baseline:
