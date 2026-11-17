@@ -609,9 +609,15 @@ impl LoginGuard {
         None
     }
 
-    /// 记录一次失败。到达 `max_keys` 时淘汰**最久没有活动**的 key（按该 key 最后一
-    /// 条记录的时间取最早者）——宁可错杀一个陈旧 key，也不能让表无限增长。
-    pub fn record_failure(&self, key: &str) {
+    /// 记录一次失败，返回**本次失败后该 key 在窗口内的总次数**。
+    ///
+    /// 返回值用于「恰好跨过锁定阈值那一次」触发审计与告警（只在 `n == lock_after`
+    /// 时触发，锁定期间被拦的请求继续计数但不会重复告警）。返回 `usize` 对既有
+    /// 调用方（`let _ = g.record_failure(..)`）完全兼容。
+    ///
+    /// 到达 `max_keys` 时淘汰**最久没有活动**的 key（按该 key 最后一条记录的时间
+    /// 取最早者）——宁可错杀一个陈旧 key，也不能让表无限增长。
+    pub fn record_failure(&self, key: &str) -> usize {
         let mut m = self.attempts.lock().unwrap_or_else(|e| e.into_inner());
         if !m.contains_key(key) && m.len() >= self.max_keys {
             let oldest = m
@@ -620,8 +626,18 @@ impl LoginGuard {
                 .map(|(k, _)| k.clone());
             if let Some(k) = oldest { m.remove(&k); }
         }
-        m.entry(key.to_string()).or_default().push(Instant::now());
+        let v = m.entry(key.to_string()).or_default();
+        v.push(Instant::now());
+        v.len()
     }
+
+    /// 触发锁定的失败次数阈值（供登录审计/告警判定"恰好跨过阈值"那一次）。
+    pub fn lock_after(&self) -> usize { self.lock_after }
+
+    /// 本次失败是否恰好跨过锁定阈值。锁定期间被拦下的请求仍会 `record_failure`
+    /// （计数继续推进，防止 1 req/s 慢速爆破），但 `n > lock_after` 不再触发告警，
+    /// 否则一次爆破会在整个锁定期内每 2 秒推一条通知，把运维手机打爆。
+    pub fn just_locked(&self, n: usize) -> bool { n == self.lock_after }
 
     #[cfg(test)]
     pub(crate) fn key_count(&self) -> usize {
@@ -1293,6 +1309,30 @@ mod tests {
     /// 这么小是为了让"距上次落库 30s"这种行状态既能被 1s 间隔判定为**该刷新**，
     /// 又会被写死的 60s 间隔判定为**还没到**（那条注入因此必红）。
     const T_IDLE: i64 = 4;
+
+    /// `record_failure` 返回窗口内累计次数，且恰好在 `lock_after` 那一次为真——
+    /// 这是"登录失败审计 + 告警"只在跨阈值时触发一次的前提。
+    #[test]
+    fn failure_count_drives_one_shot_lockout_signal() {
+        let g = LoginGuard::new(5);
+        let lock_after = g.lock_after();
+        assert_eq!(lock_after, 15);
+        for n in 1..lock_after {
+            let got = g.record_failure("1.2.3.4:victim");
+            assert_eq!(got, n, "返回值必须是本次失败后的累计次数");
+            assert!(!g.just_locked(got), "第 {n} 次不该触发锁定告警");
+        }
+        let at = g.record_failure("1.2.3.4:victim");
+        assert_eq!(at, lock_after);
+        assert!(g.just_locked(at), "恰好跨阈值那一次必须触发");
+
+        // 锁定期间被拦下的请求仍计数（防慢速爆破），但不再重复告警。
+        for _ in 0..5 {
+            let n = g.record_failure("1.2.3.4:victim");
+            assert!(n > lock_after);
+            assert!(!g.just_locked(n), "锁定后不得每 2 秒重复推一条告警");
+        }
+    }
 
     /// 姊妹项：活跃必须让**行**活过 `sweep()`——否则「面板重启 = 全员登出」。
     ///

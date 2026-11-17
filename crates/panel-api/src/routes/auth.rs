@@ -3,7 +3,7 @@
 use crate::{
     auth::{self, Session},
     error::{ok, ApiError, ApiResult},
-    routes::{audit, Auth, CurrentSid, Shared},
+    routes::{audit, audit_actor, Auth, CurrentSid, Shared},
     AppState,
 };
 use axum::{
@@ -37,6 +37,62 @@ pub struct MeResp {
     pub mfa_enabled: bool,
 }
 
+/// 登录失败跨过锁定阈值时：写一条 lockout 审计 + 推站内通知 + 走外部 webhook。
+///
+/// 只在 **`n == lock_after` 那一次**触发。锁定期间被拦的请求仍会计数（防 1 req/s
+/// 慢速爆破），但不重复告警——否则一次爆破会在 15 分钟内每 2 秒推一条通知，
+/// 运维会直接把告警关掉，比没有告警更糟。
+async fn note_lockout(state: &Shared, ip: &str, ua: &str, username: &str, n: usize) {
+    if !state.logins.just_locked(n) { return; }
+
+    let when = crate::now_unix();
+    let detail = serde_json::json!({
+        "username": username, "ip": ip, "attempts": n, "ua": ua
+    }).to_string();
+    audit_actor(state, username, ip, "auth.login.lockout", username, "fail", &detail).await;
+
+    crate::routes::notifications::push(
+        &state.db,
+        crate::routes::notifications::NewNotification {
+            level: crate::routes::notifications::NotifLevel::Crit,
+            source: "security",
+            title: format!("登录异常：{username} 已被临时锁定"),
+            body: Some(format!(
+                "来自 {ip} 的登录在 15 分钟内失败 {n} 次，已触发 15 分钟锁定；请核实是否为爆破尝试。"
+            )),
+            // 同一 IP 的连续爆破每 5 分钟至多一条，避免告警风暴。
+            dedup_key: Some(format!("login_lockout:{ip}:{}", when / 300)),
+        },
+    )
+    .await;
+
+    // 外部 webhook 是运维可选通道（未配 alert-webhook 时静默跳过）。
+    // ⚠ 告警失败绝不能改变登录流程——这里用 fire_opt（内部吞错），不 `?`。
+    crate::alert::fire_opt(
+        state.alert.as_deref(),
+        crate::alert::events::LOGIN_LOCKOUT,
+        &detail,
+    )
+    .await;
+}
+
+/// 一次"真的执行了身份校验"的登录失败：计数 + 审计 + 必要时告警。
+///
+/// 被 `LoginGuard` 提前拦下的 429 走 `note_lockout`（不逐条写审计，否则攻击者
+/// 可在锁定期内用 1 req/s 刷出上万条审计记录），其余失败路径统一收口到这里。
+async fn note_login_failure(
+    state: &Shared, ip: &str, ua: &str, username: &str, reason: &'static str,
+) {
+    let key = format!("{ip}:{username}");
+    let n = state.logins.record_failure(&key);
+
+    let detail = serde_json::json!({ "reason": reason, "attempts": n, "ua": ua });
+    audit_actor(state, username, ip, "auth.login.fail", username, "fail",
+                &detail.to_string()).await;
+
+    note_lockout(state, ip, ua, username, n).await;
+}
+
 /// 登录。故意**不做** GET：口令绝不能进 URL/日志。
 pub async fn login(
     State(state): State<Shared>,
@@ -49,6 +105,15 @@ pub async fn login(
 
     // 防暴力：按 IP + 用户名双维度
     let ip = client_ip(&headers);
+    // UA 只用于失败审计与告警的现场还原（帮助分辨脚本爆破与手误），
+    // 截断到 256 字符——它是攻击者可控输入，不能让它撑爆 detail_json。
+    let ua: String = headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .chars()
+        .take(256)
+        .collect();
     let key = format!("{ip}:{}", req.username);
     if let Some(wait) = state.logins.check(&key) {
         // 被拦下的尝试**同样计数**（P2-11，2026-10-20 决定）。
@@ -64,7 +129,9 @@ pub async fn login(
         // 剩余等待时间，用户可换用户名或等锁过期。
         //
         // ⚠ 计数必须放在 return 之前：放过这一条就等于回到旧行为。
-        state.logins.record_failure(&key);
+        let n = state.logins.record_failure(&key);
+        // 429 不逐条写审计（会在锁定期内被刷爆），但跨阈值那一次必须告警。
+        note_lockout(&state, &ip, &ua, &req.username, n).await;
         return Err(ApiError::too_many_requests(wait));
     }
 
@@ -89,7 +156,7 @@ pub async fn login(
     let (uid, pwd_hash, role, roots, disabled) = match row {
         Ok(v) => v,
         Err(panel_core::PanelError::NotFound(_)) => {
-            state.logins.record_failure(&key);
+            note_login_failure(&state, &ip, &ua, &req.username, "user_not_found").await;
             // 用户不存在与口令错误的响应**完全一致**，避免用户名枚举
             return Err(ApiError::unauthorized());
         }
@@ -108,7 +175,7 @@ pub async fn login(
         .map_err(ApiError::from)?;
 
     if !verified {
-        state.logins.record_failure(&key);
+        note_login_failure(&state, &ip, &ua, &req.username, "bad_password").await;
         return Err(ApiError::unauthorized());
     }
 
@@ -192,7 +259,7 @@ pub async fn login(
                 }
             } else {
                 // 第二因子错误同样计入防暴力（否则可无限爆破 6 位码）
-                state.logins.record_failure(&key);
+                note_login_failure(&state, &ip, &ua, &req.username, "bad_totp").await;
                 return Err(ApiError::unauthorized());
             }
         }
@@ -961,6 +1028,136 @@ mod tests {
         assert!(
             block.contains("WriteAck { rows_changed: n }"),
             "WriteAck 必须用 execute 的真实行数，硬编码 1 会让未命中的 UPDATE 也自称成功"
+        );
+    }
+
+    /// 构造带真实 DB 的最小 AppState（与 bootstrap 用例同源，目录带 pid+序号防并发互踩）。
+    async fn login_security_state() -> (std::sync::Arc<crate::AppState>, std::path::PathBuf) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!("panel-login-audit-{}-{}", std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("data")).unwrap();
+        let db_path = base.join("t.db");
+        let tier = panel_core::Tier::Nano;
+        {
+            let mut c = panel_db::open(&db_path, tier, "NORMAL").unwrap();
+            panel_db::migrate::apply(&mut c).unwrap();
+        }
+        let writer = std::sync::Arc::new(
+            panel_db::WriterActor::spawn(db_path.clone(), tier, "NORMAL").unwrap());
+        let pool = std::sync::Arc::new(panel_db::ReadPool::new(&db_path, tier).unwrap());
+        let tasks = std::sync::Arc::new(panel_task::TaskRunner::new(
+            writer.clone(), tier, base.join("tasks"), db_path.clone(), "NORMAL".to_string()));
+        let metrics = std::sync::Arc::new(std::sync::Mutex::new(
+            panel_db::aggregator::Aggregator::new(tier)));
+        let os = panel_os::adapter_with(panel_os::PathOverrides {
+            data_dir: Some(base.join("data")), ..Default::default()
+        });
+        let state = std::sync::Arc::new(crate::AppState::new(
+            os, writer, pool, tasks, metrics, tier, None, false, 5,
+            std::time::Duration::from_secs(1800), std::time::Duration::from_secs(43_200),
+            90, 50_000, true, true, "NORMAL".to_string(), 7, false, None,
+            std::sync::Arc::new(|_: &str| Ok::<(), panel_core::PanelError>(())), None));
+        (state, base)
+    }
+
+    async fn count_where(state: &crate::AppState, sql: &'static str) -> i64 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let v = state.pool.with(|conn| {
+                conn.query_row(sql, [], |r| r.get::<_, i64>(0))
+                    .map_err(|e| panel_core::PanelError::Database(e.to_string()))
+            }).await.unwrap_or(-1);
+            if v > 0 || std::time::Instant::now() >= deadline { return v; }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// **行为测试**：失败留痕 + 跨阈值只告警一次（用真实 DB，不靠源码字符串）。
+    #[tokio::test]
+    async fn login_failures_are_audited_and_lockout_fires_once() {
+        let (state, base) = login_security_state().await;
+        let lock_after = state.logins.lock_after();
+
+        for _ in 0..lock_after {
+            note_login_failure(&state, "1.2.3.4", "curl/8", "victim", "bad_password").await;
+        }
+        // 锁定后的请求仍计数，但不得再推告警
+        for _ in 0..3 {
+            note_login_failure(&state, "1.2.3.4", "curl/8", "victim", "bad_password").await;
+        }
+
+        let fails = count_where(&state,
+            "SELECT COUNT(*) FROM audit_log WHERE action='auth.login.fail'").await;
+        assert_eq!(fails, (lock_after + 3) as i64, "每次真实失败都必须留痕");
+
+        let lockouts = count_where(&state,
+            "SELECT COUNT(*) FROM audit_log WHERE action='auth.login.lockout'").await;
+        assert_eq!(lockouts, 1, "跨阈值那一次单列一条 lockout 审计");
+
+        let notifs = count_where(&state,
+            "SELECT COUNT(*) FROM notifications WHERE source='security' AND title LIKE '%登录异常%'").await;
+        assert_eq!(notifs, 1, "锁定告警只推一条，锁定期间的后续失败不得刷屏");
+
+        let detail = state.pool.with(|conn| {
+            conn.query_row(
+                "SELECT detail_json FROM audit_log WHERE action='auth.login.lockout'",
+                [], |r| r.get::<_, String>(0),
+            ).map_err(|e| panel_core::PanelError::Database(e.to_string()))
+        }).await.unwrap();
+        assert!(detail.contains("1.2.3.4") && detail.contains("victim"),
+            "审计详情须带来源 IP 与用户名，供事后追溯：{detail}");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ⭐ **接线守卫**：失败路径必须收口到 `note_login_failure` / `note_lockout`。
+    /// 行为测试直接调 helper，删掉 handler 里的调用照样绿——只能盯生产源码。
+    #[test]
+    fn all_login_failure_paths_are_wired_to_audit_and_alert() {
+        let prod = panel_testutil::production_source(include_str!("auth.rs"));
+        let start = prod.find("pub async fn login(").expect("login 必须存在");
+        let end = prod.find("pub async fn logout(").expect("logout 必须存在");
+        let body = &prod[start..end];
+        // 用户不存在 / 口令错 / MFA 错 三条真实校验路径
+        assert_eq!(
+            body.matches("note_login_failure(&state, &ip, &ua").count(), 3,
+            "三条身份校验失败路径必须全部写审计+告警，漏一条就等于那类爆破无痕"
+        );
+        // 429 走 note_lockout（不逐条写审计，但跨阈值必须告警）
+        assert_eq!(
+            body.matches("note_lockout(&state, &ip, &ua").count(), 1,
+            "429 分支必须接上跨阈值告警，否则锁定事件在慢速爆破下永远不响"
+        );
+        // 精确断言：裸 record_failure 在全 handler 内**恰好 1 处**（429 分支那次），
+        // 其余 3 条失败路径必须走 helper。写宽成"存在即可"会退化成恒绿。
+        assert_eq!(
+            body.matches("state.logins.record_failure(").count(), 1,
+            "只允许 429 分支保留一次裸计数；其余失败路径必须经 note_login_failure 留痕"
+        );
+        let at = body.find("state.logins.record_failure(").unwrap();
+        let near = &body[at..(at + 240).min(body.len())];
+        assert!(
+            near.contains("note_lockout(&state, &ip, &ua"),
+            "429 分支的裸计数后必须紧跟 note_lockout，否则锁定事件不会告警"
+        );
+
+        // 收口点本身也必须真正接上三件事：审计 / 站内通知 / 外部 webhook。
+        // 少任一件都是"看起来有告警、实际不响"的静默失败。
+        let lock_fn = prod.find("async fn note_lockout(").expect("note_lockout 必须存在");
+        let next_fn = prod[lock_fn..].find("async fn note_login_failure(")
+            .expect("note_login_failure 必须存在");
+        let lock_body = &prod[lock_fn..lock_fn + next_fn];
+        assert!(lock_body.contains("audit_actor("), "锁定事件必须写审计");
+        assert!(lock_body.contains("notifications::push("), "锁定事件必须推站内通知");
+        assert!(
+            lock_body.contains("events::LOGIN_LOCKOUT"),
+            "锁定事件必须走外部 webhook（未配置时由 fire_opt 静默跳过）"
+        );
+        assert!(
+            lock_body.contains("just_locked(n)"),
+            "告警必须只在跨阈值那一次触发，锁定期间持续请求不得刷屏"
         );
     }
 

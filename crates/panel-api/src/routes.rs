@@ -488,11 +488,31 @@ async fn handler_404(req: Request) -> (StatusCode, axum::Json<Envelope<()>>) {
 /// —— 实测长事务耗时 1:1 传导给其他写者。
 pub async fn audit(state: &AppState, s: &Session, action: &'static str,
                    target: &str, result: &'static str) {
-    let actor = s.username.clone();
     // 来源 IP 取自登录那一刻（Session::ip）。此前硬编码空串，导致审计列表
     // 的「来源 IP」列永远是"—"，面板被爆破时无法追溯操作来源。
-    let ip = if s.ip.is_empty() { "unknown".to_string() } else { s.ip.clone() };
+    let ip = if s.ip.is_empty() { "unknown" } else { &s.ip };
+    audit_actor(state, &s.username, ip, action, target, result, "{}").await;
+}
+
+/// 带显式 actor / IP / detail 的审计写入——**用于登录失败这类"没有 Session"的路径**。
+///
+/// 登录成功走 `audit()`（有 Session）；失败时会话尚未建立，若复用 `audit()` 就得
+/// 伪造一个 Session，反而把"谁在爆破"的信息丢掉。本函数让失败记录带上真实来源 IP
+/// 与失败原因，审计列表才能回答"哪个 IP 在什么时间连续猜错了口令"。
+///
+/// `detail_json` 必须是**合法 JSON 字符串**（调用方用 `serde_json::json!` 构造）；
+/// 写入前按 schema 约束截到 ≤2KB，且只截在 UTF-8 字符边界上。
+pub async fn audit_actor(state: &AppState, actor: &str, ip: &str, action: &'static str,
+                         target: &str, result: &'static str, detail_json: &str) {
+    let actor = actor.to_string();
+    let ip = ip.to_string();
     let target = target.to_string();
+    let detail = detail_json.to_string();
+    let detail = if detail.len() > 2048 {
+        let mut end = 2048;
+        while end > 0 && !detail.is_char_boundary(end) { end -= 1; }
+        detail[..end].to_string()
+    } else { detail };
     // 审计写失败必须留痕：静默丢弃会让"操作已生效但无记录"，事后无法发现。
     // 用 eprintln! 而非 tracing：panel-api 未引入日志设施（依赖预算纪律：零新依赖）。
     // stderr 在 systemd 部署下进 journald（journalctl -u panel），非 systemd 部署
@@ -502,7 +522,7 @@ pub async fn audit(state: &AppState, s: &Session, action: &'static str,
             "INSERT INTO audit_log(ts, actor, actor_ip, action, target, result, detail_json)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             rusqlite::params![
-                crate::now_unix(), actor, ip, action, target, result, "{}"
+                crate::now_unix(), actor, ip, action, target, result, detail
             ],
         ).map_err(|e| panel_core::PanelError::Database(e.to_string()))?;
         Ok(panel_db::WriteAck { rows_changed: 1 })
@@ -518,19 +538,7 @@ pub async fn audit(state: &AppState, s: &Session, action: &'static str,
 /// 非人工动作在 UI 审计轨迹里完全不可见，出事时只能去翻服务端日志。
 pub async fn audit_system(state: &AppState, action: &'static str,
                           target: &str, result: &'static str) {
-    let target = target.to_string();
-    if let Err(e) = state.db.exec(move |conn| {
-        conn.execute(
-            "INSERT INTO audit_log(ts, actor, actor_ip, action, target, result, detail_json)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![
-                crate::now_unix(), "system", "", action, target, result, "{}"
-            ],
-        ).map_err(|e| panel_core::PanelError::Database(e.to_string()))?;
-        Ok(panel_db::WriteAck { rows_changed: 1 })
-    }).await {
-        eprintln!("[WARN] 系统操作审计写入失败 action={action} error={e}");
-    }
+    audit_actor(state, "system", "", action, target, result, "{}").await;
 }
 
 #[cfg(test)]

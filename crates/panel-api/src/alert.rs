@@ -189,8 +189,8 @@ fn payload(event: &str, detail: &str, now: i64) -> Value {
 /// 事件名常量。**集中在这里**，调用方不要各写字符串字面量——
 /// 拼错了不会报错，只会让运维在告警里看到一个陌生的 event。
 ///
-/// 三个常量各自都有消费者（`serve.rs` 的 TaskRunner 钩子按任务 kind 映射），
-/// 不是"先定义着备用"——那种常量最后一定没人用。
+/// 前三个常量由 `serve.rs` 的 TaskRunner 钩子按任务 kind 映射，`LOGIN_LOCKOUT`
+/// 由登录锁定路径触发——每个都有真实消费者，不是"先定义着备用"。
 pub mod events {
     /// 备份任务失败（`kind=backup` 的任意一步失败）
     pub const BACKUP_FAILED: &str = "backup.failed";
@@ -198,6 +198,10 @@ pub mod events {
     pub const CERT_FAILED: &str = "cert.failed";
     /// 其它任务失败与内部周期任务失败（含超时）
     pub const JOB_FAILED: &str = "job.failed";
+    /// 登录失败触发锁定（高频爆破 / 撞库）。与任务失败同走一条 webhook，
+    /// 但**单独占一个 event**：运维可为它单独设告警通道，也不会被任务失败的
+    /// 节流窗口挤掉（节流按 event 分桶，见 `AlertSink::claim`）。
+    pub const LOGIN_LOCKOUT: &str = "login.lockout";
 }
 
 impl AlertSink {
