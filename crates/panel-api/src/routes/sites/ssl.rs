@@ -435,12 +435,27 @@ async fn resolve_dns_provider(state: &Shared, want: Option<&str>) -> ApiResult<S
             it.collect::<std::result::Result<Vec<_>, _>>().map_err(db_err)
         })
         .await?;
+    pick_dns_provider(&providers, want).map_err(|(field, reason)| ApiError::bad_request(field, reason))
+}
+
+/// 选用哪家 DNS 提供商的**纯判定**（不碰 DB，便于单测）。
+///
+/// 抽出来的原因：dns-01 的成败有一半取决于这里——选错家会把 TXT 写进别人的
+/// zone，CA 查不到记录，用户拿到的是「验证失败」，根本联想不到凭据配错了。
+/// 这类判定必须有测试，而带着 DB 查询就没法测。
+///
+/// 返回 `Err((field, reason))`，由调用方转成 ApiError（保持"文案指向动作"）。
+fn pick_dns_provider(
+    providers: &[String],
+    want: Option<&str>,
+) -> std::result::Result<String, (&'static str, String)> {
     if providers.is_empty() {
         // 不报 501：这不是"没实现"，是用户还没填凭据。文案要指向具体动作。
-        return Err(ApiError::bad_request(
+        return Err((
             "dns_provider",
             "尚未配置任何 DNS 提供商凭据。请先在「证书 → DNS 凭据」里添加 Cloudflare API Token\
-             （需要 Zone.DNS:Edit + Zone:Read 权限），再选 dns-01 签发",
+             （需要 Zone.DNS:Edit + Zone:Read 权限），再选 dns-01 签发"
+                .to_string(),
         ));
     }
     match want.map(str::trim).filter(|s| !s.is_empty()) {
@@ -448,7 +463,7 @@ async fn resolve_dns_provider(state: &Shared, want: Option<&str>) -> ApiResult<S
             if providers.iter().any(|p| p == w) {
                 Ok(w.to_string())
             } else {
-                Err(ApiError::bad_request(
+                Err((
                     "dns_provider",
                     format!("未配置提供商 `{w}` 的凭据；已配置：{}", providers.join(", ")),
                 ))
@@ -458,7 +473,7 @@ async fn resolve_dns_provider(state: &Shared, want: Option<&str>) -> ApiResult<S
             if providers.len() == 1 {
                 Ok(providers[0].clone())
             } else {
-                Err(ApiError::bad_request(
+                Err((
                     "dns_provider",
                     format!(
                         "已配置多个 DNS 提供商（{}），请明确指定用哪一个",
@@ -1113,3 +1128,74 @@ pub async fn cert_delete(
 }
 
 
+#[cfg(test)]
+mod dns_provider_pick_tests {
+    use super::pick_dns_provider;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    // 一个凭据都没配：必须是配置错误（400 路径），且文案指向「去添加 Token」。
+    // 退化成 501 会被读成「产品没做」，用户就去提 issue 而不是去填凭据了。
+    #[test]
+    fn no_credentials_points_at_the_fix_not_at_unimplemented() {
+        let (field, reason) = pick_dns_provider(&[], None).unwrap_err();
+        assert_eq!(field, "dns_provider");
+        assert!(reason.contains("尚未配置"), "实际：{reason}");
+        assert!(
+            reason.contains("DNS 凭据"),
+            "文案必须指向具体位置，否则用户不知道该去哪配：{reason}"
+        );
+        assert!(
+            !reason.contains("未实现") && !reason.contains("暂不支持"),
+            "这是配置缺失而不是功能缺失：{reason}"
+        );
+    }
+
+    // 只有一家 → 未指定时自动选中（用户不必知道 provider 叫什么）
+    #[test]
+    fn single_provider_is_auto_selected() {
+        assert_eq!(
+            pick_dns_provider(&v(&["cloudflare"]), None).unwrap(),
+            "cloudflare"
+        );
+        // 显式指定同一家也成立；两侧空白要被吃掉，否则前端多传一个空格就报「未配置」
+        assert_eq!(
+            pick_dns_provider(&v(&["cloudflare"]), Some(" cloudflare ")).unwrap(),
+            "cloudflare"
+        );
+    }
+
+    // 指定了没配过的一家：必须报错并把「已配置哪些」列出来。
+    // 否则用户会以为是自己 Token 填错了，实际是这家压根没配。
+    #[test]
+    fn unknown_provider_lists_what_is_configured() {
+        let (field, reason) = pick_dns_provider(&v(&["cloudflare"]), Some("route53")).unwrap_err();
+        assert_eq!(field, "dns_provider");
+        assert!(reason.contains("route53"), "要点名用户要的那个：{reason}");
+        assert!(
+            reason.contains("cloudflare"),
+            "要列出实际已配置的，否则无法自查：{reason}"
+        );
+    }
+
+    // 多家且未指定：不能靠猜——猜错会把 TXT 写进别人的 zone，
+    // CA 查不到记录后用户拿到「验证失败」，与真实原因隔着好几层。
+    #[test]
+    fn multiple_providers_without_choice_is_rejected() {
+        let (field, reason) =
+            pick_dns_provider(&v(&["cloudflare", "route53"]), None).unwrap_err();
+        assert_eq!(field, "dns_provider");
+        assert!(reason.contains("明确指定"), "实际：{reason}");
+        // 两家都要列出来，用户才知道有得选
+        assert!(reason.contains("cloudflare") && reason.contains("route53"), "实际：{reason}");
+    }
+
+    // 空白串等同于"未指定"（前端下拉的空选项就是 ""），不能当成一个 provider 名去匹配
+    #[test]
+    fn blank_string_is_treated_as_unspecified() {
+        assert_eq!(pick_dns_provider(&v(&["cloudflare"]), Some("")).unwrap(), "cloudflare");
+        assert_eq!(pick_dns_provider(&v(&["cloudflare"]), Some("   ")).unwrap(), "cloudflare");
+    }
+}
