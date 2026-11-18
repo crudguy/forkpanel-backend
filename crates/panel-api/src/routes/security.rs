@@ -135,6 +135,80 @@ fn is_apply_confirm(token: &str) -> bool {
     token.trim() == APPLY_CONFIRM_WORD
 }
 
+// ─────────────── SSH 端口（P1-7） ───────────────
+
+/// 改 SSH 端口的二次确认词。与「确认修复」分开一个词是刻意的：
+/// 改端口比改加固项的后果更直接（立刻可能连不上），不该复用同一句话。
+pub const SSH_PORT_CONFIRM_WORD: &str = "确认改端口";
+
+#[derive(Debug, Deserialize)]
+pub struct SshPortReq {
+    /// 新端口（1-65535）
+    pub port: u16,
+    /// 过渡期是否同时保留旧端口。**默认 true**（`#[serde(default)]` 让缺省为 false
+    /// 的坑不出现——这里显式声明默认值语义由前端传），见 `keep_old_default`。
+    #[serde(default)]
+    pub keep_old: Option<bool>,
+    /// 二次确认词，须等于 [`SSH_PORT_CONFIRM_WORD`]
+    pub confirm_token: String,
+}
+
+/// `keep_old` 缺省时的取值：**保留旧端口**。
+///
+/// 缺省必须偏保守。若默认 false，任何前端漏传都会把用户唯一的回退通道关掉；
+/// 保留旧端口的代价只是多开一个监听，比"连不上"轻得多。
+fn keep_old_default(v: Option<bool>) -> bool {
+    v.unwrap_or(true)
+}
+
+fn is_port_confirm(token: &str) -> bool {
+    token.trim() == SSH_PORT_CONFIRM_WORD
+}
+
+/// 读取 SSH 端口现状（只读，`security.manage`）。
+pub async fn ssh_port(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::SECURITY_MANAGE)?;
+    let st = state.os.security().ssh_port().await.map_err(ApiError::from)?;
+    Ok(ok(st))
+}
+
+/// 修改 SSH 端口（**高危写**：改错即失联，需 root + 二次确认）。
+///
+/// 安全网全在 provider（`linux/ssh_port.rs`）：端口占用预检 → 备份 → 写 drop-in
+/// → `sshd -t` 校验 → 失败回滚。这里只做权限、确认词与审计。
+pub async fn ssh_port_set(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    PanelJson(req): PanelJson<SshPortReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::SECURITY_MANAGE)?;
+    if !is_port_confirm(&req.confirm_token) {
+        return Err(ApiError::bad_request(
+            "confirm_token",
+            format!("请输入确认词「{SSH_PORT_CONFIRM_WORD}」以继续"),
+        ));
+    }
+    let keep_old = keep_old_default(req.keep_old);
+    let r = state
+        .os
+        .security()
+        .set_ssh_port(req.port, keep_old)
+        .await
+        .map_err(ApiError::from)?;
+    audit(
+        &state,
+        &s,
+        "security.ssh_port.set",
+        &format!("port={} keep_old={keep_old}", req.port),
+        if r.changed { "changed" } else { "unchanged" },
+    )
+    .await;
+    Ok(ok(r))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,5 +250,63 @@ mod tests {
     fn sessions_requires_security_manage() {
         assert!(crate::auth::require(&sess(&[perm::SECURITY_MANAGE]), perm::SECURITY_MANAGE).is_ok());
         assert!(crate::auth::require(&sess(&[]), perm::SECURITY_MANAGE).is_err());
+    }
+
+    /// 改端口的确认词必须与一键修复**不同**：两件事后果不同，
+    /// 复用同一个词会让"手熟"变成风险。
+    #[test]
+    fn ssh_port_confirm_word_is_distinct_and_exact() {
+        assert_ne!(SSH_PORT_CONFIRM_WORD, APPLY_CONFIRM_WORD);
+        assert!(is_port_confirm("确认改端口"));
+        assert!(is_port_confirm("  确认改端口  "));
+        // 近似词一律拒绝
+        assert!(!is_port_confirm("确认改端口X"));
+        assert!(!is_port_confirm("确认端口"));
+        assert!(!is_port_confirm(""));
+        // **交叉**：拿一键修复的词去改端口必须被拒（否则两个词的区分形同虚设）
+        assert!(!is_port_confirm(APPLY_CONFIRM_WORD));
+        assert!(!is_apply_confirm(SSH_PORT_CONFIRM_WORD));
+    }
+
+    /// `keep_old` 缺省必须保留旧端口。缺省偏保守——漏传时宁可多开一个监听，
+    /// 也不能把用户唯一的回退通道关掉。
+    #[test]
+    fn keep_old_defaults_to_true() {
+        assert!(keep_old_default(None), "缺省必须保留旧端口");
+        assert!(keep_old_default(Some(true)));
+        assert!(!keep_old_default(Some(false)));
+    }
+
+    /// 接线守卫：`/api/v1/security/ssh-port` 必须 GET+PUT 同时挂，
+    /// 且必须走 `security.manage` 权限。路由被改写（比如只留 GET、
+    /// 或错挂到只读权限）时这里变红——源码断言指向 routes.rs 真实文本。
+    #[test]
+    fn ssh_port_route_is_wired_as_get_plus_put() {
+        let src = panel_testutil::production_source(include_str!("../routes.rs"));
+        let line: Vec<&str> = src
+            .lines()
+            .filter(|l| l.contains("/api/v1/security/ssh-port"))
+            .collect();
+        assert_eq!(line.len(), 1, "ssh-port 路由必须恰好挂一次，实际 {} 次", line.len());
+        let l = line[0];
+        assert!(l.contains("get(security::ssh_port)"), "必须挂 GET：{l}");
+        assert!(l.contains("put(security::ssh_port_set)"), "必须挂 PUT：{l}");
+    }
+
+    /// 写端点必须要求 SECURITY_MANAGE（越权改 SSH 端口 = 直接把机主锁在门外）。
+    #[test]
+    fn ssh_port_set_requires_security_manage() {
+        let src = panel_testutil::production_source(include_str!("security.rs"));
+        let start = src.find("pub async fn ssh_port_set").expect("ssh_port_set 必须定义");
+        // 只取该函数体到下一个函数定义的区间，避免扫到别的函数的 require
+        let rest = &src[start..];
+        let end = rest[1..].find("pub async fn ").map(|i| i + 1).unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("perm::SECURITY_MANAGE"),
+            "ssh_port_set 必须校验 SECURITY_MANAGE 权限"
+        );
+        // 确认词校验也必须在（只靠前端拦 = 可绕过 API）
+        assert!(body.contains("is_port_confirm"), "ssh_port_set 必须校验确认词");
     }
 }

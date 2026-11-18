@@ -27,6 +27,8 @@ pub mod firewall_nft;
 pub mod metrics;
 pub mod scheduler;
 pub mod security;
+/// SSH 端口可配置（P1-7）：drop-in 写入 + 端口占用预检 + `sshd -t` 校验失败回滚。
+pub mod ssh_port;
 pub mod services;
 pub mod providers;
 pub mod terminal;

@@ -468,6 +468,36 @@ components:
         backup:    { type: [string, "null"], description: "修改前的备份文件路径，可据此回滚" }
         validated: { type: boolean, description: "是否通过配置语法校验" }
 
+    # ───────────── SSH 端口（P1-7） ─────────────
+    SshPortState:
+      type: object
+      description: |
+        SSH 端口现状。`effective` 是按 OpenSSH「先出现者生效」解析 drop-in + 主配置
+        得到的**实际生效端口**；`configured` 是配置里出现的**全部** Port 指令
+        （sshd 会同时监听每一个）。两者分开是为了避免「我改成 2222 了但 22 还在听」
+        这种认知偏差——只报一个端口号会让运维误判。
+      properties:
+        effective:   { type: integer, description: 实际生效端口（无显式配置时为编译默认 22） }
+        explicit:    { type: boolean, description: "false=走编译默认 22，从未显式配置过" }
+        source_file: { type: string,  description: 该 Port 实际生效的文件路径 }
+        configured:  { type: array, items: { type: integer }, description: 配置中出现的全部端口（去重保序） }
+        sshd_present: { type: boolean, description: "false=未检测到 sshd 配置（未装 SSH），前端应置灰而非报错" }
+
+    SshPortChange:
+      type: object
+      description: |
+        改端口结果。**`next_steps` 是本功能的重点**：改端口的真实风险不是语法，
+        而是改完连不上（防火墙没放行 / 端口被占用 / 旧端口已关无回退通道）。
+        所以必须把「还要做什么」逐条给出，而不是塞一句「请注意防火墙」让用户猜。
+      properties:
+        changed:          { type: boolean }
+        effective:        { type: integer, description: 改后的生效端口 }
+        target_file:      { type: string,  description: 写入的 drop-in 路径（优先级高于既有 drop-in） }
+        backup:           { type: [string, "null"], description: "修改前备份路径；原文件不存在时为 null（回滚=删除）" }
+        validated:        { type: boolean, description: "是否通过 `sshd -t` 校验" }
+        listening_ports:  { type: array, items: { type: integer }, description: "改后应监听的端口（keep_old 时含旧端口）" }
+        next_steps:       { type: array, items: { type: string }, description: "需要用户执行的动作；空数组=无额外动作" }
+
     # ───────────── 进程 ─────────────
     Process:
       type: object
@@ -4089,6 +4119,52 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/SecurityApplyResult' } } }
         '400': { description: "确认词不符 / 不支持的基线项 / sshd 不可用" }
+  /api/v1/security/ssh-port:
+    get:
+      operationId: get_security_ssh_port
+      tags: [security]
+      summary: 读取 SSH 端口现状（只读）
+      description: |
+        返回实际生效端口 + 配置里的全部端口。`effective` ≠ `configured` 时说明
+        sshd 正在同时监听多个端口，前端须如实展示而不是只显示一个。
+      security: [cookieAuth]
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/SshPortState' } } }
+    put:
+      operationId: put_security_ssh_port
+      tags: [security]
+      summary: 修改 SSH 端口（二次确认词 + 端口占用预检 + 失败回滚）
+      description: |
+        **高危**：端口改错即失去服务器访问。provider 侧安全网：
+        ① 新端口必须 1-65535 且未被其它进程监听（否则重启 sshd 直接 bind 失败）；
+        ② 先备份 → 写入 drop-in 目录里优先级最高的 `00-panel-port.conf`
+        （主配置第 12 行就 Include 了 drop-in，往主配置写会被旧值抢先=假控制）；
+        ③ `sshd -t` 校验，失败立刻回滚；校验器不可用则拒绝修改。
+
+        `keep_old` 缺省为 **true**（过渡期双端口监听，保留回退通道）。
+      security: [cookieAuth, csrfHeader]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [port, confirm_token]
+              properties:
+                port: { type: integer, minimum: 1, maximum: 65535 }
+                keep_old: { type: boolean, default: true, description: 过渡期是否同时保留旧端口 }
+                confirm_token: { type: string, description: "二次确认词，须等于「确认改端口」" }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/SshPortChange' } } }
+        '400': { description: "确认词不符 / 端口非法 / 端口被占用 / sshd 不可用" }
   /api/v1/security/sessions:
     get:
       operationId: get_security_sessions

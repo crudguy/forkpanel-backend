@@ -262,7 +262,10 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/security/baseline", get(security::baseline))
         .route("/api/v1/security/baseline/apply", post(security::baseline_apply))
         .route("/api/v1/security/sessions", get(security::sessions))
-        .route("/api/v1/security/sessions/{id}", delete(security::revoke_session));
+        .route("/api/v1/security/sessions/{id}", delete(security::revoke_session))
+        // SSH 端口（P1-7）：GET 只读现状；PUT 是**高危写**（需确认词，provider 侧
+        // 先做端口占用预检再备份写入，`sshd -t` 失败即回滚）
+        .route("/api/v1/security/ssh-port", get(security::ssh_port).put(security::ssh_port_set));
 
     // ── 计划任务 ──
     let cron_r = Router::new()

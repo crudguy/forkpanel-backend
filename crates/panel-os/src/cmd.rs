@@ -103,6 +103,11 @@ pub enum Bin {
     MySql, MySqlDump, Psql, PgDump,     // 数据库（可选能力）
     Tar, Gzip,                          // 备份打包
     Sshd,                               // sshd -t 配置校验：改 SSH 配置前的强制安全网
+    /// 监听端口探测（`ss -H -ltn`）。改 SSH 端口前必须确认新端口没被占用，
+    /// 否则改完重启 sshd 直接 bind 失败 → 把自己锁在服务器门外。
+    /// 安全评估：① 只读查询，argv 由 provider 编译期写死，无用户可控参数；
+    /// ② 输出按文本解析、只取 `Local Address:Port` 列，不交给 shell。
+    Ss,
     Certbot,                            // ACME 证书签发/续期（http-01 webroot）
     Fail2banClient,                     // fail2ban-client 入侵防御 jail 管理
     UserAdd, GroupAdd, Chown, Chmod, Usermod, // 用户与权限（Usermod：把用户加入附加组，仅内部白名单调用）
@@ -139,6 +144,7 @@ impl Bin {
             OpenSsl => "openssl", Gpg => "gpg",
             MySql => "mysql", MySqlDump => "mysqldump", Psql => "psql", PgDump => "pg_dump",
             Tar => "tar", Gzip => "gzip", Sshd => "sshd", Certbot => "certbot",
+            Ss => "ss",
             Fail2banClient => "fail2ban-client",
             UserAdd => "useradd", GroupAdd => "groupadd", Chown => "chown", Chmod => "chmod",
             Usermod => "usermod",

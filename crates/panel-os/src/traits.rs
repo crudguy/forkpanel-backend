@@ -1582,6 +1582,27 @@ pub struct SecurityApplyResult {
     pub validated: bool,
 }
 
+/// SSH 端口读写结果（P1-7）。
+///
+/// 端口不是"写进配置就完事"——改错端口 + 重启 = 再也连不上服务器。所以这个
+/// 结构把**生效值、配置文件、冲突、回滚点**全部如实带出来，让前端能说清
+/// "现在到底哪个端口在听"，而不是只显示一个可能骗人的配置值。
+#[derive(Debug, Clone, Serialize)]
+pub struct SshPortState {
+    /// 当前**生效**的端口（按 OpenSSH「先出现者生效」解析 drop-in + 主配置；
+    /// 都没显式设置时为编译默认 22）。这是用户实际要 ssh 的端口。
+    pub effective: u16,
+    /// 是否显式写在配置里（false = 走编译默认 22，改之前要知道自己在改什么）
+    pub explicit: bool,
+    /// `Port` 指令实际生效的那个文件的路径（便于用户核对/手工回滚）
+    pub source_file: String,
+    /// 配置里出现的**全部** Port 指令（可能多条；sshd 会同时监听多个端口）。
+    /// 如实列出，避免"我改成 2222 了但 22 还在听"这种认知偏差。
+    pub configured: Vec<u16>,
+    /// sshd 配置不存在（未装 SSH）时为 false —— 此时前端应置灰而非报错
+    pub sshd_present: bool,
+}
+
 #[async_trait]
 pub trait SecurityProvider: Send + Sync {
     /// **只读**安全基线扫描。实现**绝不修改系统**（修复是独立的高危操作）。
@@ -1595,6 +1616,41 @@ pub trait SecurityProvider: Send + Sync {
     /// 3. 校验器不可用时应**拒绝修改**——宁可不修，也不制造"把人锁在门外"的配置；
     /// 4. 只修白名单内的项，未知 key 直接报错。
     async fn apply(&self, key: &str) -> Result<SecurityApplyResult>;
+
+    /// **只读**：读取 SSH 端口现状（生效值 + 全部已配置端口）。见 [`SshPortState`]。
+    async fn ssh_port(&self) -> Result<SshPortState>;
+
+    /// **高危写操作**：修改 SSH 端口（P1-7）。
+    ///
+    /// 纪律（比 [`Self::apply`] 更严，因为改错端口的后果是**永久失联**）：
+    /// 1. 新端口必须是 1..=65535 且**未被其它进程监听**（否则重启 sshd 直接 bind 失败）；
+    /// 2. **必须先备份**，校验失败立刻回滚；
+    /// 3. `sshd -t` 校验器不可用时**拒绝修改**；
+    /// 4. 写进 **drop-in 目录里优先级最高**的文件——主配置在第 12 行就 `Include`
+    ///    了 drop-in，往主配置写 `Port` 会被 drop-in 里的旧值抢先，形成
+    ///    "改了没生效"的假控制（这类 bug 比没做更危险）；
+    /// 5. 写多个 Port（旧端口 + 新端口同时监听）由调用方用 `keep_old` 决定，
+    ///    默认保留旧端口一段时间，避免改完立刻失去回退通道。
+    async fn set_ssh_port(&self, port: u16, keep_old: bool) -> Result<SshPortChange>;
+}
+
+/// 修改 SSH 端口的结果。
+#[derive(Debug, Clone, Serialize)]
+pub struct SshPortChange {
+    pub changed: bool,
+    /// 改后的生效端口
+    pub effective: u16,
+    /// 改动前写入的文件（drop-in 路径）
+    pub target_file: String,
+    /// 修改**前**的备份文件路径（原来没有该文件时为 None，回滚 = 删除）
+    pub backup: Option<std::path::PathBuf>,
+    /// 校验通过
+    pub validated: bool,
+    /// 当前同时监听的全部端口（`keep_old=true` 时含旧端口）
+    pub listening_ports: Vec<u16>,
+    /// 需要用户去做的事（防火墙放行、重启 sshd 等）。**空数组表示没有额外动作**。
+    /// 这是本功能的重点：不告诉用户"还要放行防火墙"，他改完就被锁在门外。
+    pub next_steps: Vec<String>,
 }
 
 // ═══════════════════════════ 容器 ═══════════════════════════

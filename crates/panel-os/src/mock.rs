@@ -772,6 +772,44 @@ impl SecurityProvider for MockSecurity {
             },
         ])
     }
+
+    /// mock 不读真实配置：给稳定的 22 端口视图，便于前端联调与 E2E。
+    async fn ssh_port(&self) -> Result<crate::traits::SshPortState> {
+        Ok(crate::traits::SshPortState {
+            effective: 22,
+            explicit: false,
+            source_file: "/mock/etc/ssh/sshd_config".into(),
+            configured: vec![22],
+            sshd_present: true,
+        })
+    }
+
+    /// mock 不写盘：回显目标端口并给出与真实实现一致的 `next_steps`，
+    /// 让前端联调时能渲染出完整提示（而不是空数组导致 UI 少一块）。
+    async fn set_ssh_port(&self, port: u16, keep_old: bool) -> Result<crate::traits::SshPortChange> {
+        panel_os_validate_mock_port(port)?;
+        Ok(crate::traits::SshPortChange {
+            changed: true,
+            effective: port,
+            target_file: "/mock/etc/ssh/sshd_config.d/00-panel-port.conf".into(),
+            backup: None,
+            validated: true,
+            listening_ports: if keep_old { vec![22, port] } else { vec![port] },
+            next_steps: vec![format!("防火墙/安全组放行 TCP {port}（未放行则新端口连不上）")],
+        })
+    }
+}
+
+/// mock 的端口校验要**与真实实现同口径**：否则 0 在 mock 下能通过、
+/// 上了真机才被拒，前端联调期完全发现不了。
+fn panel_os_validate_mock_port(port: u16) -> Result<()> {
+    if port == 0 {
+        return Err(panel_core::PanelError::Validation {
+            field: "port",
+            reason: "端口必须为 1-65535（0 表示由系统随机分配，不适用于 SSH）".into(),
+        });
+    }
+    Ok(())
 }
 
 // ───────────────────────── 路径布局（内存视图） ─────────────────────────

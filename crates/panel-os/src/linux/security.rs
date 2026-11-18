@@ -133,6 +133,17 @@ impl SecurityProvider for LinuxSecurity {
         apply_ssh_item(key).await
     }
 
+    /// SSH 端口现状（只读）。
+    async fn ssh_port(&self) -> Result<crate::traits::SshPortState> {
+        crate::linux::ssh_port::current(Self::sshd_config_path()).await
+    }
+
+    /// 改 SSH 端口：写 `00-panel-port.conf` drop-in（优先级高于既有 drop-in），
+    /// 端口占用预检 → 备份 → 写 → `sshd -t` → 失败回滚。见 `linux/ssh_port.rs`。
+    async fn set_ssh_port(&self, port: u16, keep_old: bool) -> Result<crate::traits::SshPortChange> {
+        crate::linux::ssh_port::set_port(Self::sshd_config_path(), port, keep_old).await
+    }
+
     async fn baseline(&self) -> Result<Vec<SecurityCheck>> {
         let mut out = Vec::new();
         let cfg = Self::sshd_config_path();

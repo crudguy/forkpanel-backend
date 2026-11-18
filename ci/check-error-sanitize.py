@@ -26,9 +26,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 CRATES = ROOT / "crates"
 
-# 钉死值（2026-11-17 更新：P0-3 fail2ban params 读/写各新增 1 个 sanitized 构造点）
-TOTAL_PIN = 69
-SANITIZE_PIN = 37
+# 钉死值（2026-11-18 更新：P1-7 SSH 端口改完 sshd -t 校验/回滚失败新增 1 个构造点
+# 与 1 处 sanitize::stderr 调用）
+TOTAL_PIN = 70
+SANITIZE_PIN = 38
 
 HEAD = re.compile(r"(?:PanelError::)?(Command|ConfigInvalid)\s*\{")
 FIELD = re.compile(r"\bdetail\s*:")
