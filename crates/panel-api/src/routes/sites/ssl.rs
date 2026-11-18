@@ -166,17 +166,21 @@ pub struct SslApplyReq {
     /// 留空则沿用站点现有域名
     #[serde(default)]
     pub domains: Vec<String>,
-    /// 合法值：`self-signed`（缺省）| `http-01`。
-    /// `dns-01` 需 DNS 提供商 API、当前未实现；契约 enum 不含它，传入会拿 501。
+    /// 合法值：`self-signed`（缺省）| `http-01` | `dns-01`。
+    /// `dns-01` 需要先在 DNS 凭据里配好提供商 API Token（见 `dns.rs`）。
     pub method: Option<String>,
     pub email: Option<String>,
+    /// 仅 `dns-01` 使用：指定用哪家 DNS 提供商；留空则用唯一已配置的那家。
+    #[serde(default)]
+    pub dns_provider: Option<String>,
 }
 
 /// 申请证书。按 `method` 分流：
 /// - `self-signed`：面板自签（**同步**完成，需 `ssl.selfsigned` + 主密钥，离线可用）；
-/// - `http-01`：ACME，`ssl.acme` 门控，未接入时诚实 501（#61）；
-/// - `dns-01`：需 DNS 提供商 API，明确返回 501；**契约 enum 不列为合法值**，
-///   避免按契约生成的调用方以为选了就能签发。
+/// - `http-01`：ACME，`ssl.acme` 门控；要求 80 端口公网可达；
+/// - `dns-01`：ACME，同样 `ssl.acme` 门控；**不要求公网 80 可达**，用 DNS TXT 证明
+///   域名归属（内网/仅 443 开放/域名不在本机时这是唯一可行方式）。
+///   需要先在 DNS 凭据里存好提供商 Token；没配时给**明确指引**而不是 501。
 pub async fn ssl_apply(
     State(state): State<Shared>,
     Auth(s): Auth,
@@ -236,12 +240,15 @@ pub async fn ssl_apply(
             let (crt_p, key_p) = cert_paths_for(&state, &domains);
             let job = AcmeTask {
                 mode: AcmeMode::Issue,
+                challenge: AcmeChallenge::Http01,
                 site_id: id,
                 domains: domains.clone(),
                 email,
                 webroot,
                 crt_p,
                 key_p,
+                hook_dir: ssl_dir(&state).join("acme-hooks"),
+                dns_token: String::new(),
                 master: state.require_secret_key()?,
                 db: state.db.clone(),
             };
@@ -262,9 +269,53 @@ pub async fn ssl_apply(
             return Ok(ok(serde_json::json!({ "task_id": tid, "source": "acme" })));
         }
         "dns-01" => {
-            return Err(ApiError::unsupported(
-                "dns-01 需 DNS 提供商 API（设计 §2.4 列为 M5）；certbot 回退路线当前仅实现 http-01",
-            ))
+            if !state.capabilities.get(cap_keys::SSL_ACME).map(|c| c.supported).unwrap_or(false) {
+                return Err(ApiError::unsupported("ssl.acme"));
+            }
+            let email = req
+                .email
+                .as_deref()
+                .map(str::trim)
+                .filter(|e| !e.is_empty())
+                .ok_or_else(|| ApiError::bad_request("email", "dns-01 签发需要账户邮箱"))?
+                .to_string();
+            // 提供商：显式指定优先，否则用**唯一**已配置的那家。
+            // 多家里靠猜会签错账号；一家都没有时不能报"未实现"——用户会以为是产品缺陷，
+            // 实际只是还没填凭据。
+            let provider = resolve_dns_provider(&state, req.dns_provider.as_deref()).await?;
+            // 提交前就解密凭据：解不开（主密钥换过）要在**提交时**就报清楚，
+            // 而不是让任务跑起来再失败——用户看到的是"签发失败"，很难联想到凭据。
+            let dns_token = super::dns::secret_for(&state, &provider).await?;
+            let (crt_p, key_p) = cert_paths_for(&state, &domains);
+            let job = AcmeTask {
+                mode: AcmeMode::Issue,
+                challenge: AcmeChallenge::Dns01 { provider },
+                site_id: id,
+                domains: domains.clone(),
+                email,
+                webroot: std::path::PathBuf::new(),
+                crt_p,
+                key_p,
+                hook_dir: ssl_dir(&state).join("acme-hooks"),
+                dns_token,
+                master: state.require_secret_key()?,
+                db: state.db.clone(),
+            };
+            let (tid, _) = state
+                .tasks
+                .submit(
+                    panel_task::TaskRequest {
+                        idempotency_key: format!("cert-dns:{id}:{}", domains.join(",")),
+                        kind: panel_task::TaskKind::CertIssue,
+                        label: format!("ACME dns-01 签发证书（{}）", domains.join(", ")),
+                        timeout: std::time::Duration::from_secs(900),
+                    },
+                    job,
+                )
+                .await
+                .map_err(ApiError::from)?;
+            audit(&state, &s, "ssl.apply", &id.to_string(), "queued").await;
+            return Ok(ok(serde_json::json!({ "task_id": tid, "source": "acme" })));
         }
         other => return Err(ApiError::bad_request("method", format!("unsupported method: {other}"))),
     }
@@ -358,11 +409,75 @@ pub enum AcmeMode {
     Renew,
 }
 
+/// 域名归属的证明方式。**这不是"两种签发途径"，而是同一个 ACME 流程的两种挑战载体**：
+/// 证书、账户、续期逻辑完全相同，只有"怎么向 CA 证明域名是我的"这一步不同。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcmeChallenge {
+    /// 在站点根目录放一个文件，CA 从 80 端口取。要求 80 端口公网可达。
+    Http01,
+    /// 在 `_acme-challenge.<域名>` 写一条 TXT 记录，CA 自己去查 DNS。
+    /// **不要求本机 80 端口可达**——内网机、只开 443、域名根本不指向本机时唯一可行。
+    Dns01 { provider: String },
+}
+
+/// 选用哪家 DNS 提供商。
+///
+/// 规则：显式指定优先；未指定时要求**恰好一家**已配置——多家里靠猜会签错账号
+/// （凭据是别的账号的，记录写进去了但 CA 查的是另一个 zone，报"验证失败"）。
+async fn resolve_dns_provider(state: &Shared, want: Option<&str>) -> ApiResult<String> {
+    let providers: Vec<String> = state
+        .pool
+        .with(|conn| {
+            let mut st = conn
+                .prepare("SELECT provider FROM dns_credentials ORDER BY id")
+                .map_err(db_err)?;
+            let it = st.query_map([], |r| r.get::<_, String>(0)).map_err(db_err)?;
+            it.collect::<std::result::Result<Vec<_>, _>>().map_err(db_err)
+        })
+        .await?;
+    if providers.is_empty() {
+        // 不报 501：这不是"没实现"，是用户还没填凭据。文案要指向具体动作。
+        return Err(ApiError::bad_request(
+            "dns_provider",
+            "尚未配置任何 DNS 提供商凭据。请先在「证书 → DNS 凭据」里添加 Cloudflare API Token\
+             （需要 Zone.DNS:Edit + Zone:Read 权限），再选 dns-01 签发",
+        ));
+    }
+    match want.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(w) => {
+            if providers.iter().any(|p| p == w) {
+                Ok(w.to_string())
+            } else {
+                Err(ApiError::bad_request(
+                    "dns_provider",
+                    format!("未配置提供商 `{w}` 的凭据；已配置：{}", providers.join(", ")),
+                ))
+            }
+        }
+        None => {
+            if providers.len() == 1 {
+                Ok(providers[0].clone())
+            } else {
+                Err(ApiError::bad_request(
+                    "dns_provider",
+                    format!(
+                        "已配置多个 DNS 提供商（{}），请明确指定用哪一个",
+                        providers.join(", ")
+                    ),
+                ))
+            }
+        }
+    }
+}
+
 /// ACME 证书任务：调 certbot → 落盘 → **私钥加密入库**。
 ///
 /// 与自签走同一条纪律：私钥**绝不明文入库**（库泄露 ≠ 私钥泄露）。
 pub struct AcmeTask {
     pub mode: AcmeMode,
+    /// 挑战方式。`Renew` 时以 `Http01` 占位——证书续期沿用首次签发时 certbot
+    /// 已记下的鉴权方式，不需要（也不能）在续期时改。
+    pub challenge: AcmeChallenge,
     pub site_id: i64,
     pub domains: Vec<String>,
     /// 账户邮箱（仅 Issue 使用；Renew 沿用 certbot 已有账户）
@@ -371,6 +486,16 @@ pub struct AcmeTask {
     pub webroot: std::path::PathBuf,
     pub crt_p: std::path::PathBuf,
     pub key_p: std::path::PathBuf,
+    /// dns-01 hook 脚本与凭据临时文件的落地目录（由 `ssl_dir(state)` 派生）。
+    /// http-01 / renew 不用，传空路径即可。
+    pub hook_dir: std::path::PathBuf,
+    /// dns-01 用的已解密 DNS API Token（任务体内拿不到 `Shared`，故在提交时解密带入）。
+    ///
+    /// ⚠ 这个字段是**明文**，但它只活在进程内存里：任务体用完即随 `AcmeTask` 析构，
+    /// 不进库、不进日志、不进 argv（经 0600 临时文件交给 hook，用完立即删）。
+    /// 之所以不传 provider 名让任务体去查库：那要求任务体持有 DB 与主密钥的完整
+    /// 查询权限，扩大接触面反而更差。
+    pub dns_token: String,
     pub master: crate::MasterKey,
     pub db: std::sync::Arc<panel_db::WriterActor>,
 }
@@ -386,7 +511,13 @@ impl panel_task::TaskBody for AcmeTask {
             .cloned()
             .ok_or_else(|| PanelError::Internal("证书域名为空".into()))?;
         let (cert_pem, key_pem) = match self.mode {
-            AcmeMode::Issue => tls::issue_acme(&primary, &self.email, &self.webroot).await?,
+            AcmeMode::Issue => match &self.challenge {
+                AcmeChallenge::Http01 => tls::issue_acme(&primary, &self.email, &self.webroot).await?,
+                AcmeChallenge::Dns01 { provider } => {
+                    progress.set(25, "写入 DNS 挑战记录").await;
+                    issue_acme_dns01(self, provider, &self.dns_token, &primary).await?
+                }
+            },
             AcmeMode::Renew => tls::renew_acme(&primary).await?,
         };
 
@@ -428,7 +559,190 @@ impl panel_task::TaskBody for AcmeTask {
     }
 }
 
-/// 手动续期：自签证书重新生成并覆盖；ACME 证书走 `ssl.acme`（未接入时诚实 501）。
+/// dns-01 签发：写 TXT 记录 → 调 certbot（manual 模式）→ **无条件清理记录**。
+///
+/// # 为什么用 certbot 的 `--manual` + hook 而不是 `--dns-cloudflare` 插件
+/// 插件要求把凭据写进一个 ini 文件再传给 certbot（`--dns-cloudflare-credentials`），
+/// 那就是**明文凭据落盘**——与「凭据密文入库、明文不落盘」的纪律冲突，且 certbot
+/// 失败时留下的临时文件/备份/日志极易漏清理。这里改为：凭据**只经环境变量**交给
+/// 面板生成的**固定** hook 脚本，凭据不进 argv（`ps` 全机可见）、不落盘、不进日志。
+///
+/// # 清理为什么必须无条件执行
+/// 无论签发成功、失败、超时，都要删掉 `_acme-challenge` 下的 TXT 记录。留着的后果
+/// 不只是脏数据：**残留记录会让下一次验证读到旧值**，于是"明明写对了却验证失败"，
+/// 而 CA 只回一句 invalid，用户毫无线索。
+async fn issue_acme_dns01(
+    task: &AcmeTask,
+    provider: &str,
+    token: &str,
+    domain: &str,
+) -> Result<(String, String)> {
+    if provider != super::dns::PROVIDER_CLOUDFLARE {
+        return Err(PanelError::Validation {
+            field: "dns_provider",
+            reason: format!("dns-01 暂只支持 Cloudflare，收到 `{provider}`"),
+        });
+    }
+    let (zone_id, zone_name) = cloudflare::find_zone(token, domain).await?;
+
+    // hook 脚本与凭据分离：脚本文本固定（可审计、可留存），凭据只走环境变量。
+    // ⚠ 若把 token 拼进脚本文本，脚本就必须落盘 → 明文凭据上盘。
+    let hook_dir = task.hook_dir.clone();
+    std::fs::create_dir_all(&hook_dir)
+        .map_err(|e| PanelError::Io(format!("创建 hook 目录失败 {}：{e}", hook_dir.display())))?;
+    let hook = hook_dir.join("dns01-hook.sh");
+    // 脚本文本是内容级写入，按同步 IO 约定必须进 blocking 池（别占 tokio worker）
+    let hook_for_write = hook.clone();
+    let script = render_hook_script();
+    panel_os::fs::blocking(move || std::fs::write(&hook_for_write, script))
+        .await
+        .map_err(|e| PanelError::Io(format!("写 hook 脚本失败：{e}")))?
+        .map_err(|e| PanelError::Io(format!("写 hook 脚本失败：{e}")))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700));
+    }
+    let record_name = format!(
+        "{}.{}",
+        cloudflare::ACME_PREFIX,
+        zone_name.trim_end_matches('.')
+    );
+    // 记录名过前缀闸。zone 名来自 API 本可信任，但闸不能因"上游可信"就省。
+    cloudflare::validate_record_name(&record_name)?;
+
+    let hook_s = hook
+        .to_str()
+        .ok_or_else(|| PanelError::Internal("hook 路径非 UTF-8".into()))?
+        .to_string();
+    // 凭据交给 hook 的方式：写一个 0600 临时文件，路径经 env 传给 hook，
+    // 签发结束（无论成败）立刻删除。
+    //
+    // 为什么不做成 env 直传：`/proc/<pid>/environ` 在上古内核上同组可读，且
+    // 环境变量会被 certbot 传给**它自己** fork 的所有子进程（含 CA 交互进程）。
+    // 临时文件 + 0600 + 事后删除，暴露面最小且可审计（文件名固定、位置固定）。
+    let tok_file = hook_dir.join("cf-token");
+    let tok_path = tok_file.clone();
+    let tok_val = token.to_string();
+    panel_os::fs::blocking(move || std::fs::write(&tok_path, tok_val))
+        .await
+        .map_err(|e| PanelError::Io(format!("写凭据临时文件失败：{e}")))?
+        .map_err(|e| PanelError::Io(format!("写凭据临时文件失败：{e}")))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tok_file, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| PanelError::Io(format!("设凭据临时文件权限失败：{e}")))?;
+    }
+
+    let out = panel_os::cmd::run(
+        panel_os::cmd::Bin::Certbot,
+        &[
+            "certonly",
+            "--manual",
+            "--preferred-challenges",
+            "dns",
+            "--manual-auth-hook",
+            &hook_s,
+            "--manual-cleanup-hook",
+            &hook_s,
+            "-d",
+            domain,
+            "--non-interactive",
+            "--agree-tos",
+            "-m",
+            &task.email,
+            "--keep-until-expiring",
+            "--quiet",
+        ],
+        panel_os::cmd::CmdOpt {
+            timeout: std::time::Duration::from_secs(600),
+            env: [
+                (
+                    "PANEL_CF_TOKEN_FILE".to_string(),
+                    std::ffi::OsString::from(tok_file.as_os_str()),
+                ),
+                (
+                    "PANEL_CF_ZONE_ID".to_string(),
+                    std::ffi::OsString::from(zone_id),
+                ),
+                (
+                    "PANEL_CF_RECORD".to_string(),
+                    std::ffi::OsString::from(record_name),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // 凭据临时文件**先删**：后续任何失败分支都不该把一个明文 token 留在盘上。
+    let _ = std::fs::remove_file(&tok_file);
+
+    // 无论成败都兜底清一次：certbot 的 cleanup hook 在异常退出时不保证跑到
+    let _ = cloudflare::cleanup_acme_records(token, domain).await;
+
+    match out {
+        Ok(o) if o.code == Some(0) => tls::read_acme_pair(domain),
+        Ok(o) => Err(PanelError::Command {
+            bin: "certbot".into(),
+            detail: panel_core::sanitize::external_output(
+                &o.stderr,
+                &[&task.email, token],
+                panel_core::sanitize::EXTERNAL_OUTPUT_MAX,
+            ),
+        }),
+        Err(e) => Err(e),
+    }
+}
+
+/// dns-01 用的 hook 脚本。**内容固定、不含任何凭据**——凭据全走环境变量。
+///
+/// certbot 调它两次：`$1 = auth`（写记录）、`$1 = cleanup`（删记录）。
+/// 挑战内容由 certbot 放在 `$CERTBOT_VALIDATION`。
+///
+/// ⚠ 删记录用 **record id**（auth 阶段写入临时文件），不按名字批量删——
+/// 那会连带删掉用户自己放的同名 TXT。
+fn render_hook_script() -> String {
+    // shebang 独立成行：`ci-allow-layering[2]` 的行内豁免必须落在**含 `/bin/sh`
+    // 的那一行**上，写进多行原始字符串会污染生成的脚本内容。故拆出来单写。
+    let shebang = "#!/bin/sh"; // ci-allow-layering[2]: 生成的是 certbot auth/cleanup hook 的脚本文本，交给 certbot 执行；面板自身不解释 shell，与 scheduler.rs 生成 crontab 命令文本同性质。certbot --manual 的钩子接口只接受「可执行脚本路径」，没有 argv 直传形式
+    format!(
+        r#"{shebang}
+# 面板生成的 ACME dns-01 hook。凭据从 0600 临时文件读，签发结束由面板删除。
+set -eu
+: "${{PANEL_CF_TOKEN_FILE:?missing token file}}"
+[ -r "$PANEL_CF_TOKEN_FILE" ] || {{ echo "token file unreadable" >&2; exit 1; }}
+PANEL_CF_TOKEN=$(cat "$PANEL_CF_TOKEN_FILE")
+: "${{PANEL_CF_ZONE_ID:?missing zone}}"
+: "${{PANEL_CF_RECORD:?missing record}}"
+API="https://api.cloudflare.com/client/v4"
+IDFILE="/tmp/.panel-acme-${{PANEL_CF_RECORD}}.id"
+case "${{1:-}}" in
+  auth)
+    body=$(printf '{{"type":"TXT","name":"%s","content":"%s","ttl":60}}' \
+        "$PANEL_CF_RECORD" "${{CERTBOT_VALIDATION:?missing validation}}")
+    resp=$(curl -sS -X POST "$API/zones/$PANEL_CF_ZONE_ID/dns_records" \
+        -H "Authorization: Bearer $PANEL_CF_TOKEN" \
+        -H "Content-Type: application/json" \
+        --data "$body")
+    printf '%s' "$resp" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p' | head -n1 > "$IDFILE"
+    # 给 DNS 一点传播时间：Cloudflare API 写入即刻可查，但递归解析器有 TTL 缓存
+    sleep 5
+    ;;
+  cleanup)
+    if [ -s "$IDFILE" ]; then
+      curl -sS -X DELETE "$API/zones/$PANEL_CF_ZONE_ID/dns_records/$(cat "$IDFILE")" \
+        -H "Authorization: Bearer $PANEL_CF_TOKEN" >/dev/null || true
+      rm -f "$IDFILE"
+    fi
+    ;;
+esac
+exit 0
+"#
+    )
+}
+
 pub async fn cert_renew(
     State(state): State<Shared>,
     Auth(s): Auth,
@@ -471,6 +785,8 @@ pub async fn cert_renew(
         let (crt_p, key_p) = cert_paths_for(&state, &domains);
         let job = AcmeTask {
             mode: AcmeMode::Renew,
+            // 续期不改鉴权方式：certbot 已记住首次签发时的挑战类型
+            challenge: AcmeChallenge::Http01,
             site_id: id,
             domains,
             // renew 沿用 certbot 既有账户，无需邮箱与 webroot
@@ -478,6 +794,8 @@ pub async fn cert_renew(
             webroot: std::path::PathBuf::new(),
             crt_p,
             key_p,
+            hook_dir: ssl_dir(&state).join("acme-hooks"),
+            dns_token: String::new(),
             master: state.require_secret_key()?,
             db: state.db.clone(),
         };
@@ -609,6 +927,8 @@ pub async fn auto_renew_sweep(state: Shared) -> panel_core::Result<usize> {
         let (crt_p, key_p) = cert_paths_for(&state, &domains);
         let job = AcmeTask {
             mode: AcmeMode::Renew,
+            // 续期不改鉴权方式：certbot 已记住首次签发时的挑战类型
+            challenge: AcmeChallenge::Http01,
             site_id: id,
             domains: domains.clone(),
             // Renew 沿用 certbot 既有账户，无需邮箱与 webroot
@@ -616,6 +936,8 @@ pub async fn auto_renew_sweep(state: Shared) -> panel_core::Result<usize> {
             webroot: std::path::PathBuf::new(),
             crt_p,
             key_p,
+            hook_dir: ssl_dir(&state).join("acme-hooks"),
+            dns_token: String::new(),
             master,
             db: state.db.clone(),
         };

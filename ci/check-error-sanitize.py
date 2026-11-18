@@ -27,9 +27,13 @@ ROOT = Path(__file__).resolve().parent.parent
 CRATES = ROOT / "crates"
 
 # 钉死值（2026-11-18 更新：P1-7 SSH 端口改完 sshd -t 校验/回滚失败新增 1 个构造点
-# 与 1 处 sanitize::stderr 调用）
-TOTAL_PIN = 70
-SANITIZE_PIN = 38
+# 与 1 处 sanitize::stderr 调用；P2-10 ACME dns-01 新增 6 个构造点
+# —— cloudflare.rs 5 处（token 查询/zone 查询/TXT 建删/残留清理，detail 走
+# transport_err 只格式化 reqwest 错误、不含响应体）+ ssl.rs 1 处 certbot 失败
+# 回显（已过 sanitize::external_output，白名单含 email 与 token），
+# 另新增 2 处 sanitize 调用）
+TOTAL_PIN = 76
+SANITIZE_PIN = 40
 
 HEAD = re.compile(r"(?:PanelError::)?(Command|ConfigInvalid)\s*\{")
 FIELD = re.compile(r"\bdetail\s*:")

@@ -64,6 +64,13 @@ pub use conf::*;
 mod ssl;
 pub use ssl::*;
 
+// ─── Cloudflare DNS API 客户端（P2-10：ACME dns-01 的前提） ───
+pub mod cloudflare;
+
+// ─── DNS 提供商凭据（凭据密文入库、列表只回显掩码） ───
+mod dns;
+pub use dns::*;
+
 #[cfg(test)]
 mod waf_tests;
 #[cfg(test)]

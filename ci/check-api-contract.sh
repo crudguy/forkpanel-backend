@@ -203,30 +203,53 @@ else
   pass "契约未声明 tls_mode（后端暂无 TLS 实现，不伪装成已支持）"
 fi
 
-# ── [H] 契约不得把「实现恒 501」的 method 列为合法值（F-11）──
+# ── [H] 契约不得把「实现没有成功路径」的 method 列为合法值（F-11）──
 # 背景：SslApply.method 的 enum 曾列 `dns-01`，而 ssl.rs 里该分支恒定
 # `ApiError::unsupported` ⇒ 按契约生成的调用方选它必拿非预期 501。这是
 # 「契约撒谎」的一种：字段存在、枚举合法、实现却根本没有成功路径。
-echo "== [H] 契约 enum 与实现分支一致（dns-01 不得伪装成可签发） =="
-# 活性自检：先证明扫到了 enum 行与实现里的拒绝分支。正则一失效抓到 0 行，
-# 下面「不含 dns-01」会恒绿——本项目「空集恒真」的头号坑。
+#
+# P2-10 起 dns-01 **真的实现了**，契约随之把它列为可签发值。守卫因此转向
+# 反方向：enum 一旦列了 dns-01，实现就必须真有成功路径，且「缺凭据」要按
+# 配置错误（400）报，不能退回 501——501 会被调用方读成「产品没做」，而实际
+# 只是还没填 Token，文案也不会指向该做的动作。
+echo "== [H] 契约 enum 与实现分支一致（列进 enum 的 method 必须真有成功路径） =="
+# 活性自检：先证明每条判据的正则真能扫到目标。正则一失效抓到 0 行，下面
+# 「数量相等」会变成 0==0 恒绿——本项目「空集恒真」的头号坑。
 SSL_ENUM_LINES=$(grep -cE '^[[:space:]]+enum: \[self-signed' docs/api/openapi.yaml || true)
-DNS_REJECT=$(grep -c '"dns-01" =>' crates/panel-api/src/routes/sites/ssl.rs || true)
+DNS_ARM=$(grep -c '"dns-01" =>' crates/panel-api/src/routes/sites/ssl.rs || true)
+DNS_VARIANT=$(grep -c 'AcmeChallenge::Dns01' crates/panel-api/src/routes/sites/ssl.rs || true)
+DNS_IMPL=$(grep -c 'async fn issue_acme_dns01' crates/panel-api/src/routes/sites/ssl.rs || true)
 if [ "$SSL_ENUM_LINES" -ne 1 ]; then
   fail "活性自检失败：SslApply.method 的 enum 行恰好应有 1 行，实得 $SSL_ENUM_LINES"
-elif [ "$DNS_REJECT" -ne 1 ]; then
-  fail "活性自检失败：ssl.rs 里 dns-01 的显式拒绝分支恰好应有 1 处，实得 $DNS_REJECT"
 elif grep -qE '^[[:space:]]+enum: \[[^]]*dns-01' docs/api/openapi.yaml; then
-  fail "契约把 dns-01 列为合法 method，但实现恒定返回 501——按契约生成的调用方会拿到非预期错误"
+  # 契约承诺「dns-01 可签发」⇒ 实现必须有完整链路，缺一环就是撒谎。
+  # 三处各自钉死「恰好应有的数量」：多出来的往往是并行分支没接进 challenge 枚举。
+  if [ "$DNS_ARM" -ne 1 ]; then
+    fail "契约把 dns-01 列为可签发，但 ssl.rs 里 \"dns-01\" => 分支应为 1 处，实得 $DNS_ARM"
+  elif [ "$DNS_VARIANT" -lt 2 ]; then
+    fail "AcmeChallenge::Dns01 在 ssl.rs 里应有 ≥2 处（枚举定义 + 任务分支），实得 $DNS_VARIANT"
+  elif [ "$DNS_IMPL" -ne 1 ]; then
+    fail "dns-01 缺签发实现：async fn issue_acme_dns01 应为 1 处，实得 $DNS_IMPL"
+  elif grep -qE 'dns-01.*(unsupported|恒返回 501)' crates/panel-api/src/routes/sites/ssl.rs; then
+    fail "契约列 dns-01 为可签发，实现里却仍有 unsupported/501 走法"
+  else
+    pass "契约列 dns-01 为可签发，实现有完整链路（匹配分支 + challenge 变体 + 签发函数）"
+  fi
 else
-  pass "SslApply.method enum 只含真实可签发值；dns-01 在实现里仍显式拒绝"
+  # 未列进 enum ⇒ 实现里不该出现可签发的 dns-01 分支（半成品泄漏）。
+  if [ "$DNS_ARM" -ne 0 ] || [ "$DNS_IMPL" -ne 0 ]; then
+    fail "契约未列 dns-01，实现里却已有 dns-01 分支（arm=$DNS_ARM, impl=$DNS_IMPL）——契约落后于实现"
+  else
+    pass "SslApply.method enum 与实现一致：均未提供 dns-01"
+  fi
 fi
-# 只把 enum 里的 dns-01 删掉、描述也一并删光，上面仍会绿；故单独钉住成因说明。
-DNS_EXPLAIN=$(grep -c 'dns-01 需 DNS 提供商 API' docs/api/openapi.yaml || true)
+# 只把 enum 里的 dns-01 删掉、描述也一并删光，上面仍会绿；故单独钉住前置条件说明。
+# 锚点用契约里真实存在的措辞（改文案时这里要跟着改，否则是「判据指向错」）。
+DNS_EXPLAIN=$(grep -c 'dns/credentials' docs/api/openapi.yaml || true)
 if [ "$DNS_EXPLAIN" -lt 1 ]; then
-  fail "契约 501 描述未说明 dns-01 未实现的成因"
+  fail "契约未说明 dns-01 的前置条件（需先在 /api/v1/dns/credentials 存 DNS 凭据）"
 else
-  pass "契约 501 描述写明 dns-01 未实现的成因"
+  pass "契约写明 dns-01 需先在 /api/v1/dns/credentials 存 DNS 凭据"
 fi
 if grep -qE "^[[:space:]]+'400': \{ description: method 取值非法" docs/api/openapi.yaml; then
   pass "ssl/apply 端点补齐 400 成因描述"

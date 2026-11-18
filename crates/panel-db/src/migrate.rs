@@ -57,10 +57,12 @@ const MIGRATIONS: &[(u32, &str)] = &[
     // 035：审计哈希链（P2-11）——prev_hash/hash 两列 + 链尾锚点表；
     // 使「有 root 权限改库」从静默成功变成可检测篡改
     (35, include_str!("../../../migrations/035_audit_hash_chain.sql")),
+    // 036：DNS 提供商 API 凭据（P2-10）——ACME dns-01 的前提；凭据密文入库
+    (36, include_str!("../../../migrations/036_dns_credentials.sql")),
 ];
 
 /// 当前 schema 版本
-pub const LATEST: u32 = 35;
+pub const LATEST: u32 = 36;
 
 pub fn apply(conn: &mut Connection) -> Result<u32> {
     conn.execute_batch(

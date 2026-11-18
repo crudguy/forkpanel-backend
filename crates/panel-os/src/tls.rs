@@ -102,7 +102,7 @@ pub async fn renew_acme(domain: &str) -> Result<(String, String)> {
     read_acme_pair(domain)
 }
 
-fn read_acme_pair(domain: &str) -> Result<(String, String)> {
+pub fn read_acme_pair(domain: &str) -> Result<(String, String)> {
     let d = acme_live_dir(domain);
     let cert = std::fs::read_to_string(d.join("fullchain.pem")).map_err(|e| {
         panel_core::PanelError::Io(format!("读取证书失败 {}/fullchain.pem：{e}", d.display()))

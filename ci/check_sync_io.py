@@ -44,7 +44,10 @@ MICRO = {
     "create_dir_all", "remove_file", "metadata", "read_dir", "set_permissions",
     "Permissions", "symlink_metadata",
 }
-MICRO_PIN = 26  # 2026-11-10 审定值；新增微 IO 须复审后同步改这里
+MICRO_PIN = 32  # 2026-11-18 复审：P2-10 dns-01 新增 6 处元数据级操作
+# （hook 目录 create_dir_all、hook/凭据文件 set_permissions、签发后 remove_file
+# ——都是改目录项/inode 属性或删文件，不读内容、不递归，符合 MICRO 语义；
+# 两处内容级 fs::write 已按约定包进 panel_os::fs::blocking）
 
 SCAN_DIRS = ["crates/panel-api/src", "crates/panel-os/src",
              "crates/panel-task/src", "crates/panel-db/src",

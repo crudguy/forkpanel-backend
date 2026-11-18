@@ -183,6 +183,11 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/sites/{id}/log/clear", post(sites::log_clear))
         .route("/api/v1/sites/{id}/ssl/apply", post(sites::ssl_apply))
         .route("/api/v1/ssl/ca", get(sites::ssl_ca_download))
+        // DNS 凭据（P2-10 dns-01 的前提）：凭据密文入库、列表只回显掩码；
+        // save 按 provider upsert（前端不该关心记录 id）；check 用已存凭据复验
+        .route("/api/v1/dns/credentials", get(sites::list_dns_creds).put(sites::save_dns_cred))
+        .route("/api/v1/dns/credentials/{provider}", delete(sites::delete_dns_cred))
+        .route("/api/v1/dns/credentials/{provider}/check", post(sites::check_dns_cred))
         .route("/api/v1/certs", get(sites::certs))
         .route("/api/v1/certs/{id}/renew", post(sites::cert_renew))
         .route("/api/v1/certs/{id}/auto-renew", patch(sites::cert_auto_renew))
@@ -675,7 +680,7 @@ mod tests {
             (include_str!("routes/sites/conf.rs"), ".get(cap_keys::LOGS_READ)", 1, "sites::logs"),
             (include_str!("routes/logs.rs"), ".get(cap_keys::LOGS_READ)", 4, "logs::*（sources + read + download + stats 各一道）"),
             (include_str!("routes/sites/ssl.rs"), ".get(cap_keys::WEBSERVER_MANAGE)", 2, "ssl::*"),
-            (include_str!("routes/sites/ssl.rs"), ".get(cap_keys::SSL_ACME)", 4, "ssl_apply / renew / sweep / 设置"),
+            (include_str!("routes/sites/ssl.rs"), ".get(cap_keys::SSL_ACME)", 5, "ssl_apply 的 http-01 与 dns-01 各一道（P2-10 起两条 ACME 路径独立校验）/ renew / sweep / 设置"),
             (include_str!("routes/sites/ssl.rs"), ".get(cap_keys::SSL_SELFSIGNED)", 2, "ssl_apply / cert_renew"),
             (include_str!("routes/backups.rs"), ".get(cap_keys::BACKUP_MANAGE)", 3, "backups::*"),
             (include_str!("routes/terminal.rs"), ".get(cap_keys::TERMINAL_MANAGE)", 1, "terminal::ws_handler"),

@@ -869,14 +869,45 @@ components:
           description: 留空则沿用站点现有域名
         method:
           type: string
-          enum: [self-signed, http-01]
+          enum: [self-signed, http-01, dns-01]
           default: self-signed
           description: |
             self-signed=面板本地根 CA 签发（同步、离线可用，需 openssl）；
-            http-01=ACME 任务化签发（需 ssl.acme 能力位与账户邮箱）。
-            ⚠ dns-01 依赖 DNS 提供商 API，当前版本未实现、调用必得 501，
-            因此**不在合法枚举内**；调用方不要按「契约列了就能用」来生成选项。
+            http-01=ACME 任务化签发（需 ssl.acme 能力位与账户邮箱，要求 80 端口公网可达）；
+            dns-01=ACME 任务化签发，用 DNS TXT 记录证明域名归属。
+            **不要求本机 80 端口可达**——内网机、只开 443、域名不指向本机时这是唯一可行方式；
+            需要先在 `/api/v1/dns/credentials` 存好 DNS 提供商 API Token。
         email: { type: [string, "null"] }
+        dns_provider:
+          type: [string, "null"]
+          description: 仅 dns-01 使用；留空时用**唯一**已配置的提供商，多家时必须指定
+
+    DnsCredential:
+      type: object
+      description: |
+        DNS 提供商凭据（dns-01 的前提）。**`secret_masked` 永远是掩码**，
+        明文只存在于服务端内存与密文库里。
+      properties:
+        id:               { type: integer }
+        provider:         { type: string, enum: [cloudflare] }
+        provider_label:   { type: string, description: 展示名（前端不要自己维护映射，避免与后端不一致） }
+        label:            { type: string, description: 用户备注名 }
+        secret_masked:    { type: string, description: '掩码（前 4 + ****** + 后 4）；短于 12 字符整串打码，且星号数固定不泄露真实长度' }
+        zone_hint:        { type: string, description: 留空=自动探测域名所属 zone }
+        usable:           { type: boolean, description: 'false=密文解不开（主密钥可能已更换），需重填' }
+        last_check_at:    { type: integer, description: '上次校验时间戳；0=从未校验' }
+        last_check_ok:    { type: boolean }
+        last_check_msg:   { type: string }
+        created_at:       { type: integer }
+        updated_at:       { type: integer }
+    DnsCredentialSave:
+      type: object
+      required: [provider]
+      properties:
+        provider:  { type: string, enum: [cloudflare] }
+        label:     { type: string, description: 备注名，可留空 }
+        secret:    { type: string, description: 'API Token。首次添加必填；更新时留空 = 保持原值不变' }
+        zone_hint: { type: string, description: 留空=自动探测 }
 
     # ───────────── 文件 ─────────────
     FileEntry:
@@ -2717,14 +2748,15 @@ paths:
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SslApply' } } } }
       responses:
         '200': { description: 自签证书已签发并落盘（含 cert_path / not_after / days_left） }
-        '202': { description: ACME http-01 申请已入队 }
-        '400': { description: method 取值非法（非 self-signed / http-01）、域名为空或格式不合法、http-01 缺账户邮箱 }
+        '202': { description: ACME 签发已入队（http-01 或 dns-01） }
+        '400': { description: method 取值非法、域名为空或格式不合法、缺账户邮箱、dns-01 未配置 DNS 凭据（或指定了不存在的提供商） }
         '501':
           description: |
-            三种成因：① 无 Web 服务器底座（webserver.manage 不支持）——证书没有进程可加载，
-            只会造成「已配置」却不生效的假象；② ssl.acme / ssl.selfsigned 能力位缺失；
-            ③ method=dns-01 需 DNS 提供商 API，当前未实现（曾在 enum 中被误列为合法值）。
-            契约 enum 只保留真实可签发的 self-signed / http-01。
+            两种成因：① 无 Web 服务器底座（webserver.manage 不支持）——证书没有进程可加载，
+            只会造成「已配置」却不生效的假象；② ssl.acme / ssl.selfsigned 能力位缺失
+            （如未安装 certbot）。
+            ⚠ dns-01 缺凭据时返回 **400** 而非 501：那不是"没实现"，是配置缺失，
+            文案会指向具体动作（去添加 DNS Token）。
         '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' }
 
   /api/v1/ssl/ca:
@@ -4672,6 +4704,77 @@ paths:
         （库里尚无带链值的记录）——把后两者说成"通过"会让运维误以为历史也受保护。
       responses:
         '200': { description: 校验结果, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/AuditVerify' } } } } } }
+
+  # ───────── DNS 提供商凭据（dns-01 的前提） ─────────
+  /api/v1/dns/credentials:
+    get:
+      operationId: get_dns_credentials
+      tags: [sites]
+      summary: 列出 DNS 提供商凭据（**只返回掩码**）
+      description: |
+        凭据密文入库，接口永不返回明文——拿到明文就等于拿到 DNS 控制权。
+        `usable=false` 表示库里那条密文解不开（通常因主密钥更换），需重填。
+      security: [cookieAuth]
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      items: { type: array, items: { $ref: '#/components/schemas/DnsCredential' } }
+    put:
+      operationId: put_dns_credentials
+      tags: [sites]
+      summary: 新建或更新凭据（按 provider upsert）
+      description: |
+        同一 provider 再次提交即为更新，前端不必关心记录 id。
+        `secret` 留空 = **保持原值不变**（因为列表只给掩码，留空被当成清空会让
+        用户改个 label 就把凭据删掉）。首次添加时 `secret` 必填。
+        保存前会先用该 token 列一次 zone 做有效性校验，避免存一个已吊销的凭据、
+        等到签发时才报错（那时错因会指向域名而非凭据，极难自查）。
+      security: [cookieAuth, csrfHeader]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DnsCredentialSave' }
+      responses:
+        '200': { description: 已保存 }
+        '400': { description: provider 不支持 / 首次添加缺 secret / Token 无效或看不到任何 zone }
+        '403': { description: 缺少 CSRF 令牌 }
+        '429': { description: '触发限流；按 retry_after 秒后重试' }
+  /api/v1/dns/credentials/{provider}:
+    delete:
+      operationId: delete_dns_credentials_provider
+      tags: [sites]
+      summary: 删除某提供商的凭据
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: provider, in: path, required: true, schema: { type: string, enum: [cloudflare] } }]
+      responses:
+        '200': { description: 已删除（不存在也返回成功，便于前端幂等） }
+        '400': { description: provider 不支持 }
+        '403': { description: 缺少 CSRF 令牌 }
+  /api/v1/dns/credentials/{provider}/check:
+    post:
+      operationId: post_dns_credentials_provider_check
+      tags: [sites]
+      summary: 用已存凭据复验可用性（不要求重填 token）
+      description: |
+        结果同时落库（`last_check_*`），让"凭据到底还能不能用"可查——
+        否则用户只能靠反复发起签发来试探。
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: provider, in: path, required: true, schema: { type: string, enum: [cloudflare] } }]
+      responses:
+        '200': { description: '校验结果 {ok, message, zones, checked_at}' }
+        '400': { description: 凭据解不开（主密钥已更换）需重填 }
+        '403': { description: 缺少 CSRF 令牌 }
+        '404': { description: 该 provider 没有已存凭据 }
+        '429': { description: '触发限流；按 retry_after 秒后重试' }
 
   # ───────── SSE 实时频道 ─────────
   /api/v1/events/metrics:
