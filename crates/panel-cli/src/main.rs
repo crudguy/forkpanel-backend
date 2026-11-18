@@ -308,10 +308,13 @@ enum Cmd {
     /// `panel config set` 的子命令：修改 `[server]` 段的具体字段。
     #[derive(Clone, Subcommand)]
     enum ConfigSet {
-        /// 修改监听端口（1-65535）
+        /// 修改监听端口（1-65535；改端口有把自己锁在面板外的风险，需 --yes 确认）
         Port {
             /// 监听端口
             port: u16,
+            /// 显式确认：改端口会写 config.toml 并重启面板，误改可能把自己锁在外面
+            #[arg(long)]
+            yes: bool,
         },
         /// 修改监听地址；非回环地址默认拒绝，需显式 --yes
         Bind {
@@ -663,7 +666,7 @@ fn run_config(
     action: Option<ConfigAction>,
 ) -> Result<()> {
     match action {
-        Some(ConfigAction::Set { target: ConfigSet::Port { port } }) => do_set_port(cli, os, port),
+        Some(ConfigAction::Set { target: ConfigSet::Port { port, yes } }) => do_set_port(cli, os, port, yes),
         Some(ConfigAction::Set { target: ConfigSet::Bind { addr, yes } }) => do_set_bind(cli, os, &addr, yes),
         None | Some(ConfigAction::Status) => show_panel_status(cli, os),
     }
@@ -703,8 +706,122 @@ fn show_panel_status(cli: &Cli, os: &Arc<dyn panel_os::OsAdapter>) -> Result<()>
     Ok(())
 }
 
-/// 修改监听端口（root 权限；写 config.toml 的 `[server].port` 并重启服务）。
-fn do_set_port(cli: &Cli, os: &Arc<dyn panel_os::OsAdapter>, port: u16) -> Result<()> {
+/// 配置快照前缀与保留份数：改端口/bind 前的唯一回滚锚点。
+const CONFIG_SNAPSHOT_PREFIX: &str = "config.toml.panel.bak-";
+const CONFIG_SNAPSHOT_KEEP: usize = 10;
+
+/// 快照整份 config.toml 到同目录。快照内容含敏感配置，权限收紧到 0600；
+/// 保留最近 10 份，避免反复改端口把目录塞满。
+fn snapshot_config(path: &std::path::Path) -> Result<std::path::PathBuf> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| PanelError::Internal(format!("快照配置读取失败: {e}")))?;
+    let backup = path.with_file_name(format!("{CONFIG_SNAPSHOT_PREFIX}{}", panel_core::now_unix()));
+    // 写原语必须拒绝 src == dst：临时名撞目标会边读边写，产物无限增长。
+    if backup == path {
+        return Err(PanelError::Internal("快照目标与源文件相同，拒绝".into()));
+    }
+    panel_os::fs::write_private(&backup, &bytes, 0o600)?;
+    if let Some(dir) = backup.parent() {
+        panel_os::fs::prune_keep_newest(dir, CONFIG_SNAPSHOT_PREFIX, CONFIG_SNAPSHOT_KEEP);
+    }
+    Ok(backup)
+}
+
+/// 从快照回滚配置：先写同目录临时文件、校验可解析、沿用原权限再 rename。
+fn restore_config_from_snapshot(path: &std::path::Path, backup: &std::path::Path) -> Result<()> {
+    if path == backup {
+        return Err(PanelError::Internal("回滚源与目标相同，拒绝".into()));
+    }
+    let bytes = std::fs::read(backup)
+        .map_err(|e| PanelError::Internal(format!("回滚快照读取失败: {e}")))?;
+    let tmp = path.with_extension("toml.rollback-tmp");
+    std::fs::write(&tmp, &bytes)
+        .map_err(|e| PanelError::Internal(format!("回滚临时文件写入失败: {e}")))?;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    }
+    Config::load(&tmp)?;
+    std::fs::rename(&tmp, path)
+        .map_err(|e| PanelError::Internal(format!("回滚替换配置失败: {e}")))?;
+    Ok(())
+}
+
+/// 探测目标：localhost_only 时只认回环；通配 bind 也走回环；具体地址直连。
+fn reachable_host(bind: &str, localhost_only: bool) -> String {
+    if localhost_only {
+        return "127.0.0.1".into();
+    }
+    match bind {
+        "" | "0.0.0.0" | "::" | "*" => "127.0.0.1".into(),
+        "::1" => "[::1]".into(),
+        other => other.to_string(),
+    }
+}
+
+/// 改后可达性验证：6 秒内连不上就算失败（触发回滚），避免"配置写了、服务没起来、
+/// 自己被锁在外面"却以为成功。
+fn verify_panel_reachable(cfg: &Config) -> Result<()> {
+    use std::net::ToSocketAddrs;
+    let addr = format!("{}:{}", reachable_host(&cfg.server.bind, cfg.server.localhost_only), cfg.server.port);
+    let mut last = String::from("无可用地址");
+    for _ in 0..20 {
+        match addr.to_socket_addrs() {
+            Ok(mut addrs) => {
+                if let Some(sa) = addrs.next() {
+                    match std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_millis(300)) {
+                        Ok(_) => return Ok(()),
+                        Err(e) => last = e.to_string(),
+                    }
+                }
+            }
+            Err(e) => last = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    Err(PanelError::Internal(format!("改后 6 秒内无法连接 {addr}（{last}）")))
+}
+
+/// 改配置后的统一收尾：重启 → 可达性验证 → 任一失败即回滚配置并重新加载。
+/// 未检测到 systemd 单元时无法立即验证，如实说明"下次启动生效"而不是假成功。
+fn apply_network_change(cfgp: &std::path::Path, backup: &std::path::Path) -> Result<()> {
+    match restart_panel_service() {
+        Ok(RestartOutcome::Deferred) => {
+            println!("· 配置已写入；未检测到 systemd 单元，下次启动生效（本次无法验证可达性）");
+            Ok(())
+        }
+        Ok(RestartOutcome::Restarted) => {
+            let cfg = Config::load(cfgp)?;
+            if let Err(e) = verify_panel_reachable(&cfg) {
+                eprintln!("· ⚠ 改后无法连接面板（{e}），正在回滚配置…");
+                return rollback_and_restart(cfgp, backup, &e.to_string());
+            }
+            println!("· 已验证面板在新地址可达");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("· ⚠ 重启面板失败（{e}），正在回滚配置…");
+            rollback_and_restart(cfgp, backup, &e.to_string())
+        }
+    }
+}
+
+/// 回滚配置 + 再重启；两条都成功才算兜住，否则给出可复制的人工救援命令。
+fn rollback_and_restart(cfgp: &std::path::Path, backup: &std::path::Path, why: &str) -> Result<()> {
+    let cfg_rolled_back = restore_config_from_snapshot(cfgp, backup);
+    let svc_restarted = restart_panel_service();
+    match (cfg_rolled_back, svc_restarted) {
+        (Ok(()), Ok(_)) => Err(PanelError::Internal(format!(
+            "{why}；配置已回滚并重新加载，原地址应已恢复"
+        ))),
+        _ => Err(PanelError::Internal(format!(
+            "{why}；⚠ 自动回滚失败！请立即在服务器上执行：sudo cp {} {} && sudo systemctl restart panel",
+            backup.display(), cfgp.display()
+        ))),
+    }
+}
+
+/// 修改监听端口（root 权限；快照 → 写 config.toml → 重启 → 验证可达 → 失败回滚）。
+fn do_set_port(cli: &Cli, os: &Arc<dyn panel_os::OsAdapter>, port: u16, yes: bool) -> Result<()> {
     if !panel_os::fs::is_root() {
         return Err(PanelError::Internal(
             "set-port: 需要 root 权限（写 /etc/forkpanel/config.toml 并重启服务）".into(),
@@ -712,6 +829,14 @@ fn do_set_port(cli: &Cli, os: &Arc<dyn panel_os::OsAdapter>, port: u16) -> Resul
     }
     if port == 0 {
         return Err(PanelError::Validation { field: "port", reason: "端口必须是 1-65535".into() });
+    }
+    if !yes {
+        return Err(PanelError::Validation {
+            field: "port",
+            reason: format!(
+                "拒绝直接改面板端口：{port}\n  改错端口可能把自己锁在面板外。改动前会自动快照 config.toml，改后验证可达性，失败自动回滚。\n  确认请加 --yes：sudo panel config set port {port} --yes",
+            ),
+        });
     }
     let layout0 = build_layout(os, None);
     let cfgp = cli.config.clone().unwrap_or_else(|| layout0.config_dir().join("config.toml"));
@@ -721,9 +846,14 @@ fn do_set_port(cli: &Cli, os: &Arc<dyn panel_os::OsAdapter>, port: u16) -> Resul
             reason: format!("找不到配置文件 {}", cfgp.display()),
         });
     }
-    config::write_server_key(&cfgp, "port", &port.to_string())?;
+    let backup = snapshot_config(&cfgp)?;
+    println!("· 已快照配置到 {}", backup.display());
+    if let Err(e) = config::write_server_key(&cfgp, "port", &port.to_string()) {
+        let _ = restore_config_from_snapshot(&cfgp, &backup);
+        return Err(e);
+    }
     println!("· 端口已改为 {port}");
-    restart_panel_service()
+    apply_network_change(&cfgp, &backup)
 }
 
 /// 修改监听地址（root 权限）。回环地址设 `localhost_only=true`；非回环默认拒绝，需 `--yes`
@@ -751,43 +881,61 @@ fn do_set_bind(cli: &Cli, os: &Arc<dyn panel_os::OsAdapter>, addr: &str, yes: bo
             ),
         });
     }
-    config::write_server_key(&cfgp, "bind", &format!("\"{addr}\""))?;
-    config::write_server_key(&cfgp, "localhost_only", &loopback.to_string())?;
+    let backup = snapshot_config(&cfgp)?;
+    println!("· 已快照配置到 {}", backup.display());
+    let written = config::write_server_key(&cfgp, "bind", &format!("\"{addr}\""))
+        .and_then(|_| config::write_server_key(&cfgp, "localhost_only", &loopback.to_string()));
+    if let Err(e) = written {
+        let _ = restore_config_from_snapshot(&cfgp, &backup);
+        return Err(e);
+    }
     if loopback {
         println!("· 监听地址已改为 {addr}（localhost_only=true）");
     } else {
         println!("· 监听地址已改为 {addr}，并设置 localhost_only=false");
         println!("  ⚠ 已把 root 面板暴露到网络；强烈建议改用 panel expose 接 TLS。");
     }
-    restart_panel_service()
+    apply_network_change(&cfgp, &backup)
 }
 
-/// 写配置后按需重启 panel 服务（systemd 已 enable 才 restart；否则提示下次启动生效）。
-fn restart_panel_service() -> Result<()> {
+/// 重启结果：只有 Restarted 才做可达性验证；Deferred 表示下次启动才生效。
+enum RestartOutcome {
+    Restarted,
+    Deferred,
+}
+
+/// 写配置后按需重启 panel 服务。**失败必须返回 Err**（旧版只 eprintln 并返回 Ok，
+/// 导致上层无法回滚，是"改完把自己锁在外面"的根因）。
+fn restart_panel_service() -> Result<RestartOutcome> {
     // 三处进程调用都走 panel-os 唯一出口（ci/check-layering.sh 规则[1]）。
     let has_systemctl = panel_os::run_sync(panel_os::Bin::Systemctl, &["--version"])
         .map(|o| o.code == Some(0))
         .unwrap_or(false);
     if !has_systemctl {
         println!("· 未检测到 systemd，改动将在下次手动启动生效");
-        return Ok(());
+        return Ok(RestartOutcome::Deferred);
     }
     let enabled = panel_os::run_sync(panel_os::Bin::Systemctl, &["is-enabled", "--quiet", "panel"])
         .map(|o| o.code == Some(0))
         .unwrap_or(false);
     if !enabled {
         println!("· 未检测到 panel 的 systemd 单元，改动将在下次启动生效");
-        return Ok(());
+        return Ok(RestartOutcome::Deferred);
     }
     match panel_os::run_sync(panel_os::Bin::Systemctl, &["restart", "panel"]) {
-        Ok(o) if o.code == Some(0) => println!("· 已重启 panel"),
-        Ok(o) => eprintln!(
-            "· ⚠ 重启失败（退出码 {:?}）：journalctl -u panel -n 50 --no-pager",
-            o.code
-        ),
-        Err(e) => eprintln!("· ⚠ 重启命令执行失败：{e}"),
+        Ok(o) if o.code == Some(0) => {
+            println!("· 已重启 panel");
+            Ok(RestartOutcome::Restarted)
+        }
+        Ok(o) => Err(PanelError::Command {
+            bin: "systemctl".into(),
+            detail: format!("重启 panel 失败（退出码 {:?}）：journalctl -u panel -n 50 --no-pager", o.code),
+        }),
+        Err(e) => Err(PanelError::Command {
+            bin: "systemctl".into(),
+            detail: format!("重启命令执行失败：{e}"),
+        }),
     }
-    Ok(())
 }
 
 /// 交互式面板配置菜单（替代原 forkpanel / fp 壳）。仅在 TTY 下可用。
@@ -795,7 +943,7 @@ fn run_menu(cli: &Cli, os: &Arc<dyn panel_os::OsAdapter>) -> Result<()> {
     if !std::io::stdin().is_terminal() {
         return Err(PanelError::Validation {
             field: "menu",
-            reason: "非交互环境请用 `panel config --status` / `panel config set port N` / `panel config set bind ADDR`".into(),
+            reason: "非交互环境请用 `panel config status` / `panel config set port N --yes` / `panel config set bind ADDR`".into(),
         });
     }
     loop {
@@ -819,7 +967,10 @@ fn run_menu(cli: &Cli, os: &Arc<dyn panel_os::OsAdapter>) -> Result<()> {
                 let p = prompt_line("新端口 [1-65535]：")?;
                 match p.parse::<u16>() {
                     Ok(port) => {
-                        if let Err(e) = do_set_port(cli, os, port) {
+                        let confirm = prompt_line("输入「确认改端口」以写入并重启面板：")?;
+                        if confirm.trim() != "确认改端口" {
+                            eprintln!("panel: 已取消（确认词不匹配）");
+                        } else if let Err(e) = do_set_port(cli, os, port, true) {
                             eprintln!("panel: {e}");
                         }
                     }
@@ -1319,5 +1470,50 @@ mod expose_tests {
             1,
             "serve 在 localhost_only 时必须且只提示一次 `sudo panel expose`，否则小白仍以为能 IP:端口 访问"
         );
+    }
+
+    /// 自身可达性保护：改端口必须快照 + 回滚 + 验证 + 显式确认，四者缺一就会
+    /// 重演"改完把自己踢下线"。判据指向生产段（剔注释与 test 块）。
+    #[test]
+    fn set_port_has_reachability_guard() {
+        let prod = panel_testutil::production_source(include_str!("main.rs"));
+        let start = prod.find("fn do_set_port").expect("do_set_port 必须存在");
+        let end = prod.find("fn do_set_bind").expect("do_set_bind 必须存在");
+        let body = &prod[start..end];
+        assert!(body.contains("snapshot_config("), "改端口前必须快照 config.toml");
+        assert!(body.contains("restore_config_from_snapshot("), "写配置失败必须回滚");
+        assert!(body.contains("apply_network_change("), "改后必须重启+验证可达+失败回滚");
+        assert!(body.contains("yes"), "改端口必须显式 --yes 二次确认");
+    }
+
+    #[test]
+    fn set_bind_has_reachability_guard() {
+        let prod = panel_testutil::production_source(include_str!("main.rs"));
+        let start = prod.find("fn do_set_bind").expect("do_set_bind 必须存在");
+        let end = prod.find("enum RestartOutcome").expect("RestartOutcome 必须存在");
+        let body = &prod[start..end];
+        assert!(body.contains("snapshot_config("), "改 bind 前必须快照 config.toml");
+        assert!(body.contains("restore_config_from_snapshot("), "写配置失败必须回滚");
+        assert!(body.contains("apply_network_change("), "改后必须重启+验证可达+失败回滚");
+    }
+
+    /// 旧版 restart 只 eprintln 后返回 Ok，回滚逻辑永远收不到失败信号。
+    #[test]
+    fn restart_reports_failure_instead_of_swallowing() {
+        let prod = panel_testutil::production_source(include_str!("main.rs"));
+        let start = prod.find("fn restart_panel_service").expect("restart_panel_service 必须存在");
+        let end = prod.find("fn run_menu").expect("run_menu 必须存在");
+        let body = &prod[start..end];
+        assert!(body.contains("RestartOutcome::Restarted"), "真重启必须返回 Restarted 供上层验证");
+        assert!(body.contains("Err(PanelError::Command"), "重启失败必须返回 Err，否则回滚永不触发");
+    }
+
+    #[test]
+    fn reachable_host_selects_loopback_when_local_only() {
+        assert_eq!(super::reachable_host("0.0.0.0", true), "127.0.0.1");
+        assert_eq!(super::reachable_host("0.0.0.0", false), "127.0.0.1");
+        assert_eq!(super::reachable_host("::1", true), "127.0.0.1");
+        assert_eq!(super::reachable_host("::1", false), "[::1]");
+        assert_eq!(super::reachable_host("10.0.0.5", false), "10.0.0.5");
     }
 }

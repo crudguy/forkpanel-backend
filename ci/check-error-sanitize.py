@@ -31,8 +31,11 @@ CRATES = ROOT / "crates"
 # —— cloudflare.rs 5 处（token 查询/zone 查询/TXT 建删/残留清理，detail 走
 # transport_err 只格式化 reqwest 错误、不含响应体）+ ssl.rs 1 处 certbot 失败
 # 回显（已过 sanitize::external_output，白名单含 email 与 token），
-# 另新增 2 处 sanitize 调用）
-TOTAL_PIN = 76
+# 另新增 2 处 sanitize 调用；
+# 2026-11-18 自身可达性保护：main.rs 的 restart_panel_service 重启失败新增 2 个
+# Command 构造点（退出码固定文案 / run_sync 的错误对象），detail 不含外部命令
+# stderr/stdout，无需接线 sanitize）
+TOTAL_PIN = 78
 SANITIZE_PIN = 40
 
 HEAD = re.compile(r"(?:PanelError::)?(Command|ConfigInvalid)\s*\{")

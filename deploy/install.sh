@@ -239,7 +239,7 @@ ForkPanel 已安装（端口 $PORT，默认仅本机可访问）
   面板地址   http://127.0.0.1:$PORT
   引导令牌   journalctl -u panel -n 50 --no-pager
   配置面板   sudo panel            # TTY 下直接进交互菜单；看状态用 panel config status
-  改端口/地址 sudo panel config set port <N>   # 改监听地址用 set bind，非回环需 --yes
+  改端口/地址 sudo panel config set port <N> --yes   # 改监听地址用 set bind，非回环需 --yes；改前自动快照、失败回滚
   公网访问   sudo panel expose -d <域名> -a <出口IP>/32
   忘记口令   sudo panel passwd <user>
   卸载       sudo panel uninstall   # 保留数据与配置
