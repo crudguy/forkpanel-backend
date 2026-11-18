@@ -128,6 +128,10 @@ fn normalize(req: &TplReq) -> Result<Norm, ApiError> {
             rate_per_sec: req.rate_per_sec,
             burst: req.burst,
             conn_max: req.conn_max,
+            // 模板只存"拦截强度"相关的参数：观察模式是**站点当下**的运行意图
+            // （先看日志再决定拦不拦），跟着模板走会把某次的调试状态复制到
+            // 之后所有套用该模板的站点，故此处恒 false。
+            observe: Some(false),
         }),
         None,
     )?

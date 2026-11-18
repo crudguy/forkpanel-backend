@@ -361,9 +361,45 @@ pub(super) fn render_nginx(spec: &SiteSpec) -> String {
         }
     }
 
-    // ── WAF 的 http 级片段（map / limit_req_zone），同样必须排在 server 之前 ──
-    if let Some(w) = &spec.waf {
-        out.push_str(&render_waf_http(&spec.server_names, w));
+    // ── 归因 map（P1-6b/6a），必须排在 server 之前（`map` 只接受 http 上下文）──
+    //
+    // 三个来源合并进同一个变量 `${t}_fw_hit`：
+    //   WAF 规则链 → `${t}_wafhit`；IP ACL → `ip_allow`/`ip_deny`；ACL 优先。
+    // 只在开了独立 access log 时才生成：没有日志就没有读者，纯噪声。
+    // ⚠ 顺序要求：render_waf_http 先跑（它需要知道 ACL 在不在，以决定谁定型
+    //   `${t}_fw_hit`），再跑 render_ip_acl_maps（由它合并两边的标签）。
+    if log_access {
+        // log_format 只允许在 http 上下文（写进 server 块会让 nginx -t 拒绝整份配置）
+        out.push_str(&render_log_format(&spec.server_names));
+        let acl = AclSpec::from_spec(spec);
+        if let Some(w) = &spec.waf {
+            out.push_str(&render_waf_http(&spec.server_names, w, acl.as_ref(), true));
+        }
+        if let Some(acl) = acl.as_ref() {
+            // 没开 WAF 时 WAF 标签恒为空串，ACL 合并的「透传」分支自然为空
+            let prev = if spec.waf.is_some() {
+                // ⚠ `${name}_wafhit` 整体要在花括号内：写成 `${name}_wafhit` 之外的
+                // 形式（如 `"${{{n}}}_wafhit"`）会让 nginx 把 `_wafhit` 当普通文本，
+                // 于是引用了一个不存在的变量 `$panel_example_com` ⇒ `nginx -t`
+                // 报 unknown variable、整份配置加载失败。
+                format!("${{{}_wafhit}}", upstream_name(&spec.server_names))
+            } else {
+                String::new()
+            };
+            out.push_str(&render_ip_acl_maps(&spec.server_names, &prev, acl));
+        } else if spec.waf.is_none() {
+            // 既没 WAF 也没 ACL，但开了独立日志：日志格式里仍引用 `${t}_fw_hit`，
+            // 不定义会让 nginx 打日志时报 "unknown variable"→ 站点 500 且整份
+            // access log 写不出来。这里给它一个恒为空的锚，语义就是「无命中」。
+            out.push_str(&format!(
+                "map $host ${}_fw_hit {{ default \"\"; }}\n",
+                upstream_name(&spec.server_names)
+            ));
+        }
+    } else if let Some(w) = &spec.waf {
+        // 未开日志：仍要生成规则 map（server 级 if 要读 `${t}_ua` 等 0/1 变量），
+        // 但不生成归因链。
+        out.push_str(&render_waf_http(&spec.server_names, w, None, false));
     }
 
     // ── www ↔ 非 www 跳转（020）：独立 server 块 + return 301 ──
@@ -456,12 +492,13 @@ pub(super) fn render_nginx(spec: &SiteSpec) -> String {
     // 定义在 http 作用域、全机共享——两个站点都叫 `wafhit` 会让 nginx 报
     // `duplicate log_format` 并拒绝加载**整份**配置（一个站点出错，全机站点一起挂）。
     // 故复用站点净化名（与 upstream/zone 名同源，天然唯一）。
+    // ⚠⚠ **`log_format` 必须留在 http 级**，这里只能写 `access_log`。
+    //   nginx 只允许 `log_format` 出现在 http 上下文；写进 server 块会让
+    //   `nginx -t` 直接 emerg 拒绝**整份**配置（"log_format directive is not
+    //   allowed here"）——一个站点开日志，全机所有站点一起加载失败。该定义在
+    //   render_http_log_format 里，与 WAF 的 map 一同前置于 server 块。
     if let Some(al) = &spec.access_log {
-        // `upstream_name` 已带 `panel_` 前缀（如 panel_example_com），此处只追加用途后缀。
         let fmt = format!("{}_hit", upstream_name(&spec.server_names));
-        out.push_str(&format!(
-            "log_format {fmt} '$remote_addr - $remote_user [$time_local] \"$request\" '\n                     '$status $body_bytes_sent \"$http_referer\" \"$http_user_agent\" \"$fw_hit\"';\n"
-        ));
         out.push_str(&format!("    access_log {} {fmt};\n", al.display()));
     }
     if let Some(el) = &spec.error_log {
@@ -477,20 +514,18 @@ pub(super) fn render_nginx(spec: &SiteSpec) -> String {
     if let Some(list) = &spec.ip_allow {
         if !list.is_empty() {
             out.push_str("    # ── 访问控制：白名单（名单外一律拒绝）──\n");
-            // 命中归因标记（P1-6b）：仅当站点开了 access log 才有意义——威胁日志
-            // 从日志里读不到标记就退化为「只知道被拒、不知哪条规则拒的」。
-            if log_access {
-                out.push_str("    set $fw_hit \"ip_allow\";\n");
-            }
+            // 归因（P1-6b）：标签只能落在**被拒**的请求上。这里刻意不用
+            // `set $fw_hit "ip_allow";`——`set` 在 server 级是无条件执行的，名单内
+            // 的正常请求也会被打上 ip_allow 标签并写进日志（实测确认），采集器
+            // 随即把它们当成「拦截事件」，威胁日志里全是假告警。
+            // 由 http 级 map 依据「地址是否在名单内」精确判定（见 render_ip_acl_maps）。
             for ip in list { out.push_str(&format!("    allow {ip};\n")); }
             out.push_str("    deny all;\n\n");
         }
     } else if let Some(list) = &spec.ip_deny {
         if !list.is_empty() {
             out.push_str("    # ── 访问控制：黑名单 ──\n");
-            if log_access {
-                out.push_str("    set $fw_hit \"ip_deny\";\n");
-            }
+            // 同上：`deny <ip>` 只对名单内地址生效，标签也必须只落在这部分请求上。
             for ip in list { out.push_str(&format!("    deny {ip};\n")); }
             out.push('\n');
         }
@@ -510,14 +545,14 @@ pub(super) fn render_nginx(spec: &SiteSpec) -> String {
     //（重定向站点的证书由**目标站**的站点负责）。
     if !matches!(spec.kind, SiteKind::Redirect { .. }) {
         out.push_str(&render_acme_challenge_location(&spec.root));
+        // 敏感文件拒绝**不受观察模式影响**（见 render_deny_locations 的说明）
         out.push_str(&render_deny_locations(
             spec.waf.as_ref().is_some_and(|w| w.profile == WafProfile::Strict),
-            log_access,
         ));
     }
 
     if let Some(w) = &spec.waf {
-        out.push_str(&render_waf_server(&spec.server_names, w, log_access));
+        out.push_str(&render_waf_server(&spec.server_names, w));
     }
 
     match &spec.kind {
@@ -877,7 +912,12 @@ pub(super) fn route_ws_var(server_names: &[String], prefix: &str) -> String {
 /// 为什么必须排在 server 之前：nginx 只在 http 上下文接受这些指令。放错位置
 /// 不是"这个站点不生效"，而是 `nginx -t` 拒绝整份配置——**一个站点写错会让
 /// 全机所有站点一起加载失败**。
-pub(super) fn render_waf_http(server_names: &[String], w: &WafSpec) -> String {
+pub(super) fn render_waf_http(
+    server_names: &[String],
+    w: &WafSpec,
+    acl: Option<&AclSpec<'_>>,
+    emit_hit: bool,
+) -> String {
     let t = waf_token(server_names);
     let strict = w.profile == WafProfile::Strict;
     let mut o = String::new();
@@ -904,6 +944,112 @@ pub(super) fn render_waf_http(server_names: &[String], w: &WafSpec) -> String {
         ));
     }
 
+    // ── 归因链（P1-6b/6a）：把「命中哪条规则」收敛成单个变量 ──
+    //
+    // 只在开了独立 access log 时生成（`emit_hit`）：没有日志就没有读者，
+    // 整条链纯属噪声。
+    //
+    // 每条规则一跳：输入是上一步产出的标签，输出「已有标签就保持，否则本规则命中则
+    // 打本规则的标签」。第一条命中的规则胜出，与原来一排 `if ... return` 的先后顺序
+    // 语义一致（原来靠 if 的书写顺序决定谁先返回）。
+    //
+    // ⚠ 链上的值域**只有**「空串（未命中）」和「标签」两种，绝不允许出现 0/1：
+    //   规则 map 输出的是 0/1，所以第一跳负责把 0/1 规整成 ""/标签，往后各跳只看
+    //   「非空/空」。若让中间跳保留 0/1，那么「前几条都没命中」时默认分支会把 "1"
+    //   一路传下去，第四跳就会把任何请求都误判成命中路径穿越。
+    //
+    // ⚠ 为什么把判定搬进 map、而不像 P1-6b 那样在每条 `return` 前 `set`：
+    //   观察模式要求「命中也放行，但日志里仍看得出命中了什么」。`set` 只能写在
+    //   `if {}` 里，而 `if` 一旦不带 `return` 就退化成 rewrite 阶段的条件赋值，
+    //   还会引入 nginx 经典的 if/location 陷阱。让 `$fw_hit` 成为**惰性变量**之后，
+    //   serve 阶段只剩一件可替换的事：拦，还是只记。nginx 的 map 在被引用时才展开，
+    //   所以未命中的请求不会为这条链付出解析开销。
+    //
+    // 每跳一句：`map <上一步> <本步> { default "<上一步>"; "1" "<标签>"; }`
+    // 第一跳的输入是 0/1 规则变量，故 default 为 ""（未命中）；其余各跳的输入已是
+    // 「标签或空串」，default 透传即可——传下来的空串继续交给下一跳判本规则。
+    let mut step = |line: String| {
+        if emit_hit { o.push_str(&line); }
+    };
+    step(format!("map ${t}_ua ${t}_hit1 {{ default \"\"; \"1\" \"waf_ua\"; }}\n"));
+    step(format!("map ${t}_hit1 ${t}_hit2 {{ default \"${{{t}_hit1}}\"; \"1\" \"waf_sqli\"; }}\n"));
+    step(format!("map ${t}_hit2 ${t}_hit3 {{ default \"${{{t}_hit2}}\"; \"1\" \"waf_xss\"; }}\n"));
+    step(format!("map ${t}_hit3 ${t}_hit4 {{ default \"${{{t}_hit3}}\"; \"1\" \"waf_trav\"; }}\n"));
+    // 敏感文件四条：**直接内联正则**，与 render_deny_locations 共用同一份常量。
+    //
+    // ⚠ 源变量必须是 `$uri`（与拦截侧一致），不能用 `$request_uri`：后者含查询串
+    //   且不解码，`/[.]` 与扩展名锚定都会失准——实测表现为「页面返回 403，
+    //   日志里归因却是空」。
+    //
+    // 每条的形态：`map $uri <var> { default ""; "~<re>" "<标签>"; }`，只回答
+    // 「这条规则命中了吗」；再由下面一跳把它并进主链。不用「map 里直接引用另一个
+    // 变量」的写法——map 的右值默认是**字面量**，要引用变量必须整串写成 `$var`，
+    // 混进 "" 或其它字符就会被当成普通文本（静默输出变量名而非值）。
+    let _ = &mut step;
+    // 生成「这条规则命中了吗」的 map + 并入主链的两个 map（返回文本，由 step 落盘）
+    let rule = |from: &str, to: &str, tag: &str, re: &str, ci: bool| -> (String, String) {
+        let m = if ci { "~*" } else { "~" };
+        (
+            format!("map $uri ${t}_deny_{to} {{ default \"\"; \"{m}{re}\" \"{tag}\"; }}\n"),
+            // 并进主链：已有标签就保持，否则用本条规则的结果
+            format!("map ${t}_{from} ${t}_{to} {{ default \"${{{t}_{from}}}\"; \"\" \"${{{t}_deny_{to}}}\"; }}\n"),
+        )
+    };
+    // 主链此时在 hit4。「default 上一步 + 空串时取 deny 结果」正是「WAF 优先」的
+    // 语义：WAF 命中的请求 hit4 已非空，敏感文件结果被忽略；反之才取敏感文件标签。
+    for (from, to, tag, re, ci) in [
+        ("hit4", "hit5", "waf_hidden", DENY_HIDDEN, false),
+        ("hit5", "hit6", "waf_repo", DENY_REPO, true),
+        ("hit6", "hit7", "waf_backup", DENY_BACKUP, true),
+    ] {
+        let (a, b) = rule(from, to, tag, re, ci);
+        step(a);
+        step(b);
+    }
+    if strict {
+        let (a, b) = rule("hit7", "hit8", "waf_path", DENY_DIRS, true);
+        step(a);
+        step(b);
+    } else {
+        // 基础档没有目录类规则：把主链原样带到 hit8，保持后续编号一致
+        step(format!("map ${t}_hit7 ${t}_hit8 {{ default \"${{{t}_hit7}}\"; }}\n"));
+    }
+    if strict {
+        // 严格档多两条：空 UA、非常见方法。⚠ 它们的输入是 0/1 规则变量
+        // （`${t}_noua` / `${t}_method`），不是标签，故必须像敏感文件那样先单独
+        // 出一个「命中了吗」的 map 再并入——直接写 `"1" "waf_noua"` 永远不命中，
+        // 因为进入这一跳的已经是「标签或空串」，不会再有 "1"。
+        let extra = |from: &str, to: &str, tag: &str, src: &str| -> (String, String) {
+            (
+                format!("map {src} ${t}_x_{to} {{ default \"\"; \"1\" \"{tag}\"; }}\n"),
+                format!("map ${t}_{from} ${t}_{to} {{ default \"${{{t}_{from}}}\"; \"\" \"${{{t}_x_{to}}}\"; }}\n"),
+            )
+        };
+        let (a, b) = extra("hit8", "hit9", "waf_noua", &format!("${t}_noua"));
+        step(a);
+        step(b);
+        let (a, b) = extra("hit9", "hit10", "waf_method", &format!("${t}_method"));
+        step(a);
+        step(b);
+        step(format!("map ${t}_hit10 ${t}_wafhit {{ default \"${{{t}_hit10}}\"; }}\n"));
+    } else {
+        step(format!("map ${t}_hit8 ${t}_wafhit {{ default \"${{{t}_hit8}}\"; }}\n"));
+    }
+    // ⚠ 最终变量名按站点派生，**不能**用全局的 `$fw_hit`：`map` 定义在 http 作用域，
+    // 同机多站点各写一份同名 map，后加载的会静默覆盖前面的（`nginx -t` 不报错），
+    // 于是 A 站请求被 B 站的规则链求值、两边日志归因全错。`${t}_fw_hit` 里的 t 由
+    // 站点净化名派生，天然唯一。
+    //
+    // 若站点配了 IP ACL，`${t}_fw_hit` 由 render_ip_acl_maps 生成（它把 WAF 结果
+    // `${t}_wafhit` 与 ACL 判定合并）；没配 ACL 时才在这里定型。
+    //
+    // ⚠ 定型与 `acl` 无关、只由 `emit_hit` 决定：没开 access log 时整条归因链都
+    //   不该生成（没有读者），若仍定型 `${t}_fw_hit`，配置里就多出一条永远没人读
+    //   的 map——`nginx -t` 不报错，但它会让人误以为归因在工作。
+    if emit_hit && acl.is_none() {
+        o.push_str(&format!("map ${t}_wafhit ${t}_fw_hit {{ default \"${{{t}_wafhit}}\"; }}\n"));
+    }
+
     if let Some(r) = w.rate_per_sec {
         // 10m 共享内存约记住 16 万个 IP。rate 必须 ≥1——nginx 会拒绝 rate=0r/s。
         o.push_str(&format!("limit_req_zone $binary_remote_addr zone={t}_rl:10m rate={r}r/s;\n"));
@@ -921,41 +1067,110 @@ pub(super) fn render_waf_http(server_names: &[String], w: &WafSpec) -> String {
     o
 }
 
+/// 站点的 access log 格式定义（http 级）。
+///
+/// ⚠ **`log_format` 只能出现在 http 上下文**。写进 server 块会让 `nginx -t`
+/// 以 `"log_format" directive is not allowed here` 直接 emerg，拒绝加载**整份**
+/// 配置——一个站点开了独立日志，全机所有站点一起挂。这是实际踩过的坑：单测只
+/// 断言「输出里有这段字符串」，不看它在 server 块内还是外，于是测试全绿而
+/// 真机配置加载失败。
+///
+/// 格式名 / 归因变量名都按站点净化名派生：`log_format` 是全机共享的定义，
+/// 两个站点重名会让 nginx 报 duplicate（同样整份配置挂掉）。
+pub(super) fn render_log_format(server_names: &[String]) -> String {
+    let base = upstream_name(server_names);
+    format!(
+        "log_format {base}_hit '$remote_addr - $remote_user [$time_local] \"$request\" '\n                   '$status $body_bytes_sent \"$http_referer\" \"$http_user_agent\" \"${base}_fw_hit\"';\n"
+    )
+}
+
+/// 站点的 IP ACL 视图（仅渲染归因 map 时用到）。
+/// 借用原字段，避免为了传参而复制两份名单。
+pub(super) struct AclSpec<'a> {
+    pub allow: Option<&'a [String]>,
+    pub deny: Option<&'a [String]>,
+}
+
+impl<'a> AclSpec<'a> {
+    /// 从站点配置里取非空的 ACL；两种模式都没配时返回 `None`。
+    /// 白名单优先：`ip_allow` 非空时 `ip_deny` 被忽略（与渲染处同一条互斥规则）。
+    pub fn from_spec(spec: &'a SiteSpec) -> Option<Self> {
+        let allow = spec.ip_allow.as_deref().filter(|l| !l.is_empty());
+        if allow.is_some() {
+            return Some(Self { allow, deny: None });
+        }
+        let deny = spec.ip_deny.as_deref().filter(|l| !l.is_empty());
+        deny.map(|d| Self { allow: None, deny: Some(d) })
+    }
+}
+
+/// IP ACL 的**归因 map**（P1-6b）。
+///
+/// 为什么不能像最初那样写 `set $fw_hit "ip_allow";`：`set` 在 server 级是无条件
+/// 执行的——白名单里**被放行**的正常请求也会被标记成 `ip_allow` 并写进 access log，
+/// 采集器随即把它当拦截事件，威胁日志变成一堆假告警（实测确认：允许的请求返回
+/// 404，日志里照样是 `hit="ip_allow"`）。归因必须**只落在被拒的请求**上。
+///
+/// 语义与 nginx 的 `allow/deny` 严格对齐：
+/// - 白名单模式：默认标签 `ip_allow`（名单外＝被拒），名单内清零
+/// - 黑名单模式：默认空，名单内打 `ip_deny`
+///
+/// `prev` 是 WAF 链算出的标签：ACL 优先，WAF 标签只在 ACL 未命中时透传。
+pub(super) fn render_ip_acl_maps(server_names: &[String], prev: &str, acl: &AclSpec<'_>) -> String {
+    let t = waf_token(server_names);
+    let mut o = String::new();
+    o.push_str(&format!(
+        "# ── IP 访问控制归因（{}）──\n",
+        if acl.allow.is_some() { "白名单" } else { "黑名单" }
+    ));
+    let var = format!("${t}_aclhit");
+    if let Some(list) = acl.allow {
+        o.push_str(&format!("map $remote_addr {var} {{\n    default \"ip_allow\";\n"));
+        for ip in list { o.push_str(&format!("    \"{}\" \"\";\n", ip.trim())); }
+        o.push_str("}\n");
+    } else if let Some(list) = acl.deny {
+        o.push_str(&format!("map $remote_addr {var} {{\n    default \"\";\n"));
+        for ip in list { o.push_str(&format!("    \"{}\" \"ip_deny\";\n", ip.trim())); }
+        o.push_str("}\n");
+    }
+    // 合并：ACL 判定出标签时用它，否则透传 WAF 的结果
+    o.push_str(&format!(
+        "map {var} ${t}_fw_hit {{ default \"{prev}\"; \"ip_allow\" \"ip_allow\"; \"ip_deny\" \"ip_deny\"; }}\n"
+    ));
+    o
+}
+
 /// WAF 的 **server 级**片段（拦截判定 + 限速 + 隐藏文件拒绝）。
 ///
-/// `log_access`：站点是否产出独立 access log。为真时每条 `return` 前先
-/// `set $fw_hit "<规则>"`，采集器就能从日志里读出「是哪条规则拦的」——
-/// 否则 access log 里全是同色 403，威胁日志只能显示状态码（见 027 迁移的
-/// 「不做规则级归因」边界说明，本改动正是把那条边界补上）。
-pub(super) fn render_waf_server(server_names: &[String], w: &WafSpec, log_access: bool) -> String {
+/// 归因（`$fw_hit`）不再写在这里：它是 http 级 `map` 链惰性算出来的（见
+/// `render_waf_http`），因此**不依赖 access log 是否开启**——没开独立日志时
+/// 变量只是没人读，不会产生任何配置副作用。
+///
+/// ⚠ `observe == true` 时本函数**一条 `return` 都不生成**：命中只体现在日志里，
+/// 请求照常放行。但限速 / 并发连接上限仍然生效——那两条是资源边界，不是"拦截
+/// 规则"，放开它们等于给自己开 DoS 口子。
+pub(super) fn render_waf_server(server_names: &[String], w: &WafSpec) -> String {
     let t = waf_token(server_names);
     let strict = w.profile == WafProfile::Strict;
     let mut o = String::new();
 
-    o.push_str("\n    # ── WAF 拦截（命中即拒）──\n");
-    // 规则名与采集器的 `rule_label()`（panel-api routes/waf_events.rs）一一对应；
-    // 改这里必须同步改那边，跨 crate 的 `every_emitted_hit_tag_is_mapped` 单测会
-    // 扫描本文件的全部 `hit("<tag>")` 调用点位，缺一条即红。
-    let hit = |name: &str| -> String {
-        if log_access {
-            format!("    set $fw_hit \"{name}\";\n")
-        } else {
-            String::new()
+    if w.observe {
+        o.push_str("\n    # ── WAF 观察模式：命中只记日志，不拦截 ──\n");
+        // 即使不拦，也要让 `$fw_hit` 被求值——nginx 的 map 是惰性的，只定义不引用
+        // 就永远不会计算，日志里读到的却是这个变量（变量被 log_format 引用时会
+        // 求值，但显式 `set` 一份更容易在读配置时确认"这条链真的接上了"）。
+        // 代价：每条请求多一次 set，可忽略。
+        o.push_str("    set $fw_observe \"1\";\n");
+    } else {
+        o.push_str("\n    # ── WAF 拦截（命中即拒）──\n");
+        o.push_str(&format!("    if (${t}_ua)     {{ return 403; }}\n"));
+        o.push_str(&format!("    if (${t}_sqli)   {{ return 403; }}\n"));
+        o.push_str(&format!("    if (${t}_xss)    {{ return 403; }}\n"));
+        o.push_str(&format!("    if (${t}_trav)   {{ return 403; }}\n"));
+        if strict {
+            o.push_str(&format!("    if (${t}_noua)   {{ return 403; }}\n"));
+            o.push_str(&format!("    if (${t}_method) {{ return 405; }}\n"));
         }
-    };
-    o.push_str(&hit("waf_ua"));
-    o.push_str(&format!("    if (${t}_ua)   {{ return 403; }}\n"));
-    o.push_str(&hit("waf_sqli"));
-    o.push_str(&format!("    if (${t}_sqli) {{ return 403; }}\n"));
-    o.push_str(&hit("waf_xss"));
-    o.push_str(&format!("    if (${t}_xss)  {{ return 403; }}\n"));
-    o.push_str(&hit("waf_trav"));
-    o.push_str(&format!("    if (${t}_trav) {{ return 403; }}\n"));
-    if strict {
-        o.push_str(&hit("waf_noua"));
-        o.push_str(&format!("    if (${t}_noua)   {{ return 403; }}\n"));
-        o.push_str(&hit("waf_method"));
-        o.push_str(&format!("    if (${t}_method) {{ return 405; }}\n"));
     }
     if let Some(_r) = w.rate_per_sec {
         o.push_str(&format!("    limit_req zone={t}_rl burst={} nodelay;\n", w.burst));
@@ -966,6 +1181,20 @@ pub(super) fn render_waf_server(server_names: &[String], w: &WafSpec, log_access
 
     o
 }
+
+/// 敏感文件拒绝的**四条正则**（唯一事实源）。
+///
+/// 既用于 server 级 `if`（真正拦截），也用于 http 级 `map`（归因链）——
+/// 两边共用同一份字符串，避免「改了拦截规则忘了改归因」：那种漂移是静默的，
+/// 日志里明明被拒却显示"未归因"，排查时极难定位到是哪个环节漏了。
+///
+/// ⚠ 一律作用于 **`$uri`**（已解码、不含查询串），不是 `$request_uri`：
+/// 扩展名锚定 `$` 才对得上，否则 `/a.sql?x=1` 会漏。归因 map 必须用同一个变量，
+/// 否则会出现「拦了却归因为空」或「拦了却归因成别的规则」。
+pub(super) const DENY_HIDDEN: &str = "/[.](?!well-known/)";
+pub(super) const DENY_REPO: &str = "/[.](git|svn|hg)(/|$)";
+pub(super) const DENY_BACKUP: &str = "[.](sql|bak|old|orig|swp|save|tar|gz|tgz|zip|7z|rar)$";
+pub(super) const DENY_DIRS: &str = "^/(config|conf|configs|logs?|backup|backups|dumps?|db|database)(/|$)";
 
 /// 敏感文件拒绝规则。**默认站点就有，不依赖 WAF**。
 ///
@@ -979,17 +1208,13 @@ pub(super) fn render_waf_server(server_names: &[String], w: &WafSpec, log_access
 ///
 /// `strict` 仅在 WAF 严格档追加「目录类」规则：默认档只挡文件（误杀面极小），
 /// 目录名匹配面大（`logs` / `backup` 这类名字在真实项目里很常见），故归严格档。
-pub(super) fn render_deny_locations(strict: bool, log_access: bool) -> String {
+pub(super) fn render_deny_locations(strict: bool) -> String {
     let mut o = String::new();
     o.push_str("\n    # ── 敏感文件拒绝（默认生效，无需开启任何防护）──\n");
-    // 归因标记：`waf_hidden` / `waf_repo` / `waf_backup` / `waf_path` 对应下面四条规则。
-    let hit = |name: &str| -> String {
-        if log_access {
-            format!("    set $fw_hit \"{name}\";\n")
-        } else {
-            String::new()
-        }
-    };
+    // ⚠ 本段**不受 WAF 观察模式影响**：`.env` / `*.sql` / `.git` 一旦能被下载走就是
+    // 确定的信息泄露，不存在"先观察几天"的余地——放行等于把凭据敞开。观察模式只
+    // 作用于 WAF 关键词规则（可能有误杀的那部分）。归因标签（waf_hidden 等）由
+    // http 级 map 链给出，这里不必 set。
     // ⚠⚠ **必须用 server 级 `if`，不能用 `location ~` 正则**——这是本项目踩过的
     // 一个真坑（多路由上线后 `/.env` 直接 200 下载走源码）：
     //   nginx 的 location 优先级是「`=` > 前缀 `^~` > 正则 > 普通前缀」，
@@ -1009,18 +1234,14 @@ pub(super) fn render_deny_locations(strict: bool, log_access: bool) -> String {
     //   （`.` 前面是字母而非 `/`）。
     //   `(?!)` 是 PCRE 否定前瞻：放行 `/.well-known/`（ACME http-01 挑战文件落在这里，
     //   一刀切会把证书签发/续期打死，且症状是「证书莫名过期」，与本规则毫无字面关联）。
-    o.push_str(&hit("waf_hidden"));
-    o.push_str("    if ($uri ~ \"/[.](?!well-known/)\") { return 403; }\n");
+    o.push_str(&format!("    if ($uri ~ \"{DENY_HIDDEN}\") {{ return 403; }}\n"));
     // 版本库目录：同样**不加 `^` 锚点**，覆盖任意层级（`/x/.git/config` 也拦）。
     // 上一条 `"/[.]"` 已能拦 `/.git/…`，但拦不住 `/x/.git/…`，故这条针对目录名。
-    o.push_str(&hit("waf_repo"));
-    o.push_str("    if ($uri ~* \"/[.](git|svn|hg)(/|$)\") { return 403; }\n");
+    o.push_str(&format!("    if ($uri ~* \"{DENY_REPO}\") {{ return 403; }}\n"));
     // 备份与编辑器残留：正常站点不需要对外提供这些
-    o.push_str(&hit("waf_backup"));
-    o.push_str("    if ($uri ~* \"[.](sql|bak|old|orig|swp|save|tar|gz|tgz|zip|7z|rar)$\") { return 403; }\n");
+    o.push_str(&format!("    if ($uri ~* \"{DENY_BACKUP}\") {{ return 403; }}\n"));
     if strict {
-        o.push_str(&hit("waf_path"));
-        o.push_str("    if ($uri ~* \"^/(config|conf|configs|logs?|backup|backups|dumps?|db|database)(/|$)\") { return 403; }\n");
+        o.push_str(&format!("    if ($uri ~* \"{DENY_DIRS}\") {{ return 403; }}\n"));
     }
     o
 }

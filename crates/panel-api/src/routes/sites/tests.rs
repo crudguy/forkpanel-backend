@@ -146,6 +146,7 @@
             waf_rate: None,
             waf_burst: Some(0),
             waf_conn_max: None,
+            waf_observe: 0,
             upstreams_json: None,
             fpm: None,
             spa: 0,
@@ -256,18 +257,18 @@
     #[test]
     fn fingerprint_is_separator_safe() {
         // 分隔符回归：没有 \u{1f} 时 ("a","bc") 与 ("ab","c") 会撞同一指纹 → 漏报
-        let a = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None, false, None, None, None, None, "[]", None, "");
-        let b = deploy_fingerprint("ab", "c", "/r", "static", false, None, None, None, None, false, None, None, None, None, "[]", None, "");
+        let a = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None, false, None, None, None, None, false, "[]", None, "");
+        let b = deploy_fingerprint("ab", "c", "/r", "static", false, None, None, None, None, false, None, None, None, None, false, "[]", None, "");
         assert_ne!(a, b, "字段边界必须由分隔符保护");
         // 自定义片段（019）参与指纹：只差它一处也必须产生不同指纹
         // ——否则改了 custom_conf「未同步」不会亮，等于坏了 017 的核心承诺。
-        let c = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None, false, None, None, None, None, "[]", Some("add_header X-A 1;"), "");
+        let c = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None, false, None, None, None, None, false, "[]", Some("add_header X-A 1;"), "");
         assert_ne!(a, c, "custom_conf 必须进入指纹");
-        let d = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None, false, None, None, None, None, "[]", Some("add_header X-A 2;"), "");
+        let d = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None, false, None, None, None, None, false, "[]", Some("add_header X-A 2;"), "");
         assert_ne!(c, d, "custom_conf 内容变化必须反映到指纹");
         // 高级配置（020）同理：www 跳转 / TLS 档位 / 伪静态都会改变渲染结果，
         // 漏进指纹 = 改了它们「未同步」不亮（与 custom_conf 同款静默分叉）。
-        let e = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None, false, None, None, None, None, "[]", None, r#"{"www":"to_www"}"#);
+        let e = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None, false, None, None, None, None, false, "[]", None, r#"{"www":"to_www"}"#);
         assert_ne!(a, e, "高级配置必须进入指纹");
     }
 
@@ -275,10 +276,85 @@
     fn fingerprint_includes_conn_limit() {
         // 连接数上限会改变渲染输出，必须进指纹：否则改了它「未同步」不亮。
         let base = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None,
-                                      false, None, None, None, None, "[]", None, "");
+                                      false, None, None, None, None, false, "[]", None, "");
         let with_conn = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None,
-                                           false, None, None, None, Some(32), "[]", None, "");
+                                           false, None, None, None, Some(32), false, "[]", None, "");
         assert_ne!(base, with_conn, "waf_conn_max 必须参与指纹");
+    }
+
+    #[test]
+    fn fingerprint_includes_waf_observe() {
+        // 观察模式直接决定 server 块里有没有 `return 403`——两种渲染结果天差地别。
+        // 漏进指纹的后果最坏：用户从「拦截」切到「观察」，配置其实没重发，
+        // 而 UI 因为指纹一致而在报告「已同步」，等于谎报当前在拦。
+        let base = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None,
+                                      true, Some("basic"), None, Some(0), None, false, "[]", None, "");
+        let observe = deploy_fingerprint("a", "bc", "/r", "static", false, None, None, None, None,
+                                          true, Some("basic"), None, Some(0), None, true, "[]", None, "");
+        assert_ne!(base, observe, "waf_observe 必须参与指纹");
+    }
+
+    #[test]
+    fn build_waf_keeps_observe_when_omitted() {
+        // 接口是 PATCH 语义：省掉的字段一律沿用当前值。observe 若在省略时
+        // 默认成 false，用户只改一个限速数字就会把「只记不拦」静默换成「直接拦」——
+        // 而这恰恰是观察模式存在的前提（先看日志再决定开不开拦截）。
+        let cur = panel_os::WafSpec {
+            profile: panel_os::WafProfile::Basic,
+            rate_per_sec: None,
+            burst: 0,
+            conn_max: None,
+            observe: true,
+        };
+        let req = WafReq {
+            enabled: true,
+            profile: None,
+            rate_per_sec: None,
+            burst: None,
+            conn_max: None,
+            observe: None,      // 没提
+        };
+        let out = build_waf(Some(&req), Some(&cur)).unwrap().unwrap();
+        assert!(out.observe, "省略 observe 必须沿用当前值，不能默认关掉");
+
+        // 显式 false 才是真关。
+        let req_off = WafReq { observe: Some(false), ..req };
+        let out_off = build_waf(Some(&req_off), Some(&cur)).unwrap().unwrap();
+        assert!(!out_off.observe, "显式 observe=false 必须生效");
+
+        // 首次开启（没有当前值）默认不观察：默认值不该替用户决定放宽防护。
+        let req_new = WafReq {
+            enabled: true,
+            profile: None,
+            rate_per_sec: None,
+            burst: None,
+            conn_max: None,
+            observe: None,
+        };
+        let fresh = build_waf(Some(&req_new), None).unwrap().unwrap();
+        assert!(!fresh.observe, "无历史值时默认应为拦截模式");
+    }
+
+    #[test]
+    fn build_waf_disables_observe_when_turned_off() {
+        // 关掉 WAF 时返回 None（站点级 WAF 配置被抹掉）。这里钉住语义：
+        // 重新开启后不会带着上次的观察模式——与 rate/burst/conn_max 同款处置。
+        let cur = panel_os::WafSpec {
+            profile: panel_os::WafProfile::Basic,
+            rate_per_sec: Some(10),
+            burst: 20,
+            conn_max: Some(8),
+            observe: true,
+        };
+        let req = WafReq {
+            enabled: false,
+            profile: None,
+            rate_per_sec: None,
+            burst: None,
+            conn_max: None,
+            observe: None,
+        };
+        assert!(build_waf(Some(&req), Some(&cur)).unwrap().is_none());
     }
 
     #[test]

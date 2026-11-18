@@ -1,11 +1,11 @@
     use super::*;
 
     fn req(enabled: bool, profile: Option<&str>, rate: Option<u32>, burst: Option<u32>) -> WafReq {
-        WafReq { enabled, profile: profile.map(str::to_string), rate_per_sec: rate, burst, conn_max: None }
+        WafReq { enabled, profile: profile.map(str::to_string), rate_per_sec: rate, burst, conn_max: None, observe: None }
     }
 
     fn spec(profile: panel_os::WafProfile, rate: Option<u32>, burst: u32) -> panel_os::WafSpec {
-        panel_os::WafSpec { profile, rate_per_sec: rate, burst, conn_max: None }
+        panel_os::WafSpec { profile, rate_per_sec: rate, burst, conn_max: None, observe: false }
     }
 
     /// 缺省必须**保留**而不是关闭：否则任何不知道 `waf` 字段的调用方
@@ -39,7 +39,7 @@
     fn conn_max_is_independent_of_rate_and_bounded() {
         let with_conn = build_waf(
             Some(&WafReq {
-                enabled: true, profile: None, rate_per_sec: None, burst: None, conn_max: Some(20),
+                enabled: true, profile: None, rate_per_sec: None, burst: None, conn_max: Some(20), observe: None,
             }),
             None,
         ).unwrap().unwrap();
@@ -48,7 +48,7 @@
 
         let zero = build_waf(
             Some(&WafReq {
-                enabled: true, profile: None, rate_per_sec: None, burst: None, conn_max: Some(0),
+                enabled: true, profile: None, rate_per_sec: None, burst: None, conn_max: Some(0), observe: None,
             }),
             None,
         ).unwrap().unwrap();
@@ -57,7 +57,7 @@
         let bad = build_waf(
             Some(&WafReq {
                 enabled: true, profile: None, rate_per_sec: None, burst: None,
-                conn_max: Some(WAF_CONN_MAX + 1),
+                conn_max: Some(WAF_CONN_MAX + 1), observe: None,
             }),
             None,
         );

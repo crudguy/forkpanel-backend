@@ -18,6 +18,8 @@ pub(super) struct RawSite {
     pub(super) waf_burst: Option<i64>,
     /// 每 IP 并发连接数上限（031 迁移）；NULL / 0 = 不限
     pub(super) waf_conn_max: Option<i64>,
+    /// WAF 观察模式（034 迁移）：1 = 命中只记日志不拦截
+    pub(super) waf_observe: i32,
     /// JSON 数组：反代后端列表（static 站点为 NULL）
     pub(super) upstreams_json: Option<String>,
     /// php-fpm 目标（unix:/path.sock | host:port）；非 php 站点为 NULL
@@ -99,6 +101,7 @@ impl RawSite {
             rate_per_sec: self.waf_rate.and_then(|n| u32::try_from(n).ok()).filter(|n| *n > 0),
             burst: self.waf_burst.and_then(|n| u32::try_from(n).ok()).unwrap_or(0),
             conn_max: self.waf_conn_max.and_then(|n| u32::try_from(n).ok()).filter(|n| *n > 0),
+            observe: self.waf_observe != 0,
         })
     }
 }
@@ -127,6 +130,8 @@ pub struct SiteOut {
     pub waf_burst: Option<i64>,
     /// 每 IP 并发连接数上限；null = 不限
     pub waf_conn_max: Option<i64>,
+    /// WAF 观察模式：true = 命中只记日志、不拦截
+    pub waf_observe: bool,
     /// 反代后端列表（kind=proxy 时存在）
     pub upstreams: Option<Vec<String>>,
     /// php-fpm 目标（kind=php 时存在）
@@ -414,6 +419,9 @@ pub(super) fn deploy_fingerprint(
     waf_rate: Option<i64>,
     waf_burst: Option<i64>,
     waf_conn_max: Option<i64>,
+    // 观察模式（P1-6a）：直接改变渲染出的 server 块（有无 `return 403`），
+    // 漏进指纹 = 切了观察模式后「未同步」不亮、旧拦截配置被当成"已是最新"。
+    waf_observe: bool,
     routes_json: &str,
     custom_conf: Option<&str>,
     // 高级配置（020）打包成的 JSON：9 个字段合成一段，避免参数表继续膨胀；
@@ -436,6 +444,7 @@ pub(super) fn deploy_fingerprint(
     push(&mut s, &waf_rate.map(|c| c.to_string()).unwrap_or_default());
     push(&mut s, &waf_burst.map(|c| c.to_string()).unwrap_or_default());
     push(&mut s, &waf_conn_max.map(|c| c.to_string()).unwrap_or_default());
+    push(&mut s, if waf_observe { "1" } else { "0" });
     push(&mut s, routes_json);
     // 自定义片段（019）参与渲染 → 必须进指纹：否则改了它「未同步」不会亮。
     push(&mut s, custom_conf.unwrap_or(""));
@@ -593,6 +602,7 @@ pub(super) fn fingerprint_of(r: &RawSite) -> String {
         r.waf_rate,
         r.waf_burst,
         r.waf_conn_max,
+        r.waf_observe != 0,
         &r.routes_json,
         r.custom_conf.as_deref(),
         &advanced_json_of(r),
@@ -623,6 +633,7 @@ pub(super) fn to_out(r: &RawSite) -> SiteOut {
         waf_rate_per_sec: r.waf_rate,
         waf_burst: r.waf_burst,
         waf_conn_max: r.waf_conn_max,
+        waf_observe: r.waf_observe != 0,
         upstreams: r.upstreams_json.as_deref().and_then(|s| serde_json::from_str(s).ok()),
         fpm: r.fpm.clone(),
         spa: r.spa != 0,
@@ -676,11 +687,12 @@ pub(super) const SITE_SELECT: &str = "s.id, s.name, s.domains, s.root, s.kind, s
        s.ip_allow, s.ip_deny, s.auth_basic, s.auth_user, s.lb_policy,
        s.proxy_connect_timeout, s.proxy_send_timeout, s.proxy_read_timeout,
        s.log_access, s.log_error, s.log_error_level, s.remark, s.last_applied_at,
-       s.waf_conn_max";
+       s.waf_conn_max, s.waf_observe";
 // ⚠ 列序与下方 `r.get(N)` 一一对应。加列**一律追加到末尾**（routes_json = 18、
 //   manual_conf = 19、conf_snapshot = 20、custom_conf = 21、www_redirect = 22 …
 //   rewrite_custom = 29、last_ver_hash = 30、ip_allow = 31 … log_error_level = 42、
-//   remark = 43、last_applied_at = 44、waf_conn_max = 45），这样既有索引全部不变——
+//   remark = 43、last_applied_at = 44、waf_conn_max = 45、waf_observe = 46），
+//   这样既有索引全部不变——
 //   中途插列会让每个 r.get 静默错位（本项目已踩过一次：tls_count 子查询列把后续
 //   整体后移一位，apply 运行时才报 `Invalid column type`）。
 //   三个 fetch 函数中的 get(18…30) 必须同步（last_ver_hash 是子查询派生列）。
@@ -750,6 +762,7 @@ pub(super) async fn fetch_all(state: &Shared) -> Result<Vec<RawSite>> {
                     remark: r.get(43)?,
                     last_applied_at: r.get(44)?,
                     waf_conn_max: r.get(45)?,
+                    waf_observe: r.get(46)?,
                     })
                 })
                 .map_err(db_err)?;
@@ -817,6 +830,7 @@ pub(super) async fn fetch_one(state: &Shared, id: i64) -> Result<Option<RawSite>
                     remark: r.get(43)?,
                     last_applied_at: r.get(44)?,
                     waf_conn_max: r.get(45)?,
+                    waf_observe: r.get(46)?,
                 })
             })
             .map_err(db_err)?;
@@ -881,6 +895,7 @@ pub(super) async fn fetch_one_by_name(state: &Shared, name: &str) -> Result<Opti
                     remark: r.get(43)?,
                     last_applied_at: r.get(44)?,
                     waf_conn_max: r.get(45)?,
+                    waf_observe: r.get(46)?,
                 })
             })
             .map_err(db_err)?;

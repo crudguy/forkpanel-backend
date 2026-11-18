@@ -479,31 +479,44 @@ mod tests {
     /// 两处字符串分别住在 panel-os / panel-api，改一边漏另一边会**静默**退化成
     /// 「未知标记」——这条测试是唯一的交叉校验点。
     ///
-    /// 扫描口径：渲染器有两种写法——① 字面量 `set $fw_hit "ip_allow";`；
-    /// ② 辅助闭包 `hit("waf_ua")`（闭包里 format! 展开）。**不能直接扫
-    /// `set $fw_hit \"`**：那会把闭包自身的 `format!("…{name}…")` 当成标记名。
+    /// 扫描口径跟着渲染器当前的写法走：归因链现在由**一串 `map`** 表达，
+    /// 标记一律出现在 map 的**值位置**（`"1" "waf_ua"` / `"waf_hidden"`），
+    /// 而不是早先的 `set $fw_hit "ip_allow"` 或 `hit("…")` 闭包。所以这里扫的是
+    /// 所有 `"waf_{…}"` / `"ip_{…}"` 形态的字符串字面量。
+    ///
+    /// **不要改成"扫所有双引号串再看像不像标记"**：map 的键位置有大量 `"1"`、`""`，
+    /// 而值位置还有 `"${t}_hit1"` 这类变量引用占位；判据只认具体的标记字面量，
+    /// 才不会把占位符当成漏归因的标记。
     #[test]
     fn every_emitted_hit_tag_is_mapped() {
         let src = panel_testutil::production_source(
             include_str!("../../../panel-os/src/linux/providers/webserver.rs"),
         );
         let mut tags: Vec<String> = Vec::new();
-
-        // ① 字面量写法
-        for cap in src.split("set $fw_hit \\\"").skip(1) {
-            let tag: String = cap.chars().take_while(|c| *c != '"' && *c != '\\').collect();
-            if !tag.is_empty() && !tag.starts_with('{') {
-                tags.push(tag);
+        // 渲染器里标记有两种源码写法，必须都认：
+        //   ① `format!("… \"waf_ua\" …")`  —— 在格式串里，引号**被转义**
+        //   ② `("hit4", "hit5", "waf_hidden", …)` —— 作普通字符串实参，引号**裸写**
+        // 只按其中一种扫都会漏一半（实测：只扫 ① 得 6 个，只扫裸串得 7 个）。
+        let mut scan = |open: &str, close: &str| {
+            let mut rest = src.as_str();
+            while let Some(p) = rest.find(open) {
+                let start = p + open.len();
+                let Some(rel_end) = rest[start..].find(close) else { break };
+                let end = start + rel_end;
+                let lit = &rest[start..end];
+                // 标记的形态：`waf_xxx` / `ip_xxx`，且不带变量插值占位。
+                // `ip_hash` 是负载均衡策略名、不是归因标记，排除掉。
+                if (lit.starts_with("waf_") || lit.starts_with("ip_"))
+                    && !lit.contains('{')
+                    && lit != "ip_hash"
+                {
+                    tags.push(lit.to_string());
+                }
+                rest = &rest[end + close.len()..];
             }
-        }
-        // ② 闭包调用写法（源码文本是 `hit("waf_sqli")`——单个反斜杠都没有，
-        // 所以分隔串就是 `hit("` 这五个字符；写成 `hit(\"` 会一个都匹配不到）
-        for cap in src.split("hit(\"").skip(1) {
-            let tag: String = cap.chars().take_while(|c| *c != '"' && *c != '\\').collect();
-            if !tag.is_empty() {
-                tags.push(tag);
-            }
-        }
+        };
+        scan("\\\"", "\\\"");   // ① 格式串内（转义引号）
+        scan("\"", "\"");       // ② 普通字符串实参
 
         tags.sort();
         tags.dedup();

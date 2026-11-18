@@ -224,7 +224,7 @@ use super::*;
 
     fn spec_waf(profile: WafProfile, rate: Option<u32>, burst: u32) -> SiteSpec {
         let mut s = spec_static();
-        s.waf = Some(WafSpec { profile, rate_per_sec: rate, burst, conn_max: None });
+        s.waf = Some(WafSpec { profile, rate_per_sec: rate, burst, conn_max: None, observe: false });
         s
     }
 
@@ -354,63 +354,216 @@ use super::*;
         s.access_log = Some(std::path::PathBuf::from("/var/log/forkpanel/a.access.log"));
         let out = render_nginx(&s);
 
-        // 六条 WAF 规则 + 四条敏感文件规则（严格档多一条 waf_path）+ 黑名单未配置
+        // 十条规则的归因标签都必须在 map 链里出现（严格档）
         for tag in [
             "waf_ua", "waf_sqli", "waf_xss", "waf_trav", "waf_noua", "waf_method",
             "waf_hidden", "waf_repo", "waf_backup", "waf_path",
         ] {
-            assert!(
-                out.contains(&format!("set $fw_hit \"{tag}\";")),
-                "缺少归因标记 {tag}：\n{out}"
-            );
+            assert!(out.contains(&format!("\"{tag}\"")), "缺少归因标签 {tag}：\n{out}");
         }
-        // 日志格式带 $fw_hit，且名字按站点唯一（conf.d 下多站同文件作用域，重名即整份配置挂掉）
-        assert!(out.contains("\"$http_user_agent\" \"$fw_hit\"'"), "日志格式缺 $fw_hit：\n{out}");
+        // 日志格式引用按站点派生的归因变量，且格式名按站点唯一
+        //（conf.d 下多站同文件作用域，log_format 重名会让 nginx 拒绝整份配置）
         assert!(
-            out.contains("log_format panel_example_com_hit"),
-            "log_format 名须按站点净化且唯一：\n{out}"
+            out.contains("\"$http_user_agent\" \"$panel_example_com_fw_hit\"'"),
+            "日志格式须引用本站点的归因变量：\n{out}"
         );
+        assert!(out.contains("log_format panel_example_com_hit"), "{out}");
         assert!(
             out.contains("access_log /var/log/forkpanel/a.access.log panel_example_com_hit;"),
             "access_log 须引用本站点专属格式：\n{out}"
         );
 
-        // 没开 access log：不写 set / 不写 log_format（死变量会污染配置且无意义）
+        // 没开 access log：不写归因变量 / log_format（死变量会污染配置且无意义）
         let off = render_nginx(&spec_waf(WafProfile::Strict, None, 0));
-        assert!(!off.contains("$fw_hit"), "未开日志就不该有归因标记：\n{off}");
+        assert!(!off.contains("_fw_hit"), "未开日志就不该有归因变量：\n{off}");
         assert!(!off.contains("log_format"), "未开日志就不该定义 log_format：\n{off}");
+        // 但规则 map 必须还在——server 级的 if 要读这些 0/1 变量
+        assert!(off.contains("map $http_user_agent $panel_example_com_ua"), "{off}");
     }
 
-    /// ⚠ 归因标记必须**紧贴在该条的 return 之前**。
+    /// ⚠ 归因链必须是「标签 → 标签」的链，不能把 0/1 混进去。
     ///
-    /// 只断言「`set $fw_hit "x";` 存在」是恒绿的空判据：把 set 写到 return 之后
-    /// （或者写到整个 WAF 块末尾）同样能通过，但日志里读到的 `$fw_hit` 恒为空串
-    /// ——威胁日志全显示「未归因」，功能等于没做，而测试与编译器都毫无反应。
-    /// 这里按「set 行 + 紧跟的 return 行」成对匹配，把顺序钉死。
+    /// 这是整条链最容易写错的地方：规则 map 输出 0/1，中间跳如果 default 直接透传
+    /// `$上一步`，那么「前几条都没命中」时传下来的就是 "1"，后面的跳会把**任何**
+    /// 请求都判成命中（比如全站都被标成路径穿越）。判据：除第一跳外，每一跳的
+    /// default 都必须引用上一跳的变量，且取值表中不得出现 0/1 作为输出。
     #[test]
-    fn waf_hit_tags_immediately_precede_their_return() {
+    fn waf_hit_chain_only_propagates_tags() {
         let mut s = spec_waf(WafProfile::Strict, None, 0);
         s.access_log = Some(std::path::PathBuf::from("/var/log/forkpanel/a.access.log"));
         let out = render_nginx(&s);
-        let lines: Vec<&str> = out.lines().collect();
 
-        let mut checked = 0usize;
-        for (i, line) in lines.iter().enumerate() {
-            let t = line.trim();
-            if !t.starts_with("set $fw_hit ") {
-                continue;
-            }
-            let tag = t.trim_start_matches("set $fw_hit ").trim_end_matches(';').trim_matches('"');
-            // 下一条非空行必须就是 return
-            let next = lines[i + 1..].iter().map(|l| l.trim()).find(|l| !l.is_empty());
-            let Some(next) = next else { panic!("标记 {tag} 后没有任何指令") };
-            assert!(
-                next.starts_with("if (") && next.contains("return "),
-                "标记 {tag} 的下一条指令不是 if…return（顺序反了，日志里恒为空串）：\n  set → {next}"
+        // 第一跳：输入 0/1，输出 ""/标签 —— default 必须是空串
+        assert!(
+            out.contains("map $panel_example_com_ua $panel_example_com_hit1 { default \"\"; \"1\" \"waf_ua\"; }"),
+            "首跳必须把 0/1 规整成空串/标签：\n{out}"
+        );
+        // 后续每一跳：default 必须透传上一跳（`$` 引用），输出只能是标签
+        let hops = [
+            ("hit1", "hit2", "waf_sqli"),
+            ("hit2", "hit3", "waf_xss"),
+            ("hit3", "hit4", "waf_trav"),
+        ];
+        for (from, to, tag) in hops {
+            let expect = format!(
+                "map $panel_example_com_{from} $panel_example_com_{to} {{ default \"${{panel_example_com_{from}}}\"; \"1\" \"{tag}\"; }}"
             );
-            checked += 1;
+            assert!(out.contains(&expect), "第 {from}→{to} 跳不符合「透传标签」语义，期望：{expect}\n实际：\n{out}");
         }
-        assert!(checked >= 10, "应检查到至少 10 个归因标记，实际 {checked}：\n{out}");
+        // 敏感文件四条不是 0/1 规则变量，而是「$uri 正则单独成 map + 空串时取它」：
+        // 兜住「前序命中就保持、都为空才取本规则」的语义，且输入里不会再出现 "1"。
+        for (from, to, tag) in [
+            ("hit4", "hit5", "waf_hidden"),
+            ("hit5", "hit6", "waf_repo"),
+            ("hit6", "hit7", "waf_backup"),
+            ("hit7", "hit8", "waf_path"),
+        ] {
+            let rule_map = format!("map $uri $panel_example_com_deny_{to}");
+            assert!(out.contains(&rule_map), "缺少 {tag} 的规则 map：{rule_map}\n{out}");
+            let merge = format!(
+                "map $panel_example_com_{from} $panel_example_com_{to} {{ default \"${{panel_example_com_{from}}}\"; \"\" \"${{panel_example_com_deny_{to}}}\"; }}"
+            );
+            assert!(out.contains(&merge), "{from}→{to} 的合并跳不符合「有标签就保持」语义，期望：{merge}\n{out}");
+        }
+    }
+
+    /// 观察模式（P1-6a）：命中只记账，不生成任何拦截 return。
+    ///
+    /// 判据不是「有 set $fw_observe」，而是**真的没有 return**——把 if…return 留着
+    /// 只加个标记变量，观察模式就成了摆设（用户以为在观察，实际还在拦）。
+    /// 同时确认反方向：关掉 observe 后 return 必须回来，否则就是"永久观察"
+    /// （防护静默失效，比误杀更难发现）。
+    #[test]
+    fn observe_mode_emits_no_blocking_return() {
+        let mut s = spec_waf(WafProfile::Strict, None, 0);
+        s.access_log = Some(std::path::PathBuf::from("/var/log/forkpanel/a.access.log"));
+        s.waf.as_mut().expect("waf").observe = true;
+        let out = render_nginx(&s);
+
+        // WAF 关键词规则一条都不能拦（敏感文件拒绝不算在内，它不受观察模式影响）
+        for tag in ["waf_ua", "waf_sqli", "waf_xss", "waf_trav", "waf_noua", "waf_method"] {
+            assert!(
+                !out.contains(&format!("\"1\" \"{tag}\"; }}\n    if (")),
+                "观察模式下 {tag} 仍然直接跟着 return：\n{out}"
+            );
+        }
+        for v in ["ua", "sqli", "xss", "trav", "noua", "method"] {
+            assert!(
+                !out.lines().any(|l| {
+                    let t = l.trim();
+                    t.starts_with(&format!("if (${v})")) || t.starts_with(&format!("if ($panel_example_com_{v})"))
+                }),
+                "观察模式下不该生成 {v} 的拦截 if：\n{out}"
+            );
+        }
+        // 归因链仍在（观察模式的意义就是"记下来"），日志变量仍被引用
+        assert!(out.contains("map $panel_example_com_hit9 $panel_example_com_hit10"), "观察模式仍须保留归因链：\n{out}");
+        assert!(out.contains("\"$panel_example_com_fw_hit\"'"), "观察模式仍须把归因写进日志：\n{out}");
+
+        // 反方向：关掉 observe，拦截必须回来
+        let mut off = spec_waf(WafProfile::Strict, None, 0);
+        off.access_log = Some(std::path::PathBuf::from("/var/log/forkpanel/a.access.log"));
+        let blocking = render_nginx(&off);
+        assert!(
+            blocking.lines().any(|l| {
+                let t = l.trim();
+                t.starts_with("if ($panel_example_com_ua") && t.contains("return 403")
+            }),
+            "关掉观察模式后必须恢复拦截：\n{blocking}"
+        );
+    }
+
+    /// 敏感文件拒绝**不受**观察模式影响：`.env` / `*.sql` / `.git` 一旦能被下载走
+    /// 就是确定的信息泄露，不存在"先观察几天"的余地。
+    #[test]
+    fn observe_mode_does_not_exempt_sensitive_files() {
+        let mut s = spec_waf(WafProfile::Strict, None, 0);
+        s.waf.as_mut().expect("waf").observe = true;
+        let out = render_nginx(&s);
+        for needle in [
+            r#"if ($uri ~ "/[.](?!well-known/)") { return 403; }"#,
+            r#"if ($uri ~* "/[.](git|svn|hg)(/|$)") { return 403; }"#,
+        ] {
+            assert!(out.contains(needle), "观察模式不该放过敏感文件拒绝：{needle}\n{out}");
+        }
+    }
+
+    /// ⚠⚠ `log_format` 必须在 **http 上下文**，不能写进 server 块。
+    ///
+    /// nginx 只允许 `log_format` 出现在 http 上下文；写进 server 块会让 `nginx -t`
+    /// 直接 emerg（`"log_format" directive is not allowed here`），拒绝加载**整份**
+    /// 配置——一个站点开日志，全机所有站点一起挂。这条曾真实漏网：只断言「输出里
+    /// 有这段字符串」时测试全绿，而真机配置加载失败（判据必须看它在块内还是块外）。
+    #[test]
+    fn log_format_lives_outside_any_server_block() {
+        let mut s = spec_waf(WafProfile::Strict, None, 0);
+        s.access_log = Some(std::path::PathBuf::from("/var/log/forkpanel/a.access.log"));
+        let out = render_nginx(&s);
+
+        // 逐行跟踪花括号深度：深度 0 才是 http 级
+        let mut depth = 0i32;
+        let mut found: Option<i32> = None;
+        for line in out.lines() {
+            let t = line.trim();
+            if t.starts_with("log_format ") {
+                found = Some(depth);
+            }
+            depth += t.matches('{').count() as i32;
+            depth -= t.matches('}').count() as i32;
+        }
+        assert_eq!(found, Some(0), "log_format 必须定义在 http 上下文（深度 0），实际深度 {found:?}：\n{out}");
+    }
+
+    /// ⚠ 敏感文件归因链必须作用于 `$uri`，与拦截侧同源。
+    ///
+    /// 拦截规则用 `$uri`（已解码、不含查询串），若 map 用 `$request_uri`，两者对
+    /// `/a.sql?x=1` 这类路径判定不同 → 页面返回 403 但日志归因为空。实测踩过。
+    #[test]
+    fn deny_attribution_uses_the_same_uri_variable_as_the_block() {
+        let mut s = spec_waf(WafProfile::Strict, None, 0);
+        s.access_log = Some(std::path::PathBuf::from("/var/log/forkpanel/a.access.log"));
+        let out = render_nginx(&s);
+        for (tag, re) in [
+            ("waf_hidden", DENY_HIDDEN),
+            ("waf_repo", DENY_REPO),
+            ("waf_backup", DENY_BACKUP),
+        ] {
+            // 归因 map 的键是同一份正则，源变量必须是 $uri
+            let want = "map $uri $panel_example_com_deny_";
+            assert!(out.contains(want), "敏感文件归因 map 必须以 $uri 为源：\n{out}");
+            assert!(
+                out.lines().any(|l| l.contains(re) && l.starts_with("map $uri")),
+                "归因 map 里的 {tag} 正则必须与拦截侧一致（{re}）：\n{out}"
+            );
+        }
+        assert!(
+            !out.contains("map $request_uri $panel_example_com_deny_"),
+            "敏感文件归因不得用 $request_uri（与拦截侧不同源，归因会失准）：\n{out}"
+        );
+    }
+
+    /// ⚠ IP ACL 的归因**绝不能用无条件 `set`**。
+    ///
+    /// `set` 在 server 级对每个请求都执行——白名单里被放行的正常请求也会被打上
+    /// `ip_allow` 并写进日志，采集器随即当成拦截事件，威胁日志全是假告警。
+    /// 实测确认过（放行的请求 200，日志里照样 hit="ip_allow"）。
+    #[test]
+    fn ip_acl_attribution_is_conditional_not_a_bare_set() {
+        let mut s = spec_static();
+        s.ip_allow = Some(vec!["10.0.0.5".into()]);
+        s.access_log = Some(std::path::PathBuf::from("/var/log/forkpanel/a.access.log"));
+        let out = render_nginx(&s);
+        assert!(
+            !out.contains("set $panel_example_com_fw_hit \"ip_allow\""),
+            "ACL 归因不得用无条件 set（会把放行的请求也标成被拒）：\n{out}"
+        );
+        // 必须由 map 依据「地址是否在名单内」判定：名单外默认 ip_allow，名单内为空
+        assert!(
+            out.contains("map $remote_addr $panel_example_com_aclhit"),
+            "ACL 归因须由 map 按地址判定：\n{out}"
+        );
+        assert!(out.contains("default \"ip_allow\";"), "白名单模式的默认标签应是 ip_allow：\n{out}");
+        assert!(out.contains("\"10.0.0.5\" \"\";"), "名单内地址必须被清成空标签：\n{out}");
     }
 
     /// 两个站点各自开日志时，log_format 名必须不同——重名会让 nginx 拒绝加载
@@ -426,6 +579,7 @@ use super::*;
             rate_per_sec: None,
             burst: 0,
             conn_max: None,
+            observe: false,
         });
         b.access_log = Some(std::path::PathBuf::from("/var/log/forkpanel/b.access.log"));
         let (oa, ob) = (render_nginx(&a), render_nginx(&b));
@@ -436,17 +590,27 @@ use super::*;
     #[test]
     fn waf_basic_vs_strict_differences() {
         let basic = render_nginx(&spec_waf(WafProfile::Basic, None, 0));
-        assert!(basic.contains("if ($panel_example_com_ua)   { return 403; }"), "{basic}");
-        assert!(basic.contains("if ($panel_example_com_sqli) { return 403; }"), "{basic}");
-        assert!(basic.contains("if ($panel_example_com_xss)  { return 403; }"), "{basic}");
-        assert!(basic.contains("if ($panel_example_com_trav) { return 403; }"), "{basic}");
+        // 对齐方式随 `$变量名` 长度自适应（变量名按站点派生，长度会变），
+        // 故只钉「条件 + 动作」，不钉中间的空格数。
+        let has_ret = |out: &str, var: &str, code: &str| -> bool {
+            out.lines().any(|l| {
+                let t = l.trim();
+                t.starts_with(&format!("if (${var})")) && t.ends_with(&format!("{{ return {code}; }}"))
+            })
+        };
+        for v in ["ua", "sqli", "xss", "trav"] {
+            assert!(has_ret(&basic, &format!("panel_example_com_{v}"), "403"), "基础档缺 {v} 拦截：\n{basic}");
+        }
         assert!(!basic.contains("_method"), "基础档不该限制请求方法：\n{basic}");
         assert!(!basic.contains("_noua"), "基础档不该拦空 UA：\n{basic}");
         assert!(!basic.contains("limit_req zone="), "未配置限速就不该出现 limit_req：\n{basic}");
 
         let strict = render_nginx(&spec_waf(WafProfile::Strict, None, 0));
-        assert!(strict.contains("_noua)   { return 403; }"), "{strict}");
-        assert!(strict.contains("_method) { return 405; }"), "非白名单方法应 405 而非 403：\n{strict}");
+        assert!(has_ret(&strict, "panel_example_com_noua", "403"), "严格档缺空 UA 拦截：\n{strict}");
+        assert!(
+            has_ret(&strict, "panel_example_com_method", "405"),
+            "非白名单方法应 405 而非 403：\n{strict}"
+        );
         // 敏感文件拒绝已**默认生效**（不再随 WAF 档位变化）：两档都该有
         // 隐藏文件 + 版本库 + 备份/残留三类 deny。
         for (name, out) in [("basic", &basic), ("strict", &strict)] {
@@ -601,7 +765,7 @@ use super::*;
                     // 权限失败，而这与配置内容无关。测试改用高位端口：WAF 片段与端口
                     // 无关，结论不受影响。
                     s.listen = vec![18080, 18443];
-                    s.waf = Some(WafSpec { profile, rate_per_sec: rate, burst: 20, conn_max: None });
+                    s.waf = Some(WafSpec { profile, rate_per_sec: rate, burst: 20, conn_max: None, observe: false });
                     specs.push(s);
                 }
             }
