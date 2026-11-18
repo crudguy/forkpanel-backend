@@ -385,7 +385,11 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/users/{id}", patch(users::patch).delete(users::delete))
         .route("/api/v1/roles", get(roles::list).post(roles::create))
         .route("/api/v1/roles/{name}", patch(roles::patch).delete(roles::remove))
-        .route("/api/v1/audit", get(audit::list));
+        .route("/api/v1/audit", get(audit::list))
+        // 导出：与列表共用筛选条件，返回 CSV 附件（取证/合规用途）
+        .route("/api/v1/audit/export", get(audit::export))
+        // 哈希链校验：一键确认审计记录未被改动（P2-11）
+        .route("/api/v1/audit/verify", get(audit::verify));
 
     // ── SSE：多频道 ──
     let sse_r = Router::new()
@@ -515,18 +519,40 @@ pub async fn audit_actor(state: &AppState, actor: &str, ip: &str, action: &'stat
         while end > 0 && !detail.is_char_boundary(end) { end -= 1; }
         detail[..end].to_string()
     } else { detail };
+    // 主密钥决定能否落哈希链：`None`（master.key 未加载）时仍照常写审计——
+    // 宁可"可写但暂不可校验"，也不要因为缺密钥把审计整条丢掉。
+    // 代价是那段时间的记录 `hash` 为 NULL，校验端点会如实把它们算作未上链。
+    let key = state.master_key;
+    let ts = crate::now_unix();
     // 审计写失败必须留痕：静默丢弃会让"操作已生效但无记录"，事后无法发现。
     // 用 eprintln! 而非 tracing：panel-api 未引入日志设施（依赖预算纪律：零新依赖）。
     // stderr 在 systemd 部署下进 journald（journalctl -u panel），非 systemd 部署
     // 打到启动终端；**不会**重定向进 /var/log/forkpanel 下的文件。
     if let Err(e) = state.db.exec(move |conn| {
-        conn.execute(
-            "INSERT INTO audit_log(ts, actor, actor_ip, action, target, result, detail_json)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![
-                crate::now_unix(), actor, ip, action, target, result, detail
-            ],
-        ).map_err(|e| panel_core::PanelError::Database(e.to_string()))?;
+        match key {
+            Some(k) => {
+                // 链式写入：读链尾、插入、推进锚点必须在同一事务里（见 audit_chain::append）。
+                let mut row = crate::audit_chain::AuditRow {
+                    id: 0,
+                    ts,
+                    actor,
+                    actor_ip: Some(ip),
+                    action: action.to_string(),
+                    target: Some(target),
+                    result: result.to_string(),
+                    detail_json: Some(detail),
+                };
+                crate::audit_chain::append(conn, &k, &mut row)
+                    .map_err(|e| panel_core::PanelError::Database(e.to_string()))?;
+            }
+            None => {
+                conn.execute(
+                    "INSERT INTO audit_log(ts, actor, actor_ip, action, target, result, detail_json)
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![ts, actor, ip, action, target, result, detail],
+                ).map_err(|e| panel_core::PanelError::Database(e.to_string()))?;
+            }
+        }
         Ok(panel_db::WriteAck { rows_changed: 1 })
     }).await {
         eprintln!("[WARN] 审计日志写入失败（操作已生效但无留痕） action={action} error={e}");
@@ -665,5 +691,42 @@ mod tests {
                  多了＝新端点接了门或写法变了——先确认口径，再改这里。"
             );
         }
+    }
+
+    /// **接线守卫**：审计导出端点必须存在，且只以 GET 暴露。
+    ///
+    /// 存在理由：导出端点如果被误删，不会影响 `list`，前端按钮点了才发现 404；
+    /// 若被改成 POST，浏览器无法直接下载、前端也得跟着改。两种都不会被任何
+    /// 行为测试察觉（现有测试只覆盖 `list`），所以钉在源码上。
+    #[test]
+    fn audit_export_route_is_wired_as_get() {
+        let prod = crate::test_support::production_source(include_str!("routes.rs"));
+        assert_eq!(
+            prod.matches(r#".route("/api/v1/audit/export", get(audit::export))"#).count(),
+            1,
+            "审计导出路由必须恰好挂载一次"
+        );
+    }
+
+    /// 导出与列表必须共用同一套筛选与同一权限：两者一旦分叉，
+    /// 「看到的」与「导出的」就会不一致，而审计场景下这是取证事故。
+    #[test]
+    fn audit_export_reuses_list_filters_and_permission() {
+        let src = crate::test_support::production_source(include_str!("routes/audit.rs"));
+        // 导出 handler 内必须调 Filters::parse（不是另写一份参数解析）
+        let exp = src
+            .find("pub async fn export(")
+            .expect("export handler 必须存在");
+        let body = &src[exp..];
+        let end = body.find("\n}\n").map(|i| i + 2).unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains("Filters::parse(&q)"),
+            "导出必须复用 Filters::parse，不能另写一份筛选口径"
+        );
+        assert!(
+            body.contains("perm::AUDIT_VIEW"),
+            "导出必须要求 AUDIT_VIEW，否则等于把审计材料对无权限角色敞开"
+        );
     }
 }

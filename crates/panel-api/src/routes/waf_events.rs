@@ -162,13 +162,30 @@ fn parse_tz(tz: &str) -> Option<i64> {
 }
 
 /// 民用历 → 天数（Howard Hinnant `days_from_civil`），无依赖。
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+///
+/// 跨模块复用于审计导出（`audit.rs` 把 unix 秒格式化成可读时间）：
+/// 同一份历法换算只应存在一处，否则某个边缘日期会在两个出口给出不同结果。
+pub(crate) fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = (if y >= 0 { y } else { y - 399 }) / 400;
     let yoe = y - era * 400;                                        // [0, 399]
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;                // [0, 146096]
     era * 146097 + doe - 719468
+}
+
+/// 天数 → 民用历 `(y, m, d)`（Howard Hinnant `civil_from_days`，`days_from_civil` 的逆）。
+pub(crate) fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = z - era * 146097;                                            // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;       // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);                     // [0, 365]
+    let mp = (5 * doy + 2) / 153;                                          // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1;                                  // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };                         // [1, 12]
+    ((if m <= 2 { y + 1 } else { y }), m, d)
 }
 
 /// nginx `time_local`：`dd/Mon/yyyy:HH:MM:SS +ZZZZ`（本地时区）→ unix 秒（UTC）。

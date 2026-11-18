@@ -52,6 +52,7 @@ pub mod sse;
 pub mod totp;
 pub mod webhook;
 pub mod alert;
+pub mod audit_chain;
 
 use error::{ApiError, ApiResult};
 use panel_core::{crypto::MasterKey, CapabilityMap, Tier};

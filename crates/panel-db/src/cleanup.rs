@@ -20,7 +20,7 @@
 
 use crate::{Result, WriteAck};
 use panel_core::{PanelError, Tier};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 /// 按预估删除行数选择批次大小。**这是实测结论，不要凭直觉改。**
 pub fn batch_for(estimated_rows: u64) -> Option<usize> {
@@ -115,6 +115,55 @@ pub fn prune_audit(conn: &Connection, retention_days: u32, max_rows: u64) -> Res
         }
     }
     Ok(WriteAck { rows_changed: changed })
+}
+
+/// 修剪后把哈希链锚点收敛到当前链尾（035）。
+///
+/// 为什么必须做：锚点记着"链曾经到过哪一条"。正常修剪删的是**最老**的行，
+/// 锚点指向最新那条，所以一般不受影响——那次直连比较会直接短路返回，不写库。
+///
+/// 真正的风险在另一个方向：行数上限逻辑是「删最老的」，但如果某次修剪把
+/// 链尾那条也扫掉了（例如 max_rows 被设得极小、或时间窗跨过全部记录），
+/// 锚点就成了指向不存在行的悬空引用，`verify()` 会永远报"尾部被截断"，
+/// 把**正常的保留期清理**误报成攻击。运维一旦习惯了"这个红是误报"，
+/// 真正被篡改时也会被忽略——假红比没检测更毒。
+///
+/// 因此策略是「只在链尾与锚点不一致时收敛」。修剪导致的收敛是可解释的：
+/// 收敛前库内最后一条链上记录本身能完整校验通过；被攻击者截断则不会。
+pub fn rebase_audit_anchor(conn: &Connection) -> Result<()> {
+    let head: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT id, hash FROM audit_log WHERE hash IS NOT NULL ORDER BY id DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| PanelError::Database(format!("rebase anchor: read head: {e}")))?;
+
+    // 空链（新库/从未上链）什么都不做
+    let Some((id, hash)) = head else { return Ok(()) };
+
+    let cur: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT last_id, last_hash FROM audit_hash_anchor WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| PanelError::Database(format!("rebase anchor: read anchor: {e}")))?;
+
+    // 一致就不写：省一次写，也让"锚点被改过"这件事保持可辨识
+    if matches!(&cur, Some((cid, ch)) if *cid == id && ch == &hash) {
+        return Ok(());
+    }
+
+    conn.execute(
+        "INSERT INTO audit_hash_anchor(id, last_id, last_hash, updated_ts) VALUES(1, ?1, ?2, ?3)
+         ON CONFLICT(id) DO UPDATE SET last_id = ?1, last_hash = ?2, updated_ts = ?3",
+        rusqlite::params![id, hash, now_unix()],
+    )
+    .map_err(|e| PanelError::Database(format!("rebase anchor: write: {e}")))?;
+    Ok(())
 }
 
 /// 清理通知。
@@ -377,5 +426,113 @@ mod tests {
         }
         let msg = c.execute("DELETE FROM audit_log", []).unwrap_err().to_string();
         assert!(msg.contains("append-only"), "错误路径也必须回收令牌：{msg}");
+    }
+
+    // ───────── 035：哈希链锚点收敛 ─────────
+
+    /// 夹具：带 035 两列 + 锚点表的最小库。审计链的哈希计算在 panel-api，
+    /// panel-db 不该反向依赖它，所以这里直接写死若干 `hash` 值——
+    /// 本模块只关心「锚点是否跟着链尾走」，不关心链值怎么算出来的。
+    fn audit_db_with_chain() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE audit_log(
+                id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, actor TEXT NOT NULL,
+                actor_ip TEXT, action TEXT NOT NULL, target TEXT, result TEXT NOT NULL,
+                detail_json TEXT, prev_hash TEXT, hash TEXT);
+             CREATE TABLE audit_hash_anchor(
+                id INTEGER PRIMARY KEY CHECK (id = 1), last_id INTEGER NOT NULL,
+                last_hash TEXT NOT NULL, updated_ts INTEGER NOT NULL);
+             CREATE TABLE _audit_permit(permit INTEGER PRIMARY KEY);",
+        ).unwrap();
+        c
+    }
+
+    fn push_chained(c: &Connection, id: i64, ts: i64) {
+        c.execute(
+            "INSERT INTO audit_log(id, ts, actor, action, result, prev_hash, hash)
+             VALUES(?1, ?2, 'admin', 'act', 'ok', ?3, ?4)",
+            rusqlite::params![id, ts, format!("prev{id}"), format!("hash{id}")],
+        ).unwrap();
+        let now = now_unix();
+        c.execute(
+            "INSERT INTO audit_hash_anchor(id, last_id, last_hash, updated_ts) VALUES(1, ?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET last_id=?1, last_hash=?2, updated_ts=?3",
+            rusqlite::params![id, format!("hash{id}"), now],
+        ).unwrap();
+    }
+
+    /// 正常修剪（只删最老的行）不该改动锚点——锚点本来就指向最新的那条。
+    #[test]
+    fn rebase_is_noop_when_anchor_already_at_head() {
+        let c = audit_db_with_chain();
+        let now = now_unix();
+        push_chained(&c, 1, now - 100 * 86_400);
+        push_chained(&c, 2, now - 90 * 86_400);
+        push_chained(&c, 3, now - 86_400);
+
+        prune_audit(&c, 90, 50_000).unwrap(); // 删掉 id=1
+        rebase_audit_anchor(&c).unwrap();
+
+        let (lid, lhash): (i64, String) = c
+            .query_row("SELECT last_id, last_hash FROM audit_hash_anchor WHERE id=1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((lid, lhash.as_str()), (3, "hash3"), "锚点仍应指向链尾 id=3");
+    }
+
+    /// 链尾被修剪扫掉时锚点必须收敛——否则 verify 会永远报「尾部被截断」，
+    /// 把正常保留期清理误报成攻击（假红会让人忽略真红）。
+    #[test]
+    fn rebase_follows_head_when_tail_was_pruned() {
+        let c = audit_db_with_chain();
+        let now = now_unix();
+        push_chained(&c, 1, now - 200 * 86_400);
+        push_chained(&c, 2, now - 190 * 86_400);
+        push_chained(&c, 3, now - 180 * 86_400);
+
+        // 全部过期：链尾也被清掉，锚点悬空
+        prune_audit(&c, 90, 50_000).unwrap();
+        assert_eq!(c.query_row("SELECT count(*) FROM audit_log", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+
+        rebase_audit_anchor(&c).unwrap();
+
+        // 空链：锚点保留原值（无从收敛），但函数不能 panic、不能写坏
+        let n: i64 = c.query_row("SELECT count(*) FROM audit_hash_anchor", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1, "锚点行必须仍在（只是无法收敛到新值）");
+    }
+
+    /// 部分修剪：链尾存活时锚点保持指向链尾，绝不退到被删的行上。
+    #[test]
+    fn rebase_never_points_anchor_at_deleted_row() {
+        let c = audit_db_with_chain();
+        let now = now_unix();
+        push_chained(&c, 1, now - 200 * 86_400);
+        push_chained(&c, 2, now - 86_400);
+
+        prune_audit(&c, 90, 50_000).unwrap();
+        rebase_audit_anchor(&c).unwrap();
+
+        let lid: i64 = c
+            .query_row("SELECT last_id FROM audit_hash_anchor WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        let exists: i64 = c
+            .query_row("SELECT count(*) FROM audit_log WHERE id=?1", rusqlite::params![lid], |r| r.get(0))
+            .unwrap();
+        assert_eq!(exists, 1, "锚点必须指向仍然存在的行，实际指向 id={lid}");
+    }
+
+    /// 未上链的库（hash 全 NULL）：rebase 必须静默跳过，不能把 NULL 写成锚点。
+    #[test]
+    fn rebase_ignores_unchained_database() {
+        let c = audit_db_with_chain();
+        c.execute(
+            "INSERT INTO audit_log(id, ts, actor, action, result) VALUES(1, 1, 'old', 'legacy', 'ok')",
+            [],
+        ).unwrap();
+        rebase_audit_anchor(&c).unwrap();
+        let n: i64 = c.query_row("SELECT count(*) FROM audit_hash_anchor", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0, "无链值时不该写锚点");
     }
 }

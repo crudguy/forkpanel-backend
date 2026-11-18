@@ -1499,6 +1499,21 @@ components:
         page_size: { type: integer }
         total: { type: integer }
 
+    AuditVerify:
+      type: object
+      description: 审计哈希链校验结果（P2-11）
+      properties:
+        status:
+          type: string
+          enum: [intact, broken, not_chained]
+          description: |
+            intact=链完整；broken=发现篡改/断链；not_chained=库里尚无带链值的记录。
+            **not_chained 不等于通过**，调用方不得把它渲染成"校验成功"。
+        checked: { type: integer, description: 实际参与校验的链记录条数 }
+        unchained: { type: integer, description: 未上链的记录条数（哈希链启用前的历史行），如实披露 }
+        broken_at_id: { type: [integer, "null"], description: 第一条对不上的记录 id（仅 broken 时有值） }
+        reason: { type: [string, "null"], description: 断裂原因（仅 broken 时有值） }
+
     TaskAccepted:
       type: object
       properties:
@@ -4541,6 +4556,46 @@ paths:
         - { name: since,  in: query, schema: { type: integer }, description: 起始时间戳（含，Unix 秒） }
         - { name: until,  in: query, schema: { type: integer }, description: 截止时间戳（含，Unix 秒）；不得早于 since，否则 400 }
       responses: { '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/AuditPage' } } } } } } }
+
+  /api/v1/audit/export:
+    get:
+      operationId: get_audit_export
+      tags: [audit]
+      summary: 审计日志导出（CSV 附件）
+      description: |
+        与 `GET /api/v1/audit` **共用同一套筛选条件与权限**（audit.view），差别只在于不分页、
+        返回 `text/csv` 附件。共用是刻意的：两套条件必然漂移，届时用户会拿着导出的 CSV
+        与页面列表对不上，取证场景下这是最不能接受的一类不一致。
+        - 行数硬顶 50000；被截断时响应头带 `x-capped: 1`，不谎称是全集。
+        - 输出带 UTF-8 BOM（Excel 直接双击打开中文表头不乱码）。
+        - 以 `= + - @` 开头的单元格会前置单引号，避免 Excel/WPS 把审计内容当公式执行。
+      parameters:
+        - { name: action, in: query, schema: { type: string }, description: 动作精确匹配 }
+        - { name: actor,  in: query, schema: { type: string }, description: 操作人精确匹配 }
+        - { name: result, in: query, schema: { type: string }, description: 结果精确匹配 }
+        - { name: q,      in: query, schema: { type: string }, description: 关键词，模糊匹配 target / detail_json }
+        - { name: since,  in: query, schema: { type: integer }, description: 起始时间戳（含，Unix 秒） }
+        - { name: until,  in: query, schema: { type: integer }, description: 截止时间戳（含，Unix 秒）；不得早于 since，否则 400 }
+      responses:
+        '200':
+          description: CSV 文件
+          headers:
+            x-capped: { schema: { type: string }, description: 值为 1 表示结果被 50000 行上限截断 }
+          content:
+            text/csv: { schema: { type: string } }
+
+  /api/v1/audit/verify:
+    get:
+      operationId: get_audit_verify
+      tags: [audit]
+      summary: 审计日志哈希链完整性校验
+      description: |
+        逐条重算链值并检查 `prev_hash` 是否接得上，最后比对链尾锚点。
+        需要 master.key 才能校验；未加载主密钥时返回 501，**绝不返回"通过"**。
+        `status` 三态必须区分：`intact`（完整）/`broken`（发现篡改）/`not_chained`
+        （库里尚无带链值的记录）——把后两者说成"通过"会让运维误以为历史也受保护。
+      responses:
+        '200': { description: 校验结果, content: { application/json: { schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/AuditVerify' } } } } } }
 
   # ───────── SSE 实时频道 ─────────
   /api/v1/events/metrics:

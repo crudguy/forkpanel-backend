@@ -540,6 +540,10 @@ async fn register_internal_jobs(
                     panel_db::cleanup::prune_metrics(conn, panel_db::aggregator::Retention::default())?;
                     // 审计：默认 90 天 + 5 万行上限（实测 180 天 = 4.12MB）
                     panel_db::cleanup::prune_audit(conn, retention, max_rows)?;
+                    // 修剪后收敛哈希链锚点（035）：若修剪把链尾那条也扫掉，锚点会
+                    // 悬空、verify 会把正常清理误报成"尾部被截断"。紧跟在 prune
+                    // 之后、同一事务内，避免中间态被并发的校验读到。
+                    panel_db::cleanup::rebase_audit_anchor(conn)?;
                     panel_db::cleanup::prune_task_runs(conn, retention)?;
                     // 通知此前是唯一没有 prune 的业务表（只增不减：WAF 告警 /
                     // 任务完成 / 备份结果都会写一行）。保留期与审计同口径。
