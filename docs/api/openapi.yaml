@@ -971,13 +971,28 @@ components:
         size: { type: integer }
 
     # ───────────── 数据库 ─────────────
+    # 引擎清单/默认端口与账号/能力位的唯一事实源。前端下拉由它驱动，不持有副本。
+    EngineOption:
+      type: object
+      required: [key, label, external, user_required, client_ready, readonly_sql, artifact_ext, schema_label]
+      properties:
+        key:            { type: string, description: 稳定标识，同时是连接落库的 engine 值 }
+        label:          { type: string, description: 界面显示名 }
+        default_port:   { type: [integer, "null"], description: 默认端口；null 表示不需要端口（SQLite） }
+        default_user:   { type: [string, "null"], description: 默认账号；null 表示不需要账号 }
+        external:       { type: boolean, description: 是否走外部连接（host/port/user）；SQLite 为 false }
+        user_required:  { type: boolean, description: 新增连接时是否强制填写账号 }
+        client_ready:   { type: boolean, description: 本机客户端工具是否在位；不代表目标库可达 }
+        readonly_sql:   { type: boolean, description: 只读 SQL 控制台是否开放（判据是服务端只读护栏） }
+        artifact_ext:   { type: string, description: 备份产物扩展名（不含点） }
+        schema_label:   { type: string, description: 「库」下一级的层级名；空串表示没有这一层 }
     DbConnection:
       type: object
       required: [name, engine]
       properties:
         id:         { type: integer }
         name:       { type: string }
-        engine:     { type: string, enum: [sqlite, mysql, postgres] }
+        engine:     { type: string, enum: [sqlite, mysql, mariadb, postgres, mongodb, redis, mssql, oracle, clickhouse] }
         host:       { type: [string, "null"] }
         port:       { type: [integer, "null"] }
         username:   { type: [string, "null"] }
@@ -996,7 +1011,7 @@ components:
       type: object
       required: [engine, readonly_sql, default_sql, samples]
       properties:
-        engine: { type: string, enum: [sqlite, mysql, postgres] }
+        engine: { type: string, enum: [sqlite, mysql, mariadb, postgres, mongodb, redis, mssql, oracle, clickhouse] }
         readonly_sql:
           type: boolean
           description: "与 DbConnection.readonly_sql 同源同值；打开控制台前再确认一次，避免列表数据过期导致按钮亮着、内容说不能跑"
@@ -1017,7 +1032,7 @@ components:
       type: object
       properties:
         name: { type: string }
-        engine: { type: string, enum: [sqlite, mysql, postgres] }
+        engine: { type: string, enum: [sqlite, mysql, mariadb, postgres, mongodb, redis, mssql, oracle, clickhouse] }
         host: { type: string }
         port: { type: integer }
         username: { type: string, description: "mysql/postgres 必填（连主机账号）；sqlite 为本地文件、可空" }
@@ -3114,6 +3129,20 @@ paths:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/FileActionResult' } } }
 
   # ───────── 数据库 ─────────
+  /api/v1/db/engines:
+    get:
+      operationId: get_db_engines
+      tags: [db]
+      summary: 受支持引擎的元数据（下拉项/默认端口与账号/能力位）
+      description: |
+        前端引擎清单、默认端口/账号与能力位的唯一事实源。新增引擎只需后端注册表加一项，
+        前端下拉、表单占位与门控随之更新，无需改前端代码。
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, required: [engines], properties: { engines: { type: array, items: { $ref: '#/components/schemas/EngineOption' } } } } } }
   /api/v1/db/connections:
     get:
       operationId: get_db_connections
@@ -3138,7 +3167,7 @@ paths:
       tags: [db]
       summary: 更新数据库连接（写需 db.manage；字段缺省保留现值，口令留空=不修改）
       security: [cookieAuth, csrfHeader]
-      requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { name: { type: string, description: 连接名 }, engine: { type: string, enum: [mysql, postgres, sqlite], description: 引擎 }, host: { type: string, description: 主机 }, port: { type: integer, description: 端口 }, user: { type: string, description: 账号（mysql/postgres 必填） }, password: { type: string, description: 口令，留空=不修改 }, default_db: { type: string, description: 默认库（sqlite 为 .db 文件路径） } } } } } }
+      requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { name: { type: string, description: 连接名 }, engine: { type: string, enum: [sqlite, mysql, mariadb, postgres, mongodb, redis, mssql, oracle, clickhouse], description: 引擎 }, host: { type: string, description: 主机 }, port: { type: integer, description: 端口 }, user: { type: string, description: 账号（mysql/postgres 必填） }, password: { type: string, description: 口令，留空=不修改 }, default_db: { type: string, description: 默认库（sqlite 为 .db 文件路径） } } } } } }
       responses: { '200': { description: ok }, '400': { description: 校验失败 }, '404': { description: 连接不存在 }, '409': { description: 连接名已存在 } }
     delete:
       operationId: delete_db_connections_id

@@ -129,11 +129,10 @@ pub async fn list(
 
     let mut dtos = Vec::new();
     for (id, name, engine, host, port, default_db, pwd, remark) in rows {
-        let eng = match engine.as_str() {
-            "mysql" => panel_os::DbEngine::MySql,
-            "postgres" => panel_os::DbEngine::Postgres,
-            _ => panel_os::DbEngine::Sqlite,
-        };
+        // 字符串→枚举只走注册表（唯一事实源）。未知字符串仍兜底 SQLite，
+        // 仅为兼容历史脏数据；新引擎一律由 ALL_ENGINES 正确解析。
+        let eng = panel_os::DbEngine::from_key(&engine)
+            .unwrap_or(panel_os::DbEngine::Sqlite);
         // 逐连接按引擎判定「是否已实装」：未实装的引擎（mysql/postgres）诚实置灰，不撒谎
         let available = state.os.databases().supports(eng);
         // 只读 SQL 控制台的能力位同样逐引擎判定，但判据不同（见 ConnDto::readonly_sql）。
@@ -142,9 +141,7 @@ pub async fn list(
         let readonly_sql = state.os.databases().readonly_sql(eng);
         dtos.push(ConnDto {
             id, name,
-            engine: match eng { panel_os::DbEngine::MySql => "mysql",
-                                panel_os::DbEngine::Postgres => "postgres",
-                                panel_os::DbEngine::Sqlite => "sqlite" },
+            engine: eng.as_str(),
             host, port, default_db,
             client_ready: available,
             readonly_sql,
@@ -153,6 +150,49 @@ pub async fn list(
         });
     }
     Ok(ok(dtos))
+}
+
+/// 引擎元数据（下发前端）。**这是引擎清单/默认端口/账号/能力的唯一事实源**：
+/// 前端不得再硬编码下拉项或写 `mysql ? 3306 : 5432` 这类二元三元——
+/// 第 4 个引擎到来时那种写法会静默选错默认值。
+#[derive(Debug, Serialize)]
+pub struct EngineOptionDto {
+    pub key: &'static str,
+    pub label: &'static str,
+    pub default_port: Option<u16>,
+    pub default_user: Option<&'static str>,
+    /// 是否需要 host/port/user 等外部连接参数（SQLite 为 false）
+    pub external: bool,
+    /// 新增连接时是否强制填写账号
+    pub user_required: bool,
+    /// 本机客户端是否在位（SQLite 内建恒 true）
+    pub client_ready: bool,
+    /// 只读 SQL 控制台是否开放
+    pub readonly_sql: bool,
+    /// 备份产物扩展名
+    pub artifact_ext: &'static str,
+    /// "库"下一级的层级名，空串表示没有这一层
+    pub schema_label: &'static str,
+}
+
+pub async fn engines(
+    State(state): State<Shared>, Auth(s): Auth,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::DB_VIEW)?;
+    let db = state.os.databases();
+    let list: Vec<EngineOptionDto> = panel_os::ALL_ENGINES.iter().map(|e| EngineOptionDto {
+        key: e.key,
+        label: e.label,
+        default_port: e.default_port,
+        default_user: e.default_user,
+        external: e.external,
+        user_required: e.user_required,
+        client_ready: db.supports(e.engine),
+        readonly_sql: db.readonly_sql(e.engine),
+        artifact_ext: e.artifact_ext,
+        schema_label: e.schema_label,
+    }).collect();
+    Ok(ok(serde_json::json!({ "engines": list })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -185,10 +225,12 @@ pub async fn create(
             return Err(ApiError::bad_request("default_db", "invalid database name"));
         }
     }
-    let engine = match req.engine.as_str() {
-        "mysql" | "postgres" | "sqlite" => req.engine.clone(),
-        other => return Err(ApiError::bad_request("engine", format!("unsupported: {other}"))),
-    };
+    // 引擎白名单来自 ALL_ENGINES（唯一事实源）。不要再手写三选一——
+    // 第 4 个引擎到来时那种写法会让新引擎直接 400。
+    if panel_os::DbEngine::from_key(&req.engine).is_none() {
+        return Err(ApiError::bad_request("engine", format!("unsupported: {}", req.engine)));
+    }
+    let engine = req.engine.clone();
     // mysql/postgres 必填 user（见 validate_connection_create）。放在口令加密前先拦，
     // 避免无账号的连接落库后才在备份/还原时炸出不可归因的认证失败。
     validate_connection_create(&engine, &req.user)?;
@@ -262,7 +304,7 @@ pub async fn update(
             return Err(ApiError::bad_request("default_db", "invalid database name"));
         }
     }
-    if !matches!(engine.as_str(), "mysql" | "postgres" | "sqlite") {
+    if panel_os::DbEngine::from_key(&engine).is_none() {
         return Err(ApiError::bad_request("engine", format!("unsupported: {engine}")));
     }
     validate_connection_create(&engine, &user)?;
@@ -634,13 +676,17 @@ async fn snapshot_before_restore(
     dir: &std::path::Path,
 ) -> Result<std::path::PathBuf> {
     let tag = match target.engine {
+        // 保留历史 tag 以兼容既有快照的清理前缀
         panel_os::DbEngine::MySql => "mysql",
         panel_os::DbEngine::Postgres => "pg",
         // sqlite 由 provider 内 `.bak-<ts>` 承担，不应走到这里
-        panel_os::DbEngine::Sqlite => return Err(PanelError::Internal("sqlite 不需要 pg/mysql 快照".into())),
+        panel_os::DbEngine::Sqlite => return Err(PanelError::Internal("sqlite 不需要额外快照".into())),
+        // 新引擎用注册表中的稳定 key；产物后缀如实按引擎取，不一律 .sql
+        e => e.as_str(),
     };
     std::fs::create_dir_all(dir).map_err(|e| PanelError::Io(format!("create safety dir: {e}")))?;
-    let name = format!("pre-restore-{tag}-{}.sql", crate::now_unix());
+    let ext = target.engine.spec().artifact_ext;
+    let name = format!("pre-restore-{tag}-{}.{ext}", crate::now_unix());
     let snap = panel_os::paths::resolve_within_for_create(dir, &name)?;
     os.databases().backup(target, &snap, Box::new(|_line| {})).await?;
     prune_pre_restore(dir, tag, PRE_RESTORE_KEEP);
@@ -753,10 +799,13 @@ fn validate_sqlite_path(state: &Shared, db: &str) -> ApiResult<()> {
 /// 与其留一个「建出来必失败」的连接，不如创建时就拦下（负向对照见测试）。
 /// sqlite 是本地文件、无账号概念，user 可不填。
 fn validate_connection_create(engine: &str, user: &Option<String>) -> ApiResult<()> {
-    if (engine == "mysql" || engine == "postgres")
-        && user.as_ref().is_none_or(|u| u.trim().is_empty())
-    {
-        return Err(ApiError::bad_request("user", "mysql/postgres 连接必须指定账号（user 必填）"));
+    // "远端引擎必须填账号"由注册表统一回答，不再按引擎名手写 if。
+    let user_required = panel_os::DbEngine::from_key(engine)
+        .map(|e| e.spec().user_required)
+        .unwrap_or(false);
+    if user_required && user.as_ref().is_none_or(|u| u.trim().is_empty()) {
+        return Err(ApiError::bad_request(
+            "user", format!("{engine} 连接必须指定账号（user 必填）")));
     }
     Ok(())
 }
@@ -777,11 +826,9 @@ pub(crate) async fn load_target(state: &Shared, conn: i64, db_override: Option<&
         .ok_or_else(|| ApiError::not_found("connection"))?;
     let (engine_s, host, port, user, pwd_enc, database) = row;
 
-    let engine = match engine_s.as_str() {
-        "mysql" => panel_os::DbEngine::MySql,
-        "postgres" => panel_os::DbEngine::Postgres,
-        _ => panel_os::DbEngine::Sqlite,
-    };
+    // 与 list() 同源：字符串→枚举只走注册表；未知值兜底 SQLite 仅为兼容历史脏数据
+    let engine = panel_os::DbEngine::from_key(&engine_s)
+        .unwrap_or(panel_os::DbEngine::Sqlite);
     // 口令解密：有密文则必须有主密钥（对齐 create 的纪律）
     let password = match pwd_enc {
         Some(blob) => {
@@ -813,11 +860,7 @@ fn map_db_err(e: PanelError) -> ApiError {
     ApiError::from(e)
 }
 
-fn engine_str(e: panel_os::DbEngine) -> &'static str {
-    match e { panel_os::DbEngine::MySql => "mysql",
-              panel_os::DbEngine::Postgres => "postgres",
-              panel_os::DbEngine::Sqlite => "sqlite" }
-}
+fn engine_str(e: panel_os::DbEngine) -> &'static str { e.as_str() }
 
 pub async fn databases_of(
     State(state): State<Shared>, Auth(s): Auth, AxPath(conn): AxPath<i64>,
@@ -1066,7 +1109,15 @@ fn sql_console_meta(engine: &str) -> (&'static str, Vec<(&'static str, &'static 
             ],
             "会话以只读模式执行，写语句会被数据库拒绝；个别配置类函数（如 pg_reload_conf）不受此约束。",
         ),
-        // SQLite：sqlite_master 是它的目录表；PRAGMA 是它的元数据入口
+        // MongoDB/Redis 根本没有 SQL 语义，给 SQLite 的 sqlite_master 会彻底误导。
+        // 其余引擎即便控制台不开放，meta 内容仍与能力位解耦——这是既有契约：
+        // 门控只看 readonly_sql，meta 不能因为按钮灰了就开天窗。
+        "mongodb" | "redis" => (
+            "",
+            Vec::new(),
+            "该引擎不是 SQL 数据库，未开放自写 SQL 控制台。请用「浏览」查看数据。",
+        ),
+        // 未知字符串仍走 SQLite 示例，仅为兼容历史脏数据
         _ => (
             "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
             vec![
@@ -1111,11 +1162,7 @@ pub async fn sql_meta(
     crate::auth::require(&s, perm::DB_VIEW)?;
     ensure_dbms(&state)?;
     let t = load_target(&state, conn, None).await?;
-    let eng = match t.engine {
-        panel_os::DbEngine::MySql => "mysql",
-        panel_os::DbEngine::Postgres => "postgres",
-        panel_os::DbEngine::Sqlite => "sqlite",
-    };
+    let eng = t.engine.as_str();
     let (default_sql, samples, note) = sql_console_meta(eng);
     Ok(ok(serde_json::json!(SqlMetaDto {
         engine: eng,
@@ -1642,11 +1689,15 @@ mod tests {
 
     #[test]
     fn engines_are_closed_set() {
-        for ok in ["mysql", "postgres", "sqlite"] {
-            assert!(matches!(ok, "mysql" | "postgres" | "sqlite"));
+        // 白名单来自注册表（唯一事实源），不再手写三选一：
+        // 新增引擎时本测试自动覆盖，未知字符串必须被拒。
+        let keys: Vec<&str> = panel_os::ALL_ENGINES.iter().map(|e| e.key).collect();
+        assert_eq!(keys.len(), 9, "受支持引擎清单变更时请同步断言数量");
+        for key in keys {
+            assert!(panel_os::DbEngine::from_key(key).is_some(), "{key} 必须可解析");
+            assert!(validate_connection_create(key, &Some("u".into())).is_ok(), "{key} 带账号应通过");
         }
-        assert!(!matches!("oracle", "mysql" | "postgres" | "sqlite"));
-        assert!(!matches!("redis", "mysql" | "postgres" | "sqlite"));
+        assert!(panel_os::DbEngine::from_key("not_an_engine").is_none());
     }
 
     #[test]
@@ -1747,7 +1798,9 @@ mod tests {
     /// 但 `_ =>` 兜底必须是"能用的那一套"，而不是空列表让控制台开天窗。
     #[test]
     fn unknown_engine_falls_back_to_sqlite_samples_not_empty() {
-        let (default_sql, samples, note) = sql_console_meta("oracle");
+        // 用一个真正未知的字符串：oracle 现在是 9 个受支持引擎之一，
+        // 再拿它当"未知"会掩盖注册表扩张后的语义漂移。
+        let (default_sql, samples, note) = sql_console_meta("not_an_engine");
         assert!(!default_sql.is_empty());
         assert!(!samples.is_empty(), "兜底分支不能给空示例");
         assert!(!note.is_empty(), "兜底分支的边界提示不能空");

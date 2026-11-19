@@ -1412,8 +1412,80 @@ pub trait WebServerProvider: Send + Sync {
 
 // ═══════════════════════════ 数据库引擎 ═══════════════════════════
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DbEngine { Sqlite, MySql, Postgres }
+/// 面板支持的全部数据库引擎。
+///
+/// **元数据（显示名、默认端口、产物扩展名、连接表单语义…）的唯一来源是
+/// [`EngineSpec`]，不要再在别处用 `match engine` 重抄一遍**——散落的二元三元
+/// 表达式（如 `mysql ? 3306 : 5432`）会在第 4 个引擎到来时静默选错默认值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DbEngine {
+    Sqlite,
+    MySql,
+    MariaDb,
+    Postgres,
+    MongoDb,
+    Redis,
+    MsSql,
+    Oracle,
+    ClickHouse,
+}
+
+/// 单个引擎的静态元数据。前端的下拉项、默认端口/账号、连接表单字段显隐、
+/// 备份产物后缀，全部由这张表下发——这是"引擎清单"的唯一事实源。
+#[derive(Debug, Clone, Copy)]
+pub struct EngineSpec {
+    pub engine: DbEngine,
+    /// API / URL 中的稳定字符串（落库值，永不改名）
+    pub key: &'static str,
+    /// 界面显示名
+    pub label: &'static str,
+    /// 默认端口；`None` 表示不需要端口（SQLite 内建）
+    pub default_port: Option<u16>,
+    /// 默认账号；`None` 表示不需要账号
+    pub default_user: Option<&'static str>,
+    /// 是否走外部连接（host/port/user/password）：SQLite 为 false
+    pub external: bool,
+    /// 新增连接时是否强制填写账号（远端引擎必须指定账号）
+    pub user_required: bool,
+    /// 备份产物扩展名（不含点）
+    pub artifact_ext: &'static str,
+    /// "库"的下一级层级名，供前端文案（空串 = 没有这一层）
+    pub schema_label: &'static str,
+}
+
+/// 全量引擎表。**顺序即前端下拉顺序**，稳定，勿随意重排。
+pub const ALL_ENGINES: &[EngineSpec] = &[
+    EngineSpec { engine: DbEngine::Sqlite,     key: "sqlite",     label: "SQLite",     default_port: None,            default_user: None,       external: false, user_required: false, artifact_ext: "db",  schema_label: "catalog" },
+    EngineSpec { engine: DbEngine::MySql,      key: "mysql",      label: "MySQL",      default_port: Some(3306),      default_user: Some("root"),    external: true,  user_required: true,  artifact_ext: "sql", schema_label: "" },
+    EngineSpec { engine: DbEngine::MariaDb,    key: "mariadb",    label: "MariaDB",    default_port: Some(3306),      default_user: Some("root"),    external: true,  user_required: true,  artifact_ext: "sql", schema_label: "" },
+    EngineSpec { engine: DbEngine::Postgres,   key: "postgres",   label: "PostgreSQL", default_port: Some(5432),      default_user: Some("postgres"),external: true,  user_required: true,  artifact_ext: "sql", schema_label: "schema" },
+    EngineSpec { engine: DbEngine::MongoDb,    key: "mongodb",    label: "MongoDB",    default_port: Some(27017),     default_user: None,       external: true,  user_required: false, artifact_ext: "archive", schema_label: "collection" },
+    EngineSpec { engine: DbEngine::Redis,      key: "redis",      label: "Redis",      default_port: Some(6379),      default_user: None,       external: true,  user_required: false, artifact_ext: "rdb",  schema_label: "" },
+    EngineSpec { engine: DbEngine::MsSql,      key: "mssql",      label: "SQL Server", default_port: Some(1433),      default_user: Some("sa"),      external: true,  user_required: true,  artifact_ext: "sql", schema_label: "schema" },
+    EngineSpec { engine: DbEngine::Oracle,     key: "oracle",     label: "Oracle",     default_port: Some(1521),      default_user: Some("system"),  external: true,  user_required: true,  artifact_ext: "dmp", schema_label: "schema" },
+    EngineSpec { engine: DbEngine::ClickHouse, key: "clickhouse", label: "ClickHouse", default_port: Some(9000),      default_user: Some("default"), external: true,  user_required: true,  artifact_ext: "sql", schema_label: "" },
+];
+
+impl DbEngine {
+    /// 稳定字符串表示（落库 / API）。**唯一来源**：[`EngineSpec::key`]。
+    pub fn as_str(self) -> &'static str { self.spec().key }
+
+    /// 从 API 下发的引擎 key 解析。未知字符串返回 `None`，绝不静默兜底成 SQLite。
+    /// 命名避开 `FromStr::from_str`（返回 Option 而非 Result，语义不同）。
+    pub fn from_key(s: &str) -> Option<Self> {
+        ALL_ENGINES.iter().find(|e| e.key == s).map(|e| e.engine)
+    }
+
+    /// 取该引擎的元数据。表由 [`ALL_ENGINES`] 静态定义，索引必然命中。
+    pub fn spec(self) -> &'static EngineSpec {
+        ALL_ENGINES.iter().find(|e| e.engine == self).expect("engine missing from ALL_ENGINES")
+    }
+
+    /// 全量引擎（供 API 下发与穷举测试）。
+    pub fn all() -> impl Iterator<Item = DbEngine> {
+        ALL_ENGINES.iter().map(|e| e.engine)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct DbTarget {
@@ -1513,9 +1585,19 @@ pub struct DbQueryResult {
 /// 不必依赖"本机装没装 psql"——依赖了就只能在一种机器上验一半，另一半恒绿。
 pub fn db_console_open(engine: DbEngine, client_present: bool) -> bool {
     match engine {
+        // SQLite：内建只读连接；PostgreSQL：PGOPTIONS 会话护栏 + psql 在位。
         DbEngine::Sqlite => true,
         DbEngine::Postgres => client_present,
-        DbEngine::MySql => false,
+        // 其余引擎没有**服务端物理只读护栏**。只读账号是账号侧配置，
+        // 不是面板能替用户做的决定；关键字名单拦不住 CTE 里的 DELETE。
+        // 新引擎默认关闭——漏开只是少个按钮，误开是一个任意写库入口。
+        DbEngine::MySql
+        | DbEngine::MariaDb
+        | DbEngine::MongoDb
+        | DbEngine::Redis
+        | DbEngine::MsSql
+        | DbEngine::Oracle
+        | DbEngine::ClickHouse => false,
     }
 }
 
@@ -2512,6 +2594,13 @@ mod tests {
         assert!(!db_console_open(DbEngine::MySql, false));
         assert!(!db_console_open(DbEngine::MySql, true),
             "MySQL 关键字名单拦不住 WITH x AS (…) DELETE …，绝不能开");
+        // 其余 6 个引擎同样没有服务端物理只读护栏：客户端在不在都不能开。
+        // 这一格新引擎最易漏——漏了就是任意写库入口，故逐个钉死。
+        for e in [DbEngine::MariaDb, DbEngine::MongoDb, DbEngine::Redis,
+                  DbEngine::MsSql, DbEngine::Oracle, DbEngine::ClickHouse] {
+            assert!(!db_console_open(e, false), "{e:?} 无护栏，客户端不在更不能用");
+            assert!(!db_console_open(e, true), "{e:?} 即使客户端在位也不能开：无物理只读保证");
+        }
     }
 
     /// trait 默认值必须是「不开」：新加 provider 忘记覆盖时，
@@ -2537,7 +2626,8 @@ mod tests {
             async fn restore(&self, _t: &DbTarget, _f: &SafePath) -> Result<()> { Ok(()) }
         }
         let b = Bare;
-        for e in [DbEngine::Sqlite, DbEngine::MySql, DbEngine::Postgres] {
+        // 遍历全量引擎：新增变体自动纳入，不靠人记得改这个数组
+        for e in DbEngine::all() {
             assert!(!b.readonly_sql(e), "未覆盖 readonly_sql 的 provider 必须对所有引擎关闭");
         }
     }

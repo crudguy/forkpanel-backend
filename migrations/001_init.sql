@@ -100,7 +100,10 @@ CREATE INDEX idx_certs_expiry ON ssl_certs(not_after);
 CREATE TABLE db_connections (
     id          INTEGER PRIMARY KEY,
     name        TEXT    NOT NULL UNIQUE,
-    engine      TEXT    NOT NULL,               -- sqlite|mysql|postgres
+    -- 合法取值以 panel-os::ALL_ENGINES 为准（sqlite/mysql/mariadb/postgres/
+    -- mongodb/redis/mssql/oracle/clickhouse）；API 白名单也来自同一处，不要在
+    -- 这里另建枚举，否则新增引擎时注释与实现会静默漂移。
+    engine      TEXT    NOT NULL,
     host        TEXT,
     port        INTEGER,
     username    TEXT,

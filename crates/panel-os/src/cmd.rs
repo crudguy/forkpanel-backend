@@ -101,6 +101,16 @@ pub enum Bin {
     /// ③ 整个命令 argv 直传，不经 shell。仅用于校验，不参与任何密钥落地动作。
     Gpg,
     MySql, MySqlDump, Psql, PgDump,     // 数据库（可选能力）
+    /// 以下为其余受支持引擎的客户端。安全评估同 MySql/Psql：
+    /// ① 只经 argv 直传，不经 shell；② 口令一律走环境变量，绝不进 argv
+    /// （`ps` 可见）；③ 子命令由 provider 侧编译期写死，不接用户可控子命令；
+    /// ④ 只做只读查询/导出/恢复三类固定用途，暴露面与已有 DB 客户端同级。
+    MariaDb, MariaDbDump,               // MariaDB（与 mysql 线协议兼容）
+    MongoSh, MongoDump, MongoRestore,   // MongoDB（mongosh / mongodump / mongorestore）
+    RedisCli,                           // Redis
+    SqlCmd,                             // SQL Server
+    SqlPlus, ExpDp, ImpDp,              // Oracle
+    ClickHouseClient,                   // ClickHouse
     Tar, Gzip,                          // 备份打包
     Sshd,                               // sshd -t 配置校验：改 SSH 配置前的强制安全网
     /// 监听端口探测（`ss -H -ltn`）。改 SSH 端口前必须确认新端口没被占用，
@@ -143,6 +153,12 @@ impl Bin {
             Docker => "docker",
             OpenSsl => "openssl", Gpg => "gpg",
             MySql => "mysql", MySqlDump => "mysqldump", Psql => "psql", PgDump => "pg_dump",
+            MariaDb => "mariadb", MariaDbDump => "mariadb-dump",
+            MongoSh => "mongosh", MongoDump => "mongodump", MongoRestore => "mongorestore",
+            RedisCli => "redis-cli",
+            SqlCmd => "sqlcmd",
+            SqlPlus => "sqlplus", ExpDp => "expdp", ImpDp => "impdp",
+            ClickHouseClient => "clickhouse-client",
             Tar => "tar", Gzip => "gzip", Sshd => "sshd", Certbot => "certbot",
             Ss => "ss",
             Fail2banClient => "fail2ban-client",
@@ -203,6 +219,11 @@ pub struct CmdOpt {
     // 回调类型天然复杂；抽 type 别名反而更难读，故显式豁免该 lint。
     #[allow(clippy::type_complexity)]
     pub on_line: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
+    /// 写入子进程 stdin 的内容。存在理由：`sqlplus` 的连接凭据既不能进 argv
+    /// （`ps` 可见），也没有标准环境变量可走，只能从 stdin 喂 `/nolog` 脚本。
+    /// 默认 `None` 时 stdin 仍是 `/dev/null`，与从前逐字节一致。
+    /// ⚠️ Debug 输出必须打码——这里经常装的是数据库口令。
+    pub stdin: Option<String>,
 }
 
 impl std::fmt::Debug for CmdOpt {
@@ -214,6 +235,7 @@ impl std::fmt::Debug for CmdOpt {
             .field("env", &self.env)
             .field("run_as", &self.run_as)
             .field("on_line", &self.on_line.as_ref().map(|_| "<callback>"))
+            .field("stdin", &self.stdin.as_ref().map(|_| "<redacted>"))
             .finish()
     }
 }
@@ -227,6 +249,7 @@ impl Default for CmdOpt {
             env: HashMap::new(),
             run_as: None,
             on_line: None,
+            stdin: None,
         }
     }
 }
@@ -295,8 +318,9 @@ pub async fn run(bin: Bin, args: &[&str], opt: CmdOpt) -> Result<CmdOutput> {
 
     let mut cmd = Command::new(program);
     cmd.args(args);
-    // 关键：不使用 shell；stdin 关闭，避免子进程挂起等待输入
-    cmd.stdin(Stdio::null());
+    // 关键：不使用 shell。默认关闭 stdin 避免子进程挂起等待输入；
+    // 仅当调用方显式提供脚本时才开管道（sqlplus 等客户端的凭据走这里，不进 argv）。
+    if opt.stdin.is_some() { cmd.stdin(Stdio::piped()); } else { cmd.stdin(Stdio::null()); }
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     // 固定 PATH + 清除可被劫持的动态链接器变量
@@ -349,6 +373,17 @@ pub async fn run(bin: Bin, args: &[&str], opt: CmdOpt) -> Result<CmdOutput> {
     let mut child = cmd.spawn().map_err(|e| PanelError::Command {
         bin: bin.as_str().into(), detail: format!("spawn failed: {e}")
     })?;
+
+    // 写入 stdin 后立即关闭：客户端读到 EOF 才会开始执行脚本。
+    // 用 drop 释放句柄，否则 `child.wait()` 会永远等 stdin 持有端关闭。
+    if let Some(input) = &opt.stdin {
+        use tokio::io::AsyncWriteExt;
+        if let Some(mut sin) = child.stdin.take() {
+            let _ = sin.write_all(input.as_bytes()).await;
+            let _ = sin.shutdown().await;
+            drop(sin);
+        }
+    }
 
     let out = child.stdout.take();
     let err = child.stderr.take();

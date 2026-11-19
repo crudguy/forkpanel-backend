@@ -640,12 +640,10 @@ async fn verify_artifact(
     Ok(format!("{fname}: {summary}"))
 }
 
-/// 数据库产物的扩展名：SQLite 是库文件副本（`.db`），mysql/pg 是 SQL 文本（`.sql`）。
+/// 数据库产物的扩展名。**唯一来源是引擎注册表**：MongoDB 是 JSONL archive、
+/// Redis 是文本快照、Oracle 是 dmp，一律 `.sql` 会让恢复端选错解析器。
 fn db_artifact_ext(engine: &panel_os::DbEngine) -> &'static str {
-    match engine {
-        panel_os::DbEngine::Sqlite => "db",
-        _ => "sql",
-    }
+    engine.spec().artifact_ext
 }
 
 /// 数据库产物的可恢复性校验（`kind=db` 专用）。
@@ -705,7 +703,9 @@ async fn verify_db_artifact(
             .map_err(|e| PanelError::Internal(format!("校验线程异常: {e}")))??;
             Ok(format!("{fname}: SQLite integrity_check=ok，{len} B"))
         }
-        _ => Ok(format!("{fname}: SQL 转储 {len} B（非空；未连库校验）")),
+        // 非 SQLite 产物可能是 SQL 文本、JSONL、dmp 等：统一只证明非空，
+        // 绝不把"未连库校验"说成"已验证可恢复"。
+        _ => Ok(format!("{fname}: 数据库转储 {len} B（非空；未连库校验）")),
     }
 }
 
@@ -933,7 +933,15 @@ fn estimate_backup_bytes(job: &BackupJob) -> Option<u64> {
                 let p = job.db_target.as_ref()?.database.as_deref()?;
                 std::fs::metadata(p).ok().map(|m| m.len())
             }
-            panel_os::DbEngine::MySql | panel_os::DbEngine::Postgres => None,
+            // 非文件型引擎的体积只能由服务端工具决定，跳过上限预估（不伪造数字）
+            panel_os::DbEngine::MySql
+            | panel_os::DbEngine::MariaDb
+            | panel_os::DbEngine::Postgres
+            | panel_os::DbEngine::MongoDb
+            | panel_os::DbEngine::Redis
+            | panel_os::DbEngine::MsSql
+            | panel_os::DbEngine::Oracle
+            | panel_os::DbEngine::ClickHouse => None,
         },
         _ => None,
     }

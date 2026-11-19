@@ -831,7 +831,15 @@ chmod 600 "$DATA/panel.db"
 |---|---|---|---|
 | SQLite | `.db` | 文件覆盖 | provider 内 `<库>.bak-<ts>` |
 | MySQL | `.sql` | `mysql -e "source …"` | 计划产物目录 `pre-restore-mysql-<ts>.sql`（留最近 3 份） |
+| MariaDB | `.sql` | `mariadb -e "source …"` | `pre-restore-mariadb-<ts>.sql`（留最近 3 份） |
 | PostgreSQL | `.sql` | `psql -v ON_ERROR_STOP=1 --single-transaction -f …` | 计划产物目录 `pre-restore-pg-<ts>.sql`（留最近 3 份） |
+| MongoDB | `.archive`（JSONL） | 面板按集合 `deleteMany` + `insertMany` | `pre-restore-mongodb-<ts>.archive` |
+| Redis | `.rdb`（文本快照） | 面板按 key 类型重建 | `pre-restore-redis-<ts>.rdb` |
+| SQL Server | 服务端磁盘备份 | `RESTORE DATABASE … WITH REPLACE` | `pre-restore-mssql-<ts>.sql` |
+| ClickHouse | `.sql`（仅数据） | `clickhouse-client --multiquery` | `pre-restore-clickhouse-<ts>.sql` |
+| Oracle | 不支持 | — | — |
+
+非 SQLite 引擎都依赖本机客户端工具，缺工具时操作按钮置灰；`client_ready` 只表示工具在位，**不代表目标库可达**。Oracle 的 `expdp/impdp` 依赖服务端 `DIRECTORY` 对象与相应权限，面板无法跨环境通用创建，故备份/恢复如实置灰（浏览仍可用）。MongoDB/Redis 采用面板逻辑备份而非原生工具产物，只能由面板自身恢复。SQL Server 的 `BACKUP/RESTORE … TO/FROM DISK` 写在**服务端路径**，要求面板与数据库能访问同一路径。
 
 两条容易踩的坑，都是**静默失败**，看任务状态看不出来：
 

@@ -34,9 +34,11 @@ CRATES = ROOT / "crates"
 # 另新增 2 处 sanitize 调用；
 # 2026-11-18 自身可达性保护：main.rs 的 restart_panel_service 重启失败新增 2 个
 # Command 构造点（退出码固定文案 / run_sync 的错误对象），detail 不含外部命令
-# stderr/stdout，无需接线 sanitize）
-TOTAL_PIN = 78
-SANITIZE_PIN = 40
+# stderr/stdout，无需接线 sanitize）；
+# 2026-11-19 数据库引擎扩展到 9 种：mongosh / redis-cli / clickhouse-client
+# 三处命令失败构造点，detail 均已过 sanitize::stderr）
+TOTAL_PIN = 81
+SANITIZE_PIN = 43
 
 HEAD = re.compile(r"(?:PanelError::)?(Command|ConfigInvalid)\s*\{")
 FIELD = re.compile(r"\bdetail\s*:")

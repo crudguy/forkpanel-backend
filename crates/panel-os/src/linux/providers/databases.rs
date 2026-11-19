@@ -38,7 +38,15 @@ impl LinuxDatabases {
     ) -> Result<Vec<Vec<String>>> {
         let mut env: std::collections::HashMap<String, std::ffi::OsString> =
             std::collections::HashMap::new();
-        let (bin, args): (crate::cmd::Bin, Vec<String>) = match t.engine {
+        // 一次客户端查询 = bin + argv + 可选 stdin 脚本。
+        // stdin 只为 sqlplus 存在：它的凭据既不能进 argv（ps 可见），
+        // 也没有标准环境变量可走，只能把 connect 脚本喂给 `/nolog`。
+        struct Cli {
+            bin: crate::cmd::Bin,
+            args: Vec<String>,
+            stdin: Option<String>,
+        }
+        let mut cli: Cli = match t.engine {
             DbEngine::MySql => {
                 let mut a = vec![
                     "--batch".into(),
@@ -55,7 +63,24 @@ impl LinuxDatabases {
                 if let Some(p) = &t.password {
                     env.insert("MYSQL_PWD".into(), std::ffi::OsString::from(p));
                 }
-                (crate::cmd::Bin::MySql, a)
+                Cli { bin: crate::cmd::Bin::MySql, args: a, stdin: None }
+            }
+            DbEngine::MariaDb => {
+                // MariaDB 与 MySQL 线协议兼容，客户端参数同构；口令仍走 MYSQL_PWD
+                // （mariadb 客户端兼容该变量），绝不进 argv。
+                let mut a = vec![
+                    "--batch".into(), "--raw".into(), "--skip-column-names".into(),
+                    "-h".into(), t.host.clone().unwrap_or_else(|| "127.0.0.1".into()),
+                ];
+                if let Some(p) = t.port { a.push("-P".into()); a.push(p.to_string()); }
+                if let Some(u) = &t.user { a.push("-u".into()); a.push(u.clone()); }
+                if let Some(d) = &t.database { a.push("-D".into()); a.push(d.clone()); }
+                a.push("-e".into());
+                a.push(sql.to_string());
+                if let Some(p) = &t.password {
+                    env.insert("MYSQL_PWD".into(), std::ffi::OsString::from(p));
+                }
+                Cli { bin: crate::cmd::Bin::MariaDb, args: a, stdin: None }
             }
             DbEngine::Postgres => {
                 let mut a = vec![
@@ -75,7 +100,62 @@ impl LinuxDatabases {
                 if let Some(p) = &t.password {
                     env.insert("PGPASSWORD".into(), std::ffi::OsString::from(p));
                 }
-                (crate::cmd::Bin::Psql, a)
+                Cli { bin: crate::cmd::Bin::Psql, args: a, stdin: None }
+            }
+            DbEngine::MsSql => {
+                // sqlcmd 支持 SQLCMDPASSWORD 环境变量，凭据不进 argv。
+                // -h -1 去表头、-W 去尾空格、-s 指定 TAB 分隔，与 sql_query 的
+                // 分列口径一致；-Q 执行后自动退出。
+                let host = t.host.clone().unwrap_or_else(|| "127.0.0.1".into());
+                let port = t.port.unwrap_or(1433);
+                let mut a = vec![
+                    "-S".into(), format!("tcp:{host},{port}"),
+                    "-h".into(), "-1".into(), "-W".into(), "-s".into(), "\t".into(),
+                ];
+                if let Some(u) = &t.user { a.push("-U".into()); a.push(u.clone()); }
+                if let Some(d) = &t.database { a.push("-d".into()); a.push(d.clone()); }
+                a.push("-Q".into());
+                a.push(sql.to_string());
+                if let Some(p) = &t.password {
+                    env.insert("SQLCMDPASSWORD".into(), std::ffi::OsString::from(p));
+                }
+                Cli { bin: crate::cmd::Bin::SqlCmd, args: a, stdin: None }
+            }
+            DbEngine::Oracle => {
+                // sqlplus **没有**口令环境变量，连接串里带口令会进 argv 被 `ps` 看到。
+                // 正解：`/nolog` 启动，把 connect + 查询脚本经 stdin 喂进去。
+                // cmd::run 对 stdin 内容在 Debug 里打码，不进日志。
+                let host = t.host.clone().unwrap_or_else(|| "127.0.0.1".into());
+                let port = t.port.unwrap_or(1521);
+                let service = t.database.clone().unwrap_or_else(|| "orcl".into());
+                let user = t.user.clone().unwrap_or_else(|| "system".into());
+                let pass = t.password.clone().unwrap_or_default();
+                let script = format!(
+                    "connect {user}/{pass}@//{host}:{port}/{service}\n\
+                     set heading off feedback off pagesize 0 linesize 32767 colsep '\t' echo off\n\
+                     {sql}\n\
+                     exit\n"
+                );
+                Cli { bin: crate::cmd::Bin::SqlPlus, args: vec!["-s".into(), "/nolog".into()], stdin: Some(script) }
+            }
+            DbEngine::ClickHouse => {
+                let mut a = vec![
+                    "--host".into(), t.host.clone().unwrap_or_else(|| "127.0.0.1".into()),
+                    "--port".into(), t.port.unwrap_or(9000).to_string(),
+                    "--format".into(), "TabSeparated".into(),
+                ];
+                if let Some(u) = &t.user { a.push("--user".into()); a.push(u.clone()); }
+                if let Some(d) = &t.database { a.push("--database".into()); a.push(d.clone()); }
+                a.push("--query".into());
+                a.push(sql.to_string());
+                if let Some(p) = &t.password {
+                    env.insert("CLICKHOUSE_PASSWORD".into(), std::ffi::OsString::from(p));
+                }
+                Cli { bin: crate::cmd::Bin::ClickHouseClient, args: a, stdin: None }
+            }
+            DbEngine::MongoDb | DbEngine::Redis => {
+                return Err(panel_core::PanelError::Internal(
+                    "MongoDB/Redis 不走 SQL 查询，请用各自的浏览实现".into()))
             }
             DbEngine::Sqlite => {
                 return Err(panel_core::PanelError::Internal("SQLite 不走外部客户端".into()))
@@ -86,20 +166,17 @@ impl LinuxDatabases {
             env.insert((*k).into(), std::ffi::OsString::from(v));
         }
 
-        let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let out = crate::cmd::run(
-            bin,
-            &args_ref,
-            crate::cmd::CmdOpt {
-                timeout: std::time::Duration::from_secs(20),
-                env,
-                ..Default::default()
-            },
-        )
-        .await?;
+        let args_ref: Vec<&str> = cli.args.iter().map(|s| s.as_str()).collect();
+        let mut opt = crate::cmd::CmdOpt {
+            timeout: std::time::Duration::from_secs(20),
+            env,
+            ..Default::default()
+        };
+        opt.stdin = cli.stdin.take();
+        let out = crate::cmd::run(cli.bin, &args_ref, opt).await?;
         if out.code != Some(0) {
             return Err(panel_core::PanelError::Command {
-                bin: "mysql/psql".into(),
+                bin: cli.bin.as_str().into(),
                 detail: panel_core::sanitize::stderr(&out.stderr),
             });
         }
@@ -437,6 +514,112 @@ pub(super) fn mysql_tables_from_rows(rows: Vec<Vec<String>>) -> Vec<DbTable> {
         .collect()
 }
 
+/// 把「名称 + 种类」两列结果转成表清单。行数取不到时给 -1（未知），
+/// **不伪造成 0**——0 会被前端当成"空表"，-1 才是诚实的"没统计"。
+fn tables_from_pairs(rows: Vec<Vec<String>>) -> Vec<DbTable> {
+    let mut out: Vec<DbTable> = rows.into_iter().filter_map(|r| {
+        let mut it = r.into_iter();
+        let name = it.next()?;
+        if name.is_empty() { return None; }
+        let kind = it.next().unwrap_or_default();
+        Some(DbTable {
+            name,
+            rows: -1,
+            kind: if kind.eq_ignore_ascii_case("view") { TableKind::View } else { TableKind::Table },
+        })
+    }).collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out.dedup_by(|a, b| a.name == b.name);
+    out
+}
+
+/// 把字符串变成合法的 JavaScript 字符串字面量。
+/// 不能用 Rust 的 `{:?}`：Rust 把控制字符写成 `\u{1b}`，JS 只认 `\u001b`。
+fn js_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+impl LinuxDatabases {
+    /// MongoDB：在 mongosh 里执行 JS，逐行取 `print()` 的输出。
+    ///
+    /// 口令**不进 argv**： mongosh 没有标准口令环境变量，故把账号/口令注入
+    /// 子进程环境，再由 JS 从 `process.env` 取出拼进 connection string；
+    /// argv 里只有面板自己生成的脚本。
+    pub(crate) async fn mongo_eval(t: &DbTarget, js: &str) -> Result<Vec<String>> {
+        let host = t.host.clone().unwrap_or_else(|| "127.0.0.1".into());
+        let port = t.port.unwrap_or(27017);
+        let db = t.database.clone().unwrap_or_else(|| "admin".into());
+        let mut env: std::collections::HashMap<String, std::ffi::OsString> =
+            std::collections::HashMap::new();
+        if let Some(u) = &t.user { env.insert("MONGO_USER".into(), std::ffi::OsString::from(u)); }
+        if let Some(p) = &t.password { env.insert("MONGO_PWD".into(), std::ffi::OsString::from(p)); }
+        let script = format!(
+            "const u = process.env.MONGO_USER || '';\n\
+             const p = process.env.MONGO_PWD || '';\n\
+             const cred = u ? encodeURIComponent(u) + ':' + encodeURIComponent(p) + '@' : '';\n\
+             const c = connect('mongodb://' + cred + {} + ':' + {} + '/' + {});\n\
+             {}\n",
+            js_string(&host), port, js_string(&db), js
+        );
+        let args = ["--quiet", "--eval", script.as_str()];
+        let out = crate::cmd::run(
+            crate::cmd::Bin::MongoSh, &args,
+            crate::cmd::CmdOpt { timeout: std::time::Duration::from_secs(30), env, ..Default::default() },
+        ).await?;
+        if out.code != Some(0) {
+            return Err(panel_core::PanelError::Command {
+                bin: "mongosh".into(), detail: panel_core::sanitize::stderr(&out.stderr),
+            });
+        }
+        Ok(out.stdout.lines().filter(|l| !l.trim().is_empty()).map(str::to_string).collect())
+    }
+
+    /// Redis：执行一条只读命令，逐行取原始输出。
+    /// 口令经 `REDISCLI_AUTH` 环境变量传递（redis-cli 原生支持），不进 argv。
+    pub(crate) async fn redis_cmd(t: &DbTarget, args: &[&str]) -> Result<Vec<String>> {
+        let host = t.host.clone().unwrap_or_else(|| "127.0.0.1".into());
+        let port = t.port.unwrap_or(6379).to_string();
+        let mut a = vec!["-h", host.as_str(), "-p", port.as_str(), "--raw"];
+        // 浏览路径把 Redis 的库映射成 db0/db1…；这里还原成 `-n N` 选择对应库。
+        if let Some(db) = &t.database {
+            if let Some(n) = db.strip_prefix("db") {
+                if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) {
+                    a.extend_from_slice(&["-n", n]);
+                }
+            }
+        }
+        a.extend_from_slice(args);
+        let mut env: std::collections::HashMap<String, std::ffi::OsString> =
+            std::collections::HashMap::new();
+        if let Some(p) = &t.password {
+            env.insert("REDISCLI_AUTH".into(), std::ffi::OsString::from(p));
+        }
+        let out = crate::cmd::run(
+            crate::cmd::Bin::RedisCli, &a,
+            crate::cmd::CmdOpt { timeout: std::time::Duration::from_secs(20), env, ..Default::default() },
+        ).await?;
+        if out.code != Some(0) {
+            return Err(panel_core::PanelError::Command {
+                bin: "redis-cli".into(), detail: panel_core::sanitize::stderr(&out.stderr),
+            });
+        }
+        Ok(out.stdout.lines().filter(|l| !l.trim().is_empty()).map(str::to_string).collect())
+    }
+}
+
 #[async_trait]
 impl DatabaseProvider for LinuxDatabases {
     fn engine(&self) -> DbEngine { DbEngine::Sqlite }
@@ -448,6 +631,14 @@ impl DatabaseProvider for LinuxDatabases {
             DbEngine::Sqlite => true,
             DbEngine::MySql => crate::cmd::Bin::MySql.available(),
             DbEngine::Postgres => crate::cmd::Bin::Psql.available(),
+            // MariaDB 线协议兼容：mariadb 客户端或 mysql 客户端任一在位即可
+            DbEngine::MariaDb => crate::cmd::Bin::MariaDb.available()
+                || crate::cmd::Bin::MySql.available(),
+            DbEngine::MongoDb => crate::cmd::Bin::MongoSh.available(),
+            DbEngine::Redis => crate::cmd::Bin::RedisCli.available(),
+            DbEngine::MsSql => crate::cmd::Bin::SqlCmd.available(),
+            DbEngine::Oracle => crate::cmd::Bin::SqlPlus.available(),
+            DbEngine::ClickHouse => crate::cmd::Bin::ClickHouseClient.available(),
         }
     }
 
@@ -484,6 +675,60 @@ impl DatabaseProvider for LinuxDatabases {
                 .await?;
                 return Ok(rows.into_iter().filter_map(|r| r.into_iter().next()).collect());
             }
+            DbEngine::MariaDb => {
+                let rows = LinuxDatabases::sql_query(t, "SHOW DATABASES").await?;
+                return Ok(rows
+                    .into_iter()
+                    .filter_map(|r| r.into_iter().next())
+                    .filter(|n| !matches!(n.as_str(),
+                        "information_schema" | "performance_schema" | "sys" | "mysql"))
+                    .collect());
+            }
+            DbEngine::MsSql => {
+                let rows = LinuxDatabases::sql_query(
+                    t,
+                    "SELECT name FROM sys.databases \
+                     WHERE name NOT IN ('master','tempdb','model','msdb') ORDER BY name",
+                ).await?;
+                return Ok(rows.into_iter().filter_map(|r| r.into_iter().next()).collect());
+            }
+            DbEngine::Oracle => {
+                // dba_users 需要 DBA 权限；普通账号退回 user_users（= 该账号的 schema）
+                let rows = match LinuxDatabases::sql_query(
+                    t, "SELECT username FROM dba_users WHERE oracle_maintained='N' ORDER BY username",
+                ).await {
+                    Ok(r) => r,
+                    Err(_) => LinuxDatabases::sql_query(
+                        t, "SELECT username FROM user_users ORDER BY username",
+                    ).await?,
+                };
+                return Ok(rows.into_iter().filter_map(|r| r.into_iter().next()).collect());
+            }
+            DbEngine::ClickHouse => {
+                let rows = LinuxDatabases::sql_query(t, "SHOW DATABASES").await?;
+                return Ok(rows
+                    .into_iter()
+                    .filter_map(|r| r.into_iter().next())
+                    .filter(|n| !matches!(n.as_str(), "system" | "information_schema" | "INFORMATION_SCHEMA"))
+                    .collect());
+            }
+            DbEngine::MongoDb => {
+                return LinuxDatabases::mongo_eval(
+                    t, "c.getMongo().getDBNames().forEach(n => print(n));",
+                ).await;
+            }
+            DbEngine::Redis => {
+                // Redis 没有真正的"库"层级：列出实际有 key 的 db index；
+                // 全空时给 db0，保证浏览路径不会卡在空列表上。
+                let lines = LinuxDatabases::redis_cmd(t, &["INFO", "keyspace"]).await?;
+                let mut names: Vec<String> = lines.iter()
+                    .filter_map(|l| l.strip_prefix("db"))
+                    .map(|l| format!("db{}", l.split(':').next().unwrap_or("")))
+                    .collect();
+                names.sort();
+                if names.is_empty() { names.push("db0".into()); }
+                return Ok(names);
+            }
         }
         let t = t.clone();
         tokio::task::spawn_blocking(move || {
@@ -505,7 +750,15 @@ impl DatabaseProvider for LinuxDatabases {
         match t.engine {
             // MySQL：库的下一级直接就是表（`SHOW TABLES` 已带库名），没有 schema 层。
             // 返回空 = 「没有更下一层」，前端据此跳过这一层，不把它当成「空目录」。
-            DbEngine::MySql => Ok(Vec::new()),
+            // 这些引擎要么没有比"库"更下一层，要么当前 tables() 不按该层过滤
+            // ——返回空表示"没有这一层"，不谎报一个点进去永远空着的目录。
+            DbEngine::MySql
+            | DbEngine::MariaDb
+            | DbEngine::MongoDb
+            | DbEngine::Redis
+            | DbEngine::MsSql
+            | DbEngine::Oracle
+            | DbEngine::ClickHouse => Ok(Vec::new()),
             DbEngine::Postgres => {
                 // `previewable` 的依据是**当前 tables() 的实现**：它写死 `table_schema='public'`。
                 // 所以除 public 外的 schema 点进去一定列不出东西——这必须在数据里说清楚，
@@ -593,6 +846,61 @@ impl DatabaseProvider for LinuxDatabases {
                 let rs = LinuxDatabases::sql_query(t, PG_OBJECTS_SQL).await?;
                 let mut out = pg_tables_from_rows(rs);
                 fill_row_counts(t, &mut out, pg_row_counts_sql).await;
+                return Ok(out);
+            }
+            DbEngine::MariaDb => {
+                // 与 MySQL 完全同构（线协议兼容），行数同样取精确值
+                let db = t.database.clone().unwrap_or_default();
+                let q = format!(
+                    "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES \
+                     WHERE TABLE_SCHEMA = '{}' ORDER BY TABLE_NAME",
+                    db.replace('\'', "''")
+                );
+                let rs = LinuxDatabases::sql_query(t, &q).await?;
+                let mut out = mysql_tables_from_rows(rs);
+                fill_row_counts(t, &mut out, |ns| mysql_row_counts_sql(&db, ns)).await;
+                return Ok(out);
+            }
+            DbEngine::MsSql => {
+                let rs = LinuxDatabases::sql_query(
+                    t,
+                    "SELECT TABLE_NAME, TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES \
+                     WHERE TABLE_TYPE IN ('BASE TABLE','VIEW') ORDER BY TABLE_NAME",
+                ).await?;
+                return Ok(tables_from_pairs(rs));
+            }
+            DbEngine::Oracle => {
+                let rs = LinuxDatabases::sql_query(
+                    t,
+                    "SELECT table_name, 'BASE TABLE' FROM user_tables \
+                     UNION ALL SELECT view_name, 'VIEW' FROM user_views ORDER BY 1",
+                ).await?;
+                return Ok(tables_from_pairs(rs));
+            }
+            DbEngine::ClickHouse => {
+                let rs = LinuxDatabases::sql_query(
+                    t,
+                    "SELECT name, if(engine = 'View', 'view', 'table') \
+                     FROM system.tables WHERE database = currentDatabase() ORDER BY name",
+                ).await?;
+                return Ok(tables_from_pairs(rs));
+            }
+            DbEngine::MongoDb => {
+                let lines = LinuxDatabases::mongo_eval(
+                    t, "c.getCollectionNames().forEach(n => print(n + '\\tcollection'));",
+                ).await?;
+                let rows = lines.into_iter()
+                    .map(|l| l.split('\t').map(str::to_string).collect::<Vec<_>>())
+                    .collect();
+                return Ok(tables_from_pairs(rows));
+            }
+            DbEngine::Redis => {
+                let mut out: Vec<DbTable> = LinuxDatabases::redis_cmd(t, &["--scan"]).await?
+                    .into_iter()
+                    .map(|name| DbTable { name, rows: -1, kind: TableKind::Table })
+                    .collect();
+                out.sort_by(|a, b| a.name.cmp(&b.name));
+                out.dedup_by(|a, b| a.name == b.name);
                 return Ok(out);
             }
         }
@@ -706,6 +1014,134 @@ impl DatabaseProvider for LinuxDatabases {
                     total,
                 });
             }
+            DbEngine::MariaDb => {
+                let esc = table.replace('`', "``");
+                let total = LinuxDatabases::sql_query(t, &format!("SELECT COUNT(*) FROM `{esc}`"))
+                    .await.ok().and_then(|r| r.into_iter().next())
+                    .and_then(|r| r.into_iter().next())
+                    .and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(-1);
+                let columns: Vec<String> = LinuxDatabases::sql_query(t, &format!("SHOW COLUMNS FROM `{esc}`"))
+                    .await.unwrap_or_default().into_iter().filter_map(|r| r.into_iter().next()).collect();
+                let rows = LinuxDatabases::sql_query(
+                    t, &format!("SELECT * FROM `{esc}` LIMIT {limit} OFFSET {offset}")).await?;
+                return Ok(DbRows {
+                    columns,
+                    rows: rows.into_iter().map(|r| r.into_iter().map(Some).collect()).collect(),
+                    total,
+                });
+            }
+            DbEngine::MsSql => {
+                let esc = table.replace(']', "]]");
+                let qname = format!("[{esc}]");
+                let total = LinuxDatabases::sql_query(t, &format!("SELECT COUNT(*) FROM {qname}"))
+                    .await.ok().and_then(|r| r.into_iter().next())
+                    .and_then(|r| r.into_iter().next())
+                    .and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(-1);
+                let lit = table.replace('\'', "''");
+                let columns: Vec<String> = LinuxDatabases::sql_query(
+                    t, &format!("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS \
+                                 WHERE TABLE_NAME = '{lit}' ORDER BY ORDINAL_POSITION"),
+                ).await.unwrap_or_default().into_iter().filter_map(|r| r.into_iter().next()).collect();
+                // SQL Server 的 OFFSET 必须配 ORDER BY；`ORDER BY (SELECT NULL)` 是
+                // 不承诺顺序的写法，与"预览"语义相符（不假装稳定排序）。
+                let rows = LinuxDatabases::sql_query(
+                    t, &format!("SELECT * FROM {qname} ORDER BY (SELECT NULL) \
+                                 OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY")).await?;
+                return Ok(DbRows {
+                    columns,
+                    rows: rows.into_iter().map(|r| r.into_iter().map(Some).collect()).collect(),
+                    total,
+                });
+            }
+            DbEngine::Oracle => {
+                let esc = table.replace('"', "\"\"");
+                let total = LinuxDatabases::sql_query(t, &format!("SELECT COUNT(*) FROM \"{esc}\""))
+                    .await.ok().and_then(|r| r.into_iter().next())
+                    .and_then(|r| r.into_iter().next())
+                    .and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(-1);
+                let lit = table.to_uppercase().replace('\'', "''");
+                let columns: Vec<String> = LinuxDatabases::sql_query(
+                    t, &format!("SELECT column_name FROM user_tab_columns \
+                                 WHERE table_name = '{lit}' ORDER BY column_id"),
+                ).await.unwrap_or_default().into_iter().filter_map(|r| r.into_iter().next()).collect();
+                // Oracle 11g 没有 OFFSET/FETCH：用 ROWNUM 取有界前 N 行再本地跳页。
+                // 输出在服务端就有界（offset+limit），不会先拉全表。
+                let rows = LinuxDatabases::sql_query(
+                    t, &format!("SELECT * FROM \"{esc}\" WHERE ROWNUM <= {}", offset + limit),
+                ).await?;
+                return Ok(DbRows {
+                    columns,
+                    rows: rows.into_iter().skip(offset)
+                        .map(|r| r.into_iter().map(Some).collect()).collect(),
+                    total,
+                });
+            }
+            DbEngine::ClickHouse => {
+                let db = t.database.clone().unwrap_or_else(|| "default".into());
+                let esc_db = db.replace('\'', "''");
+                let esc = table.replace('"', "\"\"");
+                let total = LinuxDatabases::sql_query(
+                    t, &format!("SELECT count() FROM \"{esc_db}\".\"{esc}\""),
+                ).await.ok().and_then(|r| r.into_iter().next())
+                    .and_then(|r| r.into_iter().next())
+                    .and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(-1);
+                let lit = table.replace('\'', "''");
+                let columns: Vec<String> = LinuxDatabases::sql_query(
+                    t, &format!("SELECT name FROM system.columns WHERE database = '{esc_db}' \
+                                 AND table = '{lit}' ORDER BY position"),
+                ).await.unwrap_or_default().into_iter().filter_map(|r| r.into_iter().next()).collect();
+                let rows = LinuxDatabases::sql_query(
+                    t, &format!("SELECT * FROM \"{esc_db}\".\"{esc}\" LIMIT {limit} OFFSET {offset}"),
+                ).await?;
+                return Ok(DbRows {
+                    columns,
+                    rows: rows.into_iter().map(|r| r.into_iter().map(Some).collect()).collect(),
+                    total,
+                });
+            }
+            DbEngine::MongoDb => {
+                let js = format!(
+                    "c.getCollection({}).find().skip({}).limit({}).forEach(d => print(JSON.stringify(d)));",
+                    js_string(table), offset, limit
+                );
+                let lines = LinuxDatabases::mongo_eval(t, &js).await?;
+                return Ok(DbRows {
+                    columns: vec!["document (JSON)".into()],
+                    rows: lines.into_iter().map(|l| vec![Some(l)]).collect(),
+                    total: -1,
+                });
+            }
+            DbEngine::Redis => {
+                // 按 key 的实际类型选命令；HGETALL/ZRANGE 是两列，其余单列。
+                let typ = LinuxDatabases::redis_cmd(t, &["TYPE", table]).await?
+                    .into_iter().next().unwrap_or_default();
+                let (columns, vals) = match typ.as_str() {
+                    "hash" => (vec!["field".into(), "value".into()],
+                        LinuxDatabases::redis_cmd(t, &["HGETALL", table]).await?),
+                    "zset" => (vec!["member".into(), "score".into()],
+                        LinuxDatabases::redis_cmd(t, &["ZRANGE", table, "0", "-1", "WITHSCORES"]).await?),
+                    "list" => (vec!["index".into(), "value".into()], {
+                        let v = LinuxDatabases::redis_cmd(t, &["LRANGE", table, "0", "-1"]).await?;
+                        v.into_iter().enumerate()
+                            .map(|(i, x)| format!("{i}") + "\t" + &x).collect()
+                    }),
+                    "set" => (vec!["member".into()],
+                        LinuxDatabases::redis_cmd(t, &["SMEMBERS", table]).await?),
+                    _ => (vec!["value".into()],
+                        LinuxDatabases::redis_cmd(t, &["GET", table]).await?),
+                };
+                let width = columns.len();
+                let all: Vec<Vec<Option<String>>> = vals.into_iter()
+                    .map(|l| l.split('\t').map(|c| Some(c.to_string())).collect())
+                    .collect();
+                let total = all.len() as i64;
+                return Ok(DbRows {
+                    columns: if all.first().map(|r| r.len()) == Some(width) { columns }
+                             else { vec!["value".into()] },
+                    rows: all.into_iter().skip(offset).take(limit).collect(),
+                    total,
+                });
+            }
         }
         let t = t.clone();
         let table = table.to_string();
@@ -774,6 +1210,20 @@ impl DatabaseProvider for LinuxDatabases {
                 return unsupported!(
                     "dbms.query: MySQL 未实装只读控制台（无服务端只读护栏可用；\
                      PostgreSQL 与 SQLite 已开放）"
+                );
+            }
+            DbEngine::MariaDb
+            | DbEngine::MongoDb
+            | DbEngine::Redis
+            | DbEngine::MsSql
+            | DbEngine::Oracle
+            | DbEngine::ClickHouse => {
+                // 与 MySQL 同理：关键字白名单只是"尽早给出可读错误"，不是安全边界。
+                // 这些引擎都没有可用的服务端物理只读护栏，宁可不给按钮，
+                // 也不能开一个能写库的入口。浏览/备份各自独立实现，不受此限。
+                return unsupported!(
+                    "dbms.query: 该引擎未实装只读控制台（无服务端只读护栏；\
+                     仅 SQLite 与 PostgreSQL 开放）"
                 );
             }
         }
@@ -874,6 +1324,122 @@ impl DatabaseProvider for LinuxDatabases {
                 on_line("PostgreSQL 备份完成".into());
                 Ok(())
             }
+            DbEngine::MariaDb => {
+                let mut env: std::collections::HashMap<String, std::ffi::OsString> = std::collections::HashMap::new();
+                if let Some(p) = &t.password { env.insert("MYSQL_PWD".into(), std::ffi::OsString::from(p)); }
+                let mut a: Vec<String> = vec![
+                    "--result-file".into(), o.as_path().to_string_lossy().into(),
+                    "--single-transaction".into(), "--routines".into(), "--triggers".into(),
+                    "--events".into(), "--skip-lock-tables".into(),
+                    "-h".into(), t.host.clone().unwrap_or_else(|| "127.0.0.1".into()),
+                ];
+                if let Some(p) = t.port { a.push("-P".into()); a.push(p.to_string()); }
+                if let Some(u) = &t.user { a.push("-u".into()); a.push(u.clone()); }
+                if let Some(d) = &t.database { a.push("-D".into()); a.push(d.clone()); }
+                let args: Vec<&str> = a.iter().map(|s| s.as_str()).collect();
+                on_line("mariadb-dump 导出中…".into());
+                crate::cmd::run_checked(
+                    crate::cmd::Bin::MariaDbDump, &args,
+                    crate::cmd::CmdOpt { timeout: std::time::Duration::from_secs(600), env, ..Default::default() },
+                ).await?;
+                on_line("MariaDB 备份完成".into());
+                Ok(())
+            }
+            DbEngine::MongoDb => {
+                // 逻辑备份（JSONL）：每行 "集合名\tJSON文档"。
+                // 刻意不用 mongodump 的 --password（会进 argv 被 ps 看到）——
+                // 复用 mongo_eval 的 env 注入通道，安全性质与浏览路径一致。
+                // 代价：产物是 JSONL 而非 BSON archive，恢复也走本面板。
+                let js = "c.getCollectionNames().forEach(n => \
+                          c.getCollection(n).find().forEach(d => print(n + '\\t' + JSON.stringify(d))));";
+                let lines = LinuxDatabases::mongo_eval(t, js).await?;
+                let (path, content) = (o.as_path().to_path_buf(), lines.join("\n"));
+                crate::fs::blocking(move || std::fs::write(&path, content))
+                    .await?.map_err(|e| panel_core::PanelError::Io(e.to_string()))?;
+                on_line("MongoDB 逻辑备份完成（JSONL）".into());
+                Ok(())
+            }
+            DbEngine::Redis => {
+                // 逻辑备份：每行 "key\ttype\tvalues"（多值以逗号分隔并转义）。
+                // 不用 `--rdb`：那是二进制，cmd 出口按 UTF-8 捕获会损坏产物。
+                let keys = LinuxDatabases::redis_cmd(t, &["--scan"]).await?;
+                let mut lines: Vec<String> = Vec::new();
+                for key in keys {
+                    let typ = LinuxDatabases::redis_cmd(t, &["TYPE", &key]).await?
+                        .into_iter().next().unwrap_or_default();
+                    let vals = match typ.as_str() {
+                        "hash" => LinuxDatabases::redis_cmd(t, &["HGETALL", &key]).await?,
+                        "list" => LinuxDatabases::redis_cmd(t, &["LRANGE", &key, "0", "-1"]).await?,
+                        "set" => LinuxDatabases::redis_cmd(t, &["SMEMBERS", &key]).await?,
+                        "zset" => LinuxDatabases::redis_cmd(t, &["ZRANGE", &key, "0", "-1", "WITHSCORES"]).await?,
+                        _ => LinuxDatabases::redis_cmd(t, &["GET", &key]).await?,
+                    };
+                    let esc = |s: &str| s.replace('\\', "\\\\").replace(',', "\\u002c")
+                        .replace('\t', "\\t").replace('\n', "\\n");
+                    lines.push(format!("{}\t{}\t{}", esc(&key), typ,
+                        vals.iter().map(|v| esc(v)).collect::<Vec<_>>().join(",")));
+                }
+                let (path, content) = (o.as_path().to_path_buf(), lines.join("\n"));
+                crate::fs::blocking(move || std::fs::write(&path, content))
+                    .await?.map_err(|e| panel_core::PanelError::Io(e.to_string()))?;
+                on_line("Redis 逻辑备份完成".into());
+                Ok(())
+            }
+            DbEngine::ClickHouse => {
+                // 逻辑备份：逐表导出 SQLInsert（只含数据，表结构需已存在）。
+                // 不导结构是因为 SHOW CREATE TABLE 的多行输出在 TSV 模式下不可靠；
+                // 与其产出一份"看着完整、恢复却失败"的产物，不如如实限定范围。
+                let db = t.database.clone().unwrap_or_else(|| "default".into());
+                let lit = db.replace('\'', "''");
+                let tables = LinuxDatabases::sql_query(
+                    t, &format!("SELECT name FROM system.tables WHERE database = '{lit}' ORDER BY name"),
+                ).await?;
+                let mut out = String::new();
+                for row in tables {
+                    let name = row.into_iter().next().unwrap_or_default();
+                    if name.is_empty() { continue; }
+                    let q = format!("SELECT * FROM \"{}\".\"{}\" FORMAT SQLInsert",
+                        lit.replace('\'', "''"), name.replace('"', "\"\""));
+                    // sql_query 按 TAB 拆列，这里 join 还原客户端原始行
+                    for row in LinuxDatabases::sql_query(t, &q).await? {
+                        out.push_str(&row.join("\t")); out.push('\n');
+                    }
+                }
+                let (path, content) = (o.as_path().to_path_buf(), out);
+                crate::fs::blocking(move || std::fs::write(&path, content))
+                    .await?.map_err(|e| panel_core::PanelError::Io(e.to_string()))?;
+                on_line("ClickHouse 备份完成（数据 SQL）".into());
+                Ok(())
+            }
+            DbEngine::MsSql => {
+                // 标准 BACKUP DATABASE：产物写在 **SQL Server 服务端**的 DISK 路径。
+                // ⚠ 面板与数据库必须能访问同一个路径（同机或共享存储）；
+                // 远端独占文件系统时此分支会由服务端报错，不伪装成功。
+                let db = t.database.clone().ok_or_else(|| PanelError::Validation {
+                    field: "database", reason: "SQL Server 备份需指定库名".into(),
+                })?;
+                let path = o.as_path().to_string_lossy().replace('\'', "''");
+                let sql = format!("BACKUP DATABASE [{}] TO DISK = '{}' WITH INIT, COMPRESSION",
+                    db.replace(']', "]]"), path);
+                let mut env: std::collections::HashMap<String, std::ffi::OsString> = std::collections::HashMap::new();
+                if let Some(p) = &t.password { env.insert("SQLCMDPASSWORD".into(), std::ffi::OsString::from(p)); }
+                let host = t.host.clone().unwrap_or_else(|| "127.0.0.1".into());
+                let port = t.port.unwrap_or(1433);
+                let mut a: Vec<String> = vec!["-S".into(), format!("tcp:{host},{port}"), "-Q".into(), sql];
+                if let Some(u) = &t.user { a.push("-U".into()); a.push(u.clone()); }
+                let args: Vec<&str> = a.iter().map(|s| s.as_str()).collect();
+                crate::cmd::run_checked(
+                    crate::cmd::Bin::SqlCmd, &args,
+                    crate::cmd::CmdOpt { timeout: std::time::Duration::from_secs(600), env, ..Default::default() },
+                ).await?;
+                on_line("SQL Server 备份完成（服务端磁盘）".into());
+                Ok(())
+            }
+            DbEngine::Oracle => {
+                // expdp 依赖服务端 DIRECTORY 对象与相应权限，面板无法跨环境通用
+                // 地创建/定位它。诚实地拒绝，而不是给一个"建了必失败"的假按钮。
+                return unsupported!("dbms.backup: Oracle 备份需服务端 DIRECTORY 对象，面板不通用支持");
+            }
         }
     }
 
@@ -944,6 +1510,116 @@ impl DatabaseProvider for LinuxDatabases {
                     crate::cmd::CmdOpt { timeout: std::time::Duration::from_secs(600), env, ..Default::default() },
                 ).await?;
                 Ok(())
+            }
+            DbEngine::MariaDb => {
+                let mut env: std::collections::HashMap<String, std::ffi::OsString> = std::collections::HashMap::new();
+                if let Some(p) = &t.password { env.insert("MYSQL_PWD".into(), std::ffi::OsString::from(p)); }
+                let mut a: Vec<String> = vec!["-h".into(), t.host.clone().unwrap_or_else(|| "127.0.0.1".into())];
+                if let Some(p) = t.port { a.push("-P".into()); a.push(p.to_string()); }
+                if let Some(u) = &t.user { a.push("-u".into()); a.push(u.clone()); }
+                if let Some(d) = &t.database { a.push("-D".into()); a.push(d.clone()); }
+                a.push("-e".into());
+                a.push(format!("source {}", from.as_path().to_string_lossy()));
+                let args: Vec<&str> = a.iter().map(|s| s.as_str()).collect();
+                crate::cmd::run_checked(
+                    crate::cmd::Bin::MariaDb, &args,
+                    crate::cmd::CmdOpt { timeout: std::time::Duration::from_secs(600), env, ..Default::default() },
+                ).await?;
+                Ok(())
+            }
+            DbEngine::MongoDb => {
+                let path = from.as_path().to_path_buf();
+                let content = crate::fs::blocking(move || std::fs::read_to_string(&path))
+                    .await?.map_err(|e| panel_core::PanelError::Io(e.to_string()))?;
+                use std::collections::BTreeMap;
+                let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                for line in content.lines() {
+                    if let Some((coll, doc)) = line.split_once('\t') {
+                        if !coll.is_empty() { groups.entry(coll.to_string()).or_default().push(doc.to_string()); }
+                    }
+                }
+                for (coll, docs) in groups {
+                    // 先清空再插入：与 SQLite/MySQL 恢复的"覆盖当前库"语义一致。
+                    let js = format!("c.getCollection({}).deleteMany({{}}); \
+                                      c.getCollection({}).insertMany([{}]);",
+                        js_string(&coll), js_string(&coll), docs.join(","));
+                    LinuxDatabases::mongo_eval(t, &js).await?;
+                }
+                Ok(())
+            }
+            DbEngine::Redis => {
+                let path = from.as_path().to_path_buf();
+                let content = crate::fs::blocking(move || std::fs::read_to_string(&path))
+                    .await?.map_err(|e| panel_core::PanelError::Io(e.to_string()))?;
+                let unesc = |s: &str| s.replace("\\u002c", ",").replace("\\t", "\t")
+                    .replace("\\n", "\n").replace("\\\\", "\\");
+                for line in content.lines() {
+                    let parts: Vec<&str> = line.split('\t').collect();
+                    if parts.len() < 3 { continue; }
+                    let key = unesc(parts[0]);
+                    let typ = parts[1];
+                    let vals: Vec<String> = parts[2].split(',').map(&unesc).collect();
+                    if vals.is_empty() { continue; }
+                    let mut args: Vec<String> = vec![typ.to_string(), key.clone()];
+                    match typ {
+                        "hash" | "zset" => args.extend(vals),
+                        _ => {
+                            LinuxDatabases::redis_cmd(t, &["DEL", &key]).await?;
+                            args.extend(vals);
+                        }
+                    }
+                    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                    LinuxDatabases::redis_cmd(t, &refs).await?;
+                }
+                Ok(())
+            }
+            DbEngine::ClickHouse => {
+                let path = from.as_path().to_path_buf();
+                let content = crate::fs::blocking(move || std::fs::read_to_string(&path))
+                    .await?.map_err(|e| panel_core::PanelError::Io(e.to_string()))?;
+                let mut env: std::collections::HashMap<String, std::ffi::OsString> = std::collections::HashMap::new();
+                if let Some(p) = &t.password { env.insert("CLICKHOUSE_PASSWORD".into(), std::ffi::OsString::from(p)); }
+                let mut a: Vec<String> = vec![
+                    "--host".into(), t.host.clone().unwrap_or_else(|| "127.0.0.1".into()),
+                    "--port".into(), t.port.unwrap_or(9000).to_string(),
+                    "--multiquery".into(),
+                ];
+                if let Some(u) = &t.user { a.push("--user".into()); a.push(u.clone()); }
+                if let Some(d) = &t.database { a.push("--database".into()); a.push(d.clone()); }
+                let args: Vec<&str> = a.iter().map(|s| s.as_str()).collect();
+                let out = crate::cmd::run(
+                    crate::cmd::Bin::ClickHouseClient, &args,
+                    crate::cmd::CmdOpt { timeout: std::time::Duration::from_secs(600), env, stdin: Some(content), ..Default::default() },
+                ).await?;
+                if out.code != Some(0) {
+                    return Err(panel_core::PanelError::Command {
+                        bin: "clickhouse-client".into(), detail: panel_core::sanitize::stderr(&out.stderr),
+                    });
+                }
+                Ok(())
+            }
+            DbEngine::MsSql => {
+                let db = t.database.clone().ok_or_else(|| PanelError::Validation {
+                    field: "database", reason: "SQL Server 恢复需指定库名".into(),
+                })?;
+                let path = from.as_path().to_string_lossy().replace('\'', "''");
+                let sql = format!("RESTORE DATABASE [{}] FROM DISK = '{}' WITH REPLACE",
+                    db.replace(']', "]]"), path);
+                let mut env: std::collections::HashMap<String, std::ffi::OsString> = std::collections::HashMap::new();
+                if let Some(p) = &t.password { env.insert("SQLCMDPASSWORD".into(), std::ffi::OsString::from(p)); }
+                let host = t.host.clone().unwrap_or_else(|| "127.0.0.1".into());
+                let port = t.port.unwrap_or(1433);
+                let mut a: Vec<String> = vec!["-S".into(), format!("tcp:{host},{port}"), "-Q".into(), sql];
+                if let Some(u) = &t.user { a.push("-U".into()); a.push(u.clone()); }
+                let args: Vec<&str> = a.iter().map(|s| s.as_str()).collect();
+                crate::cmd::run_checked(
+                    crate::cmd::Bin::SqlCmd, &args,
+                    crate::cmd::CmdOpt { timeout: std::time::Duration::from_secs(600), env, ..Default::default() },
+                ).await?;
+                Ok(())
+            }
+            DbEngine::Oracle => {
+                return unsupported!("dbms.restore: Oracle 恢复需服务端 DIRECTORY 对象，面板不通用支持");
             }
         }
     }

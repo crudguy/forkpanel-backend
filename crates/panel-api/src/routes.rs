@@ -227,6 +227,8 @@ pub fn build_router(state: Shared) -> Router {
 
     // ── 数据库 ──
     let db_r = Router::new()
+        // 引擎元数据：前端下拉/默认端口/账号/能力位的唯一事实源（静态只读，不需 DBMS 能力位）
+        .route("/api/v1/db/engines", get(databases::engines))
         .route("/api/v1/db/connections", get(databases::list).post(databases::create))
         .route("/api/v1/db/connections/{id}", patch(databases::update).delete(databases::delete))
         .route("/api/v1/db/{conn}/databases", get(databases::databases_of))
