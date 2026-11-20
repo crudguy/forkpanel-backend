@@ -203,8 +203,12 @@ pub async fn apply(
         if action != panel_os::Action::Allow && locks_out_ssh(&ports, &protected)
             && req.allow_lockout_risk != Some(true) {
                 let list = protected.iter().map(|p| p.to_string()).collect::<Vec<_>>().join("、");
+                // 文案给终端用户看，不能暴露 allow_lockout_risk 这类内部 API 参数名：
+                // 用户无从在界面上「带参数」，只会困惑。指明界面上的操作路径——
+                // 前端命中保护端口本会弹高危确认，走到这里说明是旧前端/读端口失败，
+                // 提示刷新后重试，让新前端下发保护端口并弹确认。
                 return Err(ApiError::conflict(format!(
-                    "该规则可能阻断当前 SSH 端口（{list}）。确认后请带 allow_lockout_risk=true 重试")));
+                    "该规则会封禁当前 SSH 端口（{list}），可能导致无法远程连接。请在页面确认高风险提示后重试；若未弹出确认，请刷新页面重试")));
             }
 
         // id 必须唯一**并写进 comment**：删除时靠 `panel-managed <id>` 定位规则。
