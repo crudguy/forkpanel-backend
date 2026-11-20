@@ -269,6 +269,8 @@ impl FirewallProvider for LinuxFirewall {
             let comment = format!("panel-managed {} {}",
                 id, rule.comment.clone().unwrap_or_default().trim());
             let mut args: Vec<String> = Vec::new();
+            // 封禁插到 ufw 规则表最前，否则被既有 allow 截胡，形成「报已封禁但实际没封」。
+            for p in ufw_write_prefix(rule.action) { args.push((*p).into()); }
             args.push(match rule.action { Action::Deny => "deny", Action::Reject => "reject", _ => "allow" }.into());
             let port = port_to_arg(&rule.ports);
             match &rule.ports {
@@ -427,10 +429,32 @@ fn proto_str(p: Protocol) -> &'static str {
     match p { Protocol::Udp => "udp", Protocol::Icmp => "icmp", Protocol::Any => "any", _ => "tcp" }
 }
 
+/// ufw 与 nft 同样是顺序匹配：封禁必须插到第 1 条，追加到末尾会被既有 allow 遮蔽。
+/// 放行保持追加语义（F-20：apply 不删既有规则）。
+fn ufw_write_prefix(action: Action) -> &'static [&'static str] {
+    if matches!(action, Action::Deny | Action::Reject) { &["insert", "1"] } else { &[] }
+}
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ufw_deny_inserts_at_head() {
+        assert_eq!(ufw_write_prefix(Action::Deny), &["insert", "1"]);
+        assert_eq!(ufw_write_prefix(Action::Reject), &["insert", "1"]);
+        assert!(ufw_write_prefix(Action::Allow).is_empty(), "放行保持追加");
+    }
+
+    #[test]
+    fn ufw_apply_routes_deny_to_insert() {
+        let src = panel_testutil::production_source(include_str!("firewall.rs"));
+        let start = src.find("async fn apply").expect("apply 必须存在");
+        let end = src.find("async fn delete_rule").expect("apply 之后应有 delete_rule");
+        let body = &src[start..end];
+        assert!(body.contains("ufw_write_prefix(rule.action"), "ufw apply 必须按动作分流");
+    }
 
     /// `ufw status numbered` 的真实输出片段（含表头、分割线、v6 行、comment）
     const SAMPLE: &str = "\

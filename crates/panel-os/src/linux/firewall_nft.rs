@@ -210,14 +210,11 @@ impl FirewallProvider for NftFirewall {
             let rule = &plan.rules[i];
             let id = gen_id();
             let expr = render_rule(rule, &id);
-            let e = expr.as_str();
-            if let Err(err) = self.nft_checked(
-                &["add", "rule", "inet", TABLE, CHAIN, e],
-                Duration::from_secs(20),
-            ).await {
+            let argv = rule_write_argv(rule.action, &expr);
+            if let Err(err) = self.nft_checked(&argv, Duration::from_secs(20)).await {
                 return Err(PanelError::Command {
                     bin: "nft".into(),
-                    detail: format!("add {} 失败: {}", rule.id, err),
+                    detail: format!("{} {} 失败: {}", argv[0], rule.id, err),
                 });
             }
             added += 1;
@@ -361,6 +358,19 @@ impl FirewallProvider for NftFirewall {
 }
 
 // ═══════════════════════════ 纯函数：解析 / 渲染 ═══════════════════════════
+
+/// 决定规则的写入命令：封禁插链首，放行追加链尾。
+///
+/// nft 首个 verdict 命中即终止；把 deny 追加到链尾会被前面既有的 allow
+/// 截胡，UI 却按 apply 成功报「已封禁」——典型的假成功。allow 保持追加
+/// 语义（F-20：apply 不删既有规则），两条策略各司其职。
+fn rule_write_argv(action: Action, expr: &str) -> Vec<&str> {
+    if matches!(action, Action::Deny | Action::Reject) {
+        vec!["insert", "rule", "inet", TABLE, CHAIN, "position", "0", expr]
+    } else {
+        vec!["add", "rule", "inet", TABLE, CHAIN, expr]
+    }
+}
 
 /// 从 `nft list table inet panelfw` 输出里读面板链的入站默认策略。
 /// 只认 `chain input { ... }` 块内的 policy——绝不把 Docker 等其它链的
@@ -608,6 +618,29 @@ fn gen_id() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deny_rules_are_inserted_at_chain_head() {
+        let deny = rule_write_argv(Action::Deny, "tcp dport 80 drop");
+        assert_eq!(deny[0], "insert", "封禁必须插链首，不能被旧 allow 截胡");
+        assert_eq!(deny[5], "position");
+        assert_eq!(deny[6], "0");
+        assert_eq!(rule_write_argv(Action::Reject, "tcp dport 80 reject")[0], "insert");
+        let allow = rule_write_argv(Action::Allow, "tcp dport 80 accept");
+        assert_eq!(allow[0], "add", "放行保持追加语义");
+        assert!(!allow.contains(&"position"));
+    }
+
+    #[test]
+    fn apply_routes_deny_to_insert_not_add() {
+        // 接线守卫：纯函数全绿也挡不住 apply 退回「所有规则都 add」。
+        let src = panel_testutil::production_source(include_str!("firewall_nft.rs"));
+        let start = src.find("async fn apply").expect("apply 必须存在");
+        let end = src.find("async fn delete_rule").expect("apply 之后应有 delete_rule");
+        let body = &src[start..end];
+        assert!(body.contains("rule_write_argv(rule.action"), "apply 必须按动作分流写入");
+        assert!(!body.contains("\"add\", \"rule\""), "apply 不得把所有规则都追加链尾");
+    }
+
     #[test]
     fn chain_policy_reads_only_panel_input_chain() {
         // Docker 的 FORWARD 链是 policy drop；若扫描时不限定链名，就会把
