@@ -7,8 +7,11 @@
 //! 2. **只管理自己写的规则**：幂等比对只认带 `panel-managed` 标记的规则，
 //!    `delete_rule` 拒绝删用户自建规则；`apply` 一律追加，不删既有规则（F-20）。
 //!    面板绝不能清掉用户手动加的规则——那会让用户别的安全措施一起失效。
-//! 3. **SSH 端口保护**：拒绝任何会阻断当前 SSH 连接端口的规则，
-//!    除非请求里显式声明 `allow_lockout_risk`（且 UI 必须二次确认）。
+//! 3. **SSH 端口保护**：拒绝任何会阻断当前 SSH 连接端口的规则。
+//!    封禁当前 SSH 端口时**必须**同时提供 `new_ssh_port`：先把 SSH 迁到新端口
+//!    并 reload 生效（旧端口过渡期保留），再放行新端口、应用封禁规则；
+//!    任一步失败全程回滚（SSH 配置 + 防火墙快照）。不存在"确认风险就能盲封"
+//!    的逃生阀——允许盲封等于允许把自己永久锁在门外。
 
 use crate::{
     auth::perm,
@@ -16,7 +19,7 @@ use crate::{
     routes::{audit, Auth, Shared},
 };
 use axum::{extract::{Path as AxPath, Query, State}, Json};
-use panel_core::cap_keys;
+use panel_core::{cap_keys, unit_name};
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use crate::extract::PanelJson;
@@ -154,8 +157,12 @@ pub fn parse_ports(s: &str) -> Option<panel_os::PortSpec> {
 #[derive(Debug, Deserialize)]
 pub struct ApplyReq {
     pub rules: Vec<RuleInput>,
-    /// 显式承担失联风险。**UI 必须二次确认才能置 true**
+    /// 显式承担失联风险。兼容旧客户端保留字段，但**不再作为封禁 SSH 的逃生阀**：
+    /// 现在封禁 SSH 端口必须给出 `new_ssh_port` 走"先迁移后封禁"（见 apply）。
     pub allow_lockout_risk: Option<bool>,
+    /// 新 SSH 端口：封禁规则命中当前 SSH 端口时**必填**。面板会先把 SSH 迁到
+    /// 这个端口、reload 生效并自动放行，然后才应用封禁规则。
+    pub new_ssh_port: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -181,8 +188,14 @@ pub async fn apply(
     // SSH 保护端口必须现读。写死 22 会在用户把 SSH 改到 2222 后失效，
     // 任由 deny 规则把自己锁在门外（P0）。
     let protected = protected_ports(&state).await;
+    let ssh_state = state.os.security().ssh_port().await.ok();
+
+    // 快照必须在任何变更之前取：若放在 SSH 迁移之后，snapshot() 自身失败会直接
+    // 返回错误，而 SSH 配置与监听已经改过 —— 用户看到失败提示，机器却处于半迁移态。
+    let snapshot = state.os.firewall().snapshot().await?;
 
     let mut rules = Vec::new();
+    let mut blocks_ssh = false;
     for r in &req.rules {
         let ports = parse_ports(&r.ports)
             .ok_or_else(|| ApiError::bad_request("ports", format!("invalid port spec: {}", r.ports)))?;
@@ -200,16 +213,12 @@ pub async fn apply(
         };
 
         // ── 失联保护 ──
-        if action != panel_os::Action::Allow && locks_out_ssh(&ports, &protected)
-            && req.allow_lockout_risk != Some(true) {
-                let list = protected.iter().map(|p| p.to_string()).collect::<Vec<_>>().join("、");
-                // 文案给终端用户看，不能暴露 allow_lockout_risk 这类内部 API 参数名：
-                // 用户无从在界面上「带参数」，只会困惑。指明界面上的操作路径——
-                // 前端命中保护端口本会弹高危确认，走到这里说明是旧前端/读端口失败，
-                // 提示刷新后重试，让新前端下发保护端口并弹确认。
-                return Err(ApiError::conflict(format!(
-                    "该规则会封禁当前 SSH 端口（{list}），可能导致无法远程连接。请在页面确认高风险提示后重试；若未弹出确认，请刷新页面重试")));
-            }
+        // 命中当前 SSH 端口的封禁规则不再允许"点个风险确认就盲封"：必须有新端口，
+        // 走下面的"先迁移后封禁"原子流程。allow_lockout_risk 仅为兼容旧字段保留，
+        // 不再能绕过这道门——否则等于留着一个 API 后门把自己锁死。
+        if action != panel_os::Action::Allow && locks_out_ssh(&ports, &protected) {
+            blocks_ssh = true;
+        }
 
         // id 必须唯一**并写进 comment**：删除时靠 `panel-managed <id>` 定位规则。
         // 若只写用户备注，两条同名规则会撞 id → 删除命中第一条，删错规则。
@@ -234,22 +243,71 @@ pub async fn apply(
         });
     }
 
-    // ── 应用前无条件快照 ──
-    let snapshot = state.os.firewall().snapshot().await?;
+    // ── SSH 迁移编排 ──
+    // 封禁命中当前 SSH 端口时，必须"先迁移、后封禁"：把 SSH 迁到新端口并
+    // reload 生效（keep_old=true 让旧端口过渡期仍在听），再在防火墙放行新端口，
+    // 最后才应用用户的封禁规则。全程任一步失败都回滚到操作前状态。
+    let mut ssh_migration: Option<(u16, u16)> = None; // (新端口, 迁移前的生效端口)
+    if blocks_ssh {
+        let new_port = req.new_ssh_port.ok_or_else(|| ApiError::bad_request(
+            "new_ssh_port",
+            "该规则会封禁当前 SSH 端口，必须同时提供一个新的 SSH 端口用于迁移，避免失联",
+        ))?;
+        new_port_is_safe(new_port, &rules, &protected)
+            .map_err(|reason| ApiError::bad_request("new_ssh_port", reason))?;
+
+        let old_port = ssh_state.as_ref().map(|st| st.effective).unwrap_or(FALLBACK_SSH_PORT);
+        let sec = state.os.security();
+        // 单元名必须在写配置前解析：若解析失败发生在写之后，SSH 配置已改却没回滚。
+        let sshd = unit_name("sshd").map_err(|_| ApiError::bad_request("sshd", "invalid unit name"))?;
+
+        // ① 写新端口配置：keep_old=true 是安全关键——在 reload 前后旧端口都在听，
+        //    不存在"新端口没起来、旧端口又没了"的窗口。方法自带 sshd -t 校验与写失败回滚。
+        sec.set_ssh_port(new_port, true).await.map_err(ApiError::from)?;
+
+        // ② reload 让新端口真正监听。失败则回滚 SSH 配置（回到只有旧端口）再 reload。
+        if let Err(e) = state.os.services().reload(&sshd).await {
+            let _ = sec.set_ssh_port(old_port, false).await;               // 尽力回滚配置
+            let _ = state.os.services().reload(&sshd).await;               // 尽力回滚监听
+            return Err(ApiError::from(e));
+        }
+        ssh_migration = Some((new_port, old_port));
+
+        // ③ 把"放行新端口"前置到规则列表：封禁旧端口之前，新端口必须已通。
+        //    用面板托管的 allow 规则，跟随同一份快照，回滚时一起撤销。
+        rules.insert(0, panel_os::FirewallRule {
+            id: gen_rule_id(),
+            ports: panel_os::PortSpec::Single(new_port),
+            protocol: panel_os::Protocol::Tcp,
+            action: panel_os::Action::Allow,
+            direction: panel_os::Direction::Inbound,
+            source_cidr: None,
+            comment: Some("panel ssh migration".into()),
+            panel_managed: true,
+        });
+    }
 
     // F-20：apply 是「确保存在」的追加语义，绝不删既有规则；删除走 delete_rule(id)。
     let plan = panel_os::RulePlan { rules };
     let report = match state.os.firewall().apply(plan).await {
         Ok(r) => r,
         Err(e) => {
-            // 失败自动回滚：把快照恢复回去
+            // 失败自动回滚：防火墙快照 + SSH 配置（迁过去的端口必须收回来）
             if let Err(rollback_err) = state.os.firewall().restore_snapshot(&snapshot).await {
                 eprintln!("[warn] firewall.apply 失败，回滚快照也失败（规则可能处于半应用状态）: {rollback_err}");
+            }
+            if let Some((_, old_port)) = ssh_migration {
+                let _ = state.os.security().set_ssh_port(old_port, false).await;
+                if let Ok(unit) = unit_name("sshd") { let _ = state.os.services().reload(&unit).await; }
             }
             return Err(ApiError::from(e));
         }
     };
 
+    if let Some((new_port, _)) = ssh_migration {
+        audit(&state, &s, "firewall.ssh_migrate",
+              &format!("ssh -> {new_port}, then block old port"), "ok").await;
+    }
     audit(&state, &s, "firewall.apply",
           &format!("+{}/-{}", report.added, report.removed), "ok").await;
 
@@ -260,7 +318,30 @@ pub async fn apply(
         "warnings": report.warnings,
         // 快照只用于本次 apply 失败时的自动回滚；前端目前没有撤销入口，别写成已有。
         "snapshot_bytes": snapshot.len(),
+        "ssh_migrated_to": ssh_migration.map(|(n, _)| n),
     })))
+}
+
+/// 校验用户提供的"新 SSH 端口"是否安全可用。
+///
+/// 三条判据缺一不可（都是实测会踩的坑）：
+/// 1. 端口在 1..=65535；
+/// 2. **不在**任何封禁规则的端口集里——否则 SSH 迁过去又被同一批规则封掉，
+///    等于白迁还让用户以为有退路（最危险的假保护）；
+/// 3. **不等于**任何当前受保护端口——迁到旧端口等于没迁。
+fn new_port_is_safe(new_port: u16, rules: &[panel_os::FirewallRule], protected: &[u16]) -> Result<(), String> {
+    if new_port == 0 { return Err("新 SSH 端口必须在 1-65535 之间".into()) }
+    if protected.contains(&new_port) {
+        return Err(format!("新 SSH 端口 {new_port} 与当前 SSH 端口相同，等于没有迁移"))
+    }
+    for r in rules {
+        // 只有 deny / reject 才会封住端口；allow 规则里的同端口无妨
+        if r.action == panel_os::Action::Allow { continue }
+        if locks_out_ssh(&r.ports, &[new_port]) {
+            return Err(format!("新 SSH 端口 {new_port} 也在本次封禁的端口范围内，迁过去仍会被封禁"))
+        }
+    }
+    Ok(())
 }
 
 /// 生成规则 id（写入 comment，用于精确定位待删规则）。
@@ -491,6 +572,65 @@ pub async fn fail2ban_set_params(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn deny_rule(spec: &str) -> panel_os::FirewallRule {
+        panel_os::FirewallRule {
+            id: "t".into(),
+            ports: parse_ports(spec).unwrap(),
+            protocol: panel_os::Protocol::Tcp,
+            action: panel_os::Action::Deny,
+            direction: panel_os::Direction::Inbound,
+            source_cidr: None,
+            comment: None,
+            panel_managed: true,
+        }
+    }
+
+    #[test]
+    fn new_ssh_port_rejects_unsafe_choices() {
+        // 合法：新端口既不是当前 SSH 端口，也不在封禁集里
+        assert!(new_port_is_safe(2222, &[deny_rule("22")], &[22]).is_ok());
+        // ① 端口 0
+        assert!(new_port_is_safe(0, &[], &[22]).is_err());
+        // ② 迁到当前 SSH 端口本身 = 没迁
+        assert!(new_port_is_safe(22, &[], &[22]).is_err());
+        // ③ 迁过去又被同一批规则封掉 = 假保护（最危险）
+        assert!(new_port_is_safe(2222, &[deny_rule("2222")], &[22]).is_err());
+        assert!(new_port_is_safe(2222, &[deny_rule("2200-2300")], &[22]).is_err());
+        assert!(new_port_is_safe(2222, &[deny_rule("22,2222")], &[22]).is_err());
+        assert!(new_port_is_safe(2222, &[deny_rule("all")], &[22]).is_err());
+        // allow 规则里的同端口无妨（放行不是封禁）
+        let mut allow = deny_rule("2222"); allow.action = panel_os::Action::Allow;
+        assert!(new_port_is_safe(2222, &[allow], &[22]).is_ok());
+    }
+
+    /// 接线守卫：纯函数单测全绿也挡不住 apply 退回"带 allow_lockout_risk 就盲封"。
+    /// 必须扫 apply 函数体，确认迁移链路真的接了：要求 new_ssh_port、写配置、
+    /// reload、放行新端口、失败回滚 SSH 配置。
+    #[test]
+    fn apply_requires_ssh_migration_not_blind_allow() {
+        let src = panel_testutil::production_source(include_str!("firewall.rs"));
+        let start = src.find("pub async fn apply").expect("apply 必须存在");
+        let rest = &src[start..];
+        let end = rest.find("fn new_port_is_safe").expect("apply 之后应有 new_port_is_safe");
+        let body = &rest[..end];
+        assert!(body.contains("blocks_ssh"), "apply 必须检测封禁是否命中 SSH");
+        assert!(body.contains("new_ssh_port"), "apply 必须要求新 SSH 端口");
+        assert!(body.contains("set_ssh_port(new_port, true)"),
+            "apply 必须先写新端口配置且 keep_old=true 保住过渡期旧端口");
+        assert!(body.contains("services().reload"), "apply 必须 reload sshd 让新端口生效");
+        assert!(body.contains("panel ssh migration"), "apply 必须在防火墙放行新端口");
+        assert!(body.contains("set_ssh_port(old_port, false)"), "apply 失败必须回滚 SSH 配置");
+        // 顺序守卫：快照 / 单元名解析必须早于任何写入。曾把两者放在 SSH 迁移之后，
+        // 它们一旦失败 SSH 已在半迁移态却无人回滚，用户只看到「操作失败」。
+        let at_snapshot = body.find("firewall().snapshot()").expect("apply 必须取快照");
+        let at_unit = body.find("unit_name(\"sshd\")").expect("apply 必须解析 sshd 单元名");
+        let at_write = body.find("set_ssh_port(new_port, true)").expect("apply 必须写新端口");
+        assert!(at_snapshot < at_write, "快照必须在改 SSH 配置之前");
+        assert!(at_unit < at_write, "sshd 单元名解析必须在改 SSH 配置之前");
+        assert!(!body.contains("allow_lockout_risk != Some(true)"),
+            "不得保留'带风险确认就盲封'的逃生阀");
+    }
 
     #[test]
     fn jail_params_reject_zero_negative_and_oversized_values() {

@@ -1319,7 +1319,8 @@ components:
       type: object
       properties:
         rules: { type: array, items: { $ref: '#/components/schemas/FirewallRuleInput' } }
-        allow_lockout_risk: { type: boolean, description: "显式承担 SSH 失联风险（deny/reject 命中当前 SSH 端口时必填，端口由服务端现读）" }
+        allow_lockout_risk: { type: boolean, description: "兼容旧客户端的保留字段；不再作为封禁 SSH 的逃生阀，封禁 SSH 端口必须提供 new_ssh_port" }
+        new_ssh_port: { type: integer, minimum: 1, maximum: 65535, description: "新 SSH 端口：deny/reject 命中当前 SSH 端口时必填。服务端会先迁移 SSH 到该端口、reload 生效并自动放行，再应用封禁规则；任一步失败全程回滚" }
 
     # ───────────── 安全 ─────────────
     SecurityBaselineItem:
@@ -4068,8 +4069,8 @@ paths:
           description: "已应用；added/unchanged 为本次新增与已存在的条数，warnings 非空表示落盘失败等非致命问题"
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { added: { type: integer }, removed: { type: integer }, unchanged: { type: integer }, warnings: { type: array, items: { type: string } }, snapshot_bytes: { type: integer } } } } }
-        '409': { description: "规则命中当前受保护的 SSH 端口，需二次确认后带 allow_lockout_risk=true 重试" }
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { added: { type: integer }, removed: { type: integer }, unchanged: { type: integer }, warnings: { type: array, items: { type: string } }, snapshot_bytes: { type: integer }, ssh_migrated_to: { type: integer, description: "本次成功迁移到的新 SSH 端口（未迁移时不出现）" } } } } }
+        '409': { description: "规则命中当前受保护的 SSH 端口但未提供 new_ssh_port，或新端口不安全（与当前端口相同/在本次封禁范围内）：必须先迁移 SSH 到新端口再封禁" }
         '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' }
   /api/v1/firewall/rules/{id}:
     delete:
