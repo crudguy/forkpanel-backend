@@ -125,6 +125,39 @@ impl NftFirewall {
             eprintln!("[warn] firewall {op}: 操作已生效，但规则持久化失败（重启后会丢失）: {e}");
         }
     }
+
+    /// 方案 C 存量自愈：把旧版不带 `iifname != "lo"` 的面板封禁规则**原地替换**掉。
+    ///
+    /// 只动面板自己写的规则（`parse_panel_rules` 已按 panel-managed 过滤），不碰用户规则。
+    /// 用 nft 的 `replace rule ... handle N` 而不是 delete+add：原子、保留原链内位置
+    /// （否则旧 deny 从链首掉到链尾，方案①「封禁优先」会被破坏），也没有
+    /// 「旧规则已删、新规则还没写进内核」的半迁移窗口。
+    /// 幂等：没有旧规则时零写入，返回 0。
+    async fn upgrade_legacy_deny(&self) -> Result<usize> {
+        let out = self.nft(&["-a", "list", "table", "inet", TABLE], Duration::from_secs(10)).await?;
+        if out.code != Some(0) {
+            return Ok(0); // 表不存在 → 没有存量规则
+        }
+        let mut upgraded = 0;
+        for (handle, comment, expr) in parse_panel_rules(&out.stdout) {
+            let Some(rule) = to_rule((handle, comment.clone(), expr.clone())) else { continue };
+            if !matches!(rule.action, Action::Deny | Action::Reject) { continue }
+            // 只认精确串：手写变体（如 iifname "eth0"）不算已升级，避免误跳过。
+            if expr.contains("iifname != \"lo\"") { continue }
+            let id = panel_id(&comment).unwrap_or_else(|| format!("rule-{handle}"));
+            let new_expr = render_rule(&rule, &id);
+            let h = handle.to_string();
+            self.nft_checked(
+                &["replace", "rule", "inet", TABLE, CHAIN, "handle", &h, new_expr.as_str()],
+                Duration::from_secs(20),
+            ).await?;
+            upgraded += 1;
+        }
+        if upgraded > 0 {
+            self.persist_warn("upgrade_legacy_deny").await;
+        }
+        Ok(upgraded)
+    }
 }
 
 #[async_trait]
@@ -192,6 +225,10 @@ impl FirewallProvider for NftFirewall {
     async fn apply(&self, plan: RulePlan) -> Result<ApplyReport> {
         self.ensure_nft()?;
         self.ensure_table().await?;
+
+        // 方案 C 存量自愈：旧版封禁规则没有 lo 排除，会把本机回环也封掉。
+        // 必须在读 existing 之前替换，否则幂等判定会把旧规则当成"已存在"而跳过升级。
+        self.upgrade_legacy_deny().await?;
 
         // 现状：只取面板自有规则，**仅用于幂等判定**。
         // ⚠ F-20：apply 是追加语义，绝不删既有规则；删除只走 delete_rule(id)。
@@ -271,14 +308,16 @@ impl FirewallProvider for NftFirewall {
             let id = panel_id(&r.1).unwrap_or_else(|| "restored".into());
             if let Some(rule) = to_rule(r) {
                 let expr = render_rule(&rule, &id);
+                // 方案①：回滚重放也必须让 deny 插链首，否则回滚后"封禁优先"丢失。
+                // 方案 C：render_rule 已带 lo 排除，旧快照在这里自动升级。
                 // 回滚失败必须冒泡：以前这里用 `let _ =` 吞掉错误，回滚"假成功"会让上层
                 // 以为规则已复原，实际停在半应用状态，连日志都没有一行。
-                self.nft_checked(
-                    &["add", "rule", "inet", TABLE, CHAIN, expr.as_str()],
-                    Duration::from_secs(20),
-                ).await.map_err(|e| PanelError::Command {
-                    bin: "nft".into(),
-                    detail: format!("回滚重放 {} 失败: {}", rule.id, e),
+                let argv = rule_write_argv(rule.action, &expr);
+                self.nft_checked(&argv, Duration::from_secs(20)).await.map_err(|e| {
+                    PanelError::Command {
+                        bin: "nft".into(),
+                        detail: format!("回滚重放 {} 失败: {}", rule.id, e),
+                    }
                 })?;
             }
         }
@@ -294,6 +333,9 @@ impl FirewallProvider for NftFirewall {
         // 此时用文件覆盖会抹掉现行状态，必须跳过。
         let out = self.nft(&["list", "table", "inet", TABLE], Duration::from_secs(10)).await?;
         if out.code == Some(0) {
+            // 表已在内核中（进程重启但机器没重启）：仍要自愈方案 C 的旧规则，
+            // 否则用户升级面板后只重启服务，旧封禁规则会一直连本机回环一起封。
+            self.upgrade_legacy_deny().await?;
             return Ok(());
         }
 
@@ -323,6 +365,8 @@ impl FirewallProvider for NftFirewall {
                 detail: format!("从 {} 恢复规则失败: {e}", path.display()),
             }
         })?;
+        // 持久化文件是旧版本写的（无 lo 排除），加载后立刻自愈并回写新格式。
+        self.upgrade_legacy_deny().await?;
         Ok(())
     }
 
@@ -369,6 +413,21 @@ fn rule_write_argv(action: Action, expr: &str) -> Vec<&str> {
         vec!["insert", "rule", "inet", TABLE, CHAIN, "position", "0", expr]
     } else {
         vec!["add", "rule", "inet", TABLE, CHAIN, expr]
+    }
+}
+
+/// 方案 C：封禁只作用于**外部入站**，不封服务器本机回环。
+///
+/// 用规则自身的匹配条件表达语义，而不是靠"链首先放一条 lo accept"——后者
+/// 会被 `deny insert position 0` 顶掉，且规则离开上下文就失去语义。
+/// `iifname` 是 nft 的入接口匹配：本机访问 127.0.0.1 / ::1 / 本机公网 IP 时
+/// 包从 `lo` 进，不匹配此规则；外部客户端从网卡进，正常被封。
+/// allow 不需要此前缀（放行本来就全放行，加了只会误导用户以为有防护）。
+fn external_only_prefix(action: Action) -> &'static str {
+    if matches!(action, Action::Deny | Action::Reject) {
+        "iifname != \"lo\""
+    } else {
+        ""
     }
 }
 
@@ -526,6 +585,12 @@ fn extract_source(expr: &str) -> Option<String> {
 /// 把 `FirewallRule` 渲染成 nft 规则串（含 `panel-managed <id>` comment）。
 fn render_rule(rule: &FirewallRule, id: &str) -> String {
     let mut parts: Vec<String> = Vec::new();
+    // 方案 C：封禁规则前置 lo 排除，本机回环访问不受面板防火墙影响。
+    // 放在最前（匹配条件顺序无关，但读起来最先看到"只封外部"）。
+    let prefix = external_only_prefix(rule.action);
+    if !prefix.is_empty() {
+        parts.push(prefix.to_string());
+    }
     if let Some(cidr) = &rule.source_cidr {
         // 含 ':' 视为 IPv6，否则 IPv4
         if cidr.contains(':') {
@@ -628,6 +693,85 @@ mod tests {
         let allow = rule_write_argv(Action::Allow, "tcp dport 80 accept");
         assert_eq!(allow[0], "add", "放行保持追加语义");
         assert!(!allow.contains(&"position"));
+    }
+
+    #[test]
+    fn deny_rules_exclude_loopback() {
+        // 方案 C：封禁只封外部入站，本机 127.0.0.1/::1 访问不受影响。
+        // 前缀必须在渲染层落实，不能只靠 UI 文案承诺。
+        let base = FirewallRule {
+            id: "p1".into(), ports: PortSpec::Single(80), protocol: Protocol::Tcp,
+            action: Action::Deny, direction: Direction::Inbound, source_cidr: None,
+            comment: Some("web".into()), panel_managed: true,
+        };
+        let deny = render_rule(&base, &base.id);
+        assert!(deny.starts_with("iifname != \"lo\" "), "封禁必须排除本机回环: {deny}");
+        assert!(deny.contains("tcp dport 80 drop"), "排除 lo 后其余条件必须保留: {deny}");
+        let reject = render_rule(
+            &FirewallRule { action: Action::Reject, ..base.clone() }, "p1");
+        assert!(reject.starts_with("iifname != \"lo\" "), "reject 同样排除 lo: {reject}");
+        let allow = render_rule(&FirewallRule { action: Action::Allow, ..base }, "p1");
+        assert!(!allow.contains("iifname"), "放行规则不应带 lo 排除（无意义且误导）: {allow}");
+    }
+
+    #[test]
+    fn rule_with_loopback_exclusion_roundtrips() {
+        // 带 lo 前缀的规则必须能被 list_rules / 幂等判定正确读回。
+        const EXPR: &str =
+            "iifname != \"lo\" tcp dport 8080 drop comment \"panel-managed p2 web\"";
+        let r = to_rule((5, "panel-managed p2 web".into(), EXPR.into()))
+            .expect("带 lo 排除的规则必须仍能解析");
+        assert_eq!(r.action, Action::Deny);
+        assert_eq!(r.ports, PortSpec::Single(8080));
+        assert_eq!(r.source_cidr, None, "iifname 不得被误当成源 CIDR");
+        assert_eq!(r.comment.as_deref(), Some("web"));
+    }
+
+    #[test]
+    fn legacy_deny_rendered_with_loopback_exclusion() {
+        // 存量自愈的纯逻辑：旧规则 → 解析 → 重渲染，必须带 lo 排除且保留身份。
+        const OLD: &str = "tcp dport 80 drop comment \"panel-managed p1 web\"";
+        let rule = to_rule((3, "panel-managed p1 web".into(), OLD.into()))
+            .expect("旧规则必须可解析");
+        let expr = render_rule(&rule, "p1");
+        assert!(expr.starts_with("iifname != \"lo\" "), "自愈后必须带 lo 排除: {expr}");
+        assert!(expr.contains("tcp dport 80 drop"), "端口/动作必须保留: {expr}");
+        assert!(expr.contains("comment \"panel-managed p1 web\""), "id/备注必须保留: {expr}");
+    }
+
+    #[test]
+    fn apply_self_heals_legacy_deny_before_idempotency_check() {
+        // 接线守卫：自愈必须在幂等判定之前，否则旧规则被当成"已存在"永远不升级。
+        let src = panel_testutil::production_source(include_str!("firewall_nft.rs"));
+        let start = src.find("async fn apply").expect("apply 必须存在");
+        let end = src.find("async fn delete_rule").expect("apply 之后应有 delete_rule");
+        let body = &src[start..end];
+        let at_upgrade = body.find("upgrade_legacy_deny()").expect("apply 必须自愈旧规则");
+        let at_existing = body.find("list_panel_handles()").expect("apply 必须读现状做幂等判定");
+        assert!(at_upgrade < at_existing, "自愈必须在幂等判定之前");
+    }
+
+    #[test]
+    fn snapshot_replay_preserves_deny_priority() {
+        // 方案①的回滚缺口：旧代码回滚重放硬编码 add rule，deny 掉到链尾被 allow 遮蔽。
+        let src = panel_testutil::production_source(include_str!("firewall_nft.rs"));
+        let start = src.find("async fn restore_snapshot").expect("restore_snapshot 必须存在");
+        let end = src.find("async fn restore_persisted").expect("restore_snapshot 之后应有 restore_persisted");
+        let body = &src[start..end];
+        assert!(body.contains("rule_write_argv(rule.action"),
+                "回滚重放必须按动作分流，否则 deny 追加链尾被 allow 遮蔽");
+        assert!(!body.contains("\"add\", \"rule\""), "回滚重放不得硬编码 add rule");
+    }
+
+    #[test]
+    fn persisted_restore_self_heals_legacy_deny() {
+        // 两条恢复路径都要自愈：表已在内核（进程重启）与从文件恢复（机器重启）。
+        let src = panel_testutil::production_source(include_str!("firewall_nft.rs"));
+        let start = src.find("async fn restore_persisted").expect("restore_persisted 必须存在");
+        let end = src.find("fn fail2ban_capability").expect("restore_persisted 之后应有 fail2ban_capability");
+        let body = &src[start..end];
+        assert_eq!(body.matches("upgrade_legacy_deny()").count(), 2,
+                   "进程重启与机器重启两条恢复路径都必须自愈旧规则");
     }
 
     #[test]

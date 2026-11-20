@@ -431,6 +431,13 @@ fn proto_str(p: Protocol) -> &'static str {
 
 /// ufw 与 nft 同样是顺序匹配：封禁必须插到第 1 条，追加到末尾会被既有 allow 遮蔽。
 /// 放行保持追加语义（F-20：apply 不删既有规则）。
+///
+/// 方案 C（封禁不碰本机回环）由 ufw 自身的规则分层保证，无需面板加前缀：
+/// `ufw insert 1` 只插到 `ufw-user-input` 链首，而发行版默认的
+/// `/etc/ufw/before.rules` 在该链之前已有 `-A ufw-before-input -i lo -j ACCEPT`。
+/// 本机访问 127.0.0.1 / ::1 / 本机公网 IP 的包先命中这条 ACCEPT，
+/// 后面的面板 deny/reject 看不到——与 nft 的 `iifname != "lo"` 等价。
+/// 面板不修改 before.rules（只读敏感文件），用户若自行移除该行则不在面板保证范围内。
 fn ufw_write_prefix(action: Action) -> &'static [&'static str] {
     if matches!(action, Action::Deny | Action::Reject) { &["insert", "1"] } else { &[] }
 }
