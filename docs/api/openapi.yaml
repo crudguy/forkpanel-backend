@@ -1304,7 +1304,9 @@ components:
         active:  { type: boolean }
         backend: { type: string, example: nftables }
         rules:   { type: array, items: { $ref: '#/components/schemas/FirewallRule' } }
-        protected_ports: { type: array, items: { type: integer }, description: "当前受保护的 SSH 端口（服务端现读 sshd 配置，非写死 22）；封禁规则命中这些端口需二次确认" }
+        protected_ports: { type: array, items: { type: integer }, description: "当前受保护的 SSH 端口（服务端现读 sshd 配置，非写死 22）；封禁规则命中这些端口必须提供 new_ssh_port 先迁移" }
+        default_policy: { type: [string, "null"], description: "面板链的入站默认策略（只读观察值）：accept 表示下方未列出的端口默认可访问；null=读不到" }
+        listening_ports: { type: array, items: { type: integer }, description: "本机对外监听的 TCP 端口（只读观察值，非面板规则；不含仅本机可访问的 127.0.0.1/::1）；ss 不可用或读失败时为空" }
     FirewallRuleInput:
       required: [ports]
       type: object

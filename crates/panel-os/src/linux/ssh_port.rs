@@ -148,6 +148,26 @@ pub(crate) fn listening_ports(ss_output: &str) -> Vec<u16> {
     out
 }
 
+/// 解析 `ss -H -ltn` 里**对外可达**的 LISTEN 端口：排除仅绑 127.0.0.0/8 与 ::1 的。
+///
+/// 防火墙只管外部入站流量，loopback 服务不受它约束；把这些端口标成
+/// 「默认放行」会让用户以为暴露在公网，属实报风险的反面——误报同样有害。
+pub(crate) fn publicly_listening_ports(ss_output: &str) -> Vec<u16> {
+    let mut out: Vec<u16> = Vec::new();
+    for line in ss_output.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        let Some(local) = cols.get(3) else { continue };
+        let Some((addr, port)) = local.rsplit_once(':') else { continue };
+        let addr = addr.trim_matches(['[', ']']);
+        if addr == "::1" || addr.starts_with("127.") || addr == "localhost" { continue }
+        if let Ok(p) = port.parse::<u16>() {
+            if p != 0 && !out.contains(&p) { out.push(p) }
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
 /// 检查新端口是否可用（未被其它进程监听）。
 ///
 /// `old_port` 例外：sshd 自己正在监听旧端口，切到自己身上不算冲突。
@@ -440,6 +460,21 @@ pub(crate) async fn probe_listening() -> Result<Vec<u16>> {
     Ok(listening_ports(&out.stdout))
 }
 
+/// 对外监听端口探测；`ss` 不可用时返回空集（只读观察缺失，不阻塞规则列表）。
+pub(crate) async fn probe_public_listening() -> Result<Vec<u16>> {
+    if !crate::cmd::Bin::available(crate::cmd::Bin::Ss) {
+        return Ok(Vec::new());
+    }
+    let out = crate::cmd::run(
+        crate::cmd::Bin::Ss,
+        &["-H", "-ltn"],
+        crate::cmd::CmdOpt { timeout: std::time::Duration::from_secs(10), ..Default::default() },
+    )
+    .await?;
+    if out.code != Some(0) { return Ok(Vec::new()); }
+    Ok(publicly_listening_ports(&out.stdout))
+}
+
 fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -691,6 +726,20 @@ LISTEN 0 128 [::1]:8080 [::]:*
 ";
         // IPv6 地址里含冒号，必须按最后一个 ':' 切；22 去重后只出现一次
         assert_eq!(listening_ports(out), vec![22, 2222, 8080]);
+    }
+
+    #[test]
+    fn public_listeners_exclude_loopback() {
+        let out = "\
+LISTEN 0 128 0.0.0.0:22 0.0.0.0:*
+LISTEN 0 128 [::]:22 [::]:*
+LISTEN 0 128 127.0.0.1:5432 0.0.0.0:*
+LISTEN 0 128 [::1]:6379 [::]:*
+LISTEN 0 128 192.168.1.10:8080 0.0.0.0:*
+";
+        // 22 双栈去重；5432/6379 仅本机可达，不得当成对外暴露面
+        assert_eq!(publicly_listening_ports(out), vec![22, 8080]);
+        assert!(publicly_listening_ports("").is_empty());
     }
 
     #[test]

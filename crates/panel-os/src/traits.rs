@@ -632,6 +632,17 @@ pub struct Fail2banStatus {
     pub jails: Vec<Fail2banJail>,
 }
 
+/// 入站生效状态摘要：供 UI 回答「为什么规则列表里没有 SSH 端口」。
+///
+/// `default_policy` 是面板链的入站默认策略（accept = 未列端口全部放行）；
+/// `listening_ports` 是本机当前 LISTEN 的 TCP 端口。两者都是**只读观察值**，
+/// 不是可编辑规则——面板只管理自己的显式规则，列表不能把它们当规则删。
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct InboundState {
+    pub default_policy: Option<String>,
+    pub listening_ports: Vec<u16>,
+}
+
 #[async_trait]
 pub trait FirewallProvider: Send + Sync {
     fn backend(&self) -> FirewallBackend;
@@ -644,6 +655,9 @@ pub trait FirewallProvider: Send + Sync {
     async fn is_active(&self) -> Result<bool>;
     async fn set_active(&self, active: bool) -> Result<()>;
     async fn list_rules(&self) -> Result<Vec<FirewallRule>>;
+    /// 入站默认策略 + 本机监听端口（只读观察值）。默认空实现：读不到就如实说不知道，
+    /// 不猜一个「放行 / 封禁」结论误导用户。
+    async fn inbound_state(&self) -> Result<InboundState> { Ok(InboundState::default()) }
     async fn apply(&self, plan: RulePlan) -> Result<ApplyReport>;
     /// 删除单条规则。`id` 来自 `list_rules` 返回的 `FirewallRule.id`。
     /// 实现必须只允许删除面板自己创建的（由标记识别），拒绝删除用户既有规则。

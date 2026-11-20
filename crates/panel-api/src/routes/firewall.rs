@@ -74,6 +74,15 @@ pub async fn list(
     }
     let rules = state.os.firewall().list_rules().await?;
     let active = state.os.firewall().is_active().await?;
+    // 只读观察值：默认策略 + 本机监听端口。读不到整个规则列表仍要可用，
+    // 但必须留痕——静默吞成"未启用"会让用户误判端口状态。
+    let inbound = match state.os.firewall().inbound_state().await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[warn] firewall list: 读取入站状态失败: {e}");
+            Default::default()
+        }
+    };
 
     let dtos: Vec<RuleDto> = rules.into_iter().map(|r| RuleDto {
         // 用规则自身的标记位，而不是回看 comment 前缀：`to_rule` 已把标记剥成纯用户备注
@@ -103,6 +112,9 @@ pub async fn list(
         "rules": dtos,
         // 前端据此在提交前拦“封禁 SSH 端口”；安全边界仍在后端 apply。
         "protected_ports": protected,
+        // 只读观察值（不是可编辑规则）：accept = 下方未列出的端口默认可访问。
+        "default_policy": inbound.default_policy,
+        "listening_ports": inbound.listening_ports,
     })))
 }
 

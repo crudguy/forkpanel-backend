@@ -172,6 +172,23 @@ impl FirewallProvider for NftFirewall {
             .collect())
     }
 
+    async fn inbound_state(&self) -> Result<InboundState> {
+        self.ensure_nft()?;
+        // 表不存在 = 面板防火墙未启用，此时没有"默认策略"可展示，如实返回 None。
+        let out = self.nft(&["list", "table", "inet", TABLE], Duration::from_secs(10)).await?;
+        let default_policy = if out.code == Some(0) { parse_chain_policy(&out.stdout) } else { None };
+        // 只列对外监听端口：loopback 服务不受防火墙约束，标成「默认放行」是误报。
+        // ss 不可用时是只读观察缺失，不能让整个规则列表跟着失败；但必须留痕。
+        let listening_ports = match crate::linux::ssh_port::probe_public_listening().await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[warn] firewall inbound_state: 读取本机监听端口失败: {e}");
+                Vec::new()
+            }
+        };
+        Ok(InboundState { default_policy, listening_ports })
+    }
+
     async fn apply(&self, plan: RulePlan) -> Result<ApplyReport> {
         self.ensure_nft()?;
         self.ensure_table().await?;
@@ -344,6 +361,29 @@ impl FirewallProvider for NftFirewall {
 }
 
 // ═══════════════════════════ 纯函数：解析 / 渲染 ═══════════════════════════
+
+/// 从 `nft list table inet panelfw` 输出里读面板链的入站默认策略。
+/// 只认 `chain input { ... }` 块内的 policy——绝不把 Docker 等其它链的
+/// `policy drop` 误当成入站策略，那会把「全放行」错报成「全拒绝」。
+fn parse_chain_policy(text: &str) -> Option<String> {
+    let mut in_chain = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with("chain input ") { in_chain = true; continue }
+        if in_chain && t.starts_with('}') { in_chain = false; continue }
+        if in_chain {
+            // 真实输出是 `type filter hook input priority filter; policy accept;`——
+            // policy 跟在分号后，不在行首，必须按 ';' 切片再找。
+            for seg in t.split(';') {
+                if let Some(v) = seg.trim().strip_prefix("policy ") {
+                    let v = v.trim();
+                    if !v.is_empty() { return Some(v.to_string()) }
+                }
+            }
+        }
+    }
+    None
+}
 
 /// 从 `nft -a list` 输出抽取面板自有规则：`(handle, comment, expr)`。
 /// 只认带 `panel-managed` 标记者。行格式示例：
@@ -568,6 +608,28 @@ fn gen_id() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn chain_policy_reads_only_panel_input_chain() {
+        // Docker 的 FORWARD 链是 policy drop；若扫描时不限定链名，就会把
+        // 「入站全放行」错报成「入站全拒绝」，用户会据此做出错误的封禁决策。
+        let out = r#"
+table ip filter {
+	chain FORWARD {
+		type filter hook forward priority filter; policy drop;
+	}
+}
+table inet panelfw {
+	chain input {
+		type filter hook input priority filter; policy accept;
+		tcp dport 22 accept comment "panel-managed p1 ssh"
+	}
+}
+"#;
+        assert_eq!(parse_chain_policy(out).as_deref(), Some("accept"));
+        assert_eq!(parse_chain_policy("table ip filter { chain FORWARD { policy drop; } }"), None);
+        assert_eq!(parse_chain_policy(""), None);
+    }
+
     use super::*;
 
     /// 渲染 → 解析 必须往返一致（幂等性的基础，纯函数、无需 nft 二进制）。
