@@ -21,8 +21,31 @@ use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use crate::extract::PanelJson;
 
-/// 受保护端口：**永远不能封**。22 是 SSH，面板自身端口由配置注入。
-const PROTECTED_PORTS: &[u16] = &[22];
+/// 读不到 SSH 配置时的兜底保护端口（SSH 传统默认端口）。
+///
+/// ⚠ 它**不是**“SSH 端口”本身：P1-7 支持改端口，真实受保护端口必须由
+/// [`protected_ports`] 现读 `security().ssh_port()`。写死 22 会让用户把 SSH
+/// 改到 2222 后封 2222 畅通无阻——正是“保护看着有、实际盯错对象”的锁死风险。
+const FALLBACK_SSH_PORT: u16 = 22;
+
+/// 当前受保护的 SSH 端口集合（升序去重）。
+///
+/// 22 只是兜底，真实保护对象现读：sshd 的生效端口 + 配置里的全部端口
+/// （过渡期可能同时听 22 与 2222，两个都必须保护）。
+/// 读取失败时保守退回 [22] 并打 warn——绝不能因为读不到就取消保护。
+async fn protected_ports(state: &Shared) -> Vec<u16> {
+    let mut v = vec![FALLBACK_SSH_PORT];
+    match state.os.security().ssh_port().await {
+        Ok(st) => {
+            v.push(st.effective);
+            v.extend(st.configured);
+        }
+        Err(e) => eprintln!("[warn] firewall: 读取 SSH 端口失败，按 {FALLBACK_SSH_PORT} 兜底保护：{e}"),
+    }
+    v.sort_unstable();
+    v.dedup();
+    v
+}
 
 #[derive(Debug, Serialize)]
 pub struct RuleDto {
@@ -70,10 +93,13 @@ pub async fn list(
         comment: panel_os::user_comment(r.comment.as_deref()),
     }).collect();
 
+    let protected = protected_ports(&state).await;
     Ok(ok(serde_json::json!({
         "backend": backend_name(state.os.firewall().backend()),
         "active": active,
         "rules": dtos,
+        // 前端据此在提交前拦“封禁 SSH 端口”；安全边界仍在后端 apply。
+        "protected_ports": protected,
     })))
 }
 
@@ -152,6 +178,10 @@ pub async fn apply(
         return Err(ApiError::unsupported("firewall.manage"));
     }
 
+    // SSH 保护端口必须现读。写死 22 会在用户把 SSH 改到 2222 后失效，
+    // 任由 deny 规则把自己锁在门外（P0）。
+    let protected = protected_ports(&state).await;
+
     let mut rules = Vec::new();
     for r in &req.rules {
         let ports = parse_ports(&r.ports)
@@ -170,10 +200,11 @@ pub async fn apply(
         };
 
         // ── 失联保护 ──
-        if action != panel_os::Action::Allow && locks_out_ssh(&ports)
+        if action != panel_os::Action::Allow && locks_out_ssh(&ports, &protected)
             && req.allow_lockout_risk != Some(true) {
-                return Err(ApiError::conflict(
-                    "该规则可能阻断 SSH(22)。确认后请带 allow_lockout_risk=true 重试"));
+                let list = protected.iter().map(|p| p.to_string()).collect::<Vec<_>>().join("、");
+                return Err(ApiError::conflict(format!(
+                    "该规则可能阻断当前 SSH 端口（{list}）。确认后请带 allow_lockout_risk=true 重试")));
             }
 
         // id 必须唯一**并写进 comment**：删除时靠 `panel-managed <id>` 定位规则。
@@ -236,13 +267,14 @@ fn gen_rule_id() -> String {
     format!("p{nanos:x}")
 }
 
-/// 判断是否会阻断 SSH
-fn locks_out_ssh(ports: &panel_os::PortSpec) -> bool {
+/// 判断是否会阻断当前 SSH 端口。`protected` 由 [`protected_ports`] 现读，
+/// 不能传常量——否则 SSH 改端口后保护对象错位。
+fn locks_out_ssh(ports: &panel_os::PortSpec, protected: &[u16]) -> bool {
     match ports {
-        panel_os::PortSpec::All => true,   // 封全部端口必然封掉 22
-        panel_os::PortSpec::Single(p) => PROTECTED_PORTS.contains(p),
-        panel_os::PortSpec::Range(a, b) => PROTECTED_PORTS.iter().any(|p| p >= a && p <= b),
-        panel_os::PortSpec::List(v) => v.iter().any(locks_out_ssh),
+        panel_os::PortSpec::All => true,   // 封全部端口必然封掉 SSH
+        panel_os::PortSpec::Single(p) => protected.contains(p),
+        panel_os::PortSpec::Range(a, b) => protected.iter().any(|p| p >= a && p <= b),
+        panel_os::PortSpec::List(v) => v.iter().any(|x| locks_out_ssh(x, protected)),
     }
 }
 
@@ -492,14 +524,45 @@ mod tests {
 
     #[test]
     fn ssh_lockout_detection() {
-        assert!(locks_out_ssh(&panel_os::PortSpec::All));
-        assert!(locks_out_ssh(&panel_os::PortSpec::Single(22)));
-        assert!(locks_out_ssh(&panel_os::PortSpec::Range(20, 30)));
-        assert!(locks_out_ssh(&panel_os::PortSpec::List(vec![panel_os::PortSpec::Single(80), panel_os::PortSpec::Single(22)])));
+        let p = [22u16];
+        assert!(locks_out_ssh(&panel_os::PortSpec::All, &p));
+        assert!(locks_out_ssh(&panel_os::PortSpec::Single(22), &p));
+        assert!(locks_out_ssh(&panel_os::PortSpec::Range(20, 30), &p));
+        assert!(locks_out_ssh(&panel_os::PortSpec::List(vec![panel_os::PortSpec::Single(80), panel_os::PortSpec::Single(22)]), &p));
         // 正常规则不该被拦截
-        assert!(!locks_out_ssh(&panel_os::PortSpec::Single(80)));
-        assert!(!locks_out_ssh(&panel_os::PortSpec::Range(8000, 8100)));
-        assert!(!locks_out_ssh(&panel_os::PortSpec::List(vec![panel_os::PortSpec::Single(80), panel_os::PortSpec::Single(443)])));
+        assert!(!locks_out_ssh(&panel_os::PortSpec::Single(80), &p));
+        assert!(!locks_out_ssh(&panel_os::PortSpec::Range(8000, 8100), &p));
+        assert!(!locks_out_ssh(&panel_os::PortSpec::List(vec![panel_os::PortSpec::Single(80), panel_os::PortSpec::Single(443)]), &p));
+    }
+
+    /// P0 回归：SSH 已改到 2222 时，封 2222 必须命中、封 22 不再命中。
+    /// 写死 [22] 的实现会让这条测试直接变红。
+    #[test]
+    fn ssh_lockout_uses_supplied_ports_not_hardcoded_22() {
+        assert!(locks_out_ssh(&panel_os::PortSpec::Single(2222), &[2222]));
+        assert!(!locks_out_ssh(&panel_os::PortSpec::Single(22), &[2222]));
+        // 过渡期两个端口都在听，两个都必须保护
+        assert!(locks_out_ssh(&panel_os::PortSpec::Single(22), &[22, 2222]));
+        assert!(locks_out_ssh(&panel_os::PortSpec::Single(2222), &[22, 2222]));
+        assert!(locks_out_ssh(&panel_os::PortSpec::Range(2200, 2300), &[2222]));
+        assert!(!locks_out_ssh(&panel_os::PortSpec::Single(8080), &[22, 2222]));
+    }
+
+    /// 接线守卫：纯函数单测全绿也挡不住 apply 退回写死常量，必须扫函数体。
+    #[test]
+    fn firewall_apply_uses_dynamic_ssh_ports_not_hardcoded_constant() {
+        let src = panel_testutil::production_source(include_str!("firewall.rs"));
+        assert!(!src.contains("PROTECTED_PORTS"), "不得再有写死的受保护端口常量");
+        assert_eq!(src.matches("async fn protected_ports").count(), 1);
+        let start = src.find("pub async fn apply").expect("apply 必须存在");
+        let rest = &src[start..];
+        let end = rest.find("fn gen_rule_id").expect("apply 之后应有 gen_rule_id");
+        let body = &rest[..end];
+        assert!(body.contains("let protected = protected_ports(&state).await"),
+            "apply 必须现读 SSH 保护端口");
+        assert!(body.contains("locks_out_ssh(&ports, &protected)"),
+            "失联校验必须用现读端口集，不能传常量");
+        assert!(!body.contains("locks_out_ssh(&ports, PROTECTED_PORTS)"));
     }
 
     #[test]

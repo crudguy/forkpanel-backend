@@ -1304,6 +1304,7 @@ components:
         active:  { type: boolean }
         backend: { type: string, example: nftables }
         rules:   { type: array, items: { $ref: '#/components/schemas/FirewallRule' } }
+        protected_ports: { type: array, items: { type: integer }, description: "当前受保护的 SSH 端口（服务端现读 sshd 配置，非写死 22）；封禁规则命中这些端口需二次确认" }
     FirewallRuleInput:
       required: [ports]
       type: object
@@ -1318,7 +1319,7 @@ components:
       type: object
       properties:
         rules: { type: array, items: { $ref: '#/components/schemas/FirewallRuleInput' } }
-        allow_lockout_risk: { type: boolean, description: "显式承担 SSH 失联风险（deny/reject 命中 22 时必填）" }
+        allow_lockout_risk: { type: boolean, description: "显式承担 SSH 失联风险（deny/reject 命中当前 SSH 端口时必填，端口由服务端现读）" }
 
     # ───────────── 安全 ─────────────
     SecurityBaselineItem:
@@ -4068,6 +4069,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { added: { type: integer }, removed: { type: integer }, unchanged: { type: integer }, warnings: { type: array, items: { type: string } }, snapshot_bytes: { type: integer } } } } }
+        '409': { description: "规则命中当前受保护的 SSH 端口，需二次确认后带 allow_lockout_risk=true 重试" }
         '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' }
   /api/v1/firewall/rules/{id}:
     delete:
