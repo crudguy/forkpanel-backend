@@ -41,7 +41,8 @@ pub struct MeResp {
 ///
 /// 回环 / 未指定地址绝不封——那等于把自己锁在门外。`unknown` 与伪造 IP 也在此挡掉。
 /// 私网地址**不豁免**：内网爆破同样危险，是否启用由运维按网络环境决定。
-/// ⚠ 该 IP 来自 `X-Real-IP`，只有在受信任反代后才是真来源；配置默认关闭正是为此。
+/// ⚠ IP 由 `client_ip` 给出：公网 peer 一律取 TCP 对端，只有回环 peer
+/// （本机反代 / 隧道）才信转发头，伪造头进不了这里。配置仍默认关闭。
 fn auto_ban_target(ip: &str) -> Option<&str> {
     match ip.parse::<std::net::IpAddr>() {
         Ok(addr) if !addr.is_loopback() && !addr.is_unspecified() => Some(ip),
@@ -128,6 +129,7 @@ async fn note_login_failure(
 /// 登录。故意**不做** GET：口令绝不能进 URL/日志。
 pub async fn login(
     State(state): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     PanelJson(req): PanelJson<LoginReq>,
 ) -> ApiResult<(HeaderMap, StatusCode)> {
@@ -135,8 +137,8 @@ pub async fn login(
         return Err(ApiError::bad_request("username", "required"));
     }
 
-    // 防暴力：按 IP + 用户名双维度
-    let ip = client_ip(&headers);
+    // 防暴力：按 IP + 用户名双维度。IP 只认 TCP peer（回环 peer 才信转发头）
+    let ip = client_ip(&headers, Some(peer));
     // UA 只用于失败审计与告警的现场还原（帮助分辨脚本爆破与手误），
     // 截断到 256 字符——它是攻击者可控输入，不能让它撑爆 detail_json。
     let ua: String = headers
@@ -797,13 +799,29 @@ pub async fn bootstrap(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// 取客户端 IP。**注意**：只有在受信任反代后才应读取 X-Forwarded-For，
-/// 否则该头可伪造（会导致防暴力失效）。默认只认 X-Real-IP（由前置反代设置）。
-fn client_ip(h: &HeaderMap) -> String {
-    h.get("x-real-ip")
-        .or_else(|| h.get("x-forwarded-for"))
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').next().unwrap_or("").trim().to_string())
+/// 取用于防暴力、审计与自动封禁的客户端 IP。
+///
+/// ⚠ **只有 TCP peer 是回环时才信转发头**：官方反代（`expose-public.sh`）与
+/// `ssh -L` 隧道都从回环连入——前者显式设 `X-Real-IP $remote_addr`，后者
+/// 根本没有该头。公网直连时 peer 就是真实客户端，头里的值全由客户端自填：
+/// 一旦采信，换个头就换一个 `{ip}:{username}` key 绕过 LoginGuard，还能
+/// 借 `auto_ban_on_lockout` 反射式封掉无辜 IP。
+///
+/// 与 `ip_rate_limit` 同一纪律：不以可伪造的请求头作安全判据。peer 缺失
+/// （库用法/oneshot 直调）时返回 `unknown`，不拿头补位。
+fn client_ip(h: &HeaderMap, peer: Option<SocketAddr>) -> String {
+    let from_loopback = peer.map(|p| p.ip().is_loopback()).unwrap_or(false);
+    if from_loopback {
+        if let Some(ip) = h.get("x-real-ip")
+            .or_else(|| h.get("x-forwarded-for"))
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.split(',').next().unwrap_or("").trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            return ip;
+        }
+    }
+    peer.map(|p| p.ip().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".into())
 }
@@ -827,20 +845,64 @@ mod tests {
     }
 
     #[test]
-    fn client_ip_prefers_real_ip() {
+    fn client_ip_prefers_real_ip_from_loopback_peer() {
         let mut h = HeaderMap::new();
         h.insert("x-real-ip", "203.0.113.9".parse().unwrap());
         h.insert("x-forwarded-for", "1.1.1.1, 2.2.2.2".parse().unwrap());
-        assert_eq!(client_ip(&h), "203.0.113.9");
+        let peer: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        assert_eq!(client_ip(&h, Some(peer)), "203.0.113.9");
     }
 
     #[test]
     fn client_ip_falls_back() {
         let h = HeaderMap::new();
-        assert_eq!(client_ip(&h), "unknown");
+        assert_eq!(client_ip(&h, None), "unknown");
         let mut h2 = HeaderMap::new();
         h2.insert(header::FORWARDED, "for=9.9.9.9".parse().unwrap());
-        assert_eq!(client_ip(&h2), "unknown", "不可信头不应被采用");
+        assert_eq!(client_ip(&h2, None), "unknown", "不可信头不应被采用");
+    }
+
+    /// ⭐ 公网直连时伪造头必须被完全忽略：否则换头=换 key 绕过锁定，
+    /// 还能借自动封禁反射式 ban 掉头里写的任意 IP。
+    #[test]
+    fn client_ip_ignores_forwarded_headers_from_public_peer() {
+        let mut h = HeaderMap::new();
+        h.insert("x-real-ip", "203.0.113.9".parse().unwrap());
+        h.insert("x-forwarded-for", "198.51.100.7".parse().unwrap());
+        let peer: SocketAddr = "192.0.2.44:54321".parse().unwrap();
+        assert_eq!(
+            client_ip(&h, Some(peer)),
+            "192.0.2.44",
+            "公网 peer 必须只认 TCP 对端，伪造头不能换 key / 触发误封"
+        );
+    }
+
+    /// 本机直连（`ssh -L`、curl 127.0.0.1）没有转发头时用 peer 自身。
+    #[test]
+    fn client_ip_uses_loopback_peer_when_no_forwarded_header() {
+        let h = HeaderMap::new();
+        let peer: SocketAddr = "[::1]:4321".parse().unwrap();
+        assert_eq!(client_ip(&h, Some(peer)), "::1");
+    }
+
+    /// ⭐ 源码守卫：纯函数单测挡不住有人把 login 改回裸传头。
+    /// 取生产段（剔注释/测试）后再断言，避免注释里提到 peer 就假绿。
+    #[test]
+    fn login_passes_tcp_peer_to_client_ip() {
+        let src = panel_testutil::production_source(include_str!("auth.rs"));
+        let start = src.find("pub async fn login(").expect("login 必须在生产段里");
+        let rest = &src[start..];
+        let end = rest.find("\npub async fn ").expect("login 之后应有下一个 handler");
+        let body = &rest[..end];
+        assert!(body.contains("ConnectInfo(peer): ConnectInfo<SocketAddr>"),
+            "login 必须接 TCP peer，不能只靠可伪造的请求头");
+        assert!(body.contains("client_ip(&headers, Some(peer))"),
+            "login 必须把 peer 交给 client_ip");
+
+        let ip_start = src.find("fn client_ip(").expect("client_ip 必须存在");
+        let ip_body = &src[ip_start..];
+        assert!(ip_body.contains("p.ip().is_loopback()"),
+            "只有回环 peer 才允许信任 X-Real-IP / XFF");
     }
 
     // ── 无终端初始化：引导令牌「仅 localhost 可取」+ bootstrap 后文件即删 ──
