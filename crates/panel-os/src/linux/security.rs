@@ -85,6 +85,108 @@ fn any_file(paths: &[&str]) -> bool {
     paths.iter().any(|p| Path::new(p).is_file())
 }
 
+/// 读 apt 配置（主文件 + `apt.conf.d/*.conf` 按文件名排序）。apt 按此顺序加载，
+/// 同名项**后出现者覆盖先出现者**，与 sshd 的「先出现者生效」相反。
+fn load_apt_configs() -> Vec<(PathBuf, String)> {
+    let mut out = Vec::new();
+    let main = Path::new("/etc/apt/apt.conf");
+    if let Ok(text) = std::fs::read_to_string(main) {
+        out.push((main.to_path_buf(), text));
+    }
+    if let Ok(rd) = std::fs::read_dir("/etc/apt/apt.conf.d") {
+        let mut v: Vec<PathBuf> = rd
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|x| x == "conf").unwrap_or(false))
+            .collect();
+        v.sort();
+        for p in v {
+            if let Ok(text) = std::fs::read_to_string(&p) {
+                out.push((p, text));
+            }
+        }
+    }
+    out
+}
+
+/// 解析 `APT::Periodic::<key> "<n>";`。apt 配置注释是 `//`（不是 `#`）。
+pub(crate) fn apt_periodic_value(configs: &[(PathBuf, String)], key: &str) -> Option<i64> {
+    let mut found = None;
+    for (_, text) in configs {
+        for line in text.lines() {
+            let t = line.split("//").next().unwrap_or("").trim();
+            let mut it = t.split_whitespace();
+            let Some(k) = it.next().and_then(|s| s.strip_prefix("APT::Periodic::")) else { continue };
+            if k != key { continue; }
+            // apt 语法是 `Key "1";`（空格分隔，不是 =）
+            let Some(v) = it.next() else { continue };
+            let v = v.trim_end_matches(';').trim_matches('"').trim();
+            if let Ok(n) = v.parse::<i64>() { found = Some(n); }
+        }
+    }
+    found
+}
+
+/// "自动安全更新已启用"必须看**周期配置值**，装了包不算——这是原来的假绿根因：
+/// `any_file(["/etc/apt/apt.conf.d/20auto-upgrades", "/usr/bin/unattended-upgrade"])`
+/// 只要文件在就报绿，而两个周期值都写 0 时 apt 根本不会更新。
+pub(crate) fn auto_updates_state(
+    configs: &[(PathBuf, String)], binary_present: bool,
+) -> (bool, String) {
+    let update = apt_periodic_value(configs, "Update-Package-Lists");
+    let upgrade = apt_periodic_value(configs, "Unattended-Upgrade");
+    let show = |v: Option<i64>| v.map(|n| n.to_string()).unwrap_or_else(|| "未设置".into());
+    let enabled = matches!(update, Some(v) if v >= 1) && matches!(upgrade, Some(v) if v >= 1);
+    let current = if enabled {
+        format!("Update-Package-Lists={}, Unattended-Upgrade={}", show(update), show(upgrade))
+    } else {
+        format!(
+            "Update-Package-Lists={}, Unattended-Upgrade={}{}",
+            show(update), show(upgrade),
+            if binary_present { "（已安装但未启用）" } else { "" }
+        )
+    };
+    (enabled, current)
+}
+
+/// fail2ban 的 systemd `wants` 符号链接位置（enable 后由 systemctl 建立）。
+pub(crate) const FAIL2BAN_WANTS: &[&str] = &[
+    "/etc/systemd/system/multi-user.target.wants/fail2ban.service",
+    "/lib/systemd/system/multi-user.target.wants/fail2ban.service",
+    "/usr/lib/systemd/system/multi-user.target.wants/fail2ban.service",
+];
+
+/// "已启用且在运行"= wants 链接存在 **且** 命令探测到 active。
+/// 原来的 `any_file(服务单元/二进制路径)` 只能证明"装了"，未 enable/未运行也报绿。
+pub(crate) fn fail2ban_state(wants: &[&str], active: bool, installed: bool) -> (bool, String) {
+    let enabled = wants.iter().any(|p| std::fs::symlink_metadata(p).is_ok());
+    let ok = enabled && active;
+    let current = if ok { "已启用且运行中".into() }
+        else if !installed { "未安装".into() }
+        else if !enabled { "已安装但未设置开机自启".into() }
+        else { "已启用但未运行".into() };
+    (ok, current)
+}
+
+/// 实际探测 fail2ban 是否在跑：只取 `fail2ban-client status` 的返回码，
+/// 不回显输出（外部命令输出可能含 jail/IP 等运行信息）。
+async fn fail2ban_active() -> bool {
+    if !crate::cmd::Bin::available(crate::cmd::Bin::Fail2banClient) {
+        return false;
+    }
+    matches!(
+        crate::cmd::run(
+            crate::cmd::Bin::Fail2banClient,
+            &["status"],
+            crate::cmd::CmdOpt {
+                timeout: std::time::Duration::from_secs(5),
+                ..Default::default()
+            },
+        ).await,
+        Ok(o) if o.code == Some(0)
+    )
+}
+
 /// 当前值展示：显式设置则显示 `Key value`，否则标注 OpenSSH 编译默认值。
 fn disp(key: &str, raw: Option<&str>, default: &str) -> String {
     match raw {
@@ -155,27 +257,31 @@ impl SecurityProvider for LinuxSecurity {
         // ── SSH 加固（配置不存在 → 不适用，而非"通过"）──
         out.extend(ssh_checks(&cfg));
 
-        // ── 自动安全更新（apt 系）──
+        // ── 自动安全更新（apt 系）：看周期值，不看"包装没装" ──
         if Path::new("/etc/apt").is_dir() {
-            let ok = any_file(&["/etc/apt/apt.conf.d/20auto-upgrades", "/usr/bin/unattended-upgrade"]);
-            out.push(check("system.auto_updates", "启用自动安全更新", ok,
-                if ok { "已配置" } else { "未配置" }, "已启用 unattended-upgrades",
-                "安装并启用自动更新：apt install unattended-upgrades"));
+            let configs = load_apt_configs();
+            let binary_present = Path::new("/usr/bin/unattended-upgrade").is_file();
+            let (ok, current) = auto_updates_state(&configs, binary_present);
+            out.push(check("system.auto_updates", "启用自动安全更新", ok, current,
+                "Update-Package-Lists >= 1 且 Unattended-Upgrade >= 1",
+                "在 /etc/apt/apt.conf.d/20auto-upgrades 把 APT::Periodic 两项都设为 1"));
         } else {
             out.push(na("system.auto_updates", "启用自动安全更新", "非 apt 系发行版，请用对应包管理器"));
         }
 
-        // ── fail2ban ──
+        // ── fail2ban：enable（wants 链接）+ 实际在跑，装了不算 ──
         if Path::new("/run/systemd/system").is_dir() {
-            let ok = any_file(&[
+            let installed = any_file(&[
                 "/lib/systemd/system/fail2ban.service",
                 "/usr/lib/systemd/system/fail2ban.service",
                 "/usr/bin/fail2ban-server",
                 "/usr/sbin/fail2ban-server",
             ]);
-            out.push(check("service.fail2ban", "部署 fail2ban 防暴力破解", ok,
-                if ok { "已安装" } else { "未安装" }, "已安装并启用 fail2ban",
-                "安装 fail2ban：apt install fail2ban"));
+            let active = fail2ban_active().await;
+            let (ok, current) = fail2ban_state(FAIL2BAN_WANTS, active, installed);
+            out.push(check("service.fail2ban", "部署 fail2ban 防暴力破解", ok, current,
+                "已设置开机自启且运行中",
+                "安装并启用：apt install fail2ban && systemctl enable --now fail2ban"));
         } else {
             out.push(na("service.fail2ban", "部署 fail2ban 防暴力破解", "无 systemd，跳过服务检查"));
         }
@@ -672,5 +778,69 @@ mod tests {
         assert!(!body.contains("let (p, n) = (cfg.clone()"),
             "绝不能写回主配置——那是这次假绿的根因");
         assert!(body.contains("\"-T\""), "写后必须用 sshd -T 复核生效值");
+    }
+
+    /// apt 按文件名排序加载，同名项后出现覆盖先出现；`//` 注释不得当成配置。
+    #[test]
+    fn apt_periodic_value_last_file_wins_and_comments_ignored() {
+        let configs = vec![
+            (PathBuf::from("10-early.conf"), "APT::Periodic::Update-Package-Lists \"0\";\n".into()),
+            (PathBuf::from("20-late.conf"),
+             "// APT::Periodic::Update-Package-Lists \"0\";\nAPT::Periodic::Update-Package-Lists \"1\";\n".into()),
+        ];
+        assert_eq!(apt_periodic_value(&configs, "Update-Package-Lists"), Some(1));
+        assert_eq!(apt_periodic_value(&configs, "Unattended-Upgrade"), None);
+    }
+
+    /// ⭐ 装了包但两个周期值为 0 → 必须报不通过（这正是原来的假绿）。
+    #[test]
+    fn auto_updates_requires_enabled_periodic_not_just_installed() {
+        let off = vec![(PathBuf::from("20auto-upgrades"),
+            "APT::Periodic::Update-Package-Lists \"0\";\nAPT::Periodic::Unattended-Upgrade \"0\";\n".into())];
+        let (ok, current) = auto_updates_state(&off, true);
+        assert!(!ok, "已安装但周期值为 0 不得报绿");
+        assert!(current.contains("已安装但未启用"), "文案要说清差在哪：{current}");
+
+        let half = vec![(PathBuf::from("20auto-upgrades"),
+            "APT::Periodic::Update-Package-Lists \"1\";\nAPT::Periodic::Unattended-Upgrade \"0\";\n".into())];
+        assert!(!auto_updates_state(&half, true).0, "只启用一半不算");
+
+        let on = vec![(PathBuf::from("20auto-upgrades"),
+            "APT::Periodic::Update-Package-Lists \"1\";\nAPT::Periodic::Unattended-Upgrade \"1\";\n".into())];
+        assert!(auto_updates_state(&on, true).0, "两项都为 1 才通过");
+    }
+
+    /// ⭐ enable（wants 链接）与 active 必须同时成立，装了/只启一个都不算。
+    #[test]
+    fn fail2ban_requires_enabled_and_active() {
+        let d = tmp_dir("f2b");
+        let wants = d.join("fail2ban.service");
+        std::os::unix::fs::symlink("/lib/systemd/system/fail2ban.service", &wants).unwrap();
+        let path = wants.to_string_lossy().to_string();
+        let linked: &[&str] = &[&path];
+
+        assert!(!fail2ban_state(&[], true, true).0, "没有 wants 链接不得报绿");
+        let (ok, current) = fail2ban_state(linked, true, true);
+        assert!(ok, "enable + active 应通过：{current}");
+        assert!(!fail2ban_state(linked, false, true).0, "已启用但未运行不得报绿");
+        let (_, current) = fail2ban_state(linked, false, true);
+        assert!(current.contains("未运行"), "要指出具体差在哪：{current}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 源码守卫：两项判定必须走新纯函数，不能退回 any_file 的"存在即绿"。
+    #[test]
+    fn baseline_checks_use_real_state_not_file_existence() {
+        let src = panel_testutil::production_source(include_str!("security.rs"));
+        let start = src.find("async fn baseline(&self)").expect("baseline 必须存在");
+        let rest = &src[start..];
+        let end = rest.find("pub(crate) fn ssh_fix_target").expect("baseline 之后应有一键修复白名单");
+        let body = &rest[..end];
+        assert!(body.contains("auto_updates_state(&configs, binary_present)"),
+            "自动更新必须看 APT::Periodic 周期值");
+        assert!(body.contains("fail2ban_state(FAIL2BAN_WANTS, active, installed)"),
+            "fail2ban 必须看 enable + active");
+        assert!(body.contains("fail2ban_active().await"), "必须实际探测服务在跑");
+        assert!(!body.contains("let ok = any_file("), "不得退回文件存在即通过");
     }
 }
