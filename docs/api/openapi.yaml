@@ -466,7 +466,7 @@ components:
       properties:
         changed:   { type: boolean, description: "false=已符合预期，未写盘" }
         backup:    { type: [string, "null"], description: "修改前的备份文件路径，可据此回滚" }
-        validated: { type: boolean, description: "是否通过配置语法校验" }
+        validated: { type: boolean, description: "是否通过 sshd 语法校验与生效值复核" }
 
     # ───────────── SSH 端口（P1-7） ─────────────
     SshPortState:
@@ -4162,10 +4162,12 @@ paths:
     post:
       operationId: post_security_baseline_apply
       tags: [security]
-      summary: 应用某项基线修复（二次确认词 + 先备份 → 写 → sshd -t 校验 → 失败回滚）
+      summary: 应用某项基线修复（二次确认词 + 先备份 → 写 drop-in → sshd -t + sshd -T 复核 → 失败回滚）
       description: >
         仅支持 sshd 三项白名单；**sshd 不可用时拒绝修改**——宁可不修，
-        也不写坏配置把人锁在服务器门外。响应回传备份路径，出事可据此回滚。
+        也不写坏配置把人锁在服务器门外。修复写入 drop-in（`00-panel-baseline.conf`）
+        而非主配置（drop-in 会遮蔽主配置，写了也不生效）；先跑 `sshd -t` 校验语法，
+        再用 `sshd -T` 复核生效值，任一不通过即回滚。响应回传备份路径，出事可据此回滚。
       security: [cookieAuth, csrfHeader]
       requestBody:
         required: true

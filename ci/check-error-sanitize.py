@@ -36,9 +36,11 @@ CRATES = ROOT / "crates"
 # Command 构造点（退出码固定文案 / run_sync 的错误对象），detail 不含外部命令
 # stderr/stdout，无需接线 sanitize）；
 # 2026-11-19 数据库引擎扩展到 9 种：mongosh / redis-cli / clickhouse-client
-# 三处命令失败构造点，detail 均已过 sanitize::stderr）
-TOTAL_PIN = 81
-SANITIZE_PIN = 43
+# 三处命令失败构造点，detail 均已过 sanitize::stderr）；
+# 2026-11-21 基线修复改写 drop-in + sshd -T 生效值复核：复核失败新增 1 个
+# Command 构造点，detail 里的 sshd -T stderr 已过 sanitize::stderr（+1 调用））
+TOTAL_PIN = 82
+SANITIZE_PIN = 44
 
 HEAD = re.compile(r"(?:PanelError::)?(Command|ConfigInvalid)\s*\{")
 FIELD = re.compile(r"\bdetail\s*:")

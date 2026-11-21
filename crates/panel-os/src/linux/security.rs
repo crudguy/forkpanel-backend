@@ -14,6 +14,10 @@ use std::path::{Path, PathBuf};
 const BACKUP_MARKER: &str = ".panel.bak-";
 /// 保留最近几份 sshd 备份：回滚只需最近那次，留 10 份足够兜住连续误改。
 const SSH_BACKUP_KEEP: usize = 10;
+/// 基线修复写入的 drop-in 文件名。`00-` 前缀保证排在既有 drop-in 之前——
+/// 与 SSH 端口的 `00-panel-port.conf` 同一套 OpenSSH「先出现者生效」纪律。
+/// ⚠ 绝不写主配置：drop-in 里的同名指令会遮蔽主配置，写了也不生效（假绿）。
+pub(crate) const BASELINE_DROPIN: &str = "00-panel-baseline.conf";
 
 /// Linux 安全基线：读配置/探测既有事实，产出发现项。
 #[derive(Default)]
@@ -215,6 +219,36 @@ pub(crate) fn ssh_fix_target(key: &str) -> Option<(&'static str, &'static str)> 
     }
 }
 
+/// 从 sshd 主配置路径推导基线 drop-in 路径（与 SSH 端口的 `00-panel-port.conf` 同目录）。
+pub(crate) fn baseline_dropin_path(cfg: &Path) -> Option<PathBuf> {
+    cfg.parent().map(|p| p.join("sshd_config.d").join(BASELINE_DROPIN))
+}
+
+/// 生效值是否已满足基线要求。`PermitRootLogin` 的三种安全等价值都算满足
+/// （与 `ssh_checks` 的判定保持一致，否则修完了 check 仍报风险）。
+pub(crate) fn baseline_satisfied(directive: &str, effective: Option<&str>, expected: &str) -> bool {
+    let Some(v) = effective else { return false };
+    if directive.eq_ignore_ascii_case("PermitRootLogin") {
+        return matches!(v, "no" | "prohibit-password" | "without-password");
+    }
+    v.eq_ignore_ascii_case(expected)
+}
+
+/// 解析 `sshd -T` 输出里的生效值（输出形如 `permitrootlogin no`，key 全小写）。
+/// 用它做**写后复核**：光看我们写了什么不算，得让 sshd 自己说生效值是什么。
+pub(crate) fn sshd_t_value(output: &str, directive: &str) -> Option<String> {
+    let want = directive.to_ascii_lowercase();
+    for line in output.lines() {
+        let mut it = line.split_whitespace();
+        if let (Some(k), Some(v)) = (it.next(), it.next()) {
+            if k.eq_ignore_ascii_case(&want) {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// 把 `Key <value>` 写入 sshd 配置文本：已存在则替换（保留注释行），否则追加。
 ///
 /// **纯函数**——写盘前后各有备份与校验，但"生成什么内容"这件事必须可单测验证。
@@ -254,6 +288,11 @@ fn now_secs() -> i64 {
 
 /// 修复一项 sshd 基线。**校验器不可用时拒绝修改**——
 /// 宁可不修，也不写坏配置把人锁在服务器门外。
+///
+/// ⚠ 写 **drop-in**（`00-panel-baseline.conf`）而非主配置：OpenSSH 对同一指令
+/// 「先出现者生效」，drop-in 里的同名指令会遮蔽主配置。此前写主配置的修复在
+/// Debian 默认布局（主配置顶部 `Include sshd_config.d/*.conf`）下完全无效，
+/// 却返回 `changed:true`——典型的假绿。与 SSH 端口 P1-7 是同一类坑。
 pub(crate) async fn apply_ssh_item(key: &str) -> Result<SecurityApplyResult> {
     let Some((directive, value)) = ssh_fix_target(key) else {
         return Err(PanelError::Validation {
@@ -269,70 +308,93 @@ pub(crate) async fn apply_ssh_item(key: &str) -> Result<SecurityApplyResult> {
         });
     }
 
-    let path = LinuxSecurity::sshd_config_path();
-    if !path.exists() {
-        return Err(PanelError::NotFound(format!("sshd 配置不存在：{}", path.display())));
+    let cfg = LinuxSecurity::sshd_config_path();
+    if !cfg.exists() {
+        return Err(PanelError::NotFound(format!("sshd 配置不存在：{}", cfg.display())));
     }
-    let orig = crate::fs::blocking({
-        let p = path.clone();
-        move || std::fs::read_to_string(&p)
-    }).await?.map_err(|e| PanelError::Io(e.to_string()))?;
-    let next = apply_ssh_directive(&orig, directive, value);
-    if next == orig {
-        // 已符合预期：不写盘、不备份
+
+    // ① 看**生效值**判定是否已符合，不能看主配置文本——主配置写着正确值而
+    //    被 drop-in 遮蔽，正是这次要修的假绿。
+    let effective = ssh_effective(&cfg, directive);
+    if baseline_satisfied(directive, effective.as_deref(), value) {
         return Ok(SecurityApplyResult { changed: false, backup: None, validated: true });
     }
 
-    // ① 先备份
-    let backup = path.with_extension(format!("conf.panel.bak-{}", now_secs()));
-    {
-        let (a, b) = (path.clone(), backup.clone());
-        crate::fs::blocking(move || std::fs::copy(&a, &b))
+    let target = baseline_dropin_path(&cfg).ok_or_else(|| PanelError::Validation {
+        field: "path",
+        reason: "sshd 配置无父目录，无法定位 drop-in 目录".into(),
+    })?;
+    if let Some(dir) = target.parent() {
+        let d = dir.to_path_buf();
+        crate::fs::blocking(move || std::fs::create_dir_all(&d))
+            .await?
+            .map_err(|e| PanelError::Io(format!("创建 drop-in 目录失败：{e}")))?;
+    }
+
+    let prev = crate::fs::blocking({
+        let p = target.clone();
+        move || std::fs::read_to_string(&p).ok()
+    }).await.ok().flatten();
+    let next = apply_ssh_directive(prev.as_deref().unwrap_or(""), directive, value);
+    if prev.as_deref() == Some(next.as_str()) {
+        // drop-in 已写好但生效值仍不对：存在我们覆盖不了的遮蔽源（Match 块 /
+        // 更早的 Include）。绝不返回"成功"——那比不修更危险。
+        return Err(PanelError::Validation {
+            field: "sshd",
+            reason: format!(
+                "已在 {} 写入 {directive} {value}，但 sshd 生效值仍为 {}；存在其它遮蔽配置（Match 块 / 更早的 Include），请手工排查后再修复",
+                target.display(),
+                effective.as_deref().unwrap_or("未设置"),
+            ),
+        });
+    }
+
+    // ② 备份（原文件不存在则无备份；回滚 = 删除本文件）
+    let backup = if prev.is_some() {
+        let b = target.with_extension(format!("conf.panel.bak-{}", now_secs()));
+        let (a, c) = (target.clone(), b.clone());
+        crate::fs::blocking(move || std::fs::copy(&a, &c))
             .await?
             .map_err(|e| PanelError::Io(e.to_string()))?;
-    }
-
-    // 备份文件名带秒级时间戳，每次改配置都是**新文件**、永不复用也从不清理，
-    // 目录会随改配置次数无限膨胀。只保留最近几份（回滚用得上最近的那次就够）：
-    // 前缀取自本次备份名（截到 ".panel.bak-" 为止），避免误删同目录其他文件。
-    if let (Some(dir), Some(name)) = (backup.parent(), backup.file_name().and_then(|n| n.to_str())) {
-        if let Some(i) = name.find(BACKUP_MARKER) {
-            crate::fs::prune_keep_newest(dir, &name[..i + BACKUP_MARKER.len()], SSH_BACKUP_KEEP);
+        if let (Some(dir), Some(name)) = (b.parent(), b.file_name().and_then(|n| n.to_str())) {
+            if let Some(i) = name.find(BACKUP_MARKER) {
+                crate::fs::prune_keep_newest(dir, &name[..i + BACKUP_MARKER.len()], SSH_BACKUP_KEEP);
+            }
         }
-    }
+        Some(b)
+    } else {
+        None
+    };
+    let backup_desc = backup.as_ref().map(|b| b.display().to_string())
+        .unwrap_or_else(|| "无（本次为新建 drop-in，回滚即删除）".into());
 
-    // ② 写（失败则备份仍在、原文件未变）
+    // ③ 写 drop-in（不是主配置！）
     let write_res = crate::fs::blocking({
-        let (p, n) = (path.clone(), next.clone());
+        let (p, n) = (target.clone(), next.clone());
         move || std::fs::write(&p, &n)
     }).await?;
     if let Err(e) = write_res {
         return Err(PanelError::Io(format!(
-            "写入失败，原配置未改动（备份 {}）：{e}",
-            backup.display()
+            "写入失败，原配置未改动（备份 {backup_desc}）：{e}"
         )));
     }
 
-    // ③ 校验：不通过立刻回滚
+    // ④ 语法校验：`sshd -t -f <cfg>` 走整机配置（含 Include），能抓到 drop-in 写坏。
     let out = crate::cmd::run(
         crate::cmd::Bin::Sshd,
-        &["-t", "-f", &path.to_string_lossy()],
+        &["-t", "-f", &cfg.to_string_lossy()],
         crate::cmd::CmdOpt { timeout: std::time::Duration::from_secs(10), ..Default::default() },
     )
     .await;
-    let ok = matches!(&out, Ok(o) if o.code == Some(0));
-    if !ok {
-        // ⚠ 回滚**可能失败**（备份被删、权限变化、磁盘满）。此前用 `let _ =` 吞掉结果，
-        // 而文案却无条件宣称「已自动回滚」——用户据此重启 sshd，就会在磁盘上仍是坏
-        // 配置的情况下把自己锁在门外（二轮审计 P0-9）。
-        let rolled_back = crate::fs::blocking({
-            let (a, b) = (backup.clone(), path.clone());
-            move || std::fs::copy(&a, &b).is_ok()
-        }).await.unwrap_or(false);
+    let syntax_ok = matches!(&out, Ok(o) if o.code == Some(0));
+    if !syntax_ok {
+        // ⚠ 回滚**可能失败**（备份被删、权限变化、磁盘满）。失败必须如实报出，
+        // 用户据此重启 sshd 会在磁盘上仍是坏配置时把自己锁在门外（二轮审计 P0-9）。
+        let rolled_back = rollback_dropin(&target, backup.as_ref()).await;
         if !rolled_back {
             eprintln!(
-                "[panel] ⚠ [security] sshd 配置校验未通过且**回滚失败**：目标 {} 上仍是未通过校验的配置（备份留在 {}）",
-                path.display(), backup.display()
+                "[panel] ⚠ [security] sshd 配置校验未通过且**回滚失败**：目标 {} 上仍是未通过校验的配置（备份 {backup_desc}）",
+                target.display()
             );
         }
         let why = match out {
@@ -341,11 +403,54 @@ pub(crate) async fn apply_ssh_item(key: &str) -> Result<SecurityApplyResult> {
         };
         return Err(PanelError::Command {
             bin: "sshd".into(),
-            detail: sshd_validate_failure_detail(rolled_back, &backup.display().to_string(), &why),
+            detail: sshd_validate_failure_detail(rolled_back, &target.display().to_string(), &why),
         });
     }
 
-    Ok(SecurityApplyResult { changed: true, backup: Some(backup), validated: true })
+    // ⑤ 生效值复核：写了 ≠ 生效。让 sshd 自己报生效值，任何遮蔽源都在这里被抓到。
+    let dump = crate::cmd::run(
+        crate::cmd::Bin::Sshd,
+        &["-T", "-f", &cfg.to_string_lossy()],
+        crate::cmd::CmdOpt { timeout: std::time::Duration::from_secs(10), ..Default::default() },
+    )
+    .await;
+    let actual = match &dump {
+        Ok(o) if o.code == Some(0) => sshd_t_value(&o.stdout, directive),
+        _ => None,
+    };
+    if !baseline_satisfied(directive, actual.as_deref(), value) {
+        let rolled_back = rollback_dropin(&target, backup.as_ref()).await;
+        let why = match &dump {
+            Ok(o) => panel_core::sanitize::stderr(&o.stderr),
+            Err(e) => e.to_string(),
+        };
+        return Err(PanelError::Command {
+            bin: "sshd".into(),
+            detail: format!(
+                "写入 {directive} {value} 后 sshd 生效值仍为 {}（存在遮蔽配置），已{}。请手工排查 Include / Match 块：{why}",
+                actual.as_deref().unwrap_or("未取到"),
+                if rolled_back { "回滚" } else { "**回滚失败（请勿重启 sshd）**" },
+            ),
+        });
+    }
+
+    Ok(SecurityApplyResult { changed: true, backup, validated: true })
+}
+
+/// 回滚 drop-in：有备份拷回，无备份（本次新建）则删除。返回是否成功。
+async fn rollback_dropin(target: &Path, backup: Option<&PathBuf>) -> bool {
+    match backup {
+        Some(b) => {
+            let (a, c) = (b.clone(), target.to_path_buf());
+            crate::fs::blocking(move || std::fs::copy(&a, &c))
+                .await.ok().and_then(|r| r.ok()).is_some()
+        }
+        None => {
+            let t = target.to_path_buf();
+            crate::fs::blocking(move || std::fs::remove_file(&t))
+                .await.ok().and_then(|r| r.ok()).is_some()
+        }
+    }
 }
 
 /// sshd 配置校验失败时的错误文案。
@@ -488,4 +593,84 @@ mod tests {
         assert!(bad_detail.contains("/tmp/sshd.bak"), "要告诉用户备份在哪：{bad_detail}");
     }
 
+    /// `00-` 前缀是修复生效的前提：必须排在既有 drop-in 之前。
+    #[test]
+    fn baseline_dropin_sorts_before_existing_dropins() {
+        assert!(BASELINE_DROPIN < "10-hardening.conf");
+        assert!(BASELINE_DROPIN < "20-systemd-userdb.conf");
+        assert!(BASELINE_DROPIN < "50-cloud-init.conf");
+        let cfg = Path::new("/etc/ssh/sshd_config");
+        assert_eq!(
+            baseline_dropin_path(cfg),
+            Some(PathBuf::from("/etc/ssh/sshd_config.d/00-panel-baseline.conf"))
+        );
+    }
+
+    /// `ssh_checks` 接受三种 root 登录安全值，"已符合"判定必须与之一致，
+    /// 否则修完仍报风险（或把本来就安全的配置重复写一遍）。
+    #[test]
+    fn baseline_satisfied_matches_ssh_checks_semantics() {
+        for v in ["no", "prohibit-password", "without-password"] {
+            assert!(baseline_satisfied("PermitRootLogin", Some(v), "no"), "{v} 应算安全");
+        }
+        assert!(!baseline_satisfied("PermitRootLogin", Some("yes"), "no"));
+        assert!(!baseline_satisfied("PermitRootLogin", None, "no"));
+        assert!(baseline_satisfied("PasswordAuthentication", Some("NO"), "no"));
+        assert!(!baseline_satisfied("PasswordAuthentication", Some("yes"), "no"));
+    }
+
+    /// `sshd -T` 输出 key 全小写，解析必须大小写无关且不把注释当配置。
+    #[test]
+    fn sshd_t_value_parses_lowercase_output() {
+        let dump = "permitrootlogin prohibit-password\npasswordauthentication no\n\
+                    # pubkeyauthentication no\npubkeyauthentication yes\n";
+        assert_eq!(sshd_t_value(dump, "PermitRootLogin").as_deref(), Some("prohibit-password"));
+        assert_eq!(sshd_t_value(dump, "PasswordAuthentication").as_deref(), Some("no"));
+        assert_eq!(sshd_t_value(dump, "PubkeyAuthentication").as_deref(), Some("yes"));
+        assert_eq!(sshd_t_value(dump, "ChallengeResponseAuthentication"), None);
+    }
+
+    /// ⭐ 钉住这次修的假绿根因：主配置写着正确值、drop-in 里有冲突值时，
+    /// 判定必须按**生效值**走，不能按主配置文本走。
+    #[test]
+    fn baseline_satisfied_uses_effective_value_not_main_config() {
+        let d = tmp_dir("baseff");
+        std::fs::create_dir_all(d.join("sshd_config.d")).unwrap();
+        std::fs::write(d.join("sshd_config.d/10-hard.conf"), "PermitRootLogin yes\n").unwrap();
+        let cfg = d.join("sshd_config");
+        std::fs::write(&cfg, "PermitRootLogin no\n").unwrap();
+
+        let eff = ssh_effective(&cfg, "PermitRootLogin");
+        assert_eq!(eff.as_deref(), Some("yes"), "drop-in 必须先于主配置生效");
+        assert!(
+            !baseline_satisfied("PermitRootLogin", eff.as_deref(), "no"),
+            "主配置写着 no 但生效值是 yes，必须判定为未满足（否则又是假绿）"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// ⭐ 源码守卫：`apply_ssh_item` 必须写 drop-in + `sshd -T` 复核。
+    /// 只靠上面的纯函数单测挡不住有人把写盘目标改回主配置——那会让纯函数
+    /// 全绿而修复再次失效。取生产段（剔注释/测试）后再断言，避免注释里
+    /// 提到旧路径就假绿。
+    #[test]
+    fn baseline_apply_writes_dropin_and_verifies_effective_value() {
+        let src = panel_testutil::production_source(include_str!("security.rs"));
+        let start = src.find("pub(crate) async fn apply_ssh_item")
+            .expect("apply_ssh_item 必须在生产段里");
+        let rest = &src[start..];
+        let end = rest.find("pub(crate) fn sshd_validate_failure_detail")
+            .expect("apply_ssh_item 之后应有错误文案函数");
+        let body = &rest[..end];
+
+        assert!(body.contains("ssh_effective(&cfg, directive)"),
+            "必须先按生效值判定是否已符合，不能看主配置文本");
+        assert!(body.contains("baseline_dropin_path(&cfg)"),
+            "修复目标必须是 drop-in，不能写主配置（会被 drop-in 遮蔽）");
+        assert!(body.contains("let (p, n) = (target.clone(), next.clone())"),
+            "写盘闭包必须拿 drop-in 的 target，不是主配置 cfg");
+        assert!(!body.contains("let (p, n) = (cfg.clone()"),
+            "绝不能写回主配置——那是这次假绿的根因");
+        assert!(body.contains("\"-T\""), "写后必须用 sshd -T 复核生效值");
+    }
 }

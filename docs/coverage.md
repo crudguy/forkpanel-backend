@@ -98,7 +98,7 @@
 | 方法 + 路径 | 文档要求 | 后端状态 | 备注 | 前端视图 |
 |---|---|---|---|---|
 | GET `/security/baseline` | 基线检查 | ✅ | 6 项只读检查；OpenSSH 默认值语义已修正并有单测 | SecurityView |
-| POST `/security/baseline/apply` | 应用基线 | ✅ | 已实装（**仅限 sshd 三项白名单**）：确认词 + 先备份 → 写 → `sshd -t` 校验 → 不通过回滚；**sshd 不可用则拒绝修改**（宁可不修也不锁死 SSH） | SecurityView |
+| POST `/security/baseline/apply` | 应用基线 | ✅ | 已实装（**仅限 sshd 三项白名单**）：确认词 + 先备份 → 写 drop-in（`00-panel-baseline.conf`，避开对主配置的遮蔽）→ `sshd -t` 语法校验 → `sshd -T` 生效值复核 → 不通过回滚；**sshd 不可用则拒绝修改**（宁可不修也不锁死 SSH） | SecurityView |
 | GET `/security/sessions` | 在线会话 | ✅ | 内存 SessionCache 快照（重启即清零，如实标注）；`current` 标记自己；**ip 刻意不采集**（无对端地址管道，返回 null 不伪造） | SecurityView |
 | DELETE `/security/sessions/{id}` | 吊销会话 | ✅ | 允许吊销自己的当前会话（=自我登出）；404 对不存在会话；审计只落 sid 前 8 位（sid=凭据不落库） | SecurityView |
 
