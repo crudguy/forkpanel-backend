@@ -15,6 +15,7 @@
 | `PANEL_HSTS` | `1` = 开 | 关 | 响应下发 `Strict-Transport-Security` 头。仅公网 / TLS 部署才开：本地 http 监听时开，会让浏览器缓存后无法访问 |
 | `PANEL_TLS` | `1` = 开 | 关 | 会话 cookie 加 `Secure` 属性。面板经**前置反代**终结 TLS 对外服务时才开（面板本体只提供 http，不终结 TLS——`[server].tls` 配了会被拒绝启动） |
 | `PANEL_SSHD_CONFIG` | 文件绝对路径 | `/etc/ssh/sshd_config` | 安全基线页读取并解析的 sshd 主配置路径；测试与非标准部署可用它指向别处 |
+| `PANEL_METRICS_TOKEN` | Bearer token 字符串 | 关 | `/metrics` 抓取鉴权 token 的**优先来源**（高于 `<data_dir>/metrics.token` 与 config.toml 旧值）。推荐用 systemd drop-in 设置，避免把凭据写进被 git 跟踪的 config.toml；留白时该来源不生效 |
 | `RUST_LOG` | `tracing` 过滤器语法 | `info` | 日志级别与按模块过滤，如 `debug`、`panel_api=debug,info` |
 | `PANEL_WEB_DIST` | 目录路径 | `web/dist` | **仅 `dev-assets` 特性构建**生效：前端静态资源从磁盘读取而非打进二进制。改前端后免重编后端 |
 | `HOME` | 目录 | `/root` | 注入 Web 终端的 PTY 会话（没有它 `~` 不展开、`cd` 无默认目录）；同时作为终端的起始目录 |

@@ -242,7 +242,11 @@ pub(crate) fn run(cli: &Cli, os: Arc<dyn panel_os::OsAdapter>) -> Result<()> {
         // /metrics（Prometheus 抓取）：token 留白 ⇒ 完全不注册（不是注册了回 404）。
         // 与 /healthz 同属运维面：挂 build_router 之外，避开 authed 会话分层，
         // 鉴权由 handler 自带的 Bearer token 完成（Prometheus 不走 cookie+CSRF）。
-        let app = match cfg.metrics.scrape_token.as_deref().map(str::trim) {
+        // ⚠ token 来自独立状态源（环境变量 / data_dir 文件），config.toml 的
+        // scrape_token 只作老部署只读回退——被 git 跟踪的配置绝不回写密钥。
+        let scrape_token = crate::metrics_token_state::effective(
+            &layout.data_dir(), cfg.metrics.scrape_token.as_deref());
+        let app = match scrape_token.as_deref().map(str::trim) {
             Some(t) if !t.is_empty() => app.route(
                 "/metrics",
                 axum::routing::get({

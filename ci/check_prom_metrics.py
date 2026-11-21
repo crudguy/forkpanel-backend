@@ -132,12 +132,32 @@ else:
 
 print("== [2] serve.rs：条件注册（留白不占面）+ 反假控制 ==")
 if "cfg.metrics.scrape_token" in serve:
-    ok("serve.rs 真实读取 cfg.metrics.scrape_token（不是假控制）")
+    ok("serve.rs 把 config.toml 旧值作为只读回退传入（老部署不丢配置）")
 else:
-    bad("serve.rs 不读 scrape_token ⇒ [metrics] 配置项是假控制（配了也永远不注册）")
-k = serve.find("match cfg.metrics.scrape_token")
+    bad("serve.rs 不读 cfg.metrics.scrape_token ⇒ 老部署升级后 token 丢失")
+if "metrics_token_state::effective" in serve:
+    ok("serve.rs 走独立状态源取 token（环境变量 / data_dir 文件优先）")
+else:
+    bad("serve.rs 未接 metrics_token_state::effective ⇒ token 仍只来自被 git 跟踪的 config.toml")
+
+# ⭐ 密钥绝不写回被 git 跟踪的 config.toml（与 public_ip 同一事故类）
+token_state_raw = read("crates/panel-cli/src/metrics_token_state.rs")
+token_state, _ = prod_and_test(token_state_raw)
+if "write_config_key" in serve or "write_config_key" in token_state:
+    bad("不得用 write_config_key 写 scrape_token：config.toml 被 git 跟踪，提交即泄密")
+else:
+    ok("serve / 状态源均无 config.toml 写入口")
+if "data_dir.join(STATE_FILE)" not in token_state:
+    bad("状态文件必须落在 data_dir（不受版本控制）")
+else:
+    ok("token 状态文件落在 data_dir")
+if "std::env::var(ENV_VAR)" not in token_state:
+    bad("环境变量优先级未接线（systemd drop-in 是推荐设置方式）")
+else:
+    ok("PANEL_METRICS_TOKEN 环境变量优先级已接线")
+k = serve.find("match scrape_token")
 if k < 0:
-    bad("serve.rs 缺 token 条件分支（match cfg.metrics.scrape_token）")
+    bad("serve.rs 缺 token 条件分支（match scrape_token，token 来自独立状态源）")
     match_block = ""
 else:
     brace = serve.index("{", k)

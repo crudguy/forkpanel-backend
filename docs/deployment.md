@@ -655,15 +655,39 @@ panel alert status                            # 是否已接 + 节流口径
 
 ### 5.2.4 Prometheus 抓取端点 `/metrics`
 
-**默认关闭**：config.toml 里 `[metrics] scrape_token` 缺省或留白时，
-`/metrics` **根本不注册**（请求落到 SPA 回退返回页面 HTML，不是注册了回 404）。
-配置了 token 才挂载，鉴权是独立的 Bearer token——与登录会话 / CSRF 完全分离，
-因为 Prometheus 抓取器不支持 cookie 登录流。
+**默认关闭**：token 留白时 `/metrics` **根本不注册**（请求落到 SPA 回退返回页面 HTML，
+不是注册了回 404）。配置了 token 才挂载，鉴权是独立的 Bearer token——与登录会话 /
+CSRF 完全分离，因为 Prometheus 抓取器不支持 cookie 登录流。
+
+**token 从哪来（优先级从高到低）**：
+
+1. 环境变量 `PANEL_METRICS_TOKEN`（推荐：systemd drop-in 设置，不碰任何受控文件）；
+2. `<data_dir>/metrics.token`（0600，一行明文）；
+3. config.toml `[metrics] scrape_token` —— **老部署只读回退**，新部署不要写这里。
+
+> ⚠ `deploy/config.toml` 被 git 跟踪，dev / E2E 又直接拿它当运行配置；把真实 token
+> 填进去，一次「全部提交」就会把凭据写进仓库历史（与 2026-11-16 公网 IP 事故同类）。
+> 面板**永不回写**该字段，守卫 `check_prom_metrics.py` 钉死这一点。
+
+```bash
+# 推荐：systemd drop-in（token 用 openssl rand -hex 24 生成）
+sudo systemctl edit panel
+# [Service]
+# Environment=PANEL_METRICS_TOKEN=<随机长串>
+sudo systemctl restart panel
+```
+
+不便改 systemd 单元时，也可写状态文件。token 从 stdin 读，不进 shell history 与进程列表：
+
+```bash
+openssl rand -hex 24 | sudo panel config set metrics-token
+```
+
+老部署仍可沿用 config.toml（升级不会丢 token，但请勿把该文件提交）：
 
 ```toml
 # /etc/forkpanel/config.toml
 [metrics]
-# openssl rand -hex 24 生成；写完 systemctl restart panel
 scrape_token = "<随机长串>"
 ```
 

@@ -9,6 +9,7 @@ mod embed;
 mod migrate_snapshot;
 /// 公网 IP 的独立状态文件：与 git 跟踪的 config.toml 解耦，避免真实出口 IP 入库。
 mod public_ip_state;
+mod metrics_token_state;
 mod upgrade;
 
 use clap::{CommandFactory, Parser, Subcommand};
@@ -305,7 +306,7 @@ enum Cmd {
         },
     }
 
-    /// `panel config set` 的子命令：修改 `[server]` 段的具体字段。
+    /// `panel config set` 的子命令：网络配置改 `[server]` 段，凭据只写独立状态文件。
     #[derive(Clone, Subcommand)]
     enum ConfigSet {
         /// 修改监听端口（1-65535；改端口有把自己锁在面板外的风险，需 --yes 确认）
@@ -324,6 +325,8 @@ enum Cmd {
             #[arg(long)]
             yes: bool,
         },
+        /// 设置 Prometheus 抓取 token（从 stdin 读，只写 <data_dir>/metrics.token）
+        MetricsToken,
     }
 
     /// `panel key` 的子命令。四条都作用于 `<data_dir>/master.key`。
@@ -668,6 +671,7 @@ fn run_config(
     match action {
         Some(ConfigAction::Set { target: ConfigSet::Port { port, yes } }) => do_set_port(cli, os, port, yes),
         Some(ConfigAction::Set { target: ConfigSet::Bind { addr, yes } }) => do_set_bind(cli, os, &addr, yes),
+        Some(ConfigAction::Set { target: ConfigSet::MetricsToken }) => do_set_metrics_token(cli, os),
         None | Some(ConfigAction::Status) => show_panel_status(cli, os),
     }
 }
@@ -902,6 +906,24 @@ fn do_set_bind(cli: &Cli, os: &Arc<dyn panel_os::OsAdapter>, addr: &str, yes: bo
 enum RestartOutcome {
     Restarted,
     Deferred,
+}
+
+/// 写 Prometheus scrape token：只落 `<data_dir>/metrics.token`（0600），**不碰 config.toml**。
+/// token 只从 stdin 读一行——位置参数会进 shell history 和 `ps aux`，等于换个地方泄密。
+/// 首选仍是 `PANEL_METRICS_TOKEN`（systemd drop-in）；本命令给不便改单元文件的部署用。
+fn do_set_metrics_token(cli: &Cli, os: &Arc<dyn panel_os::OsAdapter>) -> Result<()> {
+    use std::io::BufRead;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)
+        .map_err(|e| PanelError::Internal(format!("读取 token 失败: {e}")))?;
+    let layout0 = build_layout(os, None);
+    let cfg = load_cfg(cli, &layout0)?;
+    let layout = build_layout(os, Some(&cfg));
+    let target = crate::metrics_token_state::state_path(&layout.data_dir());
+    crate::metrics_token_state::write(&layout.data_dir(), &line)?;
+    println!("· metrics token 已写入 {}（0600；不写 config.toml）", target.display());
+    println!("· 生效优先级：PANEL_METRICS_TOKEN 环境变量 > 该文件 > config.toml 旧值");
+    Ok(())
 }
 
 /// 写配置后按需重启 panel 服务。**失败必须返回 Err**（旧版只 eprintln 并返回 Ok，
@@ -1515,5 +1537,21 @@ mod expose_tests {
         assert_eq!(super::reachable_host("::1", true), "127.0.0.1");
         assert_eq!(super::reachable_host("::1", false), "[::1]");
         assert_eq!(super::reachable_host("10.0.0.5", false), "10.0.0.5");
+    }
+
+    /// `write` 只声明不接线会被 clippy dead_code 拦；但接到错误的目录 / 写回 config
+    /// 仍是真泄密。钉死：CLI 生产分支真调用 + stdin 输入 + 按配置 [paths].data 定位。
+    #[test]
+    fn metrics_token_writer_is_wired_to_cli() {
+        let prod = panel_testutil::production_source(include_str!("main.rs"));
+        assert!(prod.contains("ConfigSet::MetricsToken"), "CLI 必须暴露 metrics-token 子命令");
+        assert!(prod.contains("metrics_token_state::write("), "CLI 必须真调用 write");
+        assert!(prod.contains("metrics_token_state::state_path("), "提示路径须指向真实写入目标");
+        let start = prod.find("fn do_set_metrics_token").expect("do_set_metrics_token 必须存在");
+        let end = prod.find("fn restart_panel_service").expect("restart_panel_service 必须存在");
+        let body = &prod[start..end];
+        assert!(body.contains("stdin()"), "token 必须从 stdin 读，位置参数会进 shell history");
+        assert!(body.contains("load_cfg("), "必须按 [paths].data 定位，不能用默认目录");
+        assert!(!body.contains("write_config_key"), "绝不写回被 git 跟踪的 config.toml");
     }
 }

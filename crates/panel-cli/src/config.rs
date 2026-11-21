@@ -127,10 +127,15 @@ pub struct Audit {
     pub max_rows: u64,
 }
 
-/// Prometheus 抓取端点。**默认关闭**：`scrape_token` 缺省/留白 ⇒
-/// serve.rs 不注册 /metrics（彻底不占面，而不是注册了回 404）。
-/// token 是唯一鉴权（`Authorization: Bearer`，与登录会话/CSRF 完全独立——
-/// Prometheus 抓取器不支持 cookie 流）。消费链见 cmd/serve.rs 与 ci/check_prom_metrics.py。
+/// Prometheus 抓取端点。**默认关闭**：token 留白 ⇒ serve.rs 不注册 /metrics
+/// （彻底不占面，而不是注册了回 404）。token 是唯一鉴权（`Authorization: Bearer`，
+/// 与登录会话/CSRF 完全独立——Prometheus 抓取器不支持 cookie 流）。
+///
+/// ⚠ `scrape_token` 是**老部署只读回退**，新部署请勿把真实 token 写进这里：
+/// `deploy/config.toml` 被 git 跟踪，填进去一提交就泄密。有效 token 的优先级是
+/// `PANEL_METRICS_TOKEN` 环境变量 > `<data_dir>/metrics.token`（0600）> 本字段。
+/// 读取与写入实现见 `metrics_token_state.rs`，消费链见 cmd/serve.rs 与
+/// ci/check_prom_metrics.py。
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Metrics {

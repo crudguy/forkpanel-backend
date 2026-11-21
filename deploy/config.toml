@@ -39,9 +39,11 @@ read_only = false
 retention_days = 90
 max_rows = 50000
 
-# Prometheus 抓取端点（默认关闭：删掉本节或留白 scrape_token 都行）。
-# 留白时 /metrics 完全不注册；配置后用 Bearer token 抓取，详见
-# docs/deployment.md §5.2.4。token 用 `openssl rand -hex 24` 生成。
+# Prometheus 抓取端点（默认关闭：不设 token 时 /metrics 完全不注册）。
+# ⚠ 真实 token 不要写进本文件——它被 git 跟踪，提交即泄密。推荐二选一：
+#   ① systemd drop-in 设 Environment=PANEL_METRICS_TOKEN=<token>（openssl rand -hex 24 生成）
+#   ② 写 <data_dir>/metrics.token（0600，一行）
+# 下面的 scrape_token 仅作老部署只读回退，留白即可，详见 docs/deployment.md §5.2.4。
 # [metrics]
 # scrape_token = ""
 
