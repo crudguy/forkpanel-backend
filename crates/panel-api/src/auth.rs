@@ -12,17 +12,24 @@ use std::{
 
 // ═══════════════════════════ 口令 ═══════════════════════════
 
-/// argon2id 参数（设计方案 §1.3）。
-/// nano 档位降到 8MiB：实测登录时瞬时占用即为该值，512MB 机器上需保守。
+/// argon2id 参数。OWASP 最低线 m=19456 KiB(19MiB) / t=2；旧版 Nano 8MiB、
+/// Small 16MiB 低于该线，三档统一抬升：Nano 取最低线（19MiB 瞬时占用对
+/// 512MB 机器完全可接受），Small / Standard 按机器能力递增。
+///
+/// ⚠ 兼容：已有账号的 PHC 串自带参数，`verify_password` 走串内值，改档
+/// 只影响新设 / 改设口令——老口令不会因抬升参数而失效（单测钉死）。
+pub const ARGON2_MIN_M_COST: u32 = 19 * 1024;
+
 pub struct HashParams { pub m_cost: u32, pub t_cost: u32, pub p_cost: u32 }
 
 impl HashParams {
     pub fn for_tier(t: Tier) -> Self {
-        match t {
-            Tier::Nano => Self { m_cost: 8 * 1024, t_cost: 2, p_cost: 1 },
-            Tier::Small => Self { m_cost: 16 * 1024, t_cost: 2, p_cost: 1 },
-            Tier::Standard => Self { m_cost: 19 * 1024, t_cost: 2, p_cost: 1 },
-        }
+        let m_cost = match t {
+            Tier::Nano => ARGON2_MIN_M_COST,
+            Tier::Small => 24 * 1024,
+            Tier::Standard => 32 * 1024,
+        };
+        Self { m_cost, t_cost: 2, p_cost: 1 }
     }
 }
 
@@ -460,6 +467,11 @@ impl SessionCache {
         self.db.as_ref()?;
         let h = sid_hash(sid);
         let now = now_unix();
+        // ⚠ 绝对超时必须在**恢复路径**也复核：`expires_at` 会被 persist_activity
+        // 持续滑动续期，单看它就会把一个已超过 absolute 的"长期活跃"会话在重启后
+        // 第一个请求放行（此后 get() 才会删，但那一下已经越权了）。与 get() 的
+        // `now - created_at < absolute_timeout` 保持同一判据。
+        let abs_secs = self.absolute_timeout.as_secs() as i64;
         // 注：`.ok().flatten()?` 已解包 Option，故类型注解是**元组**本身
         // P2-3：最后一列是新取的 `last_seen_at`（此前根本不读它）
         let row: (i64, String, String, String, i64, i64, i64) = pool
@@ -468,11 +480,11 @@ impl SessionCache {
                     .prepare(
                         "SELECT s.user_id, u.username, u.role, u.allowed_roots, s.created_at, s.expires_at, s.last_seen_at \
                          FROM sessions s JOIN users u ON u.id = s.user_id \
-                         WHERE s.sid_hash = ?1 AND s.expires_at > ?2 AND u.disabled = 0",
+                         WHERE s.sid_hash = ?1 AND s.expires_at > ?2 AND ?2 - s.created_at < ?3 AND u.disabled = 0",
                     )
                     .map_err(|e| PanelError::Database(e.to_string()))?;
                 let mut it = st
-                    .query_map(rusqlite::params![h, now], |r| {
+                    .query_map(rusqlite::params![h, now, abs_secs], |r| {
                         Ok((
                             r.get::<_, i64>(0)?,
                             r.get::<_, String>(1)?,
@@ -874,10 +886,28 @@ mod tests {
         assert!(!verify_password("wrong", &h).unwrap());
     }
 
+    /// 三档都必须达到 OWASP 最低线（旧 Nano 8MiB / Small 16MiB 不达标）。
     #[test]
-    fn nano_uses_smaller_argon2() {
-        assert_eq!(HashParams::for_tier(Tier::Nano).m_cost, 8 * 1024);
-        assert_eq!(HashParams::for_tier(Tier::Standard).m_cost, 19 * 1024);
+    fn all_tiers_meet_owasp_argon2_minimum() {
+        for tier in [Tier::Nano, Tier::Small, Tier::Standard] {
+            let p = HashParams::for_tier(tier);
+            assert!(p.m_cost >= ARGON2_MIN_M_COST,
+                "{tier:?} m_cost={} 低于 OWASP 19MiB 下限", p.m_cost);
+            assert!(p.t_cost >= 2, "{tier:?} t_cost 必须 >= 2");
+        }
+        let nano = HashParams::for_tier(Tier::Nano).m_cost;
+        let small = HashParams::for_tier(Tier::Small).m_cost;
+        let std = HashParams::for_tier(Tier::Standard).m_cost;
+        assert!(nano <= small && small <= std, "档位梯度不得倒挂");
+    }
+
+    /// ⭐ 抬升参数不得让老口令失效：已有 PHC 串自带参数，验证走串内值。
+    #[test]
+    fn legacy_low_cost_hash_still_verifies() {
+        let old = HashParams { m_cost: 8 * 1024, t_cost: 2, p_cost: 1 };
+        let h = hash_password("Tr0ub4dor&3xy", &old).unwrap();
+        assert!(verify_password("Tr0ub4dor&3xy", &h).unwrap(),
+            "旧 8MiB 参数生成的 PHC 串必须仍能验证，否则升级会锁死老账号");
     }
 
     #[test]
@@ -1302,6 +1332,57 @@ mod tests {
         assert!(idle >= 595,
             "恢复的会话必须保留库里的最后活跃（实测空闲 {idle}s，应约 600s）。\
              若为 0，说明又拿 now 顶替了 —— 那正是「重启后一律显示空闲 0 秒」的谎报");
+    }
+
+    /// ⭐ 绝对超时在**恢复路径**也必须复核：`expires_at` 被 persist_activity 持续
+    /// 滑动续期，只看它会把一个创建超过 12h 的"长期活跃"会话在重启后第一个请求放行。
+    #[tokio::test]
+    async fn restore_rejects_session_past_absolute_timeout() {
+        let (w, pool) = temp_db();
+        insert_tester(&w).await;
+        let absolute = 60i64;
+        let c1 = SessionCache::new_with_db(
+            Duration::from_secs(1800), Duration::from_secs(absolute as u64), w.clone());
+        let sid = generate_sid();
+        c1.insert(sid.clone(), db_sess());
+        wait_row(&pool, &sid).await;
+
+        // 把创建时间改到 120s 前，**保留 expires_at 在未来**——这正是滑动续期后的
+        // 形态；若只靠 expires_at 判定，这条会话会被错误恢复（测试前置条件）。
+        let h = sid_hash(&sid);
+        let old_created = now_unix() - 120;
+        w.exec(move |conn| {
+            conn.execute(
+                "UPDATE sessions SET created_at = ?1 WHERE sid_hash = ?2",
+                rusqlite::params![old_created, h],
+            )
+            .map(|_| panel_db::WriteAck { rows_changed: 1 })
+            .map_err(|e| PanelError::Database(e.to_string()))
+        })
+        .await
+        .unwrap();
+
+        let h2 = sid_hash(&sid);
+        let row: Option<(i64, i64)> = pool.with(move |conn| {
+            conn.query_row(
+                "SELECT created_at, expires_at FROM sessions WHERE sid_hash = ?1", [h2],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .map_err(|e| PanelError::Database(e.to_string()))
+        })
+        .await
+        .ok();
+        let (created, exp) = row.unwrap_or((i64::MAX, 0));
+        assert!(created <= now_unix() - 115,
+            "前置条件：created_at 必须真的被改老，否则这条用例恒真（异步写覆盖竞态）");
+        assert!(exp > now_unix(),
+            "前置条件：expires_at 必须在未来，否则这条用例会因 idle 过期恒真");
+
+        // 模拟重启：空缓存 + 同一份库
+        let c2 = SessionCache::new_with_db(
+            Duration::from_secs(1800), Duration::from_secs(absolute as u64), w.clone());
+        assert!(c2.get_or_restore(&sid, &pool).await.is_none(),
+            "超过绝对超时的会话不得在重启后被恢复");
     }
 
     /// 用例里会话的 idle_timeout：取 4s ⇒ 节流间隔 = 4/4 = 1s。
