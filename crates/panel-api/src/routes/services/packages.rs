@@ -182,7 +182,7 @@ pub(crate) const ALLOWED_PACKAGES: &[PkgDef] = &[
         features: "监控 SSH / 服务日志，按规则自动封禁来源 IP。",
         scenes: "公网 SSH 或面板登录防护。",
         entry: "「安全」菜单的防火墙规则页（fail2ban 区，能力位按 fail2ban-client 是否安装判定）；「服务」页看状态。",
-        howto: "面板只提供 jail 启停 / 解除封禁 / 状态查看，不提供 jail 规则表单：/etc/fail2ban/ 整目录已列入敏感路径黑名单（其 action 规则会以 root 执行命令，文件页拒绝读写），需要自定义 fail2ban 过滤器时请通过 SSH 编辑 /etc/fail2ban/jail.local 后 systemctl reload fail2ban。",
+        howto: "面板提供 jail 启停 / 手动封禁（安全中心 SSH 登录记录页「封禁此 IP」）/ 解除封禁 / 状态查看，不提供 jail 规则表单：/etc/fail2ban/ 整目录已列入敏感路径黑名单（其 action 规则会以 root 执行命令，文件页拒绝读写），需要自定义 fail2ban 过滤器时请通过 SSH 编辑 /etc/fail2ban/jail.local 后 systemctl reload fail2ban。",
         units: &["fail2ban.service"],
     },
     PkgDef {

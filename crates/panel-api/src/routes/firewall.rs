@@ -509,6 +509,62 @@ pub async fn fail2ban_unban(
     Ok(ok(serde_json::json!({ "jail": req.jail, "ip": req.ip })))
 }
 
+/// 日志页「封禁此 IP」的严格校验：解析失败 / 回环 / 未指定地址一律拒绝。
+///
+/// `ssh_login::looks_like_ip` 只是粗提取（`999.999.999.999` 也能过），封禁是
+/// 破坏性动作，必须在这里用 `IpAddr` 真解析；回环地址封了等于把自己关在门外。
+fn valid_ban_target(ip: &str) -> Result<(), ApiError> {
+    match ip.trim().parse::<IpAddr>() {
+        Ok(addr) if !addr.is_loopback() && !addr.is_unspecified() => Ok(()),
+        _ => Err(ApiError::bad_request("ip", "IP 格式非法或不可封禁（回环/未指定地址）")),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BanReq {
+    /// 缺省用 `AppState::manual_ban_jail`（来自 config.toml `[security] auto_ban_jail`）。
+    /// 与 `auto_ban_on_lockout` 开关无关：开关关着也能从日志页手动封。
+    pub jail: Option<String>,
+    pub ip: String,
+}
+
+/// 从日志 IP 手动封禁。重复封禁不重复下发：`fail2ban-client banip` 对已封 IP
+/// 会重置 bantime，一次误点就能把别人的封禁期悄悄延长。
+pub async fn fail2ban_ban(
+    State(state): State<Shared>, Auth(s): Auth, PanelJson(req): PanelJson<BanReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::FIREWALL_MANAGE)?;
+    crate::ratelimit::check_heavy(&state, &s.username, "fail2ban.ban")?;
+    valid_ban_target(&req.ip)?;
+    let jail = req.jail.as_deref().map(str::trim).filter(|v| !v.is_empty())
+        .unwrap_or(&state.manual_ban_jail);
+    validate_jail_name(jail)?;
+    if !state.capabilities.get(cap_keys::FAIL2BAN).map(|c| c.supported).unwrap_or(false) {
+        return Err(ApiError::unsupported("fail2ban.manage"));
+    }
+    let ip = req.ip.trim();
+
+    // 已封则直接返回。状态查询失败不阻断封禁：那只是少了去重，
+    // fail2ban 本身仍会执行；不能因为读状态失败就封不了。
+    if let Ok(st) = state.os.firewall().fail2ban_status().await {
+        let already = st.jails.iter().any(|j| j.name == jail
+            && j.banned_ips.iter().any(|v| v == ip));
+        if already {
+            audit(&state, &s, "firewall.fail2ban.ban",
+                  &format!("{} {} (already)", jail, ip), "skip").await;
+            return Ok(ok(serde_json::json!({
+                "jail": jail, "ip": ip, "already_banned": true,
+            })));
+        }
+    }
+
+    state.os.firewall().fail2ban_ban(jail, ip).await?;
+    audit(&state, &s, "firewall.fail2ban.ban", &format!("{} {}", jail, ip), "ok").await;
+    Ok(ok(serde_json::json!({
+        "jail": jail, "ip": ip, "already_banned": false,
+    })))
+}
+
 // ── fail2ban jail 封禁参数（运行期） ──
 
 /// 参数范围：maxretry 1..=10000；bantime/findtime 1..=30 天（秒）。
@@ -739,5 +795,37 @@ mod tests {
         assert!(c.as_deref().map(|x| x.contains(PANEL_MARK)).unwrap_or(false));
         let user = Some("my own rule".to_string());
         assert!(!user.as_deref().map(|x| x.contains(PANEL_MARK)).unwrap_or(false));
+    }
+
+    #[test]
+    fn manual_ban_target_is_strictly_validated() {
+        // 日志解析器只做粗提取，封禁入口必须真解析；空白可 trim，非法一律拒。
+        for ip in ["1.2.3.4", "2001:db8::1", " 5.6.7.8 "] {
+            assert!(valid_ban_target(ip).is_ok(), "应可封禁：{ip}");
+        }
+        for ip in ["127.0.0.1", "::1", "0.0.0.0", "::", "unknown",
+                   "999.999.999.999", "1.2.3.4; drop", "192.168.1", ""] {
+            assert!(valid_ban_target(ip).is_err(), "必须拒绝：{ip}");
+        }
+    }
+
+    #[test]
+    fn manual_ban_wiring_is_not_a_fake_control() {
+        let src = panel_testutil::production_source(include_str!("firewall.rs"));
+        // 只钉手动封禁函数体：全文件 contains 会被另外两处同名
+        // `fail2ban_status().await` 误命中——实测注入变异后守卫仍恒绿。
+        let start = src.find("pub async fn fail2ban_ban(")
+            .expect("手动封禁 handler 必须存在");
+        let end = src.find("fn valid_jail_params")
+            .expect("封禁参数校验函数必须存在");
+        assert!(start < end, "函数顺序错：封禁 handler 应在参数校验之前");
+        let body = &src[start..end];
+        assert!(body.contains("check_heavy(&state, &s.username, \"fail2ban.ban\")"),
+            "手动封禁必须接写操作限流");
+        assert!(body.contains("valid_ban_target(&req.ip)?"), "必须严格校验 IP");
+        assert!(body.contains("fail2ban_status().await"), "必须有重复封禁检查");
+        assert!(body.contains("already_banned"), "重复封禁要有明确返回");
+        assert!(body.contains("fail2ban_ban(jail, ip)"), "必须真的下发封禁");
+        assert!(body.contains("unsupported(\"fail2ban.manage\")"), "能力位门不能缺");
     }
 }

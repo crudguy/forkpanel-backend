@@ -4130,6 +4130,18 @@ paths:
           application/json:
             schema: { type: object, required: [jail, ip], properties: { jail: { type: string }, ip: { type: string } } }
       responses: { '200': { description: ok }, '501': { description: fail2ban 不可用 }, '429': { description: '触发限流（写/重活 10 次/60 秒，只读重活 30 次/60 秒）；按 retry_after 秒后重试' } }
+  /api/v1/firewall/fail2ban/ban:
+    post:
+      operationId: post_firewall_fail2ban_ban
+      tags: [firewall]
+      summary: 从日志 IP 手动封禁（已封则跳过，不重置 bantime）
+      security: [cookieAuth, csrfHeader]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [ip], properties: { jail: { type: string }, ip: { type: string } } }
+      responses: { '200': { description: ok }, '400': { description: 'IP 格式非法或 jail 名非法' }, '501': { description: fail2ban 不可用 }, '429': { description: '触发限流（写/重活 10 次/60 秒）；按 retry_after 秒后重试' } }
   /api/v1/firewall/fail2ban/params:
     get:
       operationId: get_firewall_fail2ban_params

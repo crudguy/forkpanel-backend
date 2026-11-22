@@ -144,6 +144,9 @@ pub struct AppState {
     /// 由 `config.toml [security] auto_ban_on_lockout/auto_ban_jail` 经 serve 注入；
     /// 默认关闭，因为封 IP 是破坏性动作且 `X-Real-IP` 仅在受信任反代后可信。
     pub auto_ban_jail: Option<String>,
+    /// 手动封禁（日志页「封禁此 IP」）使用的 jail 名。**与自动封禁开关无关**：
+    /// 由 `config.toml [security] auto_ban_jail` 经 serve 注入，默认 `forkpanel`。
+    pub manual_ban_jail: String,
 }
 
 /// 只读模式是否生效：**config 基线或环境变量**，任一为真即开。
@@ -200,6 +203,7 @@ impl AppState {
             last_snapshot: tokio::sync::RwLock::new(None),
             alert,
             auto_ban_jail: None,
+            manual_ban_jail: "forkpanel".to_string(),
         }
     }
 
@@ -208,6 +212,13 @@ impl AppState {
     /// 很容易漏传导致"默认兜底"的假控制。
     pub fn with_auto_ban_jail(mut self, jail: Option<String>) -> Self {
         self.auto_ban_jail = jail;
+        self
+    }
+
+    /// 部署期注入手动封禁 jail。与 `with_auto_ban_jail` 分开：自动封禁默认关闭
+    /// （None），但手动封禁总是可用，两者不能共用同一个 Option 字段。
+    pub fn with_manual_ban_jail(mut self, jail: String) -> Self {
+        self.manual_ban_jail = jail;
         self
     }
 

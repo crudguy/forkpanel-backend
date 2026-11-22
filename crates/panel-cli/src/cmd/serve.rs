@@ -204,7 +204,10 @@ pub(crate) fn run(cli: &Cli, os: Arc<dyn panel_os::OsAdapter>) -> Result<()> {
             master_key, read_only, max_login_attempts, session_idle, session_absolute,
             audit_retention_days, audit_max_rows, localhost_only, daily_backup,
             db_synchronous, backup_keep, cfg.danger.allow_web_upgrade, initial_public_ip, write_public_ip, alert.clone())
-            .with_auto_ban_jail(auto_ban_jail));
+            .with_auto_ban_jail(auto_ban_jail)
+            // 手动封禁不依赖自动封禁开关：开关关着也能从日志页封 IP，
+            // 但用同一个 jail 名配置，避免两处各写一份产生歧义。
+            .with_manual_ban_jail(cfg.security.auto_ban_jail.clone()));
 
         // ── 内部周期任务 ──
         register_internal_jobs(&sched_in, &os, writer.clone(), metrics.clone(), &layout, &cfg, tier, state.clone()).await;
