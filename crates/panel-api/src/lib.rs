@@ -53,6 +53,7 @@ pub mod totp;
 pub mod webhook;
 pub mod alert;
 pub mod audit_chain;
+pub mod ssh_login;
 
 use error::{ApiError, ApiResult};
 use panel_core::{crypto::MasterKey, CapabilityMap, Tier};

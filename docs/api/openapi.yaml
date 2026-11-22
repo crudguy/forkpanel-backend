@@ -1335,6 +1335,16 @@ components:
         expected: { type: string, example: "no" }
         advice: { type: string }
         applicable: { type: boolean, description: "该平台是否适用（如非 systemd 则 false）" }
+    SshLoginEvent:
+      type: object
+      description: SSH 登录 / 爆破事件；从统一日志源（journald）的 sshd 消息解析
+      properties:
+        ts_unix: { type: integer, description: "秒级时间戳；无结构化时间时为 0（前端显示 —）" }
+        ip:      { type: string, description: 来源 IP }
+        user:    { type: string, description: 登录用户名；解析不到为 unknown }
+        result:  { type: string, enum: [success, failed] }
+        risk:    { type: string, enum: [none, failed_password, invalid_user, root_attempt, root_login, brute_force] }
+        detail:  { type: string, description: 原始日志摘要（≤300 字符） }
     SessionInfo:
       type: object
       description: 在线会话（内存 SessionCache 快照）。ip 刻意不采集——会话层无对端地址管道，不伪造数据
@@ -4235,6 +4245,30 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { $ref: '#/components/schemas/SshPortChange' } } }
         '400': { description: "确认词不符 / 端口非法 / 端口被占用 / sshd 不可用" }
+  /api/v1/security/ssh-logins:
+    get:
+      operationId: get_security_ssh_logins
+      tags: [security]
+      summary: SSH 登录 / 爆破记录（来源 IP、时间、用户、结果、风险类型）
+      description: |
+        从统一日志源（journald）的 sshd 消息解析。同一 IP 在 300s 内失败 >= 5 次
+        升级为 brute_force；无结构化时间的文件源不参与爆破聚合（宁可漏标不误报）。
+        ip / user 筛选是字面量子串（非正则），result / risk 为精确值；服务端最多读 2000 行。
+        无 journald 时返回 source=unavailable + 空列表，不伪造数据。
+      security: [cookieAuth]
+      parameters:
+        - { name: ip, in: query, schema: { type: string }, description: "来源 IP 子串" }
+        - { name: user, in: query, schema: { type: string }, description: "用户名子串（不区分大小写）" }
+        - { name: result, in: query, schema: { type: string, enum: [success, failed] } }
+        - { name: risk, in: query, schema: { type: string, enum: [none, failed_password, invalid_user, root_attempt, root_login, brute_force] } }
+        - { name: limit, in: query, schema: { type: integer, default: 200, minimum: 1, maximum: 1000 } }
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { rows: { type: array, items: { $ref: '#/components/schemas/SshLoginEvent' } }, total: { type: integer }, source: { type: string, enum: [journald, unavailable] }, truncated: { type: boolean } } } } }
+        '501': { description: 日志读取能力不可用 }
   /api/v1/security/sessions:
     get:
       operationId: get_security_sessions

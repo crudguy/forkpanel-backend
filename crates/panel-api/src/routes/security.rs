@@ -8,8 +8,9 @@
 //! 面板重启后按哈希惰性重建，会话**不再**全员登出。
 
 use crate::{auth::perm, error::{ok, ApiError, ApiResult}, routes::{audit, Auth, CurrentSid, Shared}};
-use axum::extract::{Path as AxPath, State};
+use axum::extract::{Path as AxPath, Query, State};
 use axum::{Json, http::StatusCode};
+use panel_core::cap_keys;
 use serde::Deserialize;
 use serde_json::json;
 use crate::extract::PanelJson;
@@ -211,6 +212,56 @@ pub async fn ssh_port_set(
     Ok(ok(r))
 }
 
+// ─────────────── SSH 登录 / 爆破记录 ───────────────
+
+/// SSH 登录与爆破记录（只读）。数据源是统一日志源的 system/journald 源，
+/// 从 sshd 消息解析来源 IP / 用户 / 结果 / 风险类型，筛选在服务端完成。
+///
+/// 不直接读 `/var/log/auth.log`：Debian 13 默认只有 journald，文件是否存在
+/// 取决于 rsyslog 装没装；统一日志源已做过探测，这里只认 trait。无 journald
+/// 时如实回 `source="unavailable"` + 空列表，不伪造数据。
+pub async fn ssh_logins(
+    State(state): State<Shared>,
+    Auth(s): Auth,
+    Query(q): Query<crate::ssh_login::SshLoginFilter>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::auth::require(&s, perm::SECURITY_MANAGE)?;
+    if !state.capabilities.get(cap_keys::LOGS_READ).map(|c| c.supported).unwrap_or(false) {
+        return Err(ApiError::unsupported("logs.read"));
+    }
+    crate::ratelimit::check_read(&state, &s.username, "security.ssh_logins")?;
+
+    let mut events = Vec::new();
+    let mut source = "unavailable";
+    if let Some(src) = state.os.logs().sources().await?
+        .into_iter()
+        .find(|x| x.kind == panel_os::LogSourceKind::System)
+    {
+        let lines = state.os.logs().read(&src, panel_os::LogQuery {
+            lines: crate::ssh_login::FETCH_LINES,
+            grep: Some("sshd".into()),
+            level: None,
+            follow: false,
+            since_unix: None,
+        }).await?;
+        source = "journald";
+        for l in lines {
+            if let Some(e) = crate::ssh_login::parse_line(&l.text, l.ts_unix.unwrap_or(0)) {
+                events.push(e);
+            }
+        }
+    }
+    let total = events.len();
+    crate::ssh_login::mark_brute_force(&mut events);
+    let rows = crate::ssh_login::filter_events(events, &q);
+    Ok(ok(json!({
+        "rows": rows,
+        "total": total,
+        "source": source,
+        "truncated": total >= crate::ssh_login::FETCH_LINES,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +361,25 @@ mod tests {
         );
         // 确认词校验也必须在（只靠前端拦 = 可绕过 API）
         assert!(body.contains("is_port_confirm"), "ssh_port_set 必须校验确认词");
+    }
+
+    /// 接线守卫：端点必须真挂 GET；实现必须做权限 + 只读限流 + 统一日志源，
+    /// 且不得在业务层直接拼 journalctl 命令（分层门禁的同类坑）。
+    #[test]
+    fn ssh_logins_route_is_wired_with_guards() {
+        let routes = panel_testutil::production_source(include_str!("../routes.rs"));
+        let line: Vec<&str> = routes.lines()
+            .filter(|l| l.contains("/api/v1/security/ssh-logins"))
+            .collect();
+        assert_eq!(line.len(), 1, "ssh-logins 路由必须恰好挂一次");
+        assert!(line[0].contains("get(security::ssh_logins)"), "必须挂 GET");
+
+        let src = panel_testutil::production_source(include_str!("security.rs"));
+        let start = src.find("pub async fn ssh_logins").expect("ssh_logins 必须定义");
+        let body = &src[start..];
+        assert!(body.contains("perm::SECURITY_MANAGE"), "必须校验 security.manage");
+        assert!(body.contains("check_read("), "journald 是重活，必须走只读限流");
+        assert!(body.contains("LogSourceKind::System"), "必须走统一日志源的 system 源");
+        assert!(!body.contains("Journalctl"), "业务层不得直接拼 journalctl 命令");
     }
 }
