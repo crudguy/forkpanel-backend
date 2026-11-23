@@ -360,4 +360,75 @@ mod tests {
         assert_eq!(f(None), None);
         assert_eq!(f(Some(" https://a/b ")), Some("https://a/b".to_string()));
     }
+
+    /// 预置模板（迁移 038）必须**本身可通过新建任务的校验**。
+    ///
+    /// 只断言「迁移跑得通」是不够的：模板若带非法表达式/超长命令/越界超时，
+    /// 用户从下拉里选了它、点创建，会在提交时才吃 400——而模板是我们塞进去的，
+    /// 相当于我们给了用户一个用不了的起点。
+    #[test]
+    fn seeded_templates_pass_creation_validation() {
+        let conn = seed();
+        conn.execute_batch(include_str!("../../../../migrations/038_default_cron_templates.sql"))
+            .unwrap();
+        let sql = format!("SELECT {COLS} FROM cron_templates ORDER BY id ASC");
+        let mut st = conn.prepare(&sql).unwrap();
+        let rows: Vec<TemplateDto> = st.query_map([], row_to_dto).unwrap()
+            .map(|x| x.unwrap()).collect();
+        assert_eq!(rows.len(), 5, "默认模板条数与迁移不一致（改了迁移就要改这里）");
+
+        // 表达式合法性用**真实实现的解析器**，而不是 mock（mock 只数段数，
+        // 五段垃圾也会通过）或"看起来像五段"。
+        // 必须经 `default_adapter()` 这个跨平台入口拿调度器：直接
+        // `panel_os::linux::scheduler::LinuxScheduler` 会让业务层绑死平台，
+        // 被架构守卫 [4c] 拦下（且 force-mock 下测的就不是真实解析器了）。
+        use panel_os::traits::SchedulerProvider;
+        let adapter = panel_os::default_adapter();
+        let sched = adapter.scheduler();
+        for r in &rows {
+            assert!(sched.validate_expression(&r.expr).is_ok(),
+                "默认模板「{}」的表达式非法：{}", r.name, r.expr);
+            assert!(panel_core::rules::is_valid_system_user(&r.user),
+                "默认模板「{}」的执行用户非法：{}", r.name, r.user);
+            assert!(!r.command.trim().is_empty() && r.command.len() <= 4096,
+                "默认模板「{}」的命令长度越界", r.name);
+            assert!(crate::routes::cron::check_timeout_value(r.timeout_sec).is_ok(),
+                "默认模板「{}」的超时越界：{}", r.name, r.timeout_sec);
+            assert!(r.name.chars().count() <= MAX_TEMPLATE_NAME,
+                "默认模板名超长：{}", r.name);
+            assert!(r.description.chars().count() <= MAX_TEMPLATE_DESC,
+                "默认模板说明超长：{}", r.name);
+            // Webhook 一律留空：预填会让所有实例都往同一个地址 POST
+            assert!(r.webhook_url.is_none(), "默认模板不应预填 Webhook：{}", r.name);
+        }
+    }
+
+    /// 预置模板必须**幂等**：老库升级时若用户已经手建了同名模板，
+    /// 迁移要静默跳过、**不覆盖用户的内容**，也不能因 UNIQUE 约束而让整个迁移失败
+    /// （迁移跑挂 = 面板起不来）。
+    #[test]
+    fn seeding_is_idempotent_and_never_overwrites_user_templates() {
+        let conn = seed();
+        // 用户先手建了一条同名模板，命令与默认值不同
+        conn.execute(
+            "INSERT INTO cron_templates(name, description, expr, command, user, timeout_sec, \
+             webhook_url, created_at, updated_at) VALUES('每日备份数据库','我自己的','0 1 * * *',\
+             '/my/own.sh','root',60,NULL,1,1)",
+            [],
+        ).unwrap();
+
+        // 迁移 038 应用两次：第二次不得报错、不得改变任何行
+        conn.execute_batch(include_str!("../../../../migrations/038_default_cron_templates.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../../../migrations/038_default_cron_templates.sql"))
+            .unwrap();
+
+        let cmd: String = conn.query_row(
+            "SELECT command FROM cron_templates WHERE name = '每日备份数据库'", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(cmd, "/my/own.sh", "用户的同名模板被默认模板覆盖了");
+
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM cron_templates", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 5, "重复应用迁移不得插入重复行（用户 1 条 + 其余默认 4 条）");
+    }
 }

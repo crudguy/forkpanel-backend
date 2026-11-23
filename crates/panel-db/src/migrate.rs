@@ -63,10 +63,11 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (36, include_str!("../../../migrations/036_dns_credentials.sql")),
     // 037：计划任务模板——新建任务时预填表单；与 cron_jobs 无外键（模板是脚手架）
     (37, include_str!("../../../migrations/037_cron_templates.sql")),
+    (38, include_str!("../../../migrations/038_default_cron_templates.sql")),
 ];
 
 /// 当前 schema 版本
-pub const LATEST: u32 = 37;
+pub const LATEST: u32 = 38;
 
 pub fn apply(conn: &mut Connection) -> Result<u32> {
     conn.execute_batch(
