@@ -4534,6 +4534,12 @@ paths:
       operationId: get_tasks
       tags: [tasks]
       summary: 任务列表（进行中/完成/失败）
+      description: |
+        `state` 过滤在 SQL 侧下推（返回「最近 N 条**满足筛选**」，而非「最近 N 条里碰巧满足」）。
+        `limit` 缺省 50；`0` = 不限（受 1000 条上限兜底，供前端「全部」档）；其余取 min(limit, 1000)。
+      parameters:
+        - { name: state, in: query, required: false, schema: { type: string, enum: [queued, running, ok, failed, canceled, interrupted] } }
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 0, default: 50 } }
       responses:
         '200':
           description: ok
