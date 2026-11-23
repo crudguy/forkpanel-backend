@@ -1388,6 +1388,32 @@ components:
         finished_at: { type: [integer, "null"] }
         exit_code: { type: [integer, "null"] }
         output_path: { type: [string, "null"] }
+    # 任务模板：新建任务的脚手架。与 cron_jobs 无外键关系（删模板不影响已建任务），
+    # 因此也没有 enabled 字段——模板本身不参与调度。
+    CronTemplate:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string, description: "模板名，全局唯一，1~64 字符" }
+        description: { type: string, description: "用途说明，0~200 字符" }
+        expr: { type: string, description: "cron 五段表达式" }
+        command: { type: string }
+        user: { type: string, description: "执行用户，须为系统已有用户" }
+        timeout_sec: { type: integer, default: 1800 }
+        webhook_url: { type: [string, "null"] }
+        created_at: { type: integer }
+        updated_at: { type: integer }
+    CronTemplateReq:
+      required: [name, expr, command]
+      type: object
+      properties:
+        name: { type: string }
+        description: { type: string, default: "" }
+        expr: { type: string }
+        command: { type: string }
+        user: { type: string, default: root }
+        timeout_sec: { type: integer, default: 1800, description: "1~604800" }
+        webhook_url: { type: [string, "null"], description: "留空存 NULL" }
 
     # ───────────── 日志 ─────────────
     LogSource:
@@ -4378,6 +4404,40 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: object, properties: { expr: { type: string }, next: { type: array, items: { type: integer } } } } } }
+  /api/v1/cron/templates:
+    get:
+      operationId: get_cron_templates
+      tags: [cron]
+      summary: 任务模板列表（按 id 升序；需 cron.view，不设能力门）
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Envelope', properties: { data: { type: array, items: { $ref: '#/components/schemas/CronTemplate' } } } }
+    post:
+      operationId: post_cron_templates
+      tags: [cron]
+      summary: 新建任务模板（名称唯一，字段校验与新建任务同源）
+      security: [cookieAuth, csrfHeader]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CronTemplateReq' } } } }
+      responses: { '200': { description: 已创建 }, '400': { description: 字段非法 }, '409': { description: 同名模板已存在 }, '501': { description: 调度器能力不可用 } }
+  /api/v1/cron/templates/{id}:
+    put:
+      operationId: put_cron_templates_id
+      tags: [cron]
+      summary: 编辑任务模板（整体替换；改名撞名返回 409）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CronTemplateReq' } } } }
+      responses: { '200': { description: ok }, '400': { description: 字段非法 }, '404': { description: 模板不存在 }, '409': { description: 同名模板已存在 }, '501': { description: 调度器能力不可用 } }
+    delete:
+      operationId: delete_cron_templates_id
+      tags: [cron]
+      summary: 删除任务模板（不影响已用该模板创建的任务）
+      security: [cookieAuth, csrfHeader]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses: { '200': { description: ok }, '404': { description: 模板不存在 }, '501': { description: 调度器能力不可用 } }
   /api/v1/cron/webhook/test:
     post:
       operationId: post_cron_webhook_test

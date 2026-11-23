@@ -10,6 +10,7 @@
 pub mod apps;
 pub mod auth;
 pub mod cron;
+pub mod cron_templates;
 pub mod assistant;
 pub mod backups;
 pub mod containers;
@@ -285,7 +286,17 @@ pub fn build_router(state: Shared) -> Router {
         .route("/api/v1/cron/jobs/{id}/webhook", post(cron::webhook_test_job))
         .route("/api/v1/cron/jobs/{id}/runs", get(cron::runs))
         .route("/api/v1/cron/preview", post(cron::preview))
-        .route("/api/v1/cron/webhook/test", post(webhook::test));
+        .route("/api/v1/cron/webhook/test", post(webhook::test))
+        // 任务模板：模板只是新建任务的脚手架，与 cron_jobs 无外键关系。
+        // 读要 cron.view（选择模板属于"看得见"层级），写要 cron.manage + scheduler.manage。
+        .route(
+            "/api/v1/cron/templates",
+            get(cron_templates::list).post(cron_templates::create),
+        )
+        .route(
+            "/api/v1/cron/templates/{id}",
+            put(cron_templates::update).delete(cron_templates::delete),
+        );
 
     // ── 日志 ──
     let log_r = Router::new()
@@ -666,13 +677,15 @@ mod tests {
     #[test]
     fn capability_gates_census() {
         // (文件, needle, 期望出现次数, 说明)
-        let cases: [(&str, &str, usize, &str); 24] = [
+        let cases: [(&str, &str, usize, &str); 25] = [
             (include_str!("routes/services/mod.rs"), ".get(cap_keys::SERVICE_MANAGE)", 4, "services::*"),
             (include_str!("routes/services/packages.rs"), ".get(cap_keys::PACKAGE_INSTALL)", 5, "packages::*"),
             (include_str!("routes/services/packages.rs"), ".get(cap_keys::PACKAGE_UPGRADE)", 2, "packages::*"),
             (include_str!("routes/firewall.rs"), ".get(cap_keys::FIREWALL_MANAGE)", 4, "firewall::*"),
             (include_str!("routes/firewall.rs"), ".get(cap_keys::FAIL2BAN)", 6, "firewall::*（原有 3 + params 读写各 1 + 日志页手动封禁 1）"),
             (include_str!("routes/cron.rs"), ".get(cap_keys::SCHEDULER_MANAGE)", 7, "cron::* 每个 handler 一道"),
+            // list 只读、故意不设门（只读账号也要能选模板），故是 2 而不是 4。
+            (include_str!("routes/cron_templates.rs"), ".get(cap_keys::SCHEDULER_MANAGE)", 2, "cron_templates::create / update"),
             (include_str!("routes/containers.rs"), ".get(cap_keys::CONTAINER_MANAGE)", 1, "ensure_supported helper 内一道"),
             (include_str!("routes/containers.rs"), "ensure_supported(&state)?", 14, "14 个 handler 的接线（含 docker update 与 limits）"),
             (include_str!("routes/processes.rs"), ".get(cap_keys::PROCESS_LIST)", 1, "processes::list（P1-22 修复）"),

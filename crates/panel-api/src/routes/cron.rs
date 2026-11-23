@@ -169,10 +169,45 @@ const MAX_TIMEOUT_SEC: i64 = 86400 * 7;
 /// 18446744073709551615 秒，任务永远"运行中"且无法被超时终止。
 fn check_timeout(sec: Option<i64>) -> ApiResult<i64> {
     let v = sec.unwrap_or(1800);
+    check_timeout_value(v)
+}
+
+/// 对**已成形的**超时值做区间校验（`check_timeout` 与模板 CRUD 共用）。
+///
+/// 分成两层是因为两条路径的入参形态不同：创建/编辑是「可省略 ⇒ 取缺省」，
+/// 模板是「库里已有一个值，只需判它合不合法」。共用同一个区间常量与文案，
+/// 避免「模板能存 999999，套用后建任务被拒」这种只在套用时才暴露的不一致。
+pub(crate) fn check_timeout_value(v: i64) -> ApiResult<i64> {
     if v <= 0 || v > MAX_TIMEOUT_SEC {
         return Err(ApiError::bad_request("timeout_sec", "需在 1~604800 之间"));
     }
     Ok(v)
+}
+
+/// 计划任务字段的公共校验（create / patch / 模板 CRUD 三处共用）。
+///
+/// 为什么抽出来：这三个字段的校验此前在 create 与 patch 里各写一遍，
+/// 规则一改就得记得改两处；模板再抄一遍就是三处。抽成一处后，
+/// 「模板里能存的值 ⇒ 一定能用来建任务」这条不变式由代码结构本身保证，
+/// 而不是靠三份代码碰巧一致。
+///
+/// 返回归一化后的字段值；任一不合法直接给带字段名的 400。
+pub(crate) fn validate_job_fields(
+    state: &Shared,
+    expr: &str,
+    command: &str,
+    user: &str,
+) -> ApiResult<()> {
+    // 表达式校验**必须由平台实现做**，业务层不解析
+    state.os.scheduler().validate_expression(expr)
+        .map_err(|e| ApiError::bad_request("expr", e.to_string()))?;
+    if !panel_core::rules::is_valid_system_user(user) {
+        return Err(ApiError::bad_request("user", "invalid system user"));
+    }
+    if command.is_empty() || command.len() > 4096 {
+        return Err(ApiError::bad_request("command", "长度需在 1~4096 之间"));
+    }
+    Ok(())
 }
 
 pub async fn create(
@@ -183,24 +218,13 @@ pub async fn create(
         return Err(ApiError::unsupported("scheduler.manage"));
     }
 
-    // 表达式校验**必须由平台实现做**，业务层不解析
-    state.os.scheduler().validate_expression(&req.expr)
-        .map_err(|e| ApiError::bad_request("expr", e.to_string()))?;
+    // 表达式 / 用户 / 命令的公共校验（与 patch、模板 CRUD 同一份实现）
+    let user = req.user.unwrap_or_else(|| "root".to_string());
+    validate_job_fields(&state, &req.expr, &req.command, &user)?;
 
     // 任务名校验（会作为 crontab 里的标识，必须严格）
     if !panel_core::rules::is_valid_path_segment(&req.name) {
         return Err(ApiError::bad_request("name", "只允许字母数字、下划线与连字符"));
-    }
-
-    // 用户校验（防 `user = "root; rm -rf /"` 这类注入到 crontab 的形式）
-    let user = req.user.unwrap_or_else(|| "root".to_string());
-    if !panel_core::rules::is_valid_system_user(&user) {
-        return Err(ApiError::bad_request("user", "invalid system user"));
-    }
-
-    // 命令长度上限：crontab 单行有长度限制，且过长的命令通常意味着误用
-    if req.command.is_empty() || req.command.len() > 4096 {
-        return Err(ApiError::bad_request("command", "长度需在 1~4096 之间"));
     }
 
     // timeout_sec 范围校验（与 patch_job 的同名约束保持一致）。
@@ -347,20 +371,11 @@ pub async fn patch_job(
     let timeout_sec = req.timeout_sec.unwrap_or(base.timeout.as_secs() as i64);
 
     // 与 create 一致的全套校验（表达式校验必须由平台实现做）
-    state.os.scheduler().validate_expression(&expr)
-        .map_err(|e| ApiError::bad_request("expr", e.to_string()))?;
+    validate_job_fields(&state, &expr, &command, &user)?;
     if !panel_core::rules::is_valid_path_segment(&id) {
         return Err(ApiError::bad_request("name", "只允许字母数字、下划线与连字符"));
     }
-    if !panel_core::rules::is_valid_system_user(&user) {
-        return Err(ApiError::bad_request("user", "invalid system user"));
-    }
-    if command.is_empty() || command.len() > 4096 {
-        return Err(ApiError::bad_request("command", "长度需在 1~4096 之间"));
-    }
-    if timeout_sec <= 0 || timeout_sec > MAX_TIMEOUT_SEC {
-        return Err(ApiError::bad_request("timeout_sec", "需在 1~604800 之间"));
-    }
+    let timeout_sec = check_timeout_value(timeout_sec)?;
 
     // 现有 Webhook 元数据（来自库，系统是 crontab 但 url/事件只存库）
     let existing = cron_meta_of(&state, &id).await;
