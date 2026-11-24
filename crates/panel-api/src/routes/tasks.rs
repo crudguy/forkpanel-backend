@@ -9,7 +9,7 @@ use axum::{
     extract::{Path as AxPath, Query, State},
     Json,
 };
-use panel_core::{PanelError, Result};
+use panel_core::PanelError;
 use rusqlite::OptionalExtension;
 use serde::Deserialize;
 
@@ -112,6 +112,20 @@ pub async fn cancel(
 #[derive(Debug, Deserialize)]
 pub struct OutputQ { pub lines: Option<usize> }
 
+/// 输出文件读取失败里，只有「文件不存在」才降级成 200 + note。
+///
+/// 日志保留策略（`prune_keep_newest` 只留最近 N 份）会删掉旧日志文件，但
+/// `task_runs.output_path` 仍指向旧路径 ⇒ 任务当时确实成功了，点开输出却
+/// 500 `No such file or directory`，用户以为任务报错。状态保持原样才诚实，
+/// 这里只把「输出不可用」讲清楚。权限/编码等真实 I/O 故障仍走 500，不许降级掩盖。
+fn output_degrade_note(e: &std::io::Error) -> Option<&'static str> {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        Some("输出文件不存在或已被清理，无法查看本次输出")
+    } else {
+        None
+    }
+}
+
 pub async fn output(
     State(state): State<Shared>,
     Auth(s): Auth,
@@ -138,15 +152,24 @@ pub async fn output(
     };
 
     // 尾部读取：只取最后 n 行，不把整个文件读进内存
-    let content = tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
-        let s = std::fs::read_to_string(&p)
-            .map_err(|e| PanelError::Io(format!("read output: {e}")))?;
+    let content = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<String>> {
+        let s = std::fs::read_to_string(&p)?;
         let all: Vec<&str> = s.lines().collect();
         let start = all.len().saturating_sub(n);
         Ok(all[start..].iter().map(|x| x.to_string()).collect())
-    }).await.map_err(|e| PanelError::Internal(e.to_string()))??;
+    }).await;
 
-    Ok(ok(serde_json::json!({ "id": id, "lines": content })))
+    match content {
+        Ok(Ok(lines)) => Ok(ok(serde_json::json!({ "id": id, "lines": lines }))),
+        Ok(Err(e)) => {
+            if let Some(note) = output_degrade_note(&e) {
+                Ok(ok(serde_json::json!({ "id": id, "lines": [], "note": note })))
+            } else {
+                Err(PanelError::Io(format!("read output: {e}")).into())
+            }
+        }
+        Err(e) => Err(PanelError::Internal(e.to_string()).into()),
+    }
 }
 
 // ─────────────── 单任务详情 ───────────────
@@ -191,6 +214,32 @@ mod tests {
     use super::{effective_limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT};
     use rusqlite::Connection;
 
+    /// 文件被日志清理策略删掉后，输出接口必须降级为 200 + note，不能 500。
+    #[test]
+    fn missing_output_file_degrades_instead_of_500() {
+        use std::io::{Error, ErrorKind};
+
+        let note = super::output_degrade_note(&Error::from(ErrorKind::NotFound));
+        assert!(note.is_some(), "文件不存在必须降级为 200 + note，不能 500");
+        assert!(note.unwrap().contains("不存在"), "文案要说清文件丢失：{note:?}");
+
+        for kind in [ErrorKind::PermissionDenied, ErrorKind::InvalidData, ErrorKind::Other] {
+            assert!(super::output_degrade_note(&Error::from(kind)).is_none(),
+                "{kind:?} 是真实 I/O 故障，不能被降级掩盖");
+        }
+    }
+
+    /// 防「抽了纯函数却没接线」：输出接口必须真的消费降级判定。
+    #[test]
+    fn output_route_uses_degrade_helper() {
+        let prod = panel_testutil::production_source(include_str!("tasks.rs"));
+        assert!(prod.contains("fn output_degrade_note("), "需要有降级判定纯函数");
+        assert_eq!(prod.matches("output_degrade_note(&e)").count(), 1,
+            "输出接口必须真的调用降级判定，且只调用一处");
+        assert!(!prod.contains(".map_err(|e| PanelError::Io(format!(\"read output: {e}\")))?;"),
+            "旧的直接 500 写法复活了");
+    }
+
     // ── limit 语义 ──
 
     #[test]
@@ -217,10 +266,7 @@ mod tests {
     /// 回归不会悄悄回来——直接断言默认值 ≥ 前端常用档位。
     #[test]
     fn default_limit_covers_frontend_page_sizes() {
-        assert!(
-            DEFAULT_LIST_LIMIT >= 50,
-            "默认上限 {DEFAULT_LIST_LIMIT} 小于前端常规每页档位 50，列表会莫名只有半页"
-        );
+        const { assert!(DEFAULT_LIST_LIMIT >= 50) };
     }
 
     // ── state 过滤下推到 SQL（用真 SQLite，不用假行）──

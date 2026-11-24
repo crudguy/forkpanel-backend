@@ -478,6 +478,20 @@ pub(crate) fn run_outcome(code: Option<i32>) -> (i32, String, bool) {
     }
 }
 
+/// 任务终态 = 脚本退出码 + 日志落盘结果。
+///
+/// 日志写不进磁盘是**文件操作失败**，即便脚本 `exit 0` 也不能记成「完成」：
+/// 此前终态只看退出码，落盘失败只 `eprintln`，而 `Progress::log` 只广播不落库
+/// ⇒ 用户点开输出只有「无输出」，状态却是「成功」（本轮任务中心状态问题）。
+/// `exit_code` 保留脚本真实退出码（不谎报），`failed` 与文案体现落盘失败。
+pub(crate) fn final_outcome(code: Option<i32>, log_write_ok: bool) -> (i32, String, bool) {
+    let (ec, text, bad) = run_outcome(code);
+    if !log_write_ok {
+        return (ec, format!("{text}；任务日志落盘失败"), true);
+    }
+    (ec, text, bad)
+}
+
 #[async_trait::async_trait]
 impl panel_task::TaskBody for CronRunTask {
     async fn run(&self, progress: panel_task::Progress) -> Result<panel_task::TaskOutcome> {
@@ -543,6 +557,8 @@ impl panel_task::TaskBody for CronRunTask {
         }
 
         let mut output_path = None;
+        // 落盘结果要并入终态：写不进去就是文件操作失败，不能让任务显示「完成」。
+        let mut log_write_ok = true;
         let lines: Vec<String> = panel_core::sync::lock_recover(&buf).clone();
         if !lines.is_empty() {
             // 日志写进专属子目录而非 temp_dir 根：id 递增 → 每次都是新文件，
@@ -561,6 +577,7 @@ impl panel_task::TaskBody for CronRunTask {
                 Err(e) => {
                     // 落盘失败要让用户看得见：否则任务中心只显示「无输出」，
                     // 服务端也无日志可查，与「任务成功」的结论对不上。
+                    log_write_ok = false;
                     let msg = format!("任务日志落盘失败：{e}");
                     progress.log(&msg).await;
                     eprintln!("[panel] ⚠ [cron] {msg}");
@@ -571,7 +588,7 @@ impl panel_task::TaskBody for CronRunTask {
         let (task_state, exit_code, status_text, failed) = match &r {
             Ok(out) => {
                 // ⚠ `None`（超时被杀）必须判失败，绝不能当 0（详见 run_outcome 注释）
-                let (code, text, bad) = run_outcome(out.code);
+                let (code, text, bad) = final_outcome(out.code, log_write_ok);
                 (if bad { panel_task::TaskState::Failed } else { panel_task::TaskState::Ok },
                  code, text, bad)
             }
@@ -831,6 +848,43 @@ mod tests {
         assert!(bad, "未取得退出码必须判为失败，绝不能当成 0");
         assert_ne!(code, 0, "退出码绝不能是 0（会让列表页显示 ok）");
         assert!(text.contains("killed") || text.contains("终止"), "文案要说清是被终止：{text}");
+    }
+
+    /// 日志落盘失败属于文件操作失败，脚本 exit 0 也不能记成「完成」。
+    #[test]
+    fn log_write_failure_makes_task_failed() {
+        let (code, text, bad) = final_outcome(Some(0), true);
+        assert_eq!((code, bad), (0, false), "脚本成功且日志落盘成功才是 ok");
+        assert_eq!(text, "ok");
+
+        // 核心负向：exit 0 但写盘失败 ⇒ failed，退出码仍是真实的 0（不谎报）。
+        let (code, text, bad) = final_outcome(Some(0), false);
+        assert!(bad, "日志落盘失败必须判为失败，不能显示「完成」");
+        assert_eq!(code, 0, "exit_code 必须保留脚本真实退出码");
+        assert!(text.contains("落盘失败"), "文案要说清是文件操作失败：{text}");
+
+        let (code, text, bad) = final_outcome(Some(3), false);
+        assert!(bad);
+        assert_eq!(code, 3);
+        assert!(text.contains("3") && text.contains("落盘失败"), "{text}");
+
+        // 超时被杀 + 落盘成功仍须失败（防 run_outcome 回归）。
+        let (code, _, bad) = final_outcome(None, true);
+        assert!(bad);
+        assert_ne!(code, 0);
+    }
+
+    /// 防「抽了纯函数却没接线」：终态判定必须真的消费落盘结果。
+    #[test]
+    fn cron_log_write_failure_is_wired_into_terminal_state() {
+        let prod = panel_testutil::production_source(include_str!("cron.rs"));
+        assert!(prod.contains("let mut log_write_ok = true;"), "需有落盘结果标志");
+        assert_eq!(prod.matches("log_write_ok = false;").count(), 1,
+            "落盘失败必须有且仅有一处置标志处");
+        assert_eq!(prod.matches("final_outcome(out.code, log_write_ok)").count(), 1,
+            "终态判定必须消费落盘结果，且只消费一处");
+        assert!(!prod.contains("let (code, text, bad) = run_outcome(out.code);"),
+            "旧的只看退出码的终态判定复活了");
     }
 
     /// F-13：执行链的错误分支必须留痕，不许退回静默吞错。

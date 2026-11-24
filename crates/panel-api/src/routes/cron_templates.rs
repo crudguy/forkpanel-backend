@@ -382,7 +382,6 @@ mod tests {
         // 必须经 `default_adapter()` 这个跨平台入口拿调度器：直接
         // `panel_os::linux::scheduler::LinuxScheduler` 会让业务层绑死平台，
         // 被架构守卫 [4c] 拦下（且 force-mock 下测的就不是真实解析器了）。
-        use panel_os::traits::SchedulerProvider;
         let adapter = panel_os::default_adapter();
         let sched = adapter.scheduler();
         for r in &rows {
