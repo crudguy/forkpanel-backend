@@ -76,8 +76,15 @@ FE_LIT=$( { grep -rhoE "enabled\([^)]*\)" "$FE_DIR" 2>/dev/null
             grep -rhoE "\bcan\('[a-z]+\.[a-z]+'\)" "$FE_DIR" 2>/dev/null; } \
   | grep -oE "'[a-z]+\.[a-z]+'" | tr -d "'" | sort -u)
 # 精确限定这两个文件：它们是唯一的集中式门控表，别处的 `perm:` 不算。
-FE_DECL=$(grep -hoE "perm: '[a-z]+\.[a-z]+'" \
-  "$FE_DIR/composables/navItems.ts" "$FE_DIR/composables/navPolicy.ts" 2>/dev/null \
+# 两种声明形态都要抓：
+#   ① 单权限   `perm: 'site.view'`        —— 必须有
+#   ② 任一即可 `perm: ['log.view', 'audit.view']`（`perm: [` 起、到 `]` 止）
+# 只抓 ① 的话，写成 ② 的项会**整条绕过 [C]**：拼错一个权限名没人发现，
+# 而门禁照绿（空集恒真）。这也是 [D2] 要逐行对账的原因。
+FE_DECL=$( { grep -hoE "perm: '[a-z]+\.[a-z]+'" \
+               "$FE_DIR/composables/navItems.ts" "$FE_DIR/composables/navPolicy.ts" 2>/dev/null
+             grep -hoE "perm: \[[^]]*\]" \
+               "$FE_DIR/composables/navItems.ts" "$FE_DIR/composables/navPolicy.ts" 2>/dev/null; } \
   | grep -oE "'[a-z]+\.[a-z]+'" | tr -d "'" | sort -u)
 FE=$(printf '%s\n%s\n' "$FE_LIT" "$FE_DECL" | grep -v '^$' | sort -u)
 
@@ -179,17 +186,20 @@ DECL_SITES=$(grep -nE "perm:" \
   "$FE_DIR/composables/navItems.ts" "$FE_DIR/composables/navPolicy.ts" 2>/dev/null \
   | grep -vE ':[0-9]+:[[:space:]]*(//|\*|/\*)' || true)
 # 排除两种非声明形态：TS 类型注解 `perm: string`；gateForPath 里从
-# NAV_ITEMS 转发的 `perm: nav.perm`（值来源仍是上面的字面量表）。
+# NAV_ITEMS 转发的 `perm: ''` / `anyOf: nav.perm`（值来源仍是上面的字面量表）。
 DECL_DATA=$(printf '%s\n' "$DECL_SITES" \
   | grep -vE "perm: string([[:space:]]|$)" \
-  | grep -vE "/composables/navPolicy\.ts:[0-9]+:.*perm: nav\.perm" || true)
+  | grep -vE "/composables/navPolicy\.ts:[0-9]+:.*perm: ''" \
+  | grep -vE "/composables/navPolicy\.ts:[0-9]+:.*anyOf: nav\.perm" || true)
 DECL_TOTAL=$(count "$DECL_DATA")
-DECL_LIT=$(printf '%s\n' "$DECL_DATA" | grep -cE "perm: '[a-z]+\.[a-z]+'" || true)
+# 字面量形态：单权限 'x.y'，或数组 ['x.y', 'z.w']（数组必须**整段**只含字面量，
+# 混进变量/模板串就判非字面量——否则它又成了绕过 [C] 的暗道）。
+DECL_LIT=$(printf '%s\n' "$DECL_DATA" | grep -cE "perm: '[a-z]+\.[a-z]+'|perm: \[ *('[a-z]+\.[a-z]+'(, *)?)+\]" || true)
 if [ "$DECL_TOTAL" -lt 20 ]; then
   fail "活性自检失败：集中式门控表只扫到 $DECL_TOTAL 处 perm 声明（预期 ≥20）"
 elif [ "$DECL_LIT" -ne "$DECL_TOTAL" ]; then
-  fail "以下 perm 声明不是字面量权限点，会绕过 [C] 校验："
-  printf '%s\n' "$DECL_DATA" | grep -vE "perm: '[a-z]+\.[a-z]+'" | sed 's/^/      /'
+  fail "以下 perm 声明不是字面量权限点，会绕过 [C] 校验（数组形态也必须全是字面量）："
+  printf '%s\n' "$DECL_DATA" | grep -vE "perm: '[a-z]+\.[a-z]+'|perm: \[ *('[a-z]+\.[a-z]+'(, *)?)+\]" | sed 's/^/      /'
 else
   pass "$DECL_TOTAL 处门控表权限声明全部是字面量，且已并入 [C] 校验"
 fi

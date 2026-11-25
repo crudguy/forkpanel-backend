@@ -265,7 +265,7 @@ components:
       type: object
       properties:
         user:         { type: string }
-        role:         { type: string, enum: [owner, admin, operator, viewer] }
+        role:         { type: string, description: "内置角色名（owner/admin/operator/viewer）或自定义角色名——自定义角色由 POST /roles 创建" }
         permissions:   { type: array, items: { type: string } }
         allowed_roots: { type: array, items: { type: string } }
         # 能力矩阵（键=能力名）；与 /system/capabilities 的 features 同源
@@ -1583,7 +1583,7 @@ components:
       properties:
         id: { type: integer }
         username: { type: string }
-        role: { type: string, enum: [owner, admin, operator, viewer] }
+        role: { type: string, description: "内置角色名或自定义角色名（自定义角色由 POST /roles 创建）" }
         allowed_roots: { type: array, items: { type: string } }
         mfa_enabled: { type: boolean }
         disabled: { type: boolean }
@@ -1595,12 +1595,12 @@ components:
       properties:
         username: { type: string }
         password: { type: string, description: "最小长度 10 + 弱口令字典检查" }
-        role: { type: string, enum: [admin, operator, viewer] }
+        role: { type: string, description: "owner 不可经 API 分配；其余内置角色与自定义角色均可（后端 ensure_role_assignable 校验存在性，ensure_no_escalation 校验不超出调用者自身权限）" }
         allowed_roots: { type: array, items: { type: string } }
     UserPatch:
       type: object
       properties:
-        role: { type: string, enum: [admin, operator, viewer] }
+        role: { type: string, description: "owner 不可经 API 修改；其余内置角色与自定义角色均可（校验同上）" }
         allowed_roots: { type: array, items: { type: string } }
         disabled: { type: boolean }
         password: { type: string }
