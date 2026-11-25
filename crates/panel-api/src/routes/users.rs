@@ -272,8 +272,25 @@ pub async fn patch(
         Ok(panel_db::WriteAck { rows_changed: 1 })
     }).await.map_err(ApiError::from)?;
 
-    // 7) 禁用/改密后立即踢下线
-    if new_disabled || req.password.is_some() {
+    // 7) 变更影响「会话里快照的字段」时立即踢下线。
+    //
+    // ⚠ 为什么 `allowed_roots` 也必须踢：`auth.rs::get_or_restore` 只在**缓存未命中**
+    // 时才从 `users` 表重建 Session，内存命中直接 `Some(s.clone())` 返回旧值。于是
+    // 「改 roots」对活跃会话**完全不生效**——实测：`allowed_roots=['/home']` 时请求
+    // `/` 报 50001，改成 `['/']` 后同一会话请求 `/` 仍报 50001（直到重登才好）。
+    // 反向同理：用户旧会话是「全放行」态，改成 `/home` 后旧会话继续放行所有目录，
+    // 观感是「授权没起作用」。
+    //
+    // 角色（permissions）同理——它同样是登录时快照进 Session 的（见 auth.rs:321
+    // 「权限在这里快照进会话」的注释）。改角色不踢 ⇒ 新权限/旧权限都不准。
+    //
+    // 保守方向：宁可让用户多登一次，不可让旧权限继续放行。禁用/改密/改角色/改
+    // 目录白名单，任一变更都踢。
+    if new_disabled
+        || req.password.is_some()
+        || req.role.is_some()
+        || req.allowed_roots.is_some()
+    {
         state.sessions.remove_by_user(target_id);
     }
 
@@ -327,4 +344,52 @@ pub async fn delete(
 
     audit(&state, &s, "user.delete", &target_id.to_string(), "ok").await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    /// 会话快照字段变更必须踢下线。
+    ///
+    /// 背景：`auth.rs::get_or_restore` 只在**缓存未命中**时才从 `users` 表重建
+    /// Session，内存命中直接 `Some(s.clone())` 返回旧值。于是「改 `allowed_roots`」
+    /// 对活跃会话完全不生效——实测：`allowed_roots=['/home']` 时请求 `/` 报 50001，
+    /// 改成 `['/']` 后**同一会话**请求 `/` 仍报 50001（直到重登才好）。
+    /// 反向同理：用户旧会话是「全放行」态（roots 空或含 `/`），改成 `/home` 后旧会话
+    /// 继续放行所有目录，观感是「授权没起作用」。
+    ///
+    /// 角色（permissions）同理——它同样是登录时快照进 Session 的（auth.rs:321 注释）。
+    ///
+    /// 判据指向被检查的那一份：读 `patch` handler 源码，断言 `remove_by_user`
+    /// 的触发条件覆盖 `req.role` / `req.allowed_roots` / `req.password` / `new_disabled`
+    /// 四个分支。改坏任一分支都会转红。
+    #[test]
+    fn patch_kicks_session_on_any_snapshot_field_change() {
+        let src = include_str!("users.rs");
+        // 定位 patch handler 里「踢下线」那段（注释以「7)」开头）
+        let start = src
+            .find("// 7) 变更影响「会话里快照的字段」时立即踢下线")
+            .expect("找不到 patch 的踢会话段——改名/删段后请同步本守卫");
+        let end = src[start..]
+            .find("state.sessions.remove_by_user(target_id);")
+            .expect("踢会话段里找不到 remove_by_user 调用");
+        let seg = &src[start..start + end + "state.sessions.remove_by_user(target_id);".len()];
+
+        // 四个快照字段都必须在踢会话条件里
+        for field in ["new_disabled", "req.password.is_some()", "req.role.is_some()", "req.allowed_roots.is_some()"] {
+            assert!(seg.contains(field), "踢会话条件必须覆盖 {field}，实际段落：\n{seg}");
+        }
+        // 且必须是「或」关系（任一变更即踢），不能退化成只踢其中一个
+        let cond_start = seg.find("if new_disabled").expect("找不到 if 条件");
+        let cond_end = seg[cond_start..].find('{').expect("if 条件没有 {");
+        let cond = &seg[cond_start..cond_start + cond_end];
+        for field in ["new_disabled", "req.password.is_some()", "req.role.is_some()", "req.allowed_roots.is_some()"] {
+            assert!(cond.contains(field), "if 条件必须包含 {field}，实际条件：{cond}");
+        }
+        assert!(cond.contains("||"), "if 条件必须是 ||（任一变更即踢），实际：{cond}");
+
+        // 负向对照：把 allowed_roots 从条件里拿掉，上面必须转红
+        let bad = seg.replace("|| req.allowed_roots.is_some()", "");
+        assert!(bad != seg, "负向对照未生效");
+        assert!(!bad.contains("req.allowed_roots.is_some()"), "负向对照应不含 allowed_roots");
+    }
 }
