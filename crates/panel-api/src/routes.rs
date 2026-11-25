@@ -33,6 +33,7 @@ pub mod users;
 pub mod audit;
 pub mod multipart;
 pub mod notes;
+pub mod quick_commands;
 pub mod waf_templates;
 pub mod waf_events;
 pub mod waf_alert;
@@ -376,6 +377,17 @@ pub fn build_router(state: Shared) -> Router {
             patch(notes::update).delete(notes::delete),
         );
 
+    // ── 用户级终端快捷命令（039）：按登录用户隔离，跨设备同步 ──
+    let quick_cmd_r = Router::new()
+        .route(
+            "/api/v1/user/quick-commands",
+            get(quick_commands::list).post(quick_commands::create),
+        )
+        .route(
+            "/api/v1/user/quick-commands/{id}",
+            patch(quick_commands::update).delete(quick_commands::delete),
+        );
+
     // ── WAF 策略模板（026） ──
     let waf_tpl_r = Router::new()
         .route("/api/v1/waf/templates", get(waf_templates::list).post(waf_templates::create))
@@ -464,6 +476,7 @@ pub fn build_router(state: Shared) -> Router {
         .merge(backup_r)
         .merge(container_r)
         .merge(notes_r)
+        .merge(quick_cmd_r)
         .merge(waf_tpl_r)
         .merge(waf_evt_r)
         .merge(waf_alert_r)
