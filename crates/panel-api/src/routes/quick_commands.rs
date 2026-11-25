@@ -61,6 +61,33 @@ fn check_input(req: &QuickCommandReq) -> Result<(String, String, String), ApiErr
     Ok((label, cmd, desc))
 }
 
+/// 名称查重（按 user_id）：编辑态传 `exclude_id` 排除自身，否则「只改说明/命令」
+/// 会被自己的旧名挡住。抽成可单测函数，让「新增冲突 / 编辑冲突 / 编辑自身」三条
+/// 路径都能用内存库钉住，而不是只靠 handler 的端到端测试。
+fn label_taken(
+    conn: &rusqlite::Connection,
+    uid: i64,
+    label: &str,
+    exclude_id: Option<i64>,
+) -> Result<bool, PanelError> {
+    let found = if let Some(id) = exclude_id {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM user_quick_commands \
+             WHERE user_id = ?1 AND label = ?2 AND id <> ?3)",
+            rusqlite::params![uid, label, id],
+            |r| r.get::<_, bool>(0),
+        )
+    } else {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM user_quick_commands WHERE user_id = ?1 AND label = ?2)",
+            rusqlite::params![uid, label],
+            |r| r.get::<_, bool>(0),
+        )
+    }
+    .map_err(|e| PanelError::Database(e.to_string()))?;
+    Ok(found)
+}
+
 /// 列表：只返回当前用户的自建命令。
 pub async fn list(State(state): State<Shared>, Auth(s): Auth) -> ApiResult<Json<Value>> {
     let uid = s.user_id;
@@ -116,6 +143,15 @@ pub async fn create(
             format!("快捷命令最多 {MAX_ITEMS} 条，请先删除再添加"),
         ));
     }
+    // 同名会让用户分不清点的是哪条，写入前按当前用户查重（前端也拦，这里是服务端兜底）。
+    let l = label.clone();
+    let taken = state
+        .pool
+        .with(move |conn| label_taken(conn, uid, &l, None))
+        .await?;
+    if taken {
+        return Err(ApiError::bad_request("label", "名称已存在，请换一个"));
+    }
     let now = now_unix();
     state
         .db
@@ -143,6 +179,15 @@ pub async fn update(
     let (label, cmd, desc) = check_input(&req)?;
     let uid = s.user_id;
     ensure_owned(&state, id, uid).await?;
+    // 编辑时排除自身：只改说明/命令、沿用原名不算冲突。
+    let l = label.clone();
+    let taken = state
+        .pool
+        .with(move |conn| label_taken(conn, uid, &l, Some(id)))
+        .await?;
+    if taken {
+        return Err(ApiError::bad_request("label", "名称已存在，请换一个"));
+    }
     let now = now_unix();
     state
         .db
@@ -280,5 +325,42 @@ mod tests {
         let left: i64 = c.query_row("SELECT COUNT(*) FROM user_quick_commands", [], |r| r.get(0)).unwrap();
         assert_eq!(left, 2, "越权删除应影响 0 行");
         assert_ne!(id_a, id_b);
+    }
+
+    /// 名称唯一：新增同名拦截；编辑自身沿用旧名放行；改成同用户已有名拦截；
+    /// 跨用户同名互不干扰。
+    #[test]
+    fn label_is_unique_per_user() {
+        let c = mem_db();
+        for uid in [1, 2] {
+            c.execute(
+                "INSERT INTO users(id, username, pwd_hash, role, allowed_roots, created_at) \
+                 VALUES(?1, ?2, 'x', 'operator', '[]', 100)",
+                rusqlite::params![uid, format!("u{uid}")],
+            ).unwrap();
+        }
+        for (uid, label) in [(1, "状态"), (1, "另一条"), (2, "状态")] {
+            c.execute(
+                "INSERT INTO user_quick_commands(user_id, label, cmd, description, created_at, updated_at) \
+                 VALUES(?1, ?2, 'ls', '', 100, 100)",
+                rusqlite::params![uid, label],
+            ).unwrap();
+        }
+        let id_a: i64 = c.query_row(
+            "SELECT id FROM user_quick_commands WHERE user_id = 1 AND label = '状态'", [], |r| r.get(0),
+        ).unwrap();
+        let id_other: i64 = c.query_row(
+            "SELECT id FROM user_quick_commands WHERE user_id = 1 AND label = '另一条'", [], |r| r.get(0),
+        ).unwrap();
+        let id_b: i64 = c.query_row(
+            "SELECT id FROM user_quick_commands WHERE user_id = 2 AND label = '状态'", [], |r| r.get(0),
+        ).unwrap();
+
+        assert!(label_taken(&c, 1, "状态", None).unwrap(), "同用户新增同名必须拦");
+        assert!(!label_taken(&c, 1, "状态", Some(id_a)).unwrap(), "编辑自身沿用旧名应放行");
+        assert!(label_taken(&c, 1, "另一条", Some(id_a)).unwrap(), "改成同用户已有名必须拦");
+        assert!(!label_taken(&c, 2, "状态", Some(id_b)).unwrap(), "他人编辑自身不应被本用户同名影响");
+        assert!(!label_taken(&c, 1, "全新名", None).unwrap(), "未使用的名称应放行");
+        assert_ne!(id_a, id_other);
     }
 }
