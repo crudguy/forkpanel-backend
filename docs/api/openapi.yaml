@@ -550,8 +550,7 @@ components:
       type: object
       properties:
         id:    { type: integer, description: 快捷命令 id }
-        label: { type: string, description: 名称 }
-        cmd:   { type: string, description: 单行命令文本 }
+        cmd:   { type: string, description: 单行命令文本（同用户下唯一） }
         desc:  { type: string, description: 说明 }
 
     # ───────────── WAF 策略模板（026） ─────────────
@@ -2032,18 +2031,18 @@ paths:
     post:
       operationId: post_user_quick_commands
       tags: [terminal]
-      summary: 新建用户级终端快捷命令（039，上限 50 条）
+      summary: 新建用户级终端快捷命令（039/040，上限 50 条；同用户命令重复 → 400）
       security: [cookieAuth, csrfHeader]
-      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [label, cmd], properties: { label: { type: string, description: 名称，trim 后非空、≤40 字 }, cmd: { type: string, description: 单行命令，trim 后非空、≤500 字、禁换行 }, desc: { type: string, description: 说明，≤80 字 } } } } } }
-      responses: { '200': { description: ok }, '400': { description: 校验失败或条数达上限 } }
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [cmd], properties: { cmd: { type: string, description: 单行命令，trim 后非空、≤500 字、禁换行；同用户下唯一 }, desc: { type: string, description: 说明，≤80 字 } } } } } }
+      responses: { '200': { description: ok }, '400': { description: 校验失败、命令已存在或条数达上限 } }
   /api/v1/user/quick-commands/{id}:
     patch:
       operationId: patch_user_quick_commands_id
       tags: [terminal]
-      summary: 更新用户级终端快捷命令（039，他人或不存在的 id → 404）
+      summary: 更新用户级终端快捷命令（039/040，他人或不存在的 id → 404；命令与其他条重复 → 400）
       security: [cookieAuth, csrfHeader]
-      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [label, cmd], properties: { label: { type: string }, cmd: { type: string }, desc: { type: string } } } } } }
-      responses: { '200': { description: ok }, '400': { description: 校验失败 }, '404': { description: 快捷命令不存在或不属于当前用户 } }
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [cmd], properties: { cmd: { type: string, description: 单行命令；同用户下唯一（排除自身） }, desc: { type: string, description: 说明，≤80 字 } } } } } }
+      responses: { '200': { description: ok }, '400': { description: 校验失败或命令已存在 }, '404': { description: 快捷命令不存在或不属于当前用户 } }
     delete:
       operationId: delete_user_quick_commands_id
       tags: [terminal]

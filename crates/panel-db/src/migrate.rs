@@ -66,10 +66,12 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (38, include_str!("../../../migrations/038_default_cron_templates.sql")),
     // 039：用户级终端快捷命令——跨设备按登录用户存储
     (39, include_str!("../../../migrations/039_user_quick_commands.sql")),
+    // 040：快捷命令唯一性从 label 改到 cmd——列表展示的是命令本身，名称无用
+    (40, include_str!("../../../migrations/040_quick_commands_drop_label.sql")),
 ];
 
 /// 当前 schema 版本
-pub const LATEST: u32 = 39;
+pub const LATEST: u32 = 40;
 
 pub fn apply(conn: &mut Connection) -> Result<u32> {
     conn.execute_batch(
