@@ -195,11 +195,44 @@ pub async fn check_token(token: &str) -> Result<CfCheck> {
     })
 }
 
+/// ACME dns-01 要写的记录名：**挑战域名本身**，不是它所属的 zone。
+///
+/// CA 查的是 `_acme-challenge.<申请域名>`。写成 `_acme-challenge.<zone>` 时，
+/// apex 域名碰巧能对，但 `www.example.com` 这种子域会签不过——CA 查的是
+/// `_acme-challenge.www.example.com`。通配符域名用 apex 做验证名（RFC 8555）。
+pub fn acme_record_name(domain: &str) -> Result<String> {
+    let raw = domain.trim().trim_end_matches('.');
+    let d = raw.strip_prefix("*.").unwrap_or(raw);
+    if d.is_empty() {
+        return Err(PanelError::Validation {
+            field: "domain",
+            reason: "域名不能为空".into(),
+        });
+    }
+    let name = format!("{ACME_PREFIX}.{d}");
+    validate_record_name(&name)?;
+    Ok(name)
+}
+
+/// zone 探测顺序。用户填了「默认 zone」就只试它（权限受限的 token 列不出全部
+/// zone 时必需），否则按域名后缀从长到短试，最少保留两段。
+pub fn zone_candidates(domain: &str, hint: &str) -> Vec<String> {
+    let h = hint.trim().trim_end_matches('.').to_ascii_lowercase();
+    if !h.is_empty() {
+        return vec![h];
+    }
+    let d = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    let labels: Vec<&str> = d.split('.').collect();
+    (0..labels.len().saturating_sub(1))
+        .map(|i| labels[i..].join("."))
+        .collect()
+}
+
 /// 从域名反查 zone 名。Cloudflare 的 zone 是"注册域 + 可选子域"，而 ACME 给的
 /// 域名可能是 `a.b.example.com`，zone 却是 `example.com`。逐个后缀试探是通用做法。
 ///
 /// 返回 `(zone_id, zone_name)`。
-pub async fn find_zone(token: &str, domain: &str) -> Result<(String, String)> {
+pub async fn find_zone(token: &str, domain: &str, zone_hint: &str) -> Result<(String, String)> {
     let d = domain.trim().trim_end_matches('.');
     if d.is_empty() {
         return Err(PanelError::Validation {
@@ -208,11 +241,7 @@ pub async fn find_zone(token: &str, domain: &str) -> Result<(String, String)> {
         });
     }
     let c = client()?;
-    let labels: Vec<&str> = d.split('.').collect();
-    // 从最长的后缀开始试：a.b.example.com → a.b.example.com, b.example.com, example.com
-    // 最少保留两段（example.com）——单段（com）不是任何人的 zone。
-    for i in 0..labels.len().saturating_sub(1) {
-        let candidate = labels[i..].join(".");
+    for candidate in zone_candidates(domain, zone_hint) {
         let resp = c
             .get(format!("{CF_API}/zones?name={}", urlenc(&candidate)))
             .bearer_auth(token.trim())
@@ -236,10 +265,15 @@ pub async fn find_zone(token: &str, domain: &str) -> Result<(String, String)> {
             }
         }
     }
+    let hint_tip = if zone_hint.trim().is_empty() {
+        String::new()
+    } else {
+        format!("（已按你填的默认 zone `{}` 查找，填错请先改正）", zone_hint.trim())
+    };
     Err(PanelError::Validation {
         field: "domain",
         reason: format!(
-            "在 Cloudflare 账号下找不到 `{d}` 所属的 zone。\
+            "在 Cloudflare 账号下找不到 `{d}` 所属的 zone{hint_tip}。\
              常见原因：① 该域名的 NS 还没指到 Cloudflare；② Token 少了 Zone:Read 权限"
         ),
     })
@@ -314,19 +348,14 @@ pub async fn delete_txt(token: &str, zone_id: &str, record_id: &str) -> Result<(
     Ok(())
 }
 
-/// 兜底清理：删掉 `_acme-challenge.<domain 所属 zone>` 下**形似 ACME 挑战**的
-/// TXT 记录。
+/// 兜底清理：删掉 `_acme-challenge.<申请域名>` 下**形似 ACME 挑战**的 TXT 记录。
 ///
 /// 判据只认「名字正好是该域的 _acme-challenge」+「内容形似 base64url 且长度接近
 /// 43 字符」——用户自己放的验证 TXT（如 SPF/站点验证）名字不同、内容不同，不动。
 /// 宁可漏删也不能误删：误删用户的 DNS 记录是不可挽回的破坏。
-pub async fn cleanup_acme_records(token: &str, domain: &str) -> Result<usize> {
-    let (zone_id, zone_name) = find_zone(token, domain).await?;
-    let want = format!(
-        "{}.{}",
-        ACME_PREFIX,
-        zone_name.trim_end_matches('.').to_ascii_lowercase()
-    );
+pub async fn cleanup_acme_records(token: &str, domain: &str, zone_hint: &str) -> Result<usize> {
+    let (zone_id, _zone_name) = find_zone(token, domain, zone_hint).await?;
+    let want = acme_record_name(domain)?.to_ascii_lowercase();
     let c = client()?;
     let resp = c
         .get(format!(
@@ -459,5 +488,25 @@ mod tests {
         assert_eq!(urlenc("a b"), "a%20b");
         assert_eq!(urlenc("a&b=c"), "a%26b%3Dc");
         assert_eq!(urlenc("中文"), "%E4%B8%AD%E6%96%87");
+    }
+
+    // 回归：CA 查的是申请域名的挑战名，不是 zone 名。写成 zone 名会让
+    // `www.example.com` 这类子域永远验证失败，而报错只有一句 "invalid"。
+    #[test]
+    fn challenge_name_uses_requested_domain_not_zone() {
+        assert_eq!(acme_record_name("example.com").unwrap(), "_acme-challenge.example.com");
+        assert_eq!(acme_record_name("www.example.com").unwrap(), "_acme-challenge.www.example.com");
+        assert_eq!(acme_record_name("a.b.example.com.").unwrap(), "_acme-challenge.a.b.example.com");
+        // 通配符证书由 apex 承载验证
+        assert_eq!(acme_record_name("*.example.com").unwrap(), "_acme-challenge.example.com");
+        assert!(acme_record_name("").is_err());
+    }
+
+    #[test]
+    fn zone_hint_overrides_suffix_probing() {
+        assert_eq!(zone_candidates("www.example.com", ""), vec!["www.example.com", "example.com"]);
+        assert_eq!(zone_candidates("example.com", ""), vec!["example.com"]);
+        // 填了就用它，且不再探测其它后缀——探测到别的 zone 会把 TXT 写错地方
+        assert_eq!(zone_candidates("www.example.com", " Example.COM. "), vec!["example.com"]);
     }
 }

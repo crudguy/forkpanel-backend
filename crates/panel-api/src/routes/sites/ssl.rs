@@ -249,6 +249,7 @@ pub async fn ssl_apply(
                 key_p,
                 hook_dir: ssl_dir(&state).join("acme-hooks"),
                 dns_token: String::new(),
+                zone_hint: String::new(),
                 master: state.require_secret_key()?,
                 db: state.db.clone(),
             };
@@ -285,7 +286,7 @@ pub async fn ssl_apply(
             let provider = resolve_dns_provider(&state, req.dns_provider.as_deref()).await?;
             // 提交前就解密凭据：解不开（主密钥换过）要在**提交时**就报清楚，
             // 而不是让任务跑起来再失败——用户看到的是"签发失败"，很难联想到凭据。
-            let dns_token = super::dns::secret_for(&state, &provider).await?;
+            let cred = super::dns::credentials_for(&state, &provider).await?;
             let (crt_p, key_p) = cert_paths_for(&state, &domains);
             let job = AcmeTask {
                 mode: AcmeMode::Issue,
@@ -297,7 +298,8 @@ pub async fn ssl_apply(
                 crt_p,
                 key_p,
                 hook_dir: ssl_dir(&state).join("acme-hooks"),
-                dns_token,
+                dns_token: cred.token,
+                zone_hint: cred.zone_hint,
                 master: state.require_secret_key()?,
                 db: state.db.clone(),
             };
@@ -511,6 +513,9 @@ pub struct AcmeTask {
     /// 之所以不传 provider 名让任务体去查库：那要求任务体持有 DB 与主密钥的完整
     /// 查询权限，扩大接触面反而更差。
     pub dns_token: String,
+    /// 用户填的「默认 zone」；空串 = 按域名后缀自动探测。
+    /// 与 token 一起在提交时取出，签发/兜底清理都必须用同一份，否则会写进不同 zone。
+    pub zone_hint: String,
     pub master: crate::MasterKey,
     pub db: std::sync::Arc<panel_db::WriterActor>,
 }
@@ -530,10 +535,18 @@ impl panel_task::TaskBody for AcmeTask {
                 AcmeChallenge::Http01 => tls::issue_acme(&primary, &self.email, &self.webroot).await?,
                 AcmeChallenge::Dns01 { provider } => {
                     progress.set(25, "写入 DNS 挑战记录").await;
-                    issue_acme_dns01(self, provider, &self.dns_token, &primary).await?
+                    issue_acme_dns01(self, provider, &self.dns_token, &self.zone_hint, &primary).await?
                 }
             },
-            AcmeMode::Renew => tls::renew_acme(&primary).await?,
+            AcmeMode::Renew => match &self.challenge {
+                // dns-01 续期必须重新写一次 TXT：首签 hook 依赖的自定义环境变量
+                // 不会存进 certbot 的续期配置，裸 renew 必然失败。
+                AcmeChallenge::Dns01 { provider } => {
+                    progress.set(25, "写入 DNS 挑战记录").await;
+                    issue_acme_dns01(self, provider, &self.dns_token, &self.zone_hint, &primary).await?
+                }
+                AcmeChallenge::Http01 => tls::renew_acme(&primary).await?,
+            },
         };
 
         progress.set(70, "落盘与入库").await;
@@ -549,6 +562,11 @@ impl panel_task::TaskBody for AcmeTask {
         let dj = serde_json::to_string(&self.domains).unwrap_or_else(|_| "[]".into());
         let issuer = "ACME (certbot)".to_string();
         let cert = cert_pem;
+        // 续期方式必须跟着证书落库：裸 `certbot renew` 对 dns-01 不成立。
+        let challenge = match &self.challenge {
+            AcmeChallenge::Dns01 { .. } => "dns-01",
+            AcmeChallenge::Http01 => "http-01",
+        };
         self.db
             .exec(move |conn| {
                 conn.execute("DELETE FROM ssl_certs WHERE site_id = ?1", [site_id])
@@ -556,9 +574,9 @@ impl panel_task::TaskBody for AcmeTask {
                 conn.execute(
                     // ACME 证书默认开启自动续期（有效期仅 90 天，靠人工点续期必然会漏）。
                     // 用户可在证书列表关掉；selfsigned / manual 恒为 0（无法自动续）。
-                    "INSERT INTO ssl_certs(site_id, domains, issuer, not_after, source, key_enc, cert, renew_state, created_at, auto_renew) \
-                     VALUES(?1, ?2, ?3, ?4, 'acme', ?5, ?6, 'ok', ?7, 1)",
-                    rusqlite::params![site_id, dj, issuer, not_after, key_enc, cert, now],
+                    "INSERT INTO ssl_certs(site_id, domains, issuer, not_after, source, key_enc, cert, renew_state, created_at, auto_renew, challenge) \
+                     VALUES(?1, ?2, ?3, ?4, 'acme', ?5, ?6, 'ok', ?7, 1, ?8)",
+                    rusqlite::params![site_id, dj, issuer, not_after, key_enc, cert, now, challenge],
                 )
                 .map_err(|e| PanelError::Database(e.to_string()))?;
                 Ok(panel_db::WriteAck { rows_changed: 1 })
@@ -590,6 +608,7 @@ async fn issue_acme_dns01(
     task: &AcmeTask,
     provider: &str,
     token: &str,
+    zone_hint: &str,
     domain: &str,
 ) -> Result<(String, String)> {
     if provider != super::dns::PROVIDER_CLOUDFLARE {
@@ -598,7 +617,7 @@ async fn issue_acme_dns01(
             reason: format!("dns-01 暂只支持 Cloudflare，收到 `{provider}`"),
         });
     }
-    let (zone_id, zone_name) = cloudflare::find_zone(token, domain).await?;
+    let (zone_id, _zone_name) = cloudflare::find_zone(token, domain, zone_hint).await?;
 
     // hook 脚本与凭据分离：脚本文本固定（可审计、可留存），凭据只走环境变量。
     // ⚠ 若把 token 拼进脚本文本，脚本就必须落盘 → 明文凭据上盘。
@@ -617,13 +636,9 @@ async fn issue_acme_dns01(
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700));
     }
-    let record_name = format!(
-        "{}.{}",
-        cloudflare::ACME_PREFIX,
-        zone_name.trim_end_matches('.')
-    );
-    // 记录名过前缀闸。zone 名来自 API 本可信任，但闸不能因"上游可信"就省。
-    cloudflare::validate_record_name(&record_name)?;
+    // 记录名按「申请域名」算，不能按 zone 名算——否则子域证书写错 TXT 名。
+    // acme_record_name 内部已过 `_acme-challenge.*` 前缀闸。
+    let record_name = cloudflare::acme_record_name(domain)?;
 
     let hook_s = hook
         .to_str()
@@ -648,26 +663,29 @@ async fn issue_acme_dns01(
             .map_err(|e| PanelError::Io(format!("设凭据临时文件权限失败：{e}")))?;
     }
 
+    let mut args: Vec<&str> = vec![
+        "certonly",
+        "--manual",
+        "--preferred-challenges",
+        "dns",
+        "--manual-auth-hook",
+        &hook_s,
+        "--manual-cleanup-hook",
+        &hook_s,
+        "-d",
+        domain,
+        "--non-interactive",
+        "--agree-tos",
+    ];
+    // 续期时没有邮箱（沿用 certbot 已有账户），传空 `-m` 会让 certbot 直接失败。
+    if !task.email.trim().is_empty() {
+        args.push("-m");
+        args.push(task.email.trim());
+    }
+    args.extend(["--keep-until-expiring", "--quiet"]);
     let out = panel_os::cmd::run(
         panel_os::cmd::Bin::Certbot,
-        &[
-            "certonly",
-            "--manual",
-            "--preferred-challenges",
-            "dns",
-            "--manual-auth-hook",
-            &hook_s,
-            "--manual-cleanup-hook",
-            &hook_s,
-            "-d",
-            domain,
-            "--non-interactive",
-            "--agree-tos",
-            "-m",
-            &task.email,
-            "--keep-until-expiring",
-            "--quiet",
-        ],
+        &args,
         panel_os::cmd::CmdOpt {
             timeout: std::time::Duration::from_secs(600),
             env: [
@@ -695,7 +713,7 @@ async fn issue_acme_dns01(
     let _ = std::fs::remove_file(&tok_file);
 
     // 无论成败都兜底清一次：certbot 的 cleanup hook 在异常退出时不保证跑到
-    let _ = cloudflare::cleanup_acme_records(token, domain).await;
+    let _ = cloudflare::cleanup_acme_records(token, domain, zone_hint).await;
 
     match out {
         Ok(o) if o.code == Some(0) => tls::read_acme_pair(domain),
@@ -780,16 +798,22 @@ pub async fn cert_renew(
         .pool
         .with(move |conn| {
             let mut st = conn
-                .prepare("SELECT domains, source FROM ssl_certs WHERE id = ?1")
+                .prepare("SELECT domains, source, challenge FROM ssl_certs WHERE id = ?1")
                 .map_err(db_err)?;
             let mut it = st
-                .query_map([id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .query_map([id], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })
                 .map_err(db_err)?;
             it.next().transpose().map_err(db_err)
         })
         .await?
         .ok_or_else(|| ApiError::not_found("cert"))?;
-    let (domains_json, source) = row;
+    let (domains_json, source, stored_challenge) = row;
 
     if source != "selfsigned" {
         if !state.capabilities.get(cap_keys::SSL_ACME).map(|c| c.supported).unwrap_or(false) {
@@ -798,19 +822,28 @@ pub async fn cert_renew(
         // ACME 续期同样走任务：certbot 可能耗时，且 CA 有限流（LE 5 次/小时/域名）
         let domains: Vec<String> = serde_json::from_str(&domains_json).unwrap_or_default();
         let (crt_p, key_p) = cert_paths_for(&state, &domains);
+        // 续期必须沿用首签的挑战方式：dns-01 要重新解密凭据写 TXT，
+        // http-01 才能用裸 `certbot renew`（certbot 记住了 webroot）。
+        let (challenge, dns_token, zone_hint) = if stored_challenge == "dns-01" {
+            let provider = resolve_dns_provider(&state, None).await?;
+            let cred = super::dns::credentials_for(&state, &provider).await?;
+            (AcmeChallenge::Dns01 { provider }, cred.token, cred.zone_hint)
+        } else {
+            (AcmeChallenge::Http01, String::new(), String::new())
+        };
         let job = AcmeTask {
             mode: AcmeMode::Renew,
-            // 续期不改鉴权方式：certbot 已记住首次签发时的挑战类型
-            challenge: AcmeChallenge::Http01,
+            challenge,
             site_id: id,
             domains,
-            // renew 沿用 certbot 既有账户，无需邮箱与 webroot
+            // renew 沿用 certbot 既有账户；dns-01 重签也不需要传邮箱
             email: String::new(),
             webroot: std::path::PathBuf::new(),
             crt_p,
             key_p,
             hook_dir: ssl_dir(&state).join("acme-hooks"),
-            dns_token: String::new(),
+            dns_token,
+            zone_hint,
             master: state.require_secret_key()?,
             db: state.db.clone(),
         };
@@ -910,19 +943,23 @@ pub async fn auto_renew_sweep(state: Shared) -> panel_core::Result<usize> {
     let now = crate::now_unix();
     let due_before = now + RENEW_WINDOW_DAYS * 86_400;
 
-    let rows: Vec<(i64, String)> = state
+    let rows: Vec<(i64, String, String)> = state
         .pool
         .with(move |conn| {
             let mut st = conn
                 .prepare(
-                    "SELECT id, domains FROM ssl_certs \
+                    "SELECT id, domains, challenge FROM ssl_certs \
                      WHERE source='acme' AND auto_renew=1 \
                        AND not_after IS NOT NULL AND not_after <= ?1",
                 )
                 .map_err(db_err)?;
             let it = st
                 .query_map(rusqlite::params![due_before], |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
                 })
                 .map_err(db_err)?;
             let mut v = Vec::new();
@@ -934,25 +971,46 @@ pub async fn auto_renew_sweep(state: Shared) -> panel_core::Result<usize> {
         .await?;
 
     let mut queued = 0usize;
-    for (id, domains_json) in rows {
+    for (id, domains_json, stored_challenge) in rows {
         let domains: Vec<String> = serde_json::from_str(&domains_json).unwrap_or_default();
         if domains.is_empty() {
             continue;
         }
+        // 挑战方式跟着证书走：dns-01 必须重新解密凭据写 TXT，不能裸跑 certbot renew。
+        // 凭据失效只跳过这一张证书，不拖垮整轮扫描（其余证书照常续期）。
+        let (challenge, dns_token, zone_hint) = if stored_challenge == "dns-01" {
+            let provider = match resolve_dns_provider(&state, None).await {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("[skip] 证书 #{id} 自动续期：DNS 提供商不可用（{}）", e.message);
+                    continue;
+                }
+            };
+            let cred = match super::dns::credentials_for(&state, &provider).await {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("[skip] 证书 #{id} 自动续期：DNS 凭据不可用（{e}）");
+                    continue;
+                }
+            };
+            (AcmeChallenge::Dns01 { provider }, cred.token, cred.zone_hint)
+        } else {
+            (AcmeChallenge::Http01, String::new(), String::new())
+        };
         let (crt_p, key_p) = cert_paths_for(&state, &domains);
         let job = AcmeTask {
             mode: AcmeMode::Renew,
-            // 续期不改鉴权方式：certbot 已记住首次签发时的挑战类型
-            challenge: AcmeChallenge::Http01,
+            challenge,
             site_id: id,
             domains: domains.clone(),
-            // Renew 沿用 certbot 既有账户，无需邮箱与 webroot
+            // Renew 沿用 certbot 既有账户；dns-01 重签不需要邮箱
             email: String::new(),
             webroot: std::path::PathBuf::new(),
             crt_p,
             key_p,
             hook_dir: ssl_dir(&state).join("acme-hooks"),
-            dns_token: String::new(),
+            dns_token,
+            zone_hint,
             master,
             db: state.db.clone(),
         };

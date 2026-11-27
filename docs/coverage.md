@@ -63,8 +63,8 @@
 | GET/PATCH/DELETE `/sites/{id}` | 单体详情/更新/删除 | ✅ | 删除级联证书与磁盘 | SitesView |
 | POST `/sites/{id}/reload` | 重载 | 🟠 | `nginx -s reload`→回退 systemctl；沙箱不可验 | SitesView |
 | GET `/sites/{id}/logs` | 访问/错误日志 | ✅ | **SSE**（#59 并入日志实时流） | SitesView |
-| POST `/sites/{id}/ssl/apply` | 证书签发 | ✅ | **self-signed 同步签发**（openssl，key 经主密钥加密落盘 0600）；`method=http-01` → ✅ 走 certbot 任务（需账户邮箱，仅签主域名）；`method=dns-01` → 🟡 需 DNS 提供商 API（M5） | SitesView |
-| GET `/certs` / POST `/certs/{id}/renew` / DELETE `/certs/{id}` | 证书列表/续期/删除 | ✅ | 续期=自签重签；删除连磁盘文件清理 | SitesView |
+| POST `/sites/{id}/ssl/apply` | 证书签发 | ✅ | **self-signed 同步签发**（openssl，key 经主密钥加密落盘 0600）；`method=http-01` → ✅ 走 certbot 任务（需账户邮箱，仅签主域名）；`method=dns-01` → ✅ Cloudflare API 自动写/清理 TXT（仅主域名，需 API Token） | CertsView / SitesView |
+| GET `/certs` / POST `/certs/{id}/renew` / DELETE `/certs/{id}` | 证书列表/续期/删除 | ✅ | 续期按首签挑战方式：自签重签 / ACME 任务（dns-01 重新写 TXT）；删除连磁盘文件清理 | CertsView / SitesView |
 
 ## 6. 文件
 
@@ -244,7 +244,7 @@
     新增"带理由的行内豁免"机制并做了三态负向验证。
   - **插件系统设计稿**：`docs/design-plugin-system.md`——**只出设计，未实施**。
 - **剩余 🟡 清单**（结构化 501 或如实降级，**均为刻意不做或需外部条件**，不是"来不及做"）：
-  - `dns-01`（需 DNS 提供商 API，设计列 M5）；
+  - `dns-01` 的**多域名 SAN** 与非 Cloudflare 提供商（当前 dns-01 只签主域名、只接 Cloudflare）；
   - 备份 `kind=panel` 的**在线**恢复（面板库在线覆盖会损坏 SQLite WAL）；停服后可用
   `panel restore-db <产物>` 一条命令恢复（验产物 → 留快照 → 原子替换 → 清 WAL/SHM）；
   **本地盘没了可用 `--remote <计划 id>` 从远端副本取回**（真机验证：WebDAV 上传 → 删本地产物 → 停服 → `--remote` 取回并恢复，服务起得来、数据逐项对上，临时副本无残留）；
@@ -277,7 +277,7 @@
 | `e2e-containers` | 能力位（按 daemon 可达性）、7 类只读端点、创建安全闸门 6 条（缺确认词/特权/敏感挂载/非法名/错词） | **不创建真实容器** | 15 |
 | `e2e-cron` | 能力位、读端点、预览、11 条创建校验拒绝、创建→手动执行→任务输出与状态回写→删除 | —（用 `echo` 产证据，末了删 crontab 条目） | 34 |
 | `e2e-databases` | 6 条连接校验拒绝、SQLite 浏览全链路（库→schema→表→行→CSV 导出）、只读 SQL 闸门、生命周期 | 不碰 mysql/pg（需远端） | 42 |
-| `e2e-sites` | 能力位、读端点、7 条创建拒绝、纯 DB 生命周期、SSL `http-01`/`dns-01` 诚实 501 | **不 apply/reload 真实 nginx、不签证书** | 36 |
+| `e2e-sites` | 能力位、读端点、7 条创建拒绝、纯 DB 生命周期、SSL `http-01`/`dns-01` 能力门禁 | **不 apply/reload 真实 nginx、不签证书、不调 Cloudflare API** | 36 |
 | `e2e-firewall` | 能力位、读端点、apply 拒绝（端口/CIDR/动作）+ **SSH 失联保护冲突** | **不写真实 iptables/nft、不改启停、不删规则** | 17 |
 | `e2e-rbac` | 用户/角色 CRUD、owner 与自锁守卫（403）、**防提权**（第二会话：仅 `user.manage` 的用户不能授予自己没有的权限）、内置角色保留、被引用角色不可删、部署级设置拒绝 PATCH、审计 `user.create`/`role.create` 真写入 | 不建 owner、不动真实用户 | 63 |
 | `e2e-security` | WAF 模板校验与 CRUD（profile/限速/burst/IP 列表）、拦截事件过滤、告警阈值与窗宽越界、安全基线（只读 + 错误确认词 10001）、在线会话（恰一 current、差集识别并吊销自己新建的会话 204） | **绝不用正确确认词调 `baseline/apply`**（会写回 sshd）；告警只原值回写；只吊销本次新建的会话 | 40 |

@@ -68,10 +68,12 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (39, include_str!("../../../migrations/039_user_quick_commands.sql")),
     // 040：快捷命令唯一性从 label 改到 cmd——列表展示的是命令本身，名称无用
     (40, include_str!("../../../migrations/040_quick_commands_drop_label.sql")),
+    // 041：证书记录首签挑战方式——dns-01 续期必须重新写 TXT，不能裸跑 certbot renew
+    (41, include_str!("../../../migrations/041_cert_dns_challenge.sql")),
 ];
 
 /// 当前 schema 版本
-pub const LATEST: u32 = 40;
+pub const LATEST: u32 = 41;
 
 pub fn apply(conn: &mut Connection) -> Result<u32> {
     conn.execute_batch(

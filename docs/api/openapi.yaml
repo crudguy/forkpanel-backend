@@ -902,7 +902,7 @@ components:
         provider_label:   { type: string, description: 展示名（前端不要自己维护映射，避免与后端不一致） }
         label:            { type: string, description: 用户备注名 }
         secret_masked:    { type: string, description: '掩码（前 4 + ****** + 后 4）；短于 12 字符整串打码，且星号数固定不泄露真实长度' }
-        zone_hint:        { type: string, description: 留空=自动探测域名所属 zone }
+        zone_hint:        { type: string, description: 留空=按域名后缀自动探测；填了=固定使用该 zone（签发与清理都用它） }
         usable:           { type: boolean, description: 'false=密文解不开（主密钥可能已更换），需重填' }
         last_check_at:    { type: integer, description: '上次校验时间戳；0=从未校验' }
         last_check_ok:    { type: boolean }
@@ -916,7 +916,7 @@ components:
         provider:  { type: string, enum: [cloudflare] }
         label:     { type: string, description: 备注名，可留空 }
         secret:    { type: string, description: 'API Token。首次添加必填；更新时留空 = 保持原值不变' }
-        zone_hint: { type: string, description: 留空=自动探测 }
+        zone_hint: { type: string, description: 留空=按域名后缀自动探测；填了=固定使用该 zone }
 
     # ───────────── 文件 ─────────────
     FileEntry:

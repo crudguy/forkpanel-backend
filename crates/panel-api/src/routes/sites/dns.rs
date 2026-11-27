@@ -76,19 +76,28 @@ fn encrypt_secret(state: &Shared, plain: &str) -> ApiResult<String> {
     Ok(format!("enc:{hex}"))
 }
 
-/// 取出某 provider 的**明文** token（供签发任务在提交时带入）。
+/// 取出某 provider 的明文 token + 用户填的默认 zone（供签发任务在提交时带入）。
 ///
 /// 与列表接口刻意分开：`list_dns_creds` 永远只给掩码，明文只在这一条内部路径上
 /// 出现一次，且立即交给任务对象、随任务析构消失。
-pub async fn secret_for(state: &Shared, provider: &str) -> Result<String> {
+/// `zone_hint` 必须一起取：它是用户可见的配置项，签发时不用就是「假控制」。
+#[derive(Debug, Clone)]
+pub struct DnsSecret {
+    pub token: String,
+    pub zone_hint: String,
+}
+
+pub async fn credentials_for(state: &Shared, provider: &str) -> Result<DnsSecret> {
     let p = provider.to_string();
-    let enc = state
+    let row = state
         .pool
         .with(move |conn| {
             let mut st = conn
-                .prepare("SELECT secret_enc FROM dns_credentials WHERE provider = ?1")
+                .prepare("SELECT secret_enc, zone_hint FROM dns_credentials WHERE provider = ?1")
                 .map_err(db_err)?;
-            let mut it = st.query_map([p], |r| r.get::<_, String>(0)).map_err(db_err)?;
+            let mut it = st
+                .query_map([p], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .map_err(db_err)?;
             it.next().transpose().map_err(db_err)
         })
         .await?
@@ -96,10 +105,12 @@ pub async fn secret_for(state: &Shared, provider: &str) -> Result<String> {
             field: "dns_provider",
             reason: format!("未找到 `{provider}` 的 DNS 凭据"),
         })?;
-    decrypt_secret(state, &enc).ok_or_else(|| PanelError::Validation {
+    let (enc, zone_hint) = row;
+    let token = decrypt_secret(state, &enc).ok_or_else(|| PanelError::Validation {
         field: "secret",
         reason: "已存 DNS 凭据无法解密（主密钥可能已更换），请重新填写 API Token".into(),
-    })
+    })?;
+    Ok(DnsSecret { token, zone_hint })
 }
 
 #[derive(Debug, Serialize)]
