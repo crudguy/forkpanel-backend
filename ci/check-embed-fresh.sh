@@ -38,7 +38,7 @@ if [ ! -d "$FE_DIST" ]; then
     exit 1
   fi
   echo "[skip] check-embed-fresh：本地未构建前端（$FE_DIST 不存在），本门禁未执行（非通过）" >&2
-  echo "  构建后重跑：cd ../forkpanel-frontend && corepack pnpm@9 build" >&2
+  echo "  构建后重跑：cd ../forkpanel-frontend && corepack pnpm@10 build" >&2
   exit 0
 fi
 [ -d "$BE_DIST" ] || fail "找不到内嵌目录 $BE_DIST"

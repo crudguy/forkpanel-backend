@@ -38,8 +38,8 @@ git clone https://github.com/crudguy/forkpanel-frontend.git forkpanel-frontend  
 
 # 2. 构建前端
 cd forkpanel-frontend
-corepack enable && corepack pnpm@9 install --frozen-lockfile
-corepack pnpm@9 build                          # 产出 forkpanel-frontend/dist/
+corepack enable && corepack pnpm@10 install --frozen-lockfile
+corepack pnpm@10 build                         # 产出 forkpanel-frontend/dist/
 
 # 3. 同步进后端（这一步不可省；前端仓放在哪都行，下面路径换成你实际的）
 cd ../forkpanel-backend

@@ -77,8 +77,10 @@ jobs:
         working-directory: forkpanel-frontend
         run: |
           corepack enable
-          corepack pnpm@9 install --frozen-lockfile
-          corepack pnpm@9 build
+          # 与前端仓 .github/workflows/ci.yml 及 pnpm-workspace.yaml 的 overrides 口径一致；
+          # pnpm 9 不认 workspace 里的 overrides，会让 frozen-lockfile 永远不匹配。
+          corepack pnpm@10 install --frozen-lockfile
+          corepack pnpm@10 build
 
       # ⚠ 必须先 mkdir -p web/dist：干净 checkout 时后端仓**没有 web/ 目录**
       #   （web/dist 被 .gitignore，空目录不入库），直接 cp 会报

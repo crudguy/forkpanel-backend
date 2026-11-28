@@ -46,8 +46,10 @@ jobs:
         run: |
           cd forkpanel-frontend
           corepack enable
-          corepack pnpm@9 install --frozen-lockfile
-          corepack pnpm@9 build
+          # 与前端仓 .github/workflows/ci.yml 及 pnpm-workspace.yaml 的 overrides 口径一致；
+          # pnpm 9 不认 workspace 里的 overrides，会让 frozen-lockfile 永远不匹配。
+          corepack pnpm@10 install --frozen-lockfile
+          corepack pnpm@10 build
           cd ..
           # 必须 rm -rf 再 cp：只 cp 只增不删，会留下旧 hash 的僵尸 chunk，
           # 既撑大二进制又让 embed-fresh 的僵尸检查失去意义

@@ -82,7 +82,7 @@ else:
     bad("前端 checkout 步骤缺 `id:`——`steps.<id>.outcome` 引用会失效，构建步骤将被静默跳过")
 
 for needle, desc in [
-    ("corepack pnpm@9 build", "真的执行前端构建（不是只 install）"),
+    ("corepack pnpm@10 build", "真的执行前端构建（不是只 install）"),
     ("cp -a forkpanel-frontend/dist/. web/dist/", "把构建产物同步进 web/dist"),
     ("touch crates/panel-cli/src/embed.rs", "touch embed.rs 迫使 RustEmbed 重嵌（否则命中缓存嵌旧包）"),
 ]:
