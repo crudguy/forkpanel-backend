@@ -11,7 +11,7 @@
 #  dev 主机防火墙后端**真实在场**（firewall.manage=True，iptables/nft 在 /usr/sbin，
 #  交互 PATH 没有 ⇒ `which` 会误判缺失）。因此本脚本**绝不**：
 #   · 提交**合法**规则（会真的写 iptables/nft）；
-#   · 带 allow_lockout_risk=true 的封端口规则（会真的封端口）；
+#   · 带 new_ssh_port 的封端口规则（会真的迁移 SSH 并重放防火墙，危险）；
 #   · 调 set_enabled / set_active / delete_rule（会真的改防火墙状态/删规则）。
 #  只测：能力位、只读端点、以及**全部在 snapshot() 之前返回**的拒绝分支（零残留）。
 #  每条拒绝分支都钉死**具体 code**（不用 chk_ne）——否则 URL 写错命中 404 会假绿。
@@ -48,6 +48,9 @@ for k in p:
     if d is None: break
     d = d[int(k)] if isinstance(d,list) else d.get(k)
 print("" if d is None else d)' "$1"; }
+# jget 会把顶层 data 拆包；错误响应里 data:null 会把 detail 一起丢掉，
+# 所以校验错误字段必须走这个不拆包的专用取值器。
+jerrfield() { python3 -c 'import sys,json;print((json.load(sys.stdin).get("detail") or {}).get(sys.argv[1],""))' "$1"; }
 
 post() { curl -s -b "$CJ" -X POST "$B/api/v1$1" -H 'Content-Type: application/json' \
            -H "x-csrf-token: $CSRF" -d "$2"; }
@@ -112,9 +115,15 @@ r=$(post /firewall/rules '{"rules":[{"ports":"80","source":"999.999.999.999"}]}'
 r=$(post /firewall/rules '{"rules":[{"ports":"80","source":"1.2.3.4/99"}]}');       chk "非法 CIDR（前缀越界）→ 10001" "$(echo "$r" | jcode)" "10001"
 # 动作非法
 r=$(post /firewall/rules '{"rules":[{"ports":"80","action":"drop"}]}');             chk "未知动作 → 10001" "$(echo "$r" | jcode)" "10001"
-# SSH 失联保护：封 22 且未显式 allow_lockout_risk ⇒ 冲突（10005），不碰防火墙
-r=$(post /firewall/rules '{"rules":[{"ports":"22","action":"deny"}]}');             chk "封 SSH(22) 未确认 → 冲突 10005" "$(echo "$r" | jcode)" "10005"
-r=$(post /firewall/rules '{"rules":[{"ports":"1-65535","action":"reject"}]}');      chk "封全端口未确认 → 冲突 10005" "$(echo "$r" | jcode)" "10005"
+# SSH 失联保护：封当前 SSH 端口/全端口必须同时给 new_ssh_port 走原子迁移，
+# 没给就 10001 且错误字段指向 new_ssh_port（allow_lockout_risk 不再是逃生阀）。
+# 两条都钉死具体 code 与字段，URL 写错命中 404 或换个字段都不能假绿。
+r=$(post /firewall/rules '{"rules":[{"ports":"22","action":"deny"}]}')
+chk "封 SSH(22) 未给新端口 → 10001" "$(echo "$r" | jcode)" "10001"
+chk "封 SSH(22) 错误字段=new_ssh_port" "$(echo "$r" | jerrfield field)" "new_ssh_port"
+r=$(post /firewall/rules '{"rules":[{"ports":"1-65535","action":"reject"}]}')
+chk "封全端口未给新端口 → 10001" "$(echo "$r" | jcode)" "10001"
+chk "封全端口错误字段=new_ssh_port" "$(echo "$r" | jerrfield field)" "new_ssh_port"
 
 say "=== 4. fail2ban 诚实闸门 ==="
 if [ "$f2b_sup" = "True" ]; then
